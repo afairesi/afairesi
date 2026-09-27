@@ -735,12 +735,13 @@ def has_python_tests(path: Path) -> bool:
 def package_description(package: Package) -> str | None:
     """Extract declared package metadata where supported."""
     default = _read_regular(package.root / "default.nix")
-    if default is None:
-        return None
+    return source_package_description(default) if default is not None else None
+
+
+def source_package_description(source: str) -> str | None:
+    """Extract a literal Nix package description without evaluation."""
     with contextlib.suppress(json.JSONDecodeError, nix_syntax.NixSyntaxError):
-        description = _meta_description(default)
-        if description is not None:
-            return description
+        return _meta_description(source)
     return None
 
 
@@ -2339,7 +2340,21 @@ def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C
                         unsupported(target)
                     owners[ast.unparse(target)] = path
 
-    visit(module.body, {})
+    public_parser = next(
+        (
+            node
+            for node in module.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "parser"
+            and any(
+                isinstance(child, ast.Call)
+                and _test_names_qualified_name(child.func) in constructors
+                for child in ast.walk(node)
+            )
+        ),
+        None,
+    )
+    visit(public_parser.body if public_parser else module.body, {})
     if not found:
         message = (
             f"unsupported CLI interface in {filename}: no static argparse parser found"
@@ -2635,6 +2650,93 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
         raise unsupported(module, library)
     msg = f"unsupported CLI interface in {filename}: no supported static parser found"
     raise ValueError(msg)
+
+
+def source_package_overview(name: str, files: dict[str, str]) -> str:
+    """Summarize a package without evaluating Nix or importing Python source."""
+    description = source_package_description(files.get("default.nix", ""))
+    help_text = None
+    arguments = ["(not applicable)"]
+    if main_source := files.get("main.py"):
+        try:
+            module = ast.parse(main_source, filename="main.py")
+            help_text = ast.get_docstring(module)
+            arguments = source_package_args(main_source.encode(), "main.py") or [
+                "(none)",
+            ]
+        except (SyntaxError, ValueError) as error:
+            arguments = [f"(unavailable: {error})"]
+    tests = ["(not declared)"]
+    if test_source := files.get("test_main.py"):
+        try:
+            tests = source_test_names(test_source.encode(), "test_main.py") or [
+                "(none)",
+            ]
+        except SyntaxError as error:
+            tests = [f"(unavailable: {error})"]
+    lines = [
+        f"Name: {name}",
+        f"Description: {description or '(not declared)'}",
+        f"Help: {help_text or '(module docstring not declared)'}",
+        "Arguments:",
+        *(f"  {argument}" for argument in arguments),
+        "Tests:",
+        *(f"  {test}" for test in tests),
+    ]
+    return "\n".join(lines)
+
+
+def package_overview(package: Path) -> str:
+    """Read and summarize one package's current canonical source files."""
+    files = {
+        name: content
+        for name in ("default.nix", "main.py", "test_main.py")
+        if (content := _read_regular(package / name)) is not None
+    }
+    return source_package_overview(package.name, files) if files else ""
+
+
+def _run_overview(target: Path, *, full: bool) -> None:
+    """Show a package catalog or the complete summary of one package."""
+    if (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
+        found = False
+        for repository in home_repositories(target, require_url=False):
+            relative = repository["path"]
+            checkout = target / relative
+            if not (checkout / "flake.nix").is_file():
+                continue
+            found = True
+            sys.stdout.write(f"{relative}:\n")
+            _run_overview(checkout, full=full)
+        if not found:
+            msg = f"no checked-out flake submodules found under {target}"
+            raise ValueError(msg)
+        return
+    if (target / "flake.nix").is_file():
+        packages = detect_packages(target)
+        if not packages:
+            msg = f"no packages found under {target / 'packages'}"
+            raise ValueError(msg)
+        for package in packages:
+            if full:
+                sys.stdout.write(
+                    f"packages/{package.name}:\n{package_overview(package.root)}\n\n",
+                )
+            else:
+                sys.stdout.write(
+                    f"packages/{package.name}: "
+                    f"{package_description(package) or '(not declared)'}\n",
+                )
+        return
+    validate_name(target.name)
+    if (
+        target.parent.name != "packages"
+        or not (target.parent.parent / "flake.nix").is_file()
+        or not (target / "default.nix").is_file()
+    ):
+        msg = "expected a canonical packages/NAME inside a flake"
+        raise ValueError(msg)
+    sys.stdout.write(package_overview(target) + "\n")
 
 
 def _print_package_args(package: Path) -> None:
@@ -3401,6 +3503,23 @@ def parser() -> argparse.ArgumentParser:
         "args",
         help="list package CLI arguments or inspect their Git changes",
     )
+    overview = commands.add_parser(
+        "overview",
+        help="browse package descriptions, help, arguments, and test names",
+        description="Show a package catalog or inspect one package in detail.",
+    )
+    overview.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        default=Path(),
+        help="home, flake root, or packages/NAME (default: current directory)",
+    )
+    overview.add_argument(
+        "--full",
+        action="store_true",
+        help="show full details for every package in a flake",
+    )
     test.set_defaults(test_command=None, test_parser=test)
     test_commands = test.add_subparsers(dest="test_command", metavar="COMMAND")
     test_commands.add_parser(
@@ -3513,6 +3632,9 @@ def _dispatch_standalone_command(
     """Dispatch commands that do not require discovering the current repository."""
     if options.command == "test":
         return _dispatch_test_command(options, cli)
+    if options.command == "overview":
+        _run_overview(options.target.resolve(), full=options.full)
+        return True
     if options.command != "init":
         return False
     if options.profile == "home":
@@ -3602,7 +3724,9 @@ def main() -> None:
     except (
         CommandError,
         OSError,
+        SyntaxError,
         UnicodeError,
+        ValueError,
         json.JSONDecodeError,
         nix_syntax.NixSyntaxError,
     ) as error:

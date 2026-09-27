@@ -689,6 +689,25 @@ def _run_test_names(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[s
     )
 
 
+def test_args_prefers_conventional_public_parser(tmp_path: Path) -> None:
+    """Keep internal helper parsers out of a package's public interface."""
+    package = _make_test_names_package(tmp_path, "example", "")
+    (package / "main.py").write_text(
+        "import argparse\n"
+        "def helper():\n"
+        "    internal = argparse.ArgumentParser()\n"
+        "    internal.add_argument('--internal')\n"
+        "def parser():\n"
+        "    public = argparse.ArgumentParser()\n"
+        "    public.add_argument('--public')\n"
+        "    return public\n",
+        encoding="utf-8",
+    )
+    if _run(package, "args").stdout != "--public  optional\n":
+        msg = "internal parser leaked into CLI summary"
+        raise AssertionError(msg)
+
+
 @pytest.mark.parametrize(
     ("imports", "constructor"),
     [
@@ -863,6 +882,57 @@ def test_args_git_views_compare_interfaces(repository: Path) -> None:
     if "+--new  optional" not in _run(repository, "args", "show", "HEAD").stdout:
         message = "Unexpected argument review result"
         raise AssertionError(message)
+
+
+def test_overview_moves_from_catalog_to_package_behavior(repository: Path) -> None:
+    """Expose the reading path without executing the package or its tests."""
+    _run(repository, "add", "packages/alpha", "python", "Alpha package")
+    _run(repository, "add", "packages/zeta", "nix", "Zeta package")
+    package = repository / "packages/alpha"
+    (package / "main.py").write_text(
+        '"""Explain alpha in more detail."""\n'
+        "import argparse\n"
+        "raise RuntimeError('must not execute')\n"
+        "parser = argparse.ArgumentParser()\n"
+        "parser.add_argument('--output', help='Output path')\n",
+        encoding="utf-8",
+    )
+    (package / "test_main.py").write_text(
+        "def test_saves_output(): pass\ndef test_rejects_bad_paths(): pass\n",
+        encoding="utf-8",
+    )
+    catalog = _run(repository, "overview").stdout
+    if catalog != ("packages/alpha: Alpha package\npackages/zeta: Zeta package\n"):
+        raise AssertionError(catalog)
+    detail = _run(repository, "overview", "packages/alpha").stdout
+    for expected in (
+        "Name: alpha\n",
+        "Description: Alpha package\n",
+        "Help: Explain alpha in more detail.\n",
+        "  --output  optional; help='Output path'\n",
+        "  test saves output\n",
+        "  test rejects bad paths\n",
+    ):
+        if expected not in detail:
+            raise AssertionError(detail)
+    full = _run(repository, "overview", "--full").stdout
+    if "packages/alpha:\n" not in full or "packages/zeta:\n" not in full:
+        raise AssertionError(full)
+    if "  (not applicable)\n" not in full:
+        raise AssertionError(full)
+    if "  (not declared)\n" not in full:
+        raise AssertionError(full)
+
+
+def test_overview_lists_checked_out_home_flakes(home_repository: Path) -> None:
+    """Include the repository path above packages in a canonical home."""
+    checkout = home_repository / "forge.example/owner/demo"
+    (checkout / "flake.nix").write_text("", encoding="utf-8")
+    (checkout / ".gitignore").write_text("", encoding="utf-8")
+    _run(checkout, "add", "packages/example", "nix", "Example package")
+    output = _run(home_repository, "overview").stdout
+    if output != ("forge.example/owner/demo:\npackages/example: Example package\n"):
+        raise AssertionError(output)
 
 
 @pytest.mark.parametrize("explicit", [False, True])

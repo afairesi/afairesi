@@ -120,8 +120,8 @@ class TestHistory(unittest.TestCase):
             if agent.messages[-1]["content"] != "done":
                 msg = "Expected agent.messages[-1]['content'] == 'done'"
                 raise AssertionError(msg)
-            if agent.messages[0]["content"] != app.README.read_text():
-                msg = "Expected agent.messages[0]['content'] == app.README.read_text()"
+            if agent.messages[0]["content"] != app.SYSTEM_PROMPT:
+                msg = "Expected agent.messages[0]['content'] == app.SYSTEM_PROMPT"
                 raise AssertionError(msg)
             if not (len(agent.messages[-2]["content"]) < len(output)):
                 msg = "Expected len(agent.messages[-2]['content']) < len(output)"
@@ -985,7 +985,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
 
     def test_package_summary_fields_and_test_name_children(self) -> None:  # noqa: D102
         files = {
-            "default.nix": 'meta.description = "Useful package";\n',
+            "default.nix": '{ meta.description = "Useful package"; }\n',
             "main.py": (
                 '"""Package help."""\n'
                 "import argparse\n"
@@ -1061,6 +1061,25 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Collapsing a package must hide all package children"
                 raise AssertionError(msg)
 
+    def test_current_package_view_uses_canonical_overview(self) -> None:  # noqa: D102
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            viewer = app.Viewer(app.Agent(root))
+            with patch.object(
+                app,
+                "package_overview",
+                return_value="Name: shared",
+            ) as read:
+                entry = viewer.package_entry(root, "sample", diff=False)
+            read.assert_called_once_with(root / "packages/sample")
+            if (
+                entry is None
+                or not entry.children
+                or entry.children[0].title != "Name: shared"
+            ):
+                msg = "Package view did not display the canonical overview"
+                raise AssertionError(msg)
+
     def test_package_summary_uses_canonical_test_discovery(self) -> None:  # noqa: D102
         files = {
             "test_main.py": (
@@ -1079,7 +1098,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             msg = f"Unexpected canonical test names: {tests!r}"
             raise AssertionError(msg)
 
-    def test_argument_names_use_canonical_cli_parser(self) -> None:  # noqa: D102
+    def test_package_summary_uses_canonical_cli_parser(self) -> None:  # noqa: D102
         source = (
             "import argparse\n"
             "parser = argparse.ArgumentParser()\n"
@@ -1087,7 +1106,10 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             "build = commands.add_parser('build')\n"
             "build.add_argument('--jobs', type=int, default=2, help='Worker count')\n"
         )
-        arguments = app.Viewer.argument_names({"main.py": source})
+        arguments = app.Viewer.summary_group(
+            app.Viewer.package_summary("sample", {"main.py": source}),
+            "Arguments",
+        )
         if arguments != [
             "build: command",
             "build: --jobs  optional; default=2; type=int; help='Worker count'",
@@ -1110,7 +1132,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             package = root / "packages/sample"
             package.mkdir(parents=True)
             (package / "default.nix").write_text(
-                'meta.description = "Before";\n',
+                '{ meta.description = "Before"; }\n',
                 encoding="utf-8",
             )
             (package / "main.py").write_text(
@@ -1131,7 +1153,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 check=True,
             )
             (package / "default.nix").write_text(
-                'meta.description = "After";\n',
+                '{ meta.description = "After"; }\n',
                 encoding="utf-8",
             )
             (package / "main.py").write_text(
@@ -1152,7 +1174,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             removed = root / "packages/removed"
             removed.mkdir()
             (removed / "default.nix").write_text(
-                'meta.description = "Gone";\n',
+                '{ meta.description = "Gone"; }\n',
                 encoding="utf-8",
             )
             subprocess.run(

@@ -3,7 +3,6 @@
 """An interactive or single-prompt client for a local llama.cpp coding model."""
 
 import argparse
-import ast
 import contextlib
 import ctypes
 import curses
@@ -36,8 +35,8 @@ from git_canonical import (
     detect_packages,
     git,
     home_repositories,
-    source_package_args,
-    source_test_names,
+    package_overview,
+    source_package_overview,
 )
 
 if TYPE_CHECKING:
@@ -50,9 +49,13 @@ HTTP_TIMEOUT = 300
 MAX_REQUESTS = 20
 READLINE_GETTER = ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p)
 READLINE_HANDLER = ctypes.CFUNCTYPE(None, ctypes.c_void_p)
-README = Path(__file__).with_name("prm") / "README"
-if not README.is_file():
-    README = Path(__file__).resolve().parents[2] / "README"
+SYSTEM_PROMPT = (
+    "Work in the startup directory and read its README for repository conventions "
+    "when present. "
+    "In Canonical repositories, inspect package descriptions, CLI arguments, and "
+    "test names before source code when they answer the task. Use git-canonical "
+    "for persistent changes to canonical repository structure."
+)
 
 
 def tool(name: str, description: str, **properties: str) -> dict[str, Any]:  # noqa: D103
@@ -342,7 +345,7 @@ class Agent:  # noqa: D101
         self.messages = [
             {
                 "role": "system",
-                "content": README.read_text(encoding="utf-8"),
+                "content": SYSTEM_PROMPT,
             },
         ]
         if history is not None:
@@ -796,16 +799,11 @@ class Viewer:  # noqa: D101
         """Build one package summary or its high-level changes."""
         directory = root / "packages" / name
         filenames = ("default.nix", "main.py", "test_main.py")
-        current_files = {
-            filename: (directory / filename).read_text(encoding="utf-8")
-            for filename in filenames
-            if (directory / filename).is_file()
-        }
+        current = package_overview(directory)
         if not diff:
-            summary = self.package_summary(name, current_files)
             return TreeNode(
                 f"packages/{name}",
-                self.summary_tree(summary) if summary else None,
+                self.summary_tree(current) if current else None,
             )
         previous_files = {}
         for filename in filenames:
@@ -817,7 +815,6 @@ class Viewer:  # noqa: D101
             if completed.returncode == 0:
                 previous_files[filename] = completed.stdout
         previous = self.package_summary(name, previous_files)
-        current = self.package_summary(name, current_files)
         if only_changes and previous == current:
             return None
         summary_tree = self.merged_summary_tree(previous, current)
@@ -983,50 +980,9 @@ class Viewer:  # noqa: D101
         return entries
 
     @staticmethod
-    def argument_names(files: dict[str, str]) -> list[str]:
-        """Read the canonical static CLI summary without importing package code."""
-        with contextlib.suppress(SyntaxError, ValueError):
-            return cast(
-                "list[str]",
-                source_package_args(
-                    files.get("main.py", "").encode("utf-8"),
-                    "main.py",
-                ),
-            )
-        return []
-
-    @staticmethod
     def package_summary(name: str, files: dict[str, str]) -> str:
         """Render the user-facing package fields from source file contents."""
-        if not files:
-            return ""
-        description = ""
-        match = re.search(
-            r'description\s*=\s*"((?:[^"\\]|\\.)*)"',
-            files.get("default.nix", ""),
-        )
-        if match:
-            description = bytes(match.group(1), "utf-8").decode("unicode_escape")
-        help_text = ""
-        with contextlib.suppress(SyntaxError):
-            help_text = ast.get_docstring(ast.parse(files.get("main.py", ""))) or ""
-        test_names: list[str] = []
-        with contextlib.suppress(SyntaxError):
-            test_names = source_test_names(
-                files.get("test_main.py", "").encode("utf-8"),
-                "test_main.py",
-            )
-        arguments = Viewer.argument_names(files)
-        details = [
-            f"Name: {name}",
-            f"Description: {description or '(not declared)'}",
-            f"Help: {help_text or '(module docstring not declared)'}",
-            "Arguments:",
-        ]
-        details.extend(f"  {argument}" for argument in arguments or ["(none)"])
-        details.append("Tests:")
-        details.extend(f"  {test_name}" for test_name in test_names or ["(none)"])
-        return "\n".join(details)
+        return source_package_overview(name, files) if files else ""
 
     def event(self, kind: str, text: str, success: bool | None) -> None:  # noqa: D102, FBT001
         follow = (

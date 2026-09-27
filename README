@@ -1,31 +1,24 @@
 # Canonical
-Canonical is a set of conventions and tools for describing, inspecting, and maintaining a machine through uniformly structured Git repositories and Nix flakes.
 
-Shared conventions reduce the special cases needed to describe the machine, making it easier to understand and return to its intended form.
+Canonical uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `git canonical` creates, inspects, and converges those repositories.
 
-The `git canonical` command applies these conventions to create, inspect, and converge the repositories that describe the machine.
+Start here for the machine's conventions. Package names and descriptions show what is available; `git canonical args` shows interfaces; `git canonical test names` shows expected behavior. `git canonical overview` brings these views together. Read tests or source code when more detail is needed.
 
-Canonical state:
-Impermanent NixOS with Nix flakes enabled
-Git-tracked $HOME with whitelisted gitignore
-$HOME contains Nix flake Git submodules with directory structure <hostname>/<repository-path>
-Nix flake Git submodules contain a specific directory structure (packages/, hosts/, checks/)
-packages/package-name contain:
-`test_main.py` contains tests derived by external requirements. Test names provide a finer-grained behavioral specification than CLI help.
-`main.py` contains code that satisfies `test_main.py` and provides a conventional CLI.
-`prm/` contains tracked data/code that don't fit into `main.py`
-`tmp/` contains runtime outputs of `main.py`
+## Canonical state
 
-CLI discovery:
-`git canonical args` statically reads conventional argparse, Click, Fire, and Typer declarations in `main.py`; dynamic declarations are unsupported. Help text describes the interface, while test names describe behavior in finer detail.
+- Impermanent NixOS with Nix flakes enabled.
+- A Git-tracked `$HOME` with a whitelisted `.gitignore`.
+- Nix flake Git submodules under `$HOME` at `<hostname>/<repository-path>`, each with conventional `packages/`, `hosts/`, and `checks/` directories.
+- Package directories with conventional places for source, tests, tracked resources (`prm/`), and runtime output (`tmp/`) where applicable.
 
-Runtime constraints:
-Persistent changes in $HOME's directory structure should only be done with `git canonical` (`prm/` can be used as an escape hatch).
-More specifically, `git canonical` is used for Nix flake Git submodule initialization, package/host creation/renaming/removal, and directory structure convergence.
+## Runtime constraints
 
-Canonical state convergence:
-Rebooting for Impermanent NixOS
-`nix flake check` is used for running the checks
-`nix fmt` for Nix flake Git submodules
-`git canonical converge` for $HOME and Nix flake Git submodules
-`git clean` (dangerous) for $HOME and Nix flake Git submodules
+- Use `git canonical` for persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
+- Use `prm/` for tracked files that do not fit the conventional layout.
+
+## Canonical state convergence
+
+- Reboot to restore impermanent NixOS state.
+- Run `nix flake check` and `nix fmt` for flake repositories.
+- Run `git canonical converge` for `$HOME` and flake repositories.
+- Use `git clean` to remove untracked state when intended; it is destructive.
