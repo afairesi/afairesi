@@ -36,13 +36,15 @@ from git_canonical import (
     git,
     home_repositories,
     package_overview,
-    repository_root,
     source_package_overview,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable
-BASE_URL = os.environ.get("CODING_AGENT_BASE_URL", "http://127.0.0.1:8080")
+BASE_URL = os.environ.get(
+    "CANONICAL_AGENT_BASE_URL",
+    os.environ.get("CODING_AGENT_BASE_URL", "http://127.0.0.1:8080"),
+)
 OUTPUT_LIMIT = 16_000
 BASH_TIMEOUT = 60
 NIX_TIMEOUT = 600
@@ -57,8 +59,7 @@ SYSTEM_PROMPT = (
     "test names before source code when they answer the task. Use git-canonical "
     "for persistent changes to canonical repository structure. Put tracked "
     "resources outside the standard package layout in prm/ and runtime output "
-    "in tmp/. In Canonical flakes, nix fmt runs git canonical converge first; "
-    "review convergence changes before formatting."
+    "in tmp/. In Canonical flakes, nix fmt runs git canonical converge first."
 )
 
 
@@ -105,14 +106,13 @@ TOOLS = [
         "nix",
         "Run Nix with flakes enabled in the startup directory; 600-second timeout. "
         "Supports build, run, develop, fmt, and flake subcommands. No shell expansion. "
-        "In a Canonical flake, fmt first requires a clean convergence preview.",
+        "In a Canonical flake, fmt also applies repository convergence.",
         arguments="Arguments without nix, e.g. build .#package or flake check .",
     ),
     tool(
         "git-canonical",
         "Run git-canonical in the startup directory; 600-second timeout. "
-        "No shell expansion. Converge can stage and remove files; preview with "
-        "converge --dry-run before applying it.",
+        "No shell expansion. Converge can stage and remove files.",
         arguments=(
             "Arguments without git-canonical, e.g. converge --dry-run or "
             "add packages/name python"
@@ -150,8 +150,11 @@ class History:
             if root and Path(root).is_absolute()
             else Path.home() / ".local/state"
         )
+        key = hashlib.sha256(os.fsencode(self.cwd)).hexdigest()
+        current = base / "canonical_agent" / key
+        previous = base / "coding_agent" / key
         self.directory = (
-            base / "coding_agent" / hashlib.sha256(os.fsencode(self.cwd)).hexdigest()
+            previous if previous.is_dir() and not current.exists() else current
         )
         self.path = self.directory / "history.json"
         self.prompts: list[str] = []
@@ -430,34 +433,9 @@ class Agent:  # noqa: D101
     def bash(self, command: str) -> str:  # noqa: D102
         return self.run(["bash", "-c", command], BASH_TIMEOUT)
 
-    def canonical_formatter(self) -> bool:
-        """Identify flakes whose formatter runs Canonical convergence."""
-        try:
-            root = repository_root(self.cwd)
-            flake = (root / "flake.nix").read_text(encoding="utf-8")
-            formatter = root / "formatter.nix"
-            return "inputs.canonical" in flake or (
-                formatter.is_file()
-                and "git canonical converge" in formatter.read_text(encoding="utf-8")
-            )
-        except (GitCanonicalError, OSError):
-            return False
-
     def nix(self, arguments: str) -> str:
-        """Run Nix after checking for formatter-triggered convergence."""
+        """Run Nix with flakes enabled."""
         nix_args = shlex.split(arguments)
-        if nix_args[:1] == ["fmt"] and self.canonical_formatter():
-            preview = self.run(
-                ["git-canonical", "converge", "--dry-run"],
-                NIX_TIMEOUT,
-            )
-            if not self.tool_success:
-                return (
-                    "nix fmt stopped: Canonical convergence would change "
-                    "the checkout or could not be previewed. Review the "
-                    "preview, then run git-canonical converge explicitly "
-                    "before formatting.\n" + preview
-                )
         return self.run(
             ["nix", "--extra-experimental-features", "nix-command flakes", *nix_args],
             NIX_TIMEOUT,
@@ -1781,7 +1759,8 @@ def main(argv: list[str] | None = None) -> None:  # noqa: D103
         epilog=(
             "Prompt and chat history resume automatically for the resolved startup "
             "directory, including --prompt runs. Stored under "
-            "$XDG_STATE_HOME/coding_agent (default: ~/.local/state/coding_agent)."
+            "$XDG_STATE_HOME/canonical_agent (default: "
+            "~/.local/state/canonical_agent); existing coding_agent history is reused."
         ),
     )
     mode = parser.add_mutually_exclusive_group()

@@ -3,7 +3,7 @@ let
   pname = baseNameOf ./.;
   python = pkgs.python3;
   runtimeInputs = [
-    inputs.self.packages.${pkgs.stdenv.system}.coding_agent
+    inputs.self.packages.${pkgs.stdenv.system}.canonical_agent
     pkgs.asciinema
     pkgs.asciinema-agg
     pkgs.dejavu_fonts
@@ -22,7 +22,7 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Generate an MP4 demo of coding_agent usage";
+    description = "Generate an MP4 demo of canonical_agent usage";
     mainProgram = pname;
   };
   nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -30,7 +30,7 @@ python.pkgs.buildPythonPackage {
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \
       --prefix PATH : "${pkgs.lib.makeBinPath runtimeInputs}" \
-      --set CODING_AGENT_VIDEO_FONT_DIR "${pkgs.dejavu_fonts}/share/fonts/truetype"
+      --set CANONICAL_AGENT_VIDEO_FONT_DIR "${pkgs.dejavu_fonts}/share/fonts/truetype"
   '';
   propagatedBuildInputs = runtimeInputs;
   pyproject = false;

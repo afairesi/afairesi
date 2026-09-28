@@ -31,7 +31,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from packages.coding_agent import main as app
+from packages.canonical_agent import main as app
 
 TEST_EXPECTED_BUILDS = 2
 TEST_PAGE_HEIGHT = 2
@@ -51,6 +51,21 @@ class TestHistory(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.cwd = Path(self.directory.name)
+
+    def test_existing_coding_agent_history_is_reused(self) -> None:
+        """A command rename must not hide an existing conversation."""
+        state = self.cwd / "state"
+        with patch.dict(os.environ, {"XDG_STATE_HOME": str(state)}):
+            fresh = app.History(self.cwd)
+            previous = state / "coding_agent" / fresh.directory.name
+            previous.mkdir(parents=True)
+            if app.History(self.cwd).directory != previous:
+                msg = "Existing coding_agent history must remain accessible"
+                raise AssertionError(msg)
+            fresh.directory.mkdir(parents=True)
+            if app.History(self.cwd).directory != fresh.directory:
+                msg = "Canonical history must take precedence once created"
+                raise AssertionError(msg)
 
     def test_xdg_paths_and_directory_identity(self) -> None:  # noqa: D102
         alias = self.cwd / "alias"
@@ -180,7 +195,7 @@ class TestHistory(unittest.TestCase):
         code = """
 import os
 from pathlib import Path
-from packages.coding_agent.main import History
+from packages.canonical_agent.main import History
 with History(Path.cwd()) as history:
     history.prompts.append('pending')
     history.event('chat', 'user> pending', None)
@@ -314,7 +329,7 @@ with History(Path.cwd()) as history:
             history.prompts = ["saved prompt"]
             history.save()
         code = """
-from packages.coding_agent import main as app
+from packages.canonical_agent import main as app
 app.Agent.discover = lambda self: None
 app.Agent.completion = lambda self: {'role': 'assistant', 'content': 'replied'}
 app.main([])
@@ -661,60 +676,20 @@ class TestAgent(unittest.TestCase):  # noqa: D101
             msg = "Invalid quoting must be reported as a tool error"
             raise AssertionError(msg)
 
-    def test_canonical_fmt_requires_clean_convergence_preview(self) -> None:
-        """Do not let the formatter converge a Canonical checkout implicitly."""
+    def test_nix_fmt_uses_canonical_formatter_directly(self) -> None:
+        """Allow the formatter to apply Canonical convergence."""
         root = Path(self.directory.name)
         subprocess.run(["git", "init", "-q", str(root)], check=True)
         (root / "flake.nix").write_text(
             '{ inputs.canonical.url = "github:pbizopoulos/canonical"; }\n',
             encoding="utf-8",
         )
-        commands = []
-
-        def run(command: list[str], timeout: int) -> str:
-            commands.append((command, timeout))
-            self.agent.tool_success = len(commands) != 1
-            return "exit status: 1\nwould remove unsupported-file"
-
-        with patch.object(self.agent, "run", side_effect=run):
-            output = self.execute("nix", arguments="fmt")
-        if "nix fmt stopped" not in output or len(commands) != 1:
-            msg = "Formatting must stop when convergence would change the checkout"
-            raise AssertionError(msg)
-        if (
-            commands[0]
-            != (
-                ["git-canonical", "converge", "--dry-run"],
-                app.NIX_TIMEOUT,
-            )
-            or self.agent.tool_success
-        ):
-            msg = "Formatting must preview convergence without running Nix"
-            raise AssertionError(msg)
-        commands.clear()
-
-        def clean_run(command: list[str], timeout: int) -> str:
-            commands.append((command, timeout))
-            self.agent.tool_success = True
-            return "exit status: 0\n"
-
-        with patch.object(self.agent, "run", side_effect=clean_run):
+        with patch.object(self.agent, "run", return_value="exit status: 0\n") as run:
             self.execute("nix", arguments="fmt")
-        if [command[0] for command in commands] != [
-            ["git-canonical", "converge", "--dry-run"],
+        run.assert_called_once_with(
             ["nix", "--extra-experimental-features", "nix-command flakes", "fmt"],
-        ]:
-            msg = "A clean preview must allow nix fmt"
-            raise AssertionError(msg)
-        (root / "flake.nix").write_text("{ outputs = _: { }; }\n", encoding="utf-8")
-        commands.clear()
-        with patch.object(self.agent, "run", side_effect=clean_run):
-            self.execute("nix", arguments="fmt")
-        if [command[0] for command in commands] != [
-            ["nix", "--extra-experimental-features", "nix-command flakes", "fmt"],
-        ]:
-            msg = "Other flakes must format without a Canonical preview"
-            raise AssertionError(msg)
+            app.NIX_TIMEOUT,
+        )
 
     def test_http_sequence(self) -> None:  # noqa: D102
         calls = [
@@ -1848,7 +1823,7 @@ class TestReadlineTerminal(unittest.TestCase):  # noqa: D101
 import json
 import sys
 from pathlib import Path
-from packages.coding_agent.main import Agent, AgentError, Viewer
+from packages.canonical_agent.main import Agent, AgentError, Viewer
 agent = Agent()
 def turn(prompt):
     if prompt.startswith("wait"):

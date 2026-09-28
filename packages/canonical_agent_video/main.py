@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
 # ruff: noqa: S603, S607
-"""Generate a repeatable MP4 demonstration of coding_agent."""
+"""Generate a repeatable MP4 demonstration of canonical_agent."""
 
 import argparse
 import fcntl
@@ -51,7 +51,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         """Return the fixed mock model listing."""
-        self.send_json({"data": [{"id": "coding-agent-demo"}]})
+        self.send_json({"data": [{"id": "canonical-agent-demo"}]})
 
     def do_POST(self) -> None:
         """Return the next scripted assistant response."""
@@ -240,13 +240,13 @@ def slow_cast(path: Path) -> None:
 
 
 def session() -> int:  # noqa: C901, PLR0912, PLR0915
-    """Drive coding_agent in a fixed-size PTY and a temporary workspace."""
+    """Drive canonical_agent in a fixed-size PTY and a temporary workspace."""
     Handler.completions = 0
     server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        with tempfile.TemporaryDirectory(prefix="coding-agent-video-") as root:
+        with tempfile.TemporaryDirectory(prefix="canonical-agent-video-") as root:
             workspace, state = Path(root) / "workspace", Path(root) / "state"
             workspace.mkdir()
             (workspace / "README.md").write_text(
@@ -257,7 +257,7 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
             package.mkdir(parents=True)
             (workspace / "flake.nix").write_text("{}\n", encoding="utf-8")
             (package / "default.nix").write_text(
-                '{ meta.description = "Demo package for coding_agent"; }\n',
+                '{ meta.description = "Demo package for canonical_agent"; }\n',
                 encoding="utf-8",
             )
             (package / "main.py").write_text(
@@ -288,25 +288,25 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 check=True,
             )
             env = os.environ | {
-                "CODING_AGENT_BASE_URL": f"http://127.0.0.1:{server.server_port}",
+                "CANONICAL_AGENT_BASE_URL": f"http://127.0.0.1:{server.server_port}",
                 "XDG_STATE_HOME": str(state),
                 "HOME": root,
                 "TERM": "xterm-256color",
                 "COLUMNS": str(WIDTH),
                 "LINES": str(HEIGHT),
             }
-            print("$ coding_agent --help", flush=True)  # noqa: T201
+            print("$ canonical_agent --help", flush=True)  # noqa: T201
             subprocess.run(
-                ["coding_agent", "--help"],
+                ["canonical_agent", "--help"],
                 cwd=workspace,
                 env=env,
                 check=True,
                 timeout=TIMEOUT,
             )
             time.sleep(1.2)
-            print("\n$ coding_agent --clear-history", flush=True)  # noqa: T201
+            print("\n$ canonical_agent --clear-history", flush=True)  # noqa: T201
             subprocess.run(
-                ["coding_agent", "--clear-history"],
+                ["canonical_agent", "--clear-history"],
                 cwd=workspace,
                 env=env,
                 check=True,
@@ -314,19 +314,19 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
             )
             time.sleep(1.2)
             print(  # noqa: T201
-                '$ coding_agent --prompt "Summarize the demo repository in '
+                '$ canonical_agent --prompt "Summarize the demo repository in '
                 'one sentence."',
                 flush=True,
             )
             subprocess.run(
-                ["coding_agent", "--prompt", ONE_SHOT],
+                ["canonical_agent", "--prompt", ONE_SHOT],
                 cwd=workspace,
                 env=env,
                 check=True,
                 timeout=TIMEOUT,
             )
             time.sleep(1.5)
-            print("\n$ coding_agent", flush=True)  # noqa: T201
+            print("\n$ canonical_agent", flush=True)  # noqa: T201
             master, slave = pty.openpty()
             fcntl.ioctl(
                 slave,
@@ -334,7 +334,7 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 struct.pack("HHHH", HEIGHT, WIDTH, 0, 0),
             )
             process = subprocess.Popen(
-                ["coding_agent"],
+                ["canonical_agent"],
                 cwd=workspace,
                 env=env,
                 stdin=slave,
@@ -385,7 +385,7 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 status = process.wait(timeout=5)
                 if status or stage != DONE or not sent_eof:
                     print(  # noqa: T201
-                        "coding_agent demo did not complete successfully",
+                        "canonical_agent demo did not complete successfully",
                         file=sys.stderr,
                     )
                     return status or 1
@@ -429,23 +429,25 @@ def repository_root() -> Path:
     for candidate in candidates:
         root = candidate.resolve()
         if (root / "flake.nix").is_file() and (
-            root / "packages/coding_agent_video/default.nix"
+            root / "packages/canonical_agent_video/default.nix"
         ).is_file():
             return root
-    message = "Cannot locate the canonical checkout containing coding_agent_video"
+    message = "Cannot locate the canonical checkout containing canonical_agent_video"
     raise RuntimeError(message)
 
 
 def generate() -> Path:
     """Record a terminal session, render it, and save the MP4 in this package."""
-    for executable in ("coding_agent", "asciinema", "agg", "ffmpeg", "git"):
+    for executable in ("canonical_agent", "asciinema", "agg", "ffmpeg", "git"):
         if shutil.which(executable) is None:
             message = f"Required executable not found: {executable}"
             raise RuntimeError(message)
-    output = repository_root() / "packages/coding_agent_video/tmp/coding_agent.mp4"
+    output = (
+        repository_root() / "packages/canonical_agent_video/tmp/canonical_agent.mp4"
+    )
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="coding-agent-video-") as directory:
+    with tempfile.TemporaryDirectory(prefix="canonical-agent-video-") as directory:
         cast, gif = Path(directory) / "demo.cast", Path(directory) / "demo.gif"
         command = shlex.join(
             [sys.executable, str(Path(__file__).resolve()), "--session"],
@@ -476,7 +478,7 @@ def generate() -> Path:
                 "--font-family",
                 "DejaVu Sans Mono",
                 "--font-dir",
-                os.environ["CODING_AGENT_VIDEO_FONT_DIR"],
+                os.environ["CANONICAL_AGENT_VIDEO_FONT_DIR"],
                 str(cast),
                 str(gif),
             ],
@@ -516,7 +518,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         output = generate()
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        parser.exit(1, f"coding_agent_video: {exc}\n")
+        parser.exit(1, f"canonical_agent_video: {exc}\n")
     print(f"Created {output}")  # noqa: T201
 
 
