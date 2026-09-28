@@ -27,8 +27,6 @@
 !/packages/coding_agent/
 !/packages/coding_agent/default.nix
 !/packages/coding_agent/main.py
-!/packages/coding_agent/prm/
-!/packages/coding_agent/prm/**
 !/packages/coding_agent/test_main.py
 !/packages/coding_agent_video/
 !/packages/coding_agent_video/default.nix

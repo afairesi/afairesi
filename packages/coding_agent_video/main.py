@@ -24,11 +24,23 @@ from pathlib import Path
 from typing import Any
 
 PROMPT = "Demonstrate the available file, shell, Nix, and canonical tools."
-FOLLOW_UP = "Show me the final contents of notes.py."
+FOLLOW_UP = "Show me the final contents of packages/example/main.py."
 ONE_SHOT = "Summarize the demo repository in one sentence."
 FINISH_TOOLS = "All six tools ran: read, write, edit, bash, nix, and git-canonical."
-FINISH_READ = "The edited file now contains message = after."
-WIDTH, HEIGHT, TIMEOUT = 100, 30, 60
+FINISH_READ = "The package's main.py now contains message = after."
+DEMO_MAIN = (
+    "import argparse\n\n"
+    'message = "before"\n\n'
+    "def main():\n"
+    '    parser = argparse.ArgumentParser(description="Example CLI")\n'
+    '    parser.add_argument("--message", help="Message to print")\n'
+    "    parser.parse_args()\n\n"
+    'if __name__ == "__main__":\n'
+    "    main()\n"
+)
+WIDTH, HEIGHT, TIMEOUT = 100, 30, 180
+PLAYBACK_SLOWDOWN = 2.0
+FIRST_BATCH_TOOLS = 3
 WAITING_FOR_PROMPT, RUNNING_TOOLS, RUNNING_FOLLOW_UP, BROWSING, DONE = range(5)
 
 
@@ -60,7 +72,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     "This demo repository contains a Python package with a README."
                 ),
             }
-        elif user_prompt == PROMPT and messages[-1]["role"] != "tool":
+        elif user_prompt == PROMPT and messages[-1]["role"] == "user":
             message = {
                 "role": "assistant",
                 "content": "I will exercise each tool in this isolated workspace.",
@@ -69,20 +81,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.call(
                         "demo-write",
                         "write",
-                        path="packages/example/notes.py",
-                        content='message = "before"\n',
+                        path="packages/example/main.py",
+                        content=DEMO_MAIN,
                     ),
                     self.call(
                         "demo-edit",
                         "edit",
-                        path="packages/example/notes.py",
+                        path="packages/example/main.py",
                         old_text="before",
                         new_text="after",
                     ),
+                ],
+            }
+        elif (
+            user_prompt == PROMPT
+            and len(
+                [item for item in messages if item.get("role") == "tool"],
+            )
+            == FIRST_BATCH_TOOLS
+        ):
+            message = {
+                "role": "assistant",
+                "content": (
+                    "The file is edited. I will check it and run the command tools."
+                ),
+                "tool_calls": [
                     self.call(
                         "demo-bash",
                         "bash",
-                        command="cat packages/example/notes.py",
+                        command=(
+                            "sed -i 's/Message to print/Updated message to print/' "
+                            "packages/example/main.py && cat packages/example/main.py"
+                        ),
                     ),
                     self.call("demo-nix", "nix", arguments="--version"),
                     self.call(
@@ -99,7 +129,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     self.call(
                         "followup-read",
                         "read",
-                        path="packages/example/notes.py",
+                        path="packages/example/main.py",
                     ),
                 ],
             }
@@ -158,6 +188,57 @@ class Handler(http.server.BaseHTTPRequestHandler):
         del message_format, args
 
 
+def schedule_prompt(actions: list[tuple[float, bytes]], prompt: str) -> None:
+    """Queue keystrokes while leaving the PTY free to be recorded."""
+    moment = time.monotonic() + 1.2
+    for character in prompt:
+        actions.append((moment, character.encode()))
+        moment += 0.025
+    actions.append((moment + 0.5, b"\n"))
+
+
+def schedule_viewer(actions: list[tuple[float, bytes]]) -> None:
+    """Show transcript search, expansion, package overview, and refresh."""
+    moment = time.monotonic() + 1.5
+    for keys, pause in (
+        (b"\x1b", 0.9),
+        (b"/main.py\n", 1.2),
+        (b"n", 0.8),
+        (b"N", 0.8),
+        (b"h", 0.8),
+        (b"l", 1.2),
+        (b"L", 1.2),
+        (b"l", 1.2),
+        (b"j", 0.8),
+        (b"l", 1.2),
+        (b"/Arguments\n", 1.0),
+        (b"l", 1.2),
+        (b"h", 0.8),
+        (b"/Tests\n", 1.0),
+        (b"l", 1.2),
+        (b"r", 1.2),
+        (b"l", 0.8),
+        (b"/Arguments\n", 0.8),
+        (b"l", 1.6),
+        (b"L", 1.0),
+        (b"q", 1.0),
+        (b"\x04", 0.0),
+    ):
+        actions.append((moment, keys))
+        moment += pause
+
+
+def slow_cast(path: Path) -> None:
+    """Stretch event timestamps while keeping the terminal recording intact."""
+    lines = path.read_text(encoding="utf-8").splitlines()
+    with path.open("w", encoding="utf-8") as stream:
+        stream.write(lines[0] + "\n")
+        for line in lines[1:]:
+            event = json.loads(line)
+            event[0] *= PLAYBACK_SLOWDOWN
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+
 def session() -> int:  # noqa: C901, PLR0912, PLR0915
     """Drive coding_agent in a fixed-size PTY and a temporary workspace."""
     Handler.completions = 0
@@ -180,14 +261,31 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 encoding="utf-8",
             )
             (package / "main.py").write_text(
-                "import argparse\n\n"
-                "def main():\n"
-                '    parser = argparse.ArgumentParser(description="Example CLI")\n'
-                '    parser.add_argument("--message", help="Message to print")\n'
-                "    parser.parse_args()\n\n"
-                'if __name__ == "__main__":\n'
-                "    main()\n",
+                DEMO_MAIN.replace('message = "before"', 'message = "initial"'),
                 encoding="utf-8",
+            )
+            (package / "test_main.py").write_text(
+                "from pathlib import Path\n\n"
+                "def test_message_argument_is_available():\n"
+                '    source = Path(__file__).with_name("main.py").read_text()\n'
+                '    assert "--message" in source\n',
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+            subprocess.run(["git", "add", "."], cwd=workspace, check=True)
+            subprocess.run(
+                [
+                    "git",
+                    "-c",
+                    "user.name=Demo",
+                    "-c",
+                    "user.email=demo@example.invalid",
+                    "commit",
+                    "-qm",
+                    "Baseline demo package",
+                ],
+                cwd=workspace,
+                check=True,
             )
             env = os.environ | {
                 "CODING_AGENT_BASE_URL": f"http://127.0.0.1:{server.server_port}",
@@ -197,7 +295,16 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 "COLUMNS": str(WIDTH),
                 "LINES": str(HEIGHT),
             }
-            print("$ coding_agent --clear-history")  # noqa: T201
+            print("$ coding_agent --help", flush=True)  # noqa: T201
+            subprocess.run(
+                ["coding_agent", "--help"],
+                cwd=workspace,
+                env=env,
+                check=True,
+                timeout=TIMEOUT,
+            )
+            time.sleep(1.2)
+            print("\n$ coding_agent --clear-history", flush=True)  # noqa: T201
             subprocess.run(
                 ["coding_agent", "--clear-history"],
                 cwd=workspace,
@@ -205,9 +312,11 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 check=True,
                 timeout=TIMEOUT,
             )
+            time.sleep(1.2)
             print(  # noqa: T201
                 '$ coding_agent --prompt "Summarize the demo repository in '
                 'one sentence."',
+                flush=True,
             )
             subprocess.run(
                 ["coding_agent", "--prompt", ONE_SHOT],
@@ -216,7 +325,8 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                 check=True,
                 timeout=TIMEOUT,
             )
-            print("\n$ coding_agent")  # noqa: T201
+            time.sleep(1.5)
+            print("\n$ coding_agent", flush=True)  # noqa: T201
             master, slave = pty.openpty()
             fcntl.ioctl(
                 slave,
@@ -234,12 +344,19 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
             )
             os.close(slave)
             output = bytearray()
+            actions: list[tuple[float, bytes]] = []
             stage = WAITING_FOR_PROMPT
             sent_eof = False
             deadline = time.monotonic() + TIMEOUT
             try:
                 while time.monotonic() < deadline:
-                    ready, _, _ = select.select([master], [], [], 0.1)
+                    if actions and time.monotonic() >= actions[0][0]:
+                        _, keys = actions.pop(0)
+                        os.write(master, keys)
+                        if keys == b"\x04":
+                            sent_eof = True
+                            stage = DONE
+                    ready, _, _ = select.select([master], [], [], 0.02)
                     if ready:
                         try:
                             data = os.read(master, 65536)
@@ -250,28 +367,17 @@ def session() -> int:  # noqa: C901, PLR0912, PLR0915
                         output.extend(data)
                         os.write(sys.stdout.fileno(), data)
                         if stage == WAITING_FOR_PROMPT and b"> " in output:
-                            os.write(master, (PROMPT + "\n").encode())
+                            schedule_prompt(actions, PROMPT)
                             stage = RUNNING_TOOLS
                         if stage == RUNNING_TOOLS and FINISH_TOOLS.encode() in output:
-                            time.sleep(0.2)
-                            os.write(master, (FOLLOW_UP + "\n").encode())
+                            schedule_prompt(actions, FOLLOW_UP)
                             stage = RUNNING_FOLLOW_UP
                         if (
                             stage == RUNNING_FOLLOW_UP
                             and FINISH_READ.encode() in output
                         ):
-                            time.sleep(0.3)
-                            os.write(master, b"\x1b")
-                            time.sleep(0.3)
-                            os.write(master, b"/notes.py\n")
-                            time.sleep(0.3)
-                            os.write(master, b"nNhlLljlhrLq")
-                            time.sleep(0.3)
+                            schedule_viewer(actions)
                             stage = BROWSING
-                        if stage == BROWSING:
-                            os.write(master, b"\x04")
-                            sent_eof = True
-                            stage = DONE
                     if process.poll() is not None:
                         break
                 if process.poll() is None:
@@ -345,10 +451,21 @@ def generate() -> Path:
             [sys.executable, str(Path(__file__).resolve()), "--session"],
         )
         subprocess.run(
-            ["asciinema", "rec", "--overwrite", "--command", command, str(cast)],
+            [
+                "asciinema",
+                "rec",
+                "--overwrite",
+                "--return",
+                "--window-size",
+                f"{WIDTH}x{HEIGHT}",
+                "--command",
+                command,
+                str(cast),
+            ],
             check=True,
             timeout=TIMEOUT + 10,
         )
+        slow_cast(cast)
         subprocess.run(
             [
                 "agg",
