@@ -1080,6 +1080,48 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Package view did not display the canonical overview"
                 raise AssertionError(msg)
 
+    def test_unavailable_cli_summary_warns_on_collapsed_package(self) -> None:
+        """Expose parser diagnostics without opening the package tree."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            (package / "main.py").write_text(
+                '"""Example."""\ndef main():\n    pass\n',
+                encoding="utf-8",
+            )
+            viewer = app.Viewer(app.Agent(root))
+            entry = viewer.package_entry(root, "sample", diff=False)
+            if entry is None:
+                msg = "Expected a package entry"
+                raise AssertionError(msg)
+            viewer.mode = "high-level"
+            viewer.overview = [entry]
+            rows = viewer.rows(80)
+            if not rows[0].text.endswith("packages/sample [!]"):
+                msg = "Collapsed package must show a warning marker"
+                raise AssertionError(msg)
+            if viewer.styles(rows[0]) != [33, 7]:
+                msg = "Package warning must be visible in the overview"
+                raise AssertionError(msg)
+            entry.expanded = True
+            arguments = next(
+                node for node in entry.children or [] if node.title == "Arguments"
+            )
+            arguments.expanded = True
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "(unavailable: unsupported CLI interface" not in visible:
+                msg = "Expanding Arguments must reveal the original diagnostic"
+                raise AssertionError(msg)
+            (package / "main.py").write_text(
+                "import argparse\nparser = argparse.ArgumentParser()\n",
+                encoding="utf-8",
+            )
+            fixed = viewer.package_entry(root, "sample", diff=False)
+            if fixed is None or viewer.has_warning(fixed):
+                msg = "Warning must clear when the CLI summary becomes available"
+                raise AssertionError(msg)
+
     def test_package_summary_uses_canonical_test_discovery(self) -> None:  # noqa: D102
         files = {
             "test_main.py": (

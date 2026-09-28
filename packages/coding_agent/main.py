@@ -682,6 +682,7 @@ class TreeNode:  # noqa: D101
     children: list["TreeNode"] | None = None
     expanded: bool = False
     style: int | None = None
+    warning: bool = False
 
 
 def record_event(
@@ -874,10 +875,14 @@ class Viewer:  # noqa: D101
         )
         fields = [TreeNode(line) for line in lines[:arguments_start]]
         arguments = [
-            TreeNode(line.strip()) for line in lines[arguments_start + 1 : tests_start]
+            TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
+            for line in lines[arguments_start + 1 : tests_start]
         ]
         fields.append(TreeNode("Arguments", arguments))
-        tests = [TreeNode(line.strip()) for line in lines[tests_start + 1 :]]
+        tests = [
+            TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
+            for line in lines[tests_start + 1 :]
+        ]
         fields.append(TreeNode("Tests", tests))
         return fields
 
@@ -954,6 +959,7 @@ class Viewer:  # noqa: D101
                 TreeNode(
                     item if item in old_entries else f"+ {item}",
                     style=None if item in old_entries else 32,
+                    warning=item.startswith("(unavailable:"),
                 )
                 for item in new_entries
             )
@@ -1141,7 +1147,8 @@ class Viewer:  # noqa: D101
                 marker = "[-]" if node.expanded else "[+]" if node.children else "   "
                 prefix = "  " * depth + marker + " "
                 continuation = " " * len(prefix)
-                wrapped = self.wrap(self.safe(node.title), max(1, width - len(prefix)))
+                title = node.title + (" [!]" if self.has_warning(node) else "")
+                wrapped = self.wrap(self.safe(title), max(1, width - len(prefix)))
                 rows.append(Row(owner, -1, prefix + wrapped[0][1]))
                 rows.extend(
                     Row(owner, -1, continuation + part) for _start, part in wrapped[1:]
@@ -1170,6 +1177,8 @@ class Viewer:  # noqa: D101
         if self.mode != "chat":
             node = self.overview_visible[row.owner]
             style = self.tree_style(node)
+            if self.has_warning(node):
+                style = 33
             styles = [style] if style is not None else []
             if row.owner == self.selected:
                 styles.append(7)
@@ -1184,6 +1193,13 @@ class Viewer:  # noqa: D101
         if self.matched(row):
             styles.extend((1, 4))
         return styles
+
+    @classmethod
+    def has_warning(cls, node: TreeNode) -> bool:
+        """Show diagnostics even when their parent groups are collapsed."""
+        return node.warning or any(
+            cls.has_warning(child) for child in node.children or []
+        )
 
     @classmethod
     def tree_style(cls, node: TreeNode) -> int | None:
