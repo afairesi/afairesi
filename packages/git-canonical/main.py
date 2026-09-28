@@ -1133,7 +1133,7 @@ def canonical_typed_default(package: Package) -> str | None:
         Path("packages") / package.name / "default.nix"
     ]
     fields = {
-        "html": (("runtimeDeps", "list"),),
+        "html": (("runtimeDeps", "list"), ("prmInstall", "string")),
         "latex": (("nativeDeps", "list"),),
     }[package.kind]
     for name, kind in fields:
@@ -1476,14 +1476,29 @@ python.pkgs.buildPythonPackage {
         "html": """{ pkgs, ... }:
 let
   pname = baseNameOf ./.;
+  prmInstall = "";
   runtimeDeps = [ ];
+  site = pkgs.runCommand "${pname}-site" { } ''
+    mkdir -p "$out"
+    cp ${./index.html} "$out/index.html"
+    for asset in script.js style.css; do
+      if [ -f ${./.}/"$asset" ]; then
+        cp ${./.}/"$asset" "$out/$asset"
+      fi
+    done
+    if [ -d ${./.}/prm ]; then
+      cp -R ${./.}/prm "$out/prm"
+      chmod -R u+w "$out/prm"
+    fi
+    ${prmInstall}
+  '';
 in
 pkgs.writeShellApplication {
   meta.description = __DESCRIPTION__;
   name = pname;
   runtimeInputs = runtimeDeps ++ [ pkgs.http-server ];
   text = ''
-    exec http-server ${./.} "$@"
+    exec http-server ${site} "$@"
   '';
 }
 """,

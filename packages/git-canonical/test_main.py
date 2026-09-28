@@ -203,6 +203,30 @@ def test_structure_validation_does_not_traverse_excluded_trees(
         raise AssertionError(issues)
 
 
+def test_html_template_keeps_prm_install_hook(repository: Path) -> None:
+    """Keep bundled assets and package-specific resources across convergence."""
+    subject = import_module("packages.git-canonical.main")
+    package_root = repository / "packages/viewer"
+    package_root.mkdir(parents=True)
+    (package_root / "index.html").write_text("<!doctype html>", encoding="utf-8")
+    package = subject.Package("viewer", "html", package_root)
+    generated = subject.scaffold("html", "viewer", None)[
+        Path("packages/viewer/default.nix")
+    ]
+    if "if [ -d ${./.}/prm ]; then" not in generated:
+        msg = "HTML template does not copy prm assets"
+        raise AssertionError(msg)
+    custom = generated.replace(
+        'prmInstall = "";',
+        "prmInstall = ''\n    cp /example/sample.dcm \"$out/prm/sample.dcm\"\n  '';",
+    )
+    (package_root / "default.nix").write_text(custom, encoding="utf-8")
+    canonical = subject.canonical_typed_default(package)
+    if canonical != custom:
+        msg = "HTML convergence discarded the prm install hook"
+        raise AssertionError(msg)
+
+
 def test_invalid_source_is_rejected_before_cleanup(repository: Path) -> None:
     """A failed convergence preserves both source and unrelated work."""
     _run(repository, "add", "packages/example", "python")
