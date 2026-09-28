@@ -36,6 +36,7 @@ from git_canonical import (
     git,
     home_repositories,
     package_overview,
+    repository_root,
     source_package_overview,
 )
 
@@ -54,7 +55,10 @@ SYSTEM_PROMPT = (
     "when present. "
     "In Canonical repositories, inspect package descriptions, CLI arguments, and "
     "test names before source code when they answer the task. Use git-canonical "
-    "for persistent changes to canonical repository structure."
+    "for persistent changes to canonical repository structure. Put tracked "
+    "resources outside the standard package layout in prm/ and runtime output "
+    "in tmp/. In Canonical flakes, nix fmt runs git canonical converge first; "
+    "review convergence changes before formatting."
 )
 
 
@@ -100,15 +104,18 @@ TOOLS = [
     tool(
         "nix",
         "Run Nix with flakes enabled in the startup directory; 600-second timeout. "
-        "Supports build, run, develop, fmt, and flake subcommands. No shell expansion.",
+        "Supports build, run, develop, fmt, and flake subcommands. No shell expansion. "
+        "In a Canonical flake, fmt first requires a clean convergence preview.",
         arguments="Arguments without nix, e.g. build .#package or flake check .",
     ),
     tool(
         "git-canonical",
         "Run git-canonical in the startup directory; 600-second timeout. "
-        "No shell expansion.",
+        "No shell expansion. Converge can stage and remove files; preview with "
+        "converge --dry-run before applying it.",
         arguments=(
-            "Arguments without git-canonical, e.g. converge or package create name"
+            "Arguments without git-canonical, e.g. converge --dry-run or "
+            "add packages/name python"
         ),
     ),
 ]
@@ -423,6 +430,39 @@ class Agent:  # noqa: D101
     def bash(self, command: str) -> str:  # noqa: D102
         return self.run(["bash", "-c", command], BASH_TIMEOUT)
 
+    def canonical_formatter(self) -> bool:
+        """Identify flakes whose formatter runs Canonical convergence."""
+        try:
+            root = repository_root(self.cwd)
+            flake = (root / "flake.nix").read_text(encoding="utf-8")
+            formatter = root / "formatter.nix"
+            return "inputs.canonical" in flake or (
+                formatter.is_file()
+                and "git canonical converge" in formatter.read_text(encoding="utf-8")
+            )
+        except (GitCanonicalError, OSError):
+            return False
+
+    def nix(self, arguments: str) -> str:
+        """Run Nix after checking for formatter-triggered convergence."""
+        nix_args = shlex.split(arguments)
+        if nix_args[:1] == ["fmt"] and self.canonical_formatter():
+            preview = self.run(
+                ["git-canonical", "converge", "--dry-run"],
+                NIX_TIMEOUT,
+            )
+            if not self.tool_success:
+                return (
+                    "nix fmt stopped: Canonical convergence would change "
+                    "the checkout or could not be previewed. Review the "
+                    "preview, then run git-canonical converge explicitly "
+                    "before formatting.\n" + preview
+                )
+        return self.run(
+            ["nix", "--extra-experimental-features", "nix-command flakes", *nix_args],
+            NIX_TIMEOUT,
+        )
+
     def run(self, command: list[str], timeout: int) -> str:  # noqa: D102
         self.check_cancelled()
         with tempfile.TemporaryFile() as output:
@@ -503,15 +543,7 @@ class Agent:  # noqa: D101
             if name == "bash":
                 return self.bash(args["command"])
             if name == "nix":
-                return self.run(
-                    [
-                        "nix",
-                        "--extra-experimental-features",
-                        "nix-command flakes",
-                        *shlex.split(args["arguments"]),
-                    ],
-                    NIX_TIMEOUT,
-                )
+                return self.nix(args["arguments"])
             if name == "git-canonical":
                 return self.run(
                     ["git-canonical", *shlex.split(args["arguments"])],

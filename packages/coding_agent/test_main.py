@@ -661,6 +661,61 @@ class TestAgent(unittest.TestCase):  # noqa: D101
             msg = "Invalid quoting must be reported as a tool error"
             raise AssertionError(msg)
 
+    def test_canonical_fmt_requires_clean_convergence_preview(self) -> None:
+        """Do not let the formatter converge a Canonical checkout implicitly."""
+        root = Path(self.directory.name)
+        subprocess.run(["git", "init", "-q", str(root)], check=True)
+        (root / "flake.nix").write_text(
+            '{ inputs.canonical.url = "github:pbizopoulos/canonical"; }\n',
+            encoding="utf-8",
+        )
+        commands = []
+
+        def run(command: list[str], timeout: int) -> str:
+            commands.append((command, timeout))
+            self.agent.tool_success = len(commands) != 1
+            return "exit status: 1\nwould remove unsupported-file"
+
+        with patch.object(self.agent, "run", side_effect=run):
+            output = self.execute("nix", arguments="fmt")
+        if "nix fmt stopped" not in output or len(commands) != 1:
+            msg = "Formatting must stop when convergence would change the checkout"
+            raise AssertionError(msg)
+        if (
+            commands[0]
+            != (
+                ["git-canonical", "converge", "--dry-run"],
+                app.NIX_TIMEOUT,
+            )
+            or self.agent.tool_success
+        ):
+            msg = "Formatting must preview convergence without running Nix"
+            raise AssertionError(msg)
+        commands.clear()
+
+        def clean_run(command: list[str], timeout: int) -> str:
+            commands.append((command, timeout))
+            self.agent.tool_success = True
+            return "exit status: 0\n"
+
+        with patch.object(self.agent, "run", side_effect=clean_run):
+            self.execute("nix", arguments="fmt")
+        if [command[0] for command in commands] != [
+            ["git-canonical", "converge", "--dry-run"],
+            ["nix", "--extra-experimental-features", "nix-command flakes", "fmt"],
+        ]:
+            msg = "A clean preview must allow nix fmt"
+            raise AssertionError(msg)
+        (root / "flake.nix").write_text("{ outputs = _: { }; }\n", encoding="utf-8")
+        commands.clear()
+        with patch.object(self.agent, "run", side_effect=clean_run):
+            self.execute("nix", arguments="fmt")
+        if [command[0] for command in commands] != [
+            ["nix", "--extra-experimental-features", "nix-command flakes", "fmt"],
+        ]:
+            msg = "Other flakes must format without a Canonical preview"
+            raise AssertionError(msg)
+
     def test_http_sequence(self) -> None:  # noqa: D102
         calls = [
             call("one", "write", path="a", content="text"),
