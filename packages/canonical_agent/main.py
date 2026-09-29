@@ -809,7 +809,14 @@ class Viewer:  # noqa: D101
     ) -> TreeNode | None:
         """Build one package summary or its high-level changes."""
         directory = root / "packages" / name
-        filenames = ("default.nix", "main.py", "test_main.py")
+        filenames = (
+            "default.nix",
+            "main.py",
+            "test_main.py",
+            "index.html",
+            "script.js",
+            "style.css",
+        )
         current = package_overview(directory)
         if not diff:
             return TreeNode(
@@ -869,36 +876,35 @@ class Viewer:  # noqa: D101
 
     @staticmethod
     def summary_tree(summary: str) -> list[TreeNode]:
-        """Convert the displayed summary into field, argument, and test nodes."""
+        """Convert the displayed summary into fields and grouped detail nodes."""
         lines = summary.splitlines()
         arguments_start = next(
             (index for index, line in enumerate(lines) if line == "Arguments:"),
             len(lines),
         )
-        tests_start = next(
-            (
-                index
-                for index, line in enumerate(lines)
-                if line == "Tests:" and index > arguments_start
-            ),
-            len(lines),
-        )
         fields = [TreeNode(line) for line in lines[:arguments_start]]
-        arguments = [
-            TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
-            for line in lines[arguments_start + 1 : tests_start]
-        ]
-        fields.append(TreeNode("Arguments", arguments))
-        tests = [
-            TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
-            for line in lines[tests_start + 1 :]
-        ]
-        fields.append(TreeNode("Tests", tests))
+        for group in ("Arguments", "Tests", "Suppressions"):
+            if f"{group}:" not in lines:
+                continue
+            start = lines.index(f"{group}:")
+            end = next(
+                (
+                    index
+                    for index in range(start + 1, len(lines))
+                    if not lines[index].startswith("  ")
+                ),
+                len(lines),
+            )
+            children = [
+                TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
+                for line in lines[start + 1 : end]
+            ]
+            fields.append(TreeNode(group, children))
         return fields
 
     @classmethod
     def summary_changes(cls, previous: str, current: str) -> list[TreeNode]:
-        """Build collapsible field, argument, and test changes."""
+        """Build collapsible changes for fields and grouped details."""
         old_lines, new_lines = previous.splitlines(), current.splitlines()
         changes: list[TreeNode] = []
         old_fields = {line.partition(":")[0]: line for line in old_lines if ":" in line}
@@ -938,6 +944,20 @@ class Viewer:  # noqa: D101
         )
         if test_changes:
             changes.append(TreeNode("Tests", test_changes))
+        old_suppressions = cls.summary_group(previous, "Suppressions")
+        new_suppressions = cls.summary_group(current, "Suppressions")
+        suppression_changes = [
+            TreeNode(f"- {item}", style=31)
+            for item in old_suppressions
+            if item not in new_suppressions
+        ]
+        suppression_changes.extend(
+            TreeNode(f"+ {item}", style=32)
+            for item in new_suppressions
+            if item not in old_suppressions
+        )
+        if suppression_changes:
+            changes.append(TreeNode("Suppressions", suppression_changes))
         return changes
 
     @classmethod
@@ -957,7 +977,7 @@ class Viewer:  # noqa: D101
                     result.append(TreeNode(f"- {before}", style=31))
                 if after is not None:
                     result.append(TreeNode(f"+ {after}", style=32))
-        for group in ("Arguments", "Tests"):
+        for group in ("Arguments", "Tests", "Suppressions"):
             old_entries = cls.summary_group(previous, group)
             new_entries = cls.summary_group(current, group)
             children = [

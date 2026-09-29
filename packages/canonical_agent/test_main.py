@@ -1110,6 +1110,64 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Package view did not display the canonical overview"
                 raise AssertionError(msg)
 
+    def test_suppression_counts_appear_in_overview_and_diff(self) -> None:
+        """Keep suppression counts visible in the shared package summary."""
+        before = app.Viewer.package_summary(
+            "sample",
+            {"index.html": "<main></main>\n"},
+        )
+        after = app.Viewer.package_summary(
+            "sample",
+            {
+                "index.html": (
+                    "<!-- html-validate-disable -->\n"
+                    "<!-- html-validate-disable-next -->\n"
+                ),
+            },
+        )
+        tree = app.Viewer.summary_tree(after)
+        suppressions = next(node for node in tree if node.title == "Suppressions")
+        if {node.title for node in suppressions.children or []} != {
+            "index.html: html-validate-disable (global): 1",
+            "index.html: html-validate-disable (local): 1",
+        }:
+            msg = "Overview must distinguish global and local HTML directives"
+            raise AssertionError(msg)
+        diff = app.Viewer.merged_summary_tree(before, after)
+        changes = next(node for node in diff if node.title == "Suppressions")
+        if not any(
+            node.title == "+ index.html: html-validate-disable (global): 1"
+            for node in changes.children or []
+        ):
+            msg = "Summary diff must show new suppression counts"
+            raise AssertionError(msg)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            html = package / "index.html"
+            html.write_text("<main></main>\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            html.write_text("<!-- html-validate-disable -->\n", encoding="utf-8")
+            viewer = app.Viewer(app.Agent(root))
+            entry = viewer.package_entry(root, "sample", diff=True)
+            actual = (
+                next(
+                    node
+                    for node in entry.children or []
+                    if node.title == "Suppressions"
+                )
+                if entry
+                else None
+            )
+            if actual is None or not any(
+                node.title == "+ index.html: html-validate-disable (global): 1"
+                for node in actual.children or []
+            ):
+                msg = "HTML diff must compare the previous file contents"
+                raise AssertionError(msg)
+
     def test_unavailable_cli_summary_warns_on_collapsed_package(self) -> None:
         """Expose parser diagnostics without opening the package tree."""
         with tempfile.TemporaryDirectory() as directory:

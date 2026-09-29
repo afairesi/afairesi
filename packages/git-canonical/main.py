@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import io
 import json
 import math
 import os
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tokenize
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -2667,6 +2669,81 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
     raise ValueError(msg)
 
 
+def _python_suppressions(source: str) -> Counter[tuple[str, str]]:
+    """Count explicit suppressions in Python comments."""
+    counts: Counter[tuple[str, str]] = Counter()
+    try:
+        comments = (
+            (token.string[1:].strip(), token.start[1] == 0)
+            for token in tokenize.generate_tokens(io.StringIO(source).readline)
+            if token.type == tokenize.COMMENT
+        )
+        for comment, standalone in comments:
+            if re.search(r"^(?:ruff|flake8):\s*noqa\b", comment, re.IGNORECASE):
+                counts["noqa", "global"] += 1
+            elif re.search(r"^noqa\b", comment, re.IGNORECASE):
+                counts["noqa", "local"] += 1
+            for kind, pattern in (
+                ("type: ignore", r"^type:\s*ignore\b"),
+                ("pyright: ignore", r"^pyright:\s*ignore\b"),
+                ("nosec", r"^nosec\b"),
+                ("pragma: no cover", r"^pragma:\s*no cover\b"),
+            ):
+                if re.search(pattern, comment, re.IGNORECASE):
+                    counts[kind, "local"] += 1
+            if re.search(
+                r"^mypy:\s*(?:ignore-errors|disable-error-code)\b",
+                comment,
+                re.IGNORECASE,
+            ):
+                counts["mypy", "global"] += 1
+            if re.search(r"^pylint:\s*disable(?:-next)?=", comment, re.IGNORECASE):
+                scope = (
+                    "global"
+                    if standalone and "disable-next=" not in comment
+                    else "local"
+                )
+                counts["pylint: disable", scope] += 1
+    except tokenize.TokenError:
+        pass
+    return counts
+
+
+def source_suppressions(filename: str, source: str) -> Counter[tuple[str, str]]:
+    """Count explicit lint and type-check suppressions in source comments."""
+    if filename.endswith(".py"):
+        return _python_suppressions(source)
+    counts: Counter[tuple[str, str]] = Counter()
+    if filename.endswith(".html"):
+        web_comments = re.findall(r"<!--(.*?)-->", source, re.DOTALL)
+    elif filename.endswith((".js", ".css")):
+        pattern = (
+            r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)"""
+            r"|/\*(.*?)\*/" + (r"|(?<!:)//([^\n]*)" if filename.endswith(".js") else "")
+        )
+        web_comments = [
+            match.group(2)
+            or ((match.group(3) or "") if filename.endswith(".js") else "")
+            for match in re.finditer(pattern, source, re.DOTALL)
+            if not match.group(1)
+        ]
+    else:
+        return counts
+    for comment in web_comments:
+        directive = re.match(
+            r"\s*(html-validate|htmlhint|eslint|stylelint)-disable"
+            r"(-next-line|-next|-current|-line)?\b",
+            comment,
+            re.IGNORECASE,
+        )
+        if directive:
+            kind = f"{directive[1].lower()}-disable"
+            counts[kind, "local" if directive[2] else "global"] += 1
+        elif re.match(r"\s*prettier-ignore\b", comment, re.IGNORECASE):
+            counts["prettier-ignore", "local"] += 1
+    return counts
+
+
 def source_package_overview(name: str, files: dict[str, str]) -> str:
     """Summarize a package without evaluating Nix or importing Python source."""
     description = source_package_description(files.get("default.nix", ""))
@@ -2689,6 +2766,13 @@ def source_package_overview(name: str, files: dict[str, str]) -> str:
             ]
         except SyntaxError as error:
             tests = [f"(unavailable: {error})"]
+    suppressions = [
+        f"{filename}: {kind} ({scope}): {count}"
+        for filename, source in files.items()
+        for (kind, scope), count in sorted(
+            source_suppressions(filename, source).items(),
+        )
+    ]
     lines = [
         f"Name: {name}",
         f"Description: {description or '(not declared)'}",
@@ -2697,6 +2781,8 @@ def source_package_overview(name: str, files: dict[str, str]) -> str:
         *(f"  {argument}" for argument in arguments),
         "Tests:",
         *(f"  {test}" for test in tests),
+        "Suppressions:",
+        *(f"  {entry}" for entry in (suppressions or ["(none)"])),
     ]
     return "\n".join(lines)
 
@@ -2705,7 +2791,14 @@ def package_overview(package: Path) -> str:
     """Read and summarize one package's current canonical source files."""
     files = {
         name: content
-        for name in ("default.nix", "main.py", "test_main.py")
+        for name in (
+            "default.nix",
+            "main.py",
+            "test_main.py",
+            "index.html",
+            "script.js",
+            "style.css",
+        )
         if (content := _read_regular(package / name)) is not None
     }
     return source_package_overview(package.name, files) if files else ""

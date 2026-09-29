@@ -948,6 +948,61 @@ def test_overview_moves_from_catalog_to_package_behavior(repository: Path) -> No
         raise AssertionError(full)
 
 
+def test_overview_counts_local_and_global_suppressions(repository: Path) -> None:
+    """Count directives in comments across Python and HTML package sources."""
+    _run(repository, "add", "packages/python_sample", "python")
+    python_package = repository / "packages/python_sample"
+    (python_package / "main.py").write_text(
+        '"""# noqa is text."""\n'
+        "# ruff: noqa: D\n"
+        "value = 1  # noqa: E501, F401\n"
+        "other = 2  # type: ignore[assignment]\n",
+        encoding="utf-8",
+    )
+    (python_package / "test_main.py").write_text(
+        "def test_one(): pass  # noqa: D103\n",
+        encoding="utf-8",
+    )
+    detail = _run(repository, "overview", "packages/python_sample").stdout
+    for expected in (
+        "main.py: noqa (global): 1",
+        "main.py: noqa (local): 1",
+        "main.py: type: ignore (local): 1",
+        "test_main.py: noqa (local): 1",
+    ):
+        if expected not in detail:
+            raise AssertionError(detail)
+    _run(repository, "add", "packages/html_sample", "html")
+    html_package = repository / "packages/html_sample"
+    (html_package / "index.html").write_text(
+        "<!-- html-validate-disable -->\n"
+        "<!-- html-validate-disable-next heading-level -->\n"
+        "<p>eslint-disable is text</p>\n",
+        encoding="utf-8",
+    )
+    (html_package / "script.js").write_text(
+        'const text = "// eslint-disable";\n'
+        "/* eslint-disable no-alert */\n"
+        "alert(text); // eslint-disable-line no-alert\n",
+        encoding="utf-8",
+    )
+    (html_package / "style.css").write_text(
+        'p::before { content: "/* stylelint-disable */"; }\n'
+        "/* stylelint-disable color-no-invalid-hex */\n",
+        encoding="utf-8",
+    )
+    detail = _run(repository, "overview", "packages/html_sample").stdout
+    for expected in (
+        "index.html: html-validate-disable (global): 1",
+        "index.html: html-validate-disable (local): 1",
+        "script.js: eslint-disable (global): 1",
+        "script.js: eslint-disable (local): 1",
+        "style.css: stylelint-disable (global): 1",
+    ):
+        if expected not in detail:
+            raise AssertionError(detail)
+
+
 def test_overview_lists_checked_out_home_flakes(home_repository: Path) -> None:
     """Include the repository path above packages in a canonical home."""
     checkout = home_repository / "forge.example/owner/demo"
