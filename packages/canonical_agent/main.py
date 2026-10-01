@@ -719,36 +719,28 @@ def record_event(
 
 class Row(NamedTuple):  # noqa: D101
     owner: int
-    line: int
     text: str
-    start: int = 0
 
 
 class Viewer:  # noqa: D101
     def __init__(self, agent: Agent) -> None:  # noqa: D107
         self.agent = agent
-        self.lines: list[str] = []
-        self.entries: list[Entry] = (
-            [replace(entry) for entry in agent.history.entries]
-            if agent.history is not None
-            else []
-        )
         self.selected = 0
         self.top = 0
         self.pattern = ""
         self.direction = 1
-        self.match: tuple[int, int, int] | None = None
         self.status = ""
         self.width = 80
         self.height = 23
-        self.chat_active = False
         self.worker: threading.Thread | None = None
         self.events: queue.Queue[
             tuple[str, str, bool | None] | BaseException | None
         ] = queue.Queue()
         self.waiting_notice = False
-        self.mode = "chat"
+        self.mode = "high-level"
         self.overview: list[TreeNode] = []
+        self.full_overview: list[TreeNode] = []
+        self.diff_overview: list[TreeNode] = []
         self.overview_loaded = False
         self.overview_visible: list[TreeNode] = []
         self.overview_parents: list[int | None] = []
@@ -756,15 +748,23 @@ class Viewer:  # noqa: D101
     def refresh_overview(self) -> None:
         """Rebuild the package overview from the current working tree."""
         self.status = ""
-        self.overview = self.package_entries()
+        self.full_overview = self.package_entries(diff=False)
+        self.diff_overview = self.changed_nodes(self.full_overview)
+        self.select_overview()
         self.overview_loaded = True
         self.selected = self.top = 0
-        self.match = None
 
     def ensure_overview(self) -> None:
         """Build the package overview once, on startup or first use."""
         if not self.overview_loaded:
             self.refresh_overview()
+
+    def select_overview(self) -> None:
+        """Select a cached tree without inspecting the working directory."""
+        self.overview = (
+            self.diff_overview if self.mode == "high-level diff" else self.full_overview
+        )
+        self.selected = self.top = 0
 
     def package_entries(self, *, diff: bool = False) -> list[TreeNode]:
         """Build a collapsible package tree with high-level changes."""
@@ -848,7 +848,21 @@ class Viewer:  # noqa: D101
             previous_cli=previous_cli,
             current_cli=current_cli,
         )
+        if only_changes:
+            summary_tree = self.changed_nodes(summary_tree)
         return TreeNode(f"packages/{name}", summary_tree or None)
+
+    @classmethod
+    def changed_nodes(cls, nodes: list[TreeNode]) -> list[TreeNode]:
+        """Keep changed fields and their ancestors in a diff-only tree."""
+        result = []
+        for node in nodes:
+            children = (
+                cls.changed_nodes(node.children) if node.children is not None else None
+            )
+            if node.style is not None or children:
+                result.append(replace(node, children=children))
+        return result
 
     def home_package_entries(self, root: Path, *, diff: bool) -> list[TreeNode]:
         """Build repository summaries beneath their home-repository paths."""
@@ -915,6 +929,8 @@ class Viewer:  # noqa: D101
                 TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
                 for line in lines[start + 1 : end]
             ]
+            if group == "Suppressions":
+                children = Viewer.suppression_tree(summary, summary)
             if group == "Arguments" and cli is not None:
                 children = Viewer.cli_tree(cli)
             fields.append(TreeNode(group, children))
@@ -976,18 +992,7 @@ class Viewer:  # noqa: D101
         )
         if test_changes:
             changes.append(TreeNode("Tests", test_changes))
-        old_suppressions = cls.summary_group(previous, "Suppressions")
-        new_suppressions = cls.summary_group(current, "Suppressions")
-        suppression_changes = [
-            TreeNode(f"- {item}", style=31)
-            for item in old_suppressions
-            if item not in new_suppressions
-        ]
-        suppression_changes.extend(
-            TreeNode(f"+ {item}", style=32)
-            for item in new_suppressions
-            if item not in old_suppressions
-        )
+        suppression_changes = cls.changed_nodes(cls.suppression_tree(previous, current))
         if suppression_changes:
             changes.append(TreeNode("Suppressions", suppression_changes))
         return changes
@@ -1032,11 +1037,42 @@ class Viewer:  # noqa: D101
                 )
                 for item in new_entries
             )
+            if group == "Suppressions":
+                children = cls.suppression_tree(previous, current)
             if group == "Arguments" and current_cli is not None:
                 children = cls.cli_tree(current_cli, previous=previous_cli)
             if children or f"{group}:" in current:
                 result.append(TreeNode(group, children))
         return result
+
+    @classmethod
+    def suppression_tree(cls, previous: str, current: str) -> list[TreeNode]:
+        """Group suppression counts and their changes beneath each source filename."""
+
+        def counts(summary: str) -> dict[str, int]:
+            result = {}
+            for entry in cls.summary_group(summary, "Suppressions"):
+                label, separator, count = entry.rpartition(": ")
+                if separator and count.isdecimal():
+                    result[label] = int(count)
+            return result
+
+        before, after = counts(previous), counts(current)
+        files: dict[str, list[TreeNode]] = {}
+        for label in sorted(before.keys() | after.keys()):
+            old, new = before.get(label, 0), after.get(label, 0)
+            filename, _, kind = label.partition(": ")
+            children = files.setdefault(filename, [])
+            if old == new:
+                children.append(TreeNode(f"{kind}: {new}"))
+            else:
+                style = 32 if old == 0 else 31 if new == 0 else 33
+                children.append(TreeNode(f"{kind}: {old} → {new}", style=style))
+        return [
+            TreeNode(filename, children) for filename, children in files.items()
+        ] or [
+            TreeNode("(none)"),
+        ]
 
     @staticmethod
     def cli_tree(
@@ -1103,18 +1139,6 @@ class Viewer:  # noqa: D101
         """Render the user-facing package fields from source file contents."""
         return source_package_overview(name, files) if files else ""
 
-    def event(self, kind: str, text: str, success: bool | None) -> None:  # noqa: D102, FBT001
-        follow = (
-            self.chat_active
-            and self.selected == max(0, len(self.entries) - 1)
-            and self.match is None
-            and self.top >= max(0, len(self.rows(self.width)) - self.height)
-        )
-        record_event(self.entries, kind, text, success)
-        if follow:
-            self.selected = max(0, len(self.entries) - 1)
-            self.top = max(0, len(self.rows(self.width)) - self.height)
-
     def enqueue(self, kind: str, text: str, success: bool | None) -> None:  # noqa: FBT001
         """Transfer worker events without touching terminal-owned state."""
         self.events.put((kind, text, success))
@@ -1125,22 +1149,19 @@ class Viewer:  # noqa: D101
             msg = "A turn is already running"
             raise RuntimeError(msg)
         self.agent.cancel = threading.Event()
-        self.lines.append("> " + prompt)
-        if self.agent.history is None:
-            self.event("chat", "user> " + prompt, None)
-        self.selected = max(0, len(self.entries) - 1)
-        self.match = None
-        self.top = max(0, len(self.rows(self.width)) - self.height)
+        self.status = ""
 
         def turn() -> None:
             try:
                 try:
                     self.agent.turn(prompt)
                 except (AgentError, KeyboardInterrupt) as exc:
-                    self.agent.emit(
-                        f"\n{str(exc) or 'Cancelled'}. Completed tool effects remain; "
-                        "incomplete turn history discarded.",
+                    text = (
+                        f"{str(exc) or 'Cancelled'}. Completed tool effects remain; "
+                        "incomplete turn history discarded."
                     )
+                    self.agent.emit(text)
+                    self.enqueue("status", text, None)
             except BaseException as exc:  # noqa: BLE001
                 self.events.put(exc)
             finally:
@@ -1165,12 +1186,13 @@ class Viewer:  # noqa: D101
                 self.worker = None
                 self.agent.cancel = None
                 self.waiting_notice = False
+                status = self.status
+                self.refresh_overview()
+                self.status = status or self.status
             elif isinstance(event, BaseException):
                 failure = event
-            elif event[0] == "line":
-                self.lines.append(event[1])
-            else:
-                self.event(*event)
+            elif event[0] == "status":
+                self.status = event[1]
         if failure is not None:
             raise failure
         return changed
@@ -1221,30 +1243,7 @@ class Viewer:  # noqa: D101
         return parts
 
     def rows(self, width: int) -> list[Row]:  # noqa: D102
-        width = max(1, width)
-        if self.mode != "chat":
-            return self.overview_rows(width)
-        rows = []
-        indent = " " * min(2, width - 1)
-        for index, entry in enumerate(self.entries):
-            marker = "[-]" if entry.expanded else "[+]"
-            status = ""
-            if entry.tool:
-                status = {True: " [OK]", False: " [FAILED]", None: " [pending]"}[
-                    entry.success
-                ]
-            title = f"{marker}{status} {self.safe(entry.title)}"
-            rows.append(Row(index, -1, self.wrap(title, width)[0][1]))
-            if entry.expanded:
-                for line, content in enumerate(entry.body.splitlines() or [""]):
-                    rows.extend(
-                        Row(index, line, indent + part, start)
-                        for start, part in self.wrap(
-                            self.safe(content),
-                            width - len(indent),
-                        )
-                    )
-        return rows
+        return self.overview_rows(max(1, width))
 
     def overview_rows(self, width: int) -> list[Row]:
         """Flatten the expanded package and test groups into visible tree rows."""
@@ -1262,9 +1261,9 @@ class Viewer:  # noqa: D101
                 continuation = " " * len(prefix)
                 title = node.title + (" [!]" if self.has_warning(node) else "")
                 wrapped = self.wrap(self.safe(title), max(1, width - len(prefix)))
-                rows.append(Row(owner, -1, prefix + wrapped[0][1]))
+                rows.append(Row(owner, prefix + wrapped[0][1]))
                 rows.extend(
-                    Row(owner, -1, continuation + part) for _start, part in wrapped[1:]
+                    Row(owner, continuation + part) for _start, part in wrapped[1:]
                 )
                 if node.expanded and node.children:
                     visit(node.children, depth + 1, owner)
@@ -1272,39 +1271,15 @@ class Viewer:  # noqa: D101
         visit(self.overview, 0, None)
         return rows
 
-    def matched(self, row: Row) -> bool:
-        """Identify the wrapped row containing the current search hit."""
-        if self.match is None or self.match[:2] != (row.owner, row.line):
-            return False
-        if row.line == -1:
-            return True
-        indent = min(2, self.width - 1)
-        end = row.start + len(row.text) - indent
-        content = self.entries[row.owner].body.splitlines()[row.line]
-        return row.start <= self.match[2] < end or (
-            self.match[2] == end and end == len(self.safe(content))
-        )
-
     def styles(self, row: Row) -> list[int]:
         """Share terminal styling between the readline and curses displays."""
-        if self.mode != "chat":
-            node = self.overview_visible[row.owner]
-            style = self.tree_style(node)
-            if self.has_warning(node):
-                style = 33
-            styles = [style] if style is not None else []
-            if row.owner == self.selected:
-                styles.append(7)
-            return styles
-        styles = []
-        entry = self.entries[row.owner]
-        if row.line == -1:
-            if entry.tool and entry.success is not None:
-                styles.append(32 if entry.success else 31)
-            if row.owner == self.selected:
-                styles.append(7)
-        if self.matched(row):
-            styles.extend((1, 4))
+        node = self.overview_visible[row.owner]
+        style = self.tree_style(node)
+        if self.has_warning(node):
+            style = 33
+        styles = [style] if style is not None else []
+        if row.owner == self.selected:
+            styles.append(7)
         return styles
 
     @classmethod
@@ -1342,17 +1317,12 @@ class Viewer:  # noqa: D101
             min(self.top, max(0, len(self.rows(self.width)) - self.height)),
         )
 
-    def render_chat(self, *, follow: bool = False) -> None:
+    def render_chat(self) -> None:
         """Paint the shared tree above native readline's input row."""
         if not sys.stdout.isatty():
             return
-        follow = follow or (
-            self.selected == max(0, len(self.entries) - 1)
-            and self.match is None
-            and self.top >= max(0, len(self.rows(self.width)) - self.height)
-        )
         size = shutil.get_terminal_size()
-        waiting = self.waiting()
+        waiting = self.waiting() or self.status
         self.width, self.height = (
             max(1, size.columns - 1),
             max(
@@ -1361,8 +1331,6 @@ class Viewer:  # noqa: D101
             ),
         )
         rows = self.rows(self.width)
-        if follow:
-            self.top = max(0, len(rows) - self.height)
         self.top = min(self.top, max(0, len(rows) - self.height))
         output = ["\x1b[0m\x1b[H\x1b[2J"]
         for y, row in enumerate(rows[self.top : self.top + self.height], 1):
@@ -1374,56 +1342,13 @@ class Viewer:  # noqa: D101
         sys.stdout.write("".join(output))
         sys.stdout.flush()
 
-    def search(self, direction: int, *, repeat: bool = False) -> None:  # noqa: D102
+    def search(self, direction: int) -> None:  # noqa: D102
         try:
             pattern = re.compile(self.pattern)
         except re.error as exc:
-            self.match = None
             self.status = f"Invalid pattern: {exc}"
             return
-        if self.mode != "chat":
-            self.search_overview(pattern, direction)
-            return
-        candidates = [
-            (index, line, found.start())
-            for index, entry in enumerate(self.entries)
-            for line, content in [
-                (-1, entry.title),
-                *enumerate(entry.body.splitlines()),
-            ]
-            for found in pattern.finditer(self.safe(content))
-        ]
-        if not candidates:
-            self.match = None
-            self.status = "Pattern not found"
-            return
-        anchor = (
-            self.match
-            if repeat and self.match is not None
-            else (
-                self.selected,
-                -2
-                if direction > 0
-                else len(self.entries[self.selected].body.splitlines()),
-                -1,
-            )
-        )
-        ordered = candidates if direction > 0 else candidates[::-1]
-        match = next(
-            (
-                item
-                for item in ordered
-                if (item > anchor if direction > 0 else item < anchor)
-            ),
-            ordered[0],
-        )
-        self.match = match
-        self.selected = match[0]
-        self.entries[self.selected].expanded = True
-        self.status = ""
-        self.reveal(
-            next(i for i, row in enumerate(self.rows(self.width)) if self.matched(row)),
-        )
+        self.search_overview(pattern, direction)
 
     def search_overview(self, pattern: re.Pattern[str], direction: int) -> None:
         """Search every tree node and reveal a match through collapsed ancestors."""
@@ -1448,7 +1373,6 @@ class Viewer:  # noqa: D101
             if pattern.search(self.safe(node.title))
         ]
         if not candidates:
-            self.match = None
             self.status = "Pattern not found"
             return
         ordered = candidates if direction > 0 else candidates[::-1]
@@ -1475,31 +1399,7 @@ class Viewer:  # noqa: D101
         self.height = height
         if not rows:
             return
-        if self.mode != "chat":
-            self.navigate_overview(key, height, rows)
-            return
-        if key in ("j", "k"):
-            self.selected = max(
-                0,
-                min(len(self.entries) - 1, self.selected + (1 if key == "j" else -1)),
-            )
-            self.reveal(
-                next(i for i, row in enumerate(rows) if row.owner == self.selected),
-            )
-            self.match = None
-            return
-        if key in ("h", "l"):
-            self.match = None
-            self.entries[self.selected].expanded = key == "l"
-            self.reveal(
-                next(
-                    i
-                    for i, row in enumerate(self.rows(self.width))
-                    if row.owner == self.selected
-                ),
-            )
-            return
-        self.navigate_page(key, height, rows)
+        self.navigate_overview(key, height, rows)
 
     def navigate_overview(
         self,
@@ -1518,7 +1418,6 @@ class Viewer:  # noqa: D101
                     self.selected + (1 if key == "j" else -1),
                 ),
             )
-            self.match = None
             self.reveal(
                 next(i for i, row in enumerate(rows) if row.owner == self.selected),
             )
@@ -1529,7 +1428,6 @@ class Viewer:  # noqa: D101
                 node.expanded = True
             elif key == "h":
                 self.collapse_overview_node()
-            self.match = None
             refreshed = self.overview_rows(self.width)
             self.reveal(
                 next(
@@ -1558,7 +1456,7 @@ class Viewer:  # noqa: D101
             self.selected = parent
 
     def navigate_page(self, key: str | int, height: int, rows: list[Row]) -> None:
-        """Handle page movement shared by chat and overview views."""
+        """Handle page movement in the overview tree."""
         offsets = {
             " ": height,
             "f": height,
@@ -1577,11 +1475,9 @@ class Viewer:  # noqa: D101
                 self.top if key == "g" else min(len(rows) - 1, self.top + height - 1)
             )
             self.selected = rows[cursor_row].owner
-            self.match = None
         elif key in offsets:
             self.top = max(0, min(max(0, len(rows) - height), self.top + offsets[key]))
             self.selected = rows[self.top].owner
-            self.match = None
 
     def view(self) -> None:  # noqa: D102
         try:
@@ -1638,9 +1534,8 @@ class Viewer:  # noqa: D101
                 else self.status
                 or (
                     f"{'(END) ' if self.top + page >= len(rows) else ''}"
-                    f"{self.mode} | L view  "
-                    f"j/k {'parent' if self.mode == 'chat' else 'node'}  "
-                    f"l/h open/close  {'r refresh  ' if self.mode != 'chat' else ''}"
+                    f"D diff {'on' if self.mode == 'high-level diff' else 'off'}  "
+                    "j/k node  l/h open/close  r refresh  "
                     "space/b page  "
                     "/? search  n/N next  q quit"
                 )
@@ -1661,9 +1556,7 @@ class Viewer:  # noqa: D101
                     self.pattern = query or self.pattern
                     self.direction = 1 if editing == "/" else -1
                     editing = None
-                    if self.pattern and (
-                        self.entries if self.mode == "chat" else self.overview
-                    ):
+                    if self.pattern and self.overview:
                         self.search(self.direction)
                 elif key in ("\x7f", "\b", curses.KEY_BACKSPACE):
                     query = query[:-1]
@@ -1672,32 +1565,23 @@ class Viewer:  # noqa: D101
                 continue
             if key == "q" or (prefix == "Z" and key == "Z"):
                 return
-            if key == "L":
-                modes = ("chat", "high-level")
-                next_mode = modes[(modes.index(self.mode) + 1) % len(modes)]
-                if self.mode == "chat":
-                    self.chat_entries = self.entries
-                if next_mode == "chat":
-                    self.entries = self.chat_entries
-                else:
-                    self.ensure_overview()
-                self.mode = next_mode
-                self.selected = self.top = 0
-                self.match = None
+            if key == "D":
+                self.mode = (
+                    "high-level diff" if self.mode == "high-level" else "high-level"
+                )
+                self.ensure_overview()
+                self.select_overview()
+                self.status = ""
                 continue
-            if key == "r" and self.mode != "chat":
+            if key == "r":
                 self.refresh_overview()
                 continue
             prefix = key if key in (":", "Z") else ""
             self.status = ""
             if key in ("/", "?"):
                 editing, query = str(key), ""
-            elif (
-                key in ("n", "N")
-                and self.pattern
-                and (self.entries if self.mode == "chat" else self.overview)
-            ):
-                self.search(self.direction * (1 if key == "n" else -1), repeat=True)
+            elif key in ("n", "N") and self.pattern and self.overview:
+                self.search(self.direction * (1 if key == "n" else -1))
             else:
                 self.navigate(key, page, rows)
 
@@ -1835,8 +1719,7 @@ class Viewer:  # noqa: D101
         configure_filename_completion()
         previous = self.agent.output
         previous_event = self.agent.event
-        self.agent.output = lambda text: self.enqueue("line", text, None)
-        self.chat_active = True
+        self.agent.output = lambda _text: None
         self.agent.event = self.enqueue
         try:
             while True:
@@ -1853,16 +1736,16 @@ class Viewer:  # noqa: D101
                     if self.worker is not None:
                         self.stop_turn()
                     else:
-                        self.agent.emit(
-                            f"\n{str(exc) or 'Cancelled'}. "
+                        self.status = (
+                            f"{str(exc) or 'Cancelled'}. "
                             "Completed tool effects remain; "
-                            "incomplete turn history discarded.",
+                            "incomplete turn history discarded."
                         )
+                        self.agent.emit(self.status)
         finally:
             try:
                 self.stop_turn()
             finally:
-                self.chat_active = False
                 self.agent.output = previous
                 self.agent.event = previous_event
 

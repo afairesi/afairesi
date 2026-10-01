@@ -95,13 +95,11 @@ class TestHistory(unittest.TestCase):
                 msg = "Absolute XDG_STATE_HOME must override the default location"
                 raise AssertionError(msg)
 
-    def test_restart_restores_context_and_full_searchable_transcript(self) -> None:  # noqa: C901, D102
+    def test_restart_restores_context_without_displaying_transcript(self) -> None:  # noqa: C901, D102
         with app.History(self.cwd) as history:
             history.load()
             agent = app.Agent(self.cwd, history=history)
             agent.model = "old-model"
-            viewer = app.Viewer(agent)
-            agent.event = viewer.event
             output = "x" * (app.OUTPUT_LIMIT + 50) + "needle"
             with patch.object(
                 agent,
@@ -115,8 +113,8 @@ class TestHistory(unittest.TestCase):
             ):
                 (self.cwd / "large").write_text(output)
                 agent.turn("read it")
-            if len(viewer.entries) != 3:  # noqa: PLR2004
-                msg = "Expected len(viewer.entries) == 3"
+            if len(history.entries) != 3:  # noqa: PLR2004
+                msg = "Expected len(history.entries) == 3"
                 raise AssertionError(msg)
             if history.path.stat().st_mode & 0o777 != 0o600:  # noqa: PLR2004
                 msg = "Expected history.path.stat().st_mode & 511 == 384"
@@ -142,17 +140,19 @@ class TestHistory(unittest.TestCase):
             if not (len(agent.messages[-2]["content"]) < len(output)):
                 msg = "Expected len(agent.messages[-2]['content']) < len(output)"
                 raise AssertionError(msg)
+            if not all(not entry.expanded for entry in history.entries):
+                msg = "Restored history must not contain expanded display state"
+                raise AssertionError(msg)
+            if output not in history.entries[1].body:
+                msg = "Persisted tool output must remain complete"
+                raise AssertionError(msg)
             viewer = app.Viewer(agent)
-            if not (all(not entry.expanded for entry in viewer.entries)):
-                msg = "Expected all((not entry.expanded for entry in viewer.entries))"
-                raise AssertionError(msg)
-            viewer.pattern = "needle"
-            viewer.search(1)
-            if not (viewer.match is not None):
-                msg = "Expected viewer.match is not None"
-                raise AssertionError(msg)
-            if output not in viewer.entries[viewer.selected].body:
-                msg = "Expected output in viewer.entries[viewer.selected].body"
+            viewer.ensure_overview()
+            if any(
+                "needle" in row.text or "assistant>" in row.text
+                for row in viewer.rows(80)
+            ):
+                msg = "Restarting must show only the package overview"
                 raise AssertionError(msg)
 
     def test_failed_and_cancelled_turns_keep_only_completed_context(self) -> None:  # noqa: D102
@@ -332,7 +332,10 @@ with History(Path.cwd()) as history:
         code = """
 from packages.canonical_agent import main as app
 app.Agent.discover = lambda self: None
-app.Agent.completion = lambda self: {'role': 'assistant', 'content': 'replied'}
+def completion(self):
+    print('COMPLETED', flush=True)
+    return {'role': 'assistant', 'content': 'replied'}
+app.Agent.completion = completion
 app.main([])
 """
         for keys in (b"\x1b[A\n", b"\x12saved\n\n"):
@@ -357,10 +360,7 @@ app.main([])
                                 buffer += os.read(master, 65536)
                         os.write(master, keys)
                         buffer = b""
-                        while (
-                            b"assistant> replied" not in buffer
-                            or not buffer.endswith(b"> ")
-                        ):
+                        while b"COMPLETED" not in buffer or not buffer.endswith(b"> "):
                             if time.monotonic() >= deadline:
                                 msg = f"Recalled prompt was not answered: {buffer!r}"
                                 raise AssertionError(msg)
@@ -548,8 +548,8 @@ class TestAgent(unittest.TestCase):  # noqa: D101
         if (
             processes[0].poll() != -signal.SIGKILL
             or len(self.agent.messages) != 1
-            or not any(e.tool and e.success is False for e in viewer.entries)
-            or not any("Cancelled" in e.body for e in viewer.entries)
+            or self.agent.tool_success
+            or "Cancelled" not in viewer.status
         ):
             msg = "Cancellation must reap the process and mark its tool as failed"
             raise AssertionError(msg)
@@ -965,15 +965,77 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Refreshing must reset navigation to the start"
                 raise AssertionError(msg)
 
+    def test_diff_key_uses_cached_views_and_refreshes_only_on_request(self) -> None:
+        """D switches cached trees, and r explicitly rebuilds the current snapshot."""
+        viewer = app.Viewer(app.Agent())
+        screen = MagicMock()
+        screen.getmaxyx.return_value = (12, 80)
+        screen.get_wch.side_effect = ["D", "r", "L", "D", "q"]
+        with (
+            patch.object(
+                viewer,
+                "package_entries",
+                return_value=[
+                    app.TreeNode(
+                        "packages/example",
+                        [
+                            app.TreeNode("unchanged"),
+                            app.TreeNode("+ changed", style=32),
+                        ],
+                    ),
+                ],
+            ) as build,
+            patch.object(curses, "has_colors", return_value=False),
+            patch.object(curses, "curs_set"),
+        ):
+            viewer.ensure_overview()
+            viewer.screen(screen)
+        if [item.kwargs for item in build.call_args_list] != [
+            {"diff": False},
+            {"diff": False},
+        ] or viewer.mode != "high-level":
+            msg = "Only startup and r may recalculate the overview"
+            raise AssertionError(msg)
+        if any("high-level" in item.args[2] for item in screen.addnstr.call_args_list):
+            msg = "The footer must omit the view name"
+            raise AssertionError(msg)
+        if [node.title for node in viewer.full_overview[0].children or []] != [
+            "unchanged",
+            "+ changed",
+        ] or [node.title for node in viewer.diff_overview[0].children or []] != [
+            "+ changed",
+        ]:
+            msg = "Filtering must preserve the complete cached overview"
+            raise AssertionError(msg)
+
+    def test_diff_only_omits_unchanged_fields_and_keeps_command_ancestors(self) -> None:
+        """Filtering removes unchanged details while retaining nested change context."""
+        before = (
+            "Name: sample\nDescription: Before\nArguments:\n"
+            "  --same\nTests:\n  test same"
+        )
+        after = before.replace("Before", "After")
+        nodes = app.Viewer.merged_summary_tree(before, after)
+        nodes.append(
+            app.TreeNode(
+                "command",
+                [app.TreeNode("--same"), app.TreeNode("+ --new", style=32)],
+            ),
+        )
+        changes = app.Viewer.changed_nodes(nodes)
+        if [node.title for node in changes] != [
+            "- Description: Before",
+            "+ Description: After",
+            "command",
+        ] or [node.title for node in changes[-1].children or []] != ["+ --new"]:
+            msg = "Diff-only trees must contain changes and their command ancestors"
+            raise AssertionError(msg)
+
     def test_g_and_capital_g_move_cursor_to_viewport_edges(self) -> None:  # noqa: D102
-        for mode in ("chat", "high-level"):
+        for mode in ("high-level", "high-level diff"):
             viewer = app.Viewer(app.Agent())
             viewer.mode = mode
-            if mode == "chat":
-                for index in range(5):
-                    viewer.event("chat", f"assistant> {index}", None)
-            else:
-                viewer.overview = [app.TreeNode(str(index)) for index in range(5)]
+            viewer.overview = [app.TreeNode(str(index)) for index in range(5)]
             rows = viewer.rows(80)
             viewer.navigate("G", TEST_PAGE_HEIGHT, rows)
             if (
@@ -1111,6 +1173,64 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Package view did not display the canonical overview"
                 raise AssertionError(msg)
 
+    def test_suppression_diff_changes_counts_without_repeating_labels(self) -> None:
+        """Include bare and tagged type ignores, excluding string contents."""
+        before = app.Viewer.package_summary(
+            "sample",
+            {
+                "main.py": "value = 1  # type: ignore[assignment]\n# noqa\n",
+                "test_main.py": "# type: ignore\n",
+            },
+        )
+        after = app.Viewer.package_summary(
+            "sample",
+            {
+                "main.py": (
+                    "value = 1  # type: ignore[assignment]\n"
+                    "other = 2  # type: ignore\n"
+                    "# noqa\n"
+                    'text = "# type: ignore"\n'
+                ),
+                "test_main.py": "",
+            },
+        )
+        tree = app.Viewer.merged_summary_tree(before, after)
+        group = next(node for node in tree if node.title == "Suppressions")
+        files = {node.title: node for node in group.children or []}
+        if list(files) != ["main.py", "test_main.py"] or any(
+            node.expanded for node in files.values()
+        ):
+            msg = "Suppression filenames must be separate, collapsed groups"
+            raise AssertionError(msg)
+        if [node.title for node in files["main.py"].children or []] != [
+            "noqa (local): 1",
+            "type: ignore (local): 1 → 2",
+        ] or [node.title for node in files["test_main.py"].children or []] != [
+            "type: ignore (local): 1 → 0",
+        ]:
+            msg = "Each filename must contain its own suppression count transitions"
+            raise AssertionError(msg)
+        changes = app.Viewer.changed_nodes([group])[0]
+        changed_files = {node.title: node for node in changes.children or []}
+        if [node.title for node in changed_files["main.py"].children or []] != [
+            "type: ignore (local): 1 → 2",
+        ] or "test_main.py" not in changed_files:
+            msg = "Diff-only views must keep file parents and omit unchanged counts"
+            raise AssertionError(msg)
+        viewer = app.Viewer(app.Agent())
+        viewer.overview = [changes]
+        viewer.navigate("l", 20, viewer.rows(80))
+        if any("type: ignore" in row.text for row in viewer.rows(80)):
+            msg = "Suppression counts must stay hidden until their file is expanded"
+            raise AssertionError(msg)
+        viewer.navigate("j", 20, viewer.rows(80))
+        viewer.navigate("l", 20, viewer.rows(80))
+        if not any(
+            "type: ignore (local): 1 → 2" in row.text for row in viewer.rows(80)
+        ):
+            msg = "Expanding a file must reveal its count changes"
+            raise AssertionError(msg)
+
     def test_suppression_counts_appear_in_overview_and_diff(self) -> None:
         """Keep suppression counts visible in the shared package summary."""
         before = app.Viewer.package_summary(
@@ -1128,17 +1248,22 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         )
         tree = app.Viewer.summary_tree(after)
         suppressions = next(node for node in tree if node.title == "Suppressions")
-        if {node.title for node in suppressions.children or []} != {
-            "index.html: html-validate-disable (global): 1",
-            "index.html: html-validate-disable (local): 1",
+        files = {node.title: node for node in suppressions.children or []}
+        if list(files) != ["index.html"] or {
+            node.title for node in files["index.html"].children or []
+        } != {
+            "html-validate-disable (global): 1",
+            "html-validate-disable (local): 1",
         }:
             msg = "Overview must distinguish global and local HTML directives"
             raise AssertionError(msg)
         diff = app.Viewer.merged_summary_tree(before, after)
         changes = next(node for node in diff if node.title == "Suppressions")
         if not any(
-            node.title == "+ index.html: html-validate-disable (global): 1"
+            child.title == "html-validate-disable (global): 0 → 1"
             for node in changes.children or []
+            if node.title == "index.html"
+            for child in node.children or []
         ):
             msg = "Summary diff must show new suppression counts"
             raise AssertionError(msg)
@@ -1163,8 +1288,10 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 else None
             )
             if actual is None or not any(
-                node.title == "+ index.html: html-validate-disable (global): 1"
+                child.title == "html-validate-disable (global): 0 → 1"
                 for node in actual.children or []
+                if node.title == "index.html"
+                for child in node.children or []
             ):
                 msg = "HTML diff must compare the previous file contents"
                 raise AssertionError(msg)
@@ -1605,11 +1732,10 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                     if not started.wait(timeout=5):
                         msg = "HTTP request did not start"
                         raise AssertionError(msg)
-                    if viewer.entries or len(history.entries) != 1:
-                        msg = "Worker must not mutate the viewer's transcript"
+                    if len(history.entries) != 1:
+                        msg = "The submitted prompt must be recorded"
                         raise AssertionError(msg)
                     viewer.poll()
-                    viewer.entries[0].expanded = True
                     if history.entries[0].expanded or not viewer.waiting():
                         msg = "Display state must be separate from persisted history"
                         raise AssertionError(msg)
@@ -1649,40 +1775,37 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                     viewer.stop_turn()
 
     def test_background_events_preserve_browsing_and_search(self) -> None:
-        """Incoming output follows only when the user is following the tail."""
+        """Hidden chat events cannot move or replace the package tree."""
         viewer = app.Viewer(app.Agent())
-        for index in range(30):
-            viewer.event("chat", f"assistant> entry {index}\ndetail {index}", None)
-        viewer.chat_active = True
+        viewer.overview = [app.TreeNode(f"package {index}") for index in range(30)]
         viewer.height = 5
-        viewer.pattern = "detail 2$"
+        viewer.pattern = "package 2$"
         viewer.search(1)
-        position = viewer.selected, viewer.top, viewer.match
+        position = viewer.selected, viewer.top
         viewer.enqueue("chat", "assistant> new answer", None)
+        viewer.enqueue("tool", "tool> bash", None)
+        viewer.enqueue("output", "private output", None)
+        viewer.enqueue("finish", "", True)  # noqa: FBT003
         viewer.poll()
-        if (viewer.selected, viewer.top, viewer.match) != position:
+        if (viewer.selected, viewer.top) != position:
             msg = "New output must preserve browsing position and search match"
             raise AssertionError(msg)
-        viewer.match = None
-        viewer.selected = len(viewer.entries) - 1
-        viewer.top = len(viewer.rows(viewer.width)) - viewer.height
-        viewer.enqueue("chat", "assistant> following", None)
-        viewer.poll()
-        if (
-            viewer.selected != len(viewer.entries) - 1
-            or viewer.top != len(viewer.rows(viewer.width)) - viewer.height
+        if any(
+            "assistant>" in row.text or "private output" in row.text
+            for row in viewer.rows(80)
         ):
-            msg = "Following the transcript tail must reveal arriving output"
+            msg = "The overview must never render chat or tool history"
             raise AssertionError(msg)
 
-    def test_chat_and_view_render_the_same_tree(self) -> None:  # noqa: D102
+    def test_prompt_and_view_render_the_same_overview(self) -> None:  # noqa: D102
         viewer = app.Viewer(app.Agent())
-        viewer.event("chat", "assistant> preview\nfull response", None)
-        viewer.event("tool", "tool> bash false", None)
-        viewer.event("output", "exit status: 1\nfailed output", None)
-        viewer.event("finish", "", False)  # noqa: FBT003
-        viewer.entries[0].expanded = True
-        viewer.entries[1].expanded = True
+        viewer.overview = [
+            app.TreeNode(
+                "packages/example",
+                [app.TreeNode("- removed", style=31)],
+                expanded=True,
+            ),
+        ]
         screen = MagicMock()
         screen.getmaxyx.return_value = (12, 60)
         screen.get_wch.return_value = "q"
@@ -1705,37 +1828,16 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         if rendered != [row.text for row in viewer.rows(59)]:
             msg = "Both modes must render identical tree rows"
             raise AssertionError(msg)
-        if any(text not in chat for text in rendered) or "\x1b[31m" not in chat:
-            msg = "Chat must include expanded children and failed command color"
-            raise AssertionError(msg)
-
-    def test_search_reveals_wrapped_matches_and_repeats_on_same_line(self) -> None:  # noqa: D102
-        viewer = app.Viewer(app.Agent())
-        viewer.width, viewer.height = 20, 3
-        viewer.event("chat", "assistant> long\n" + "x" * 90 + "needle needle", None)
-        viewer.pattern = "needle"
-        viewer.search(1)
-        first = viewer.match
-        visible = viewer.rows(viewer.width)[viewer.top : viewer.top + viewer.height]
-        if not any(viewer.matched(row) and "needle" in row.text for row in visible):
-            msg = "Search must scroll to the matching wrapped segment"
-            raise AssertionError(msg)
-        viewer.search(1, repeat=True)
-        if viewer.match is None or first is None or viewer.match <= first:
-            msg = "n must advance to later matches on the same line"
-            raise AssertionError(msg)
-        viewer.pattern = "$"
-        viewer.search(1)
-        viewer.search(1, repeat=True)
-        if viewer.match is None:
-            msg = "Zero-width matches at line ends must remain navigable"
+        if any(text not in chat for text in rendered) or (
+            "\x1b[31;7m" not in chat and "\x1b[31m" not in chat
+        ):
+            msg = "The prompt display must include expanded children and diff colors"
             raise AssertionError(msg)
 
     def test_paging_at_last_parent_does_not_jump_backwards(self) -> None:  # noqa: D102
         viewer = app.Viewer(app.Agent())
-        for index in range(30):
-            viewer.event("chat", f"assistant> {index}", None)
-        for _ in viewer.entries:
+        viewer.overview = [app.TreeNode(str(index)) for index in range(30)]
+        for _ in viewer.overview:
             viewer.navigate("j", 10, viewer.rows(80))
         top = viewer.top
         viewer.navigate(" ", 10, viewer.rows(80))
@@ -1743,12 +1845,72 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             msg = "Forward paging at the final parent must not scroll backwards"
             raise AssertionError(msg)
 
+    def test_unicode_and_tiny_terminals(self) -> None:  # noqa: D102
+        viewer = app.Viewer(app.Agent())
+        viewer.overview = [app.TreeNode("界e\u0301界界")]
+        for width in (1, 2, 4, 20):
+            for _start, content in viewer.wrap("界e\u0301界界", width):
+                cells = sum(
+                    0
+                    if unicodedata.combining(char)
+                    else 2
+                    if unicodedata.east_asian_width(char) in {"W", "F"}
+                    else 1
+                    for char in content
+                )
+                if cells > width:
+                    msg = "Wide characters and indentation must fit the terminal"
+                    raise AssertionError(msg)
+
+    def test_tool_entries_use_execution_status_and_full_output(self) -> None:  # noqa: D102
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            app.History(Path(directory)) as history,
+        ):
+            agent = app.Agent(directory, history=history)
+            agent.model = "local"
+            calls = [
+                call(
+                    "ok",
+                    "bash",
+                    command="printf 'Tool error fake'; printf '%20000s' x",
+                ),
+                call("bad", "bash", command="printf 'exit status: 0'; exit 7"),
+                call("missing", "read", path="/nonexistent-coding-agent-test-file"),
+            ]
+            with patch.object(
+                agent,
+                "completion",
+                side_effect=[
+                    answer("Running", calls)["choices"][0]["message"],
+                    answer("Finished")["choices"][0]["message"],
+                ],
+            ):
+                agent.turn("test")
+            entries = [entry for entry in history.entries if entry.tool]
+            if [entry.success for entry in entries] != [True, False, False]:
+                msg = "Tool status must come from execution, regardless of output text"
+                raise AssertionError(msg)
+            if len(entries[0].body) <= app.OUTPUT_LIMIT:
+                msg = "Viewer must retain output beyond the model's truncation limit"
+                raise AssertionError(msg)
+            if (
+                "exit status: 7" not in entries[1].body
+                or "Tool error" not in entries[2].body
+            ):
+                msg = "Each tool must retain its own output"
+                raise AssertionError(msg)
+            if any(entry.expanded for entry in entries):
+                msg = "Completed tools must start collapsed"
+                raise AssertionError(msg)
+
     def test_read_output_resembling_error_is_not_duplicated(self) -> None:  # noqa: D102
-        with tempfile.TemporaryDirectory() as directory:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            app.History(Path(directory)) as history,
+        ):
             Path(directory, "example").write_text("Tool error is ordinary file content")
-            agent = app.Agent(directory)
-            viewer = app.Viewer(agent)
-            agent.event = viewer.event
+            agent = app.Agent(directory, history=history)
             agent.model = "local"
             with patch.object(
                 agent,
@@ -1761,7 +1923,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 ],
             ):
                 agent.turn("read example")
-            entry = viewer.entries[0]
+            entry = next(entry for entry in history.entries if entry.tool)
             if (
                 entry.body != "Tool error is ordinary file content"
                 or entry.success is not True
@@ -1769,130 +1931,12 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Successful file output must be retained exactly once"
                 raise AssertionError(msg)
 
-    def test_unicode_and_tiny_terminals(self) -> None:  # noqa: D102
-        viewer = app.Viewer(app.Agent())
-        viewer.event("chat", "assistant> 界\ne\u0301界界", None)
-        viewer.entries[0].expanded = True
-        for width in (1, 2, 4, 20):
-            for row in viewer.rows(width):
-                cells = sum(
-                    0
-                    if unicodedata.combining(char)
-                    else 2
-                    if unicodedata.east_asian_width(char) in {"W", "F"}
-                    else 1
-                    for char in row.text
-                )
-                if cells > width:
-                    msg = "Wide characters and indentation must fit the terminal"
-                    raise AssertionError(msg)
-
-    def test_tree_navigation_and_paging(self) -> None:  # noqa: D102
-        page_height = 10
-        viewer = app.Viewer(app.Agent())
-        viewer.event("chat", "assistant> preview\n" + "detail\n" * 40, None)
-        viewer.event("chat", "user> next", None)
-        if len(viewer.rows(80)) != len(viewer.entries):
-            msg = "New entries must be collapsed"
-            raise AssertionError(msg)
-        viewer.navigate("l", 10, viewer.rows(80))
-        viewer.navigate(" ", 10, viewer.rows(80))
-        if viewer.top != page_height or viewer.selected != 0:
-            msg = "Paging must scroll inside an expanded child"
-            raise AssertionError(msg)
-        viewer.navigate("b", 10, viewer.rows(80))
-        if viewer.top != 0:
-            msg = "Backward paging must return to the first row"
-            raise AssertionError(msg)
-        viewer.navigate("j", 10, viewer.rows(80))
-        if viewer.selected != 1 or not any(
-            row.owner == 1 and row.line == -1
-            for row in viewer.rows(80)[viewer.top : viewer.top + page_height]
-        ):
-            msg = "j must skip output and select the next parent"
-            raise AssertionError(msg)
-        viewer.navigate("k", 10, viewer.rows(80))
-        viewer.navigate("h", 10, viewer.rows(80))
-        if viewer.entries[0].expanded or len(viewer.rows(80)) != len(viewer.entries):
-            msg = "h must hide the selected output"
-            raise AssertionError(msg)
-        viewer.navigate("g", 10, viewer.rows(80))
-        viewer.navigate("k", 10, viewer.rows(80))
-        if viewer.selected != 0:
-            msg = "Parent navigation must stop at the start"
-            raise AssertionError(msg)
-
-    def test_search_expands_hidden_output_and_repeats(self) -> None:  # noqa: D102
-        viewer = app.Viewer(app.Agent())
-        for text in ("assistant> one\nhidden 1", "assistant> two\nhidden 2"):
-            viewer.event("chat", text, None)
-        viewer.pattern = r"hidden \d"
-        viewer.search(1)
-        if viewer.match != (0, 1, 0) or not viewer.entries[0].expanded:
-            msg = "Search must reveal hidden output"
-            raise AssertionError(msg)
-        viewer.search(1, repeat=True)
-        if viewer.match != (1, 1, 0) or not viewer.entries[1].expanded:
-            msg = "Repeated search must advance to the next entry"
-            raise AssertionError(msg)
-        viewer.search(-1, repeat=True)
-        if viewer.match != (0, 1, 0):
-            msg = "Reverse repeat must find the previous match"
-            raise AssertionError(msg)
-        viewer.pattern = "["
-        viewer.search(1)
-        if "Invalid pattern" not in viewer.status or viewer.match is not None:
-            msg = "Invalid patterns must clear stale matches without crashing"
-            raise AssertionError(msg)
-        viewer.pattern = "missing"
-        viewer.search(1)
-        if viewer.status != "Pattern not found":
-            msg = "Missing patterns must be reported"
-            raise AssertionError(msg)
-
-    def test_tool_entries_use_execution_status_and_full_output(self) -> None:  # noqa: D102
-        agent = app.Agent()
-        viewer = app.Viewer(agent)
-        agent.event = viewer.event
-        agent.model = "local"
-        calls = [
-            call("ok", "bash", command="printf 'Tool error fake'; printf '%20000s' x"),
-            call("bad", "bash", command="printf 'exit status: 0'; exit 7"),
-            call("missing", "read", path="/nonexistent-coding-agent-test-file"),
-        ]
-        with patch.object(
-            agent,
-            "completion",
-            side_effect=[
-                answer("Running", calls)["choices"][0]["message"],
-                answer("Finished")["choices"][0]["message"],
-            ],
-        ):
-            agent.turn("test")
-        entries = [entry for entry in viewer.entries if entry.tool]
-        if [entry.success for entry in entries] != [True, False, False]:
-            msg = "Tool status must come from execution, regardless of output text"
-            raise AssertionError(msg)
-        if len(entries[0].body) <= app.OUTPUT_LIMIT:
-            msg = "Viewer must retain output beyond the model's truncation limit"
-            raise AssertionError(msg)
-        if (
-            "exit status: 7" not in entries[1].body
-            or "Tool error" not in entries[2].body
-        ):
-            msg = "Each tool must retain its own output"
-            raise AssertionError(msg)
-        if any(entry.expanded for entry in entries):
-            msg = "Completed tools must start collapsed"
-            raise AssertionError(msg)
-
     def test_wrapping_and_control_characters(self) -> None:  # noqa: D102
         viewer = app.Viewer(app.Agent())
-        viewer.event("chat", "assistant> preview\n\x1b[31m" + "x" * 100, None)
-        viewer.entries[0].expanded = True
+        viewer.overview = [app.TreeNode("\x1b[31m" + "x" * 100)]
         width = 20
         rows = viewer.rows(width)
-        if any(len(row[2]) > width or "\x1b" in row[2] for row in rows):
+        if any(len(row.text) > width or "\x1b" in row.text for row in rows):
             msg = "Output must wrap and must not execute terminal escape sequences"
             raise AssertionError(msg)
 
@@ -1912,63 +1956,6 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         remove.assert_called_once_with()
         if slot.value != previous:
             msg = "Readline input hook must be restored"
-            raise AssertionError(msg)
-
-    def test_transcript_keeps_output_after_failure(self) -> None:  # noqa: D102
-        agent = app.Agent()
-        viewer = app.Viewer(agent)
-        agent.model = "local"
-        response = answer(
-            "Running command",
-            [call("shell", "bash", command="printf hello; printf error >&2")],
-        )["choices"][0]["message"]
-        submitted = False
-
-        def read_chat() -> str:
-            nonlocal submitted
-            if not submitted:
-                submitted = True
-                return "do it"
-            if viewer.worker is not None:
-                viewer.worker.join(timeout=5)
-                if viewer.worker.is_alive():
-                    msg = "Turn did not finish"
-                    raise AssertionError(msg)
-            raise EOFError
-
-        with (
-            patch.object(viewer, "read_chat", side_effect=read_chat),
-            patch.object(
-                agent,
-                "completion",
-                side_effect=[response, app.AgentError("offline")],
-            ),
-            contextlib.redirect_stdout(io.StringIO()),
-        ):
-            viewer.run()
-        transcript = "\n".join(viewer.lines)
-        for expected in (
-            "> do it",
-            "assistant> Running command",
-            "tool> bash",
-            "exit status: 0",
-            "helloerror",
-            "offline",
-        ):
-            if expected not in transcript:
-                raise AssertionError(expected)
-        if len(agent.messages) != 1:
-            msg = "Failed turn history must be discarded"
-            raise AssertionError(msg)
-        if agent.output is not None:
-            msg = "Output hook must be restored"
-            raise AssertionError(msg)
-        if agent.event is not None or not any(
-            entry.tool and entry.success for entry in viewer.entries
-        ):
-            msg = (
-                "Failed turns must retain completed entries and restore the event hook"
-            )
             raise AssertionError(msg)
 
 
@@ -1991,7 +1978,7 @@ class TestReadlineTerminal(unittest.TestCase):  # noqa: D101
 import json
 import sys
 from pathlib import Path
-from packages.canonical_agent.main import Agent, AgentError, Viewer
+from packages.canonical_agent.main import Agent, AgentError, TreeNode, Viewer
 agent = Agent()
 def turn(prompt):
     if prompt.startswith("wait"):
@@ -2003,10 +1990,14 @@ def turn(prompt):
             raise AgentError("offline")
     if prompt == "tool":
         agent.run([sys.executable, "-c", "import time; time.sleep(60)"], 60)
-    agent.emit("RESULT:" + json.dumps(prompt))
+    print("RESULT:" + json.dumps(prompt), flush=True)
     return ""
 agent.turn = turn
-Viewer(agent).run()
+viewer = Viewer(agent)
+viewer.package_entries = lambda **kwargs: [
+    TreeNode("packages/example", [TreeNode("searchable detail")])
+]
+viewer.run()
 """
         try:
             self.process = subprocess.Popen(
@@ -2089,7 +2080,7 @@ Viewer(agent).run()
         for quit_keys in (b"q", b":q", b"ZZ"):
             os.write(self.master, b"\x1b")
             self.wait_for(b"\x1b[?1049h")
-            self.wait_for(b"searchable transcript")
+            self.wait_for(b"packages/example")
             os.write(self.master, b"/searchable\n")
             self.wait_for(b"(END)")
             os.write(self.master, quit_keys)
@@ -2108,7 +2099,7 @@ Viewer(agent).run()
         self.wait_for(b"[+]")
         os.write(self.master, b"gl")
         self.wait_for(b"-")
-        self.wait_for(b"user> tree example")
+        self.wait_for(b"searchable detail")
         os.write(self.master, b"h")
         self.wait_for(b"+")
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 50, 0, 0))
@@ -2130,13 +2121,12 @@ Viewer(agent).run()
         self.wait_for(b"\x1b[?1049h")
         os.write(self.master, b"glq")
         self.wait_for(b"\x1b[?1049l")
-        self.wait_for(b"[-] user> resize example")
-        self.wait_for(b"  user> resize example")
+        self.wait_for(b"searchable detail")
         self.wait_prompt()
         self.wait_for(b"draft")
         fcntl.ioctl(self.master, termios.TIOCSWINSZ, struct.pack("HHHH", 12, 50, 0, 0))
         os.kill(self.process.pid, signal.SIGWINCH)
-        self.wait_for(b"  user> resize example")
+        self.wait_for(b"searchable detail")
         self.wait_prompt()
         self.wait_for(b"draft")
         self.send(b"\x01X\n", "Xdraft")
@@ -2168,7 +2158,7 @@ Viewer(agent).run()
     def test_waiting_draft_enter_resize_and_completion(self) -> None:
         """Busy turns preserve editing, cursor position and unsubmitted drafts."""
         os.write(self.master, b"wait\n")
-        self.wait_for(b"assistant> working")
+        self.wait_for(b"assistant> .")
         os.write(self.master, b"draft\x01X\n")
         self.wait_for(b"Waiting for the current answer")
         self.wait_for(b"Xdraft")
@@ -2187,14 +2177,13 @@ Viewer(agent).run()
         self.send(b"\x1b[A\x1b[A\n", "wait")
 
     def test_waiting_viewer_search_and_answer_preserve_draft(self) -> None:
-        """The transcript remains usable and receives answers while open."""
+        """The overview remains usable while an answer is running."""
         os.write(self.master, b"wait\n")
-        self.wait_for(b"assistant> working")
+        self.wait_for(b"assistant> .")
         os.write(self.master, b"draft\x01\x1b")
         self.wait_for(b"\x1b[?1049h")
         os.write(self.master, b"/searchable\n")
         self.wait_for(b"searchable")
-        self.wait_for(b"detail")
         Path(self.directory.name, "release").touch()
         self.wait_for(b'RESULT:"wait"')
         os.write(self.master, b"q")
@@ -2206,7 +2195,7 @@ Viewer(agent).run()
     def test_waiting_filename_completion_and_error(self) -> None:
         """A failed answer leaves the completed draft available for submission."""
         os.write(self.master, b"wait error\n")
-        self.wait_for(b"assistant> working")
+        self.wait_for(b"assistant> .")
         os.write(self.master, str(self.completion_path)[:-3].encode() + b"\t")
         self.wait_for(b"completion-example")
         Path(self.directory.name, "release").touch()
@@ -2226,7 +2215,7 @@ Viewer(agent).run()
             self.wait_prompt()
             self.send(f"next {index}\n".encode(), f"next {index}")
         os.write(self.master, b"wait eof\n")
-        self.wait_for(b"user> wait eof")
+        self.wait_for(b"assistant> .")
         self.wait_prompt()
         os.write(self.master, b"draft\x18a")
         self.wait_for(b"Waiting for the current answer")
