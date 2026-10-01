@@ -11,6 +11,7 @@ import io
 import json
 import math
 import os
+import posixpath
 import re
 import shlex
 import shutil
@@ -24,7 +25,7 @@ from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 from urllib.parse import urlparse
 
 import nix_syntax
@@ -2744,9 +2745,262 @@ def source_suppressions(filename: str, source: str) -> Counter[tuple[str, str]]:
     return counts
 
 
+class DeclaredDependency(TypedDict):
+    """One source declaration, without claiming an evaluated dependency closure."""
+
+    kind: str
+    target: str
+    expression: str
+    line: int
+    resolved: bool
+
+
+_DEPENDENCY_FIELDS = {
+    "propagatedBuildInputs": "runtime",
+    "propagatedNativeBuildInputs": "build",
+    "buildInputs": "build",
+    "nativeBuildInputs": "build",
+    "runtimeInputs": "runtime",
+    "dependencies": "runtime",
+    "build-system": "build",
+    "checkInputs": "test",
+    "nativeCheckInputs": "test",
+    "systemPackages": "runtime",
+}
+
+
+def _dependency_alias(
+    document: nix_syntax.Document,
+    node: Node,
+    name: str,
+) -> Node | None:
+    """Find an alias in its lexical let/recursive-set scope, respecting formals."""
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "function_expression":
+            formals = nix_syntax.field(parent, "formals")
+            if formals is not None and any(
+                child.type == "formal"
+                and (formal := nix_syntax.field(child, "name")) is not None
+                and document.text(formal) == name
+                for child in formals.named_children
+            ):
+                return None
+        if parent.type in {"let_expression", "rec_attrset_expression"}:
+            bindings = next(
+                (
+                    child
+                    for child in parent.named_children
+                    if child.type == "binding_set"
+                ),
+                None,
+            )
+            for binding in [] if bindings is None else bindings.named_children:
+                attrpath = nix_syntax.field(binding, "attrpath")
+                if attrpath is not None and nix_syntax.static_attrpath(
+                    document,
+                    attrpath,
+                ) == (name,):
+                    return cast("Node | None", nix_syntax.field(binding, "expression"))
+        parent = parent.parent
+    return None
+
+
+def _dependency_parts(
+    document: nix_syntax.Document,
+    node: Node,
+    seen: frozenset[int] = frozenset(),
+) -> list[str | None] | None:
+    """Expand static attribute prefixes and aliases, retaining dynamic components."""
+    if node.id in seen:
+        return None
+    seen = seen | {node.id}
+    if node.type in {"variable_expression", "identifier"}:
+        name = document.text(node)
+        alias = _dependency_alias(document, node, name)
+        if alias is not None:
+            return _dependency_parts(document, alias, seen)
+        return [name]
+    if node.type == "select_expression":
+        base = nix_syntax.field(node, "expression")
+        attrs = nix_syntax.field(node, "attrpath")
+        parts = None if base is None else _dependency_parts(document, base, seen)
+        if parts is None or attrs is None:
+            return None
+        for child in attrs.named_children:
+            if child.type == "identifier":
+                parts.append(document.text(child))
+            elif child.type == "string_expression" and "${" not in document.text(child):
+                parts.append(json.loads(document.text(child)))
+            else:
+                parts.append(None)
+        return parts
+    return None
+
+
+def _dependency_target(parts: list[str | None] | None, expression: str) -> str:
+    if parts is None:
+        return expression
+    for prefix in (["inputs", "self", "packages"], ["self", "packages"]):
+        if parts[: len(prefix)] == prefix and len(parts) >= len(prefix) + 2:
+            name = parts[len(prefix) + 1]
+            if name is not None:
+                return "packages/" + name
+    return (
+        ".".join(cast("list[str]", parts))
+        if all(part is not None for part in parts)
+        else expression
+    )
+
+
+def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax form
+    document: nix_syntax.Document,
+    node: Node,
+    seen: frozenset[int] = frozenset(),
+) -> list[tuple[Node, list[str | None] | None]]:
+    """Expand literal lists and simple aliases; leave computed expressions opaque."""
+    if node.id in seen:
+        return [(node, None)]
+    seen = seen | {node.id}
+    if node.type == "comment":
+        return []
+    if node.type == "list_expression":
+        return [
+            value
+            for child in node.named_children
+            for value in _dependency_values(document, child, seen)
+        ]
+    if node.type in {"variable_expression", "identifier"}:
+        alias = _dependency_alias(document, node, document.text(node))
+        if alias is not None:
+            if alias.type in {
+                "apply_expression",
+                "attrset_expression",
+                "rec_attrset_expression",
+            }:
+                return [(node, [document.text(node)])]
+            return _dependency_values(document, alias, seen)
+    if node.type == "with_expression":
+        body = nix_syntax.field(node, "body")
+        environment = nix_syntax.field(node, "environment")
+        prefix = (
+            None if environment is None else _dependency_parts(document, environment)
+        )
+        values = [] if body is None else _dependency_values(document, body, seen)
+        return [
+            (item, prefix + parts if prefix and parts and len(parts) == 1 else parts)
+            for item, parts in values
+        ]
+    if node.type == "parenthesized_expression":
+        return _dependency_values(document, node.named_children[0], seen)
+    if node.type == "binary_expression":
+        left, right = nix_syntax.field(node, "left"), nix_syntax.field(node, "right")
+        if (
+            left is not None
+            and right is not None
+            and document.source[left.end_byte : right.start_byte].strip() == b"++"
+        ):
+            return _dependency_values(document, left, seen) + _dependency_values(
+                document,
+                right,
+                seen,
+            )
+    return [(node, _dependency_parts(document, node))]
+
+
+def source_package_dependencies(source: str, name: str) -> list[DeclaredDependency]:
+    """Read dependencies on this repository's packages without evaluation."""
+    document = nix_syntax.parse(source, f"packages/{name}/default.nix")
+    records: list[DeclaredDependency] = []
+    for binding in nix_syntax.walk(document.root):
+        attrpath = (
+            nix_syntax.field(binding, "attrpath") if binding.type == "binding" else None
+        )
+        parts = (
+            None if attrpath is None else nix_syntax.static_attrpath(document, attrpath)
+        )
+        expression = nix_syntax.field(binding, "expression")
+        if not parts or parts[-1] not in _DEPENDENCY_FIELDS or expression is None:
+            continue
+        for node, reference in _dependency_values(document, expression):
+            text = document.text(node)
+            target = _dependency_target(reference, text)
+            resolved = reference is not None and (
+                target.startswith("packages/")
+                or all(part is not None for part in reference)
+            )
+            records.append(
+                {
+                    "kind": _DEPENDENCY_FIELDS[parts[-1]] if resolved else "unresolved",
+                    "target": target,
+                    "expression": text,
+                    "line": node.start_point.row + 1,
+                    "resolved": resolved,
+                },
+            )
+    known = {record["target"] for record in records}
+    for node in nix_syntax.walk(document.root):
+        text = document.text(node)
+        if node.type == "select_expression":
+            target = _dependency_target(_dependency_parts(document, node), text)
+            if target.startswith("packages/") and target not in known:
+                records.append(
+                    {
+                        "kind": "reference",
+                        "target": target,
+                        "expression": text,
+                        "line": node.start_point.row + 1,
+                        "resolved": True,
+                    },
+                )
+                known.add(target)
+        elif (
+            node.type == "path_expression"
+            and text.startswith(("./", "../"))
+            and "${" not in text
+        ):
+            target = posixpath.normpath(f"packages/{name}/{text}")
+            collection, separator, rest = target.partition("/")
+            if collection == "packages" and separator and rest:
+                package = "packages/" + rest.split("/")[0]
+                if package != f"packages/{name}":
+                    records.append(
+                        {
+                            "kind": "source",
+                            "target": package,
+                            "expression": text,
+                            "line": node.start_point.row + 1,
+                            "resolved": True,
+                        },
+                    )
+    unique = {
+        (record["kind"], record["target"], record["expression"]): record
+        for record in reversed(records)
+    }
+    return [
+        unique[key]
+        for key in sorted(unique)
+        if unique[key]["target"].startswith("packages/")
+    ]
+
+
+def _dependency_description(dependency: DeclaredDependency) -> str:
+    target = " ".join(dependency["target"].split())
+    return f"{dependency['kind']}: {target}"
+
+
 def source_package_overview(name: str, files: dict[str, str]) -> str:
     """Summarize a package without evaluating Nix or importing Python source."""
     description = source_package_description(files.get("default.nix", ""))
+    dependencies = ["(not declared)"]
+    if nix_source := files.get("default.nix"):
+        try:
+            dependencies = [
+                _dependency_description(item)
+                for item in source_package_dependencies(nix_source, name)
+            ] or ["(none)"]
+        except nix_syntax.NixSyntaxError as error:
+            dependencies = [f"(unavailable: {error})"]
     help_text = None
     arguments = ["(not applicable)"]
     if main_source := files.get("main.py"):
@@ -2779,6 +3033,8 @@ def source_package_overview(name: str, files: dict[str, str]) -> str:
         f"Help: {help_text or '(module docstring not declared)'}",
         "Arguments:",
         *(f"  {argument}" for argument in arguments),
+        "Dependencies:",
+        *(f"  {dependency}" for dependency in dependencies),
         "Tests:",
         *(f"  {test}" for test in tests),
         "Suppressions:",
@@ -2802,6 +3058,174 @@ def package_overview(package: Path) -> str:
         if (content := _read_regular(package / name)) is not None
     }
     return source_package_overview(package.name, files) if files else ""
+
+
+def _overview_graph_package(
+    scope: str,
+    package: Package,
+    nodes: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> None:
+    path = f"packages/{package.name}"
+    identifier = f"{scope}:{path}"
+    source = _read_regular(package.root / "default.nix") or ""
+    dependencies = source_package_dependencies(source, package.name) if source else []
+    nodes[identifier] = {
+        "id": identifier,
+        "kind": "package",
+        "name": package.name,
+        "repository": scope,
+        "path": path,
+        "package_type": package.kind,
+        "description": package_description(package),
+        "overview": package_overview(package.root),
+        "dependencies": dependencies,
+    }
+    edges.append(
+        {"source": f"{scope}:repository", "target": identifier, "kind": "contains"},
+    )
+    for dependency in dependencies:
+        target = dependency["target"]
+        target_id = f"{scope}:{target}"
+        nodes.setdefault(
+            target_id,
+            {
+                "id": target_id,
+                "kind": "package-reference",
+                "name": target,
+                "repository": scope,
+                "path": target,
+                "expression": dependency["expression"],
+                "resolved": dependency["resolved"],
+            },
+        )
+        edges.append(
+            {
+                "source": target_id,
+                "target": identifier,
+                "kind": dependency["kind"],
+                "declaration": {
+                    "repository": scope,
+                    "path": path + "/default.nix",
+                    "line": dependency["line"],
+                    "expression": dependency["expression"],
+                },
+            },
+        )
+
+
+def overview_data(target: Path) -> dict[str, Any]:  # noqa: C901, PLR0912 - traverse canonical collections
+    """Return a versioned, source-based graph for other Canonical clients."""
+    target = target.resolve()
+    focus = None
+    if target.parent.name == "packages" and (target / "default.nix").is_file():
+        focus = f".:packages/{target.name}"
+        target = target.parent.parent
+    current_profile = profile(target)
+    repositories = [(".", target)]
+    if current_profile == "home":
+        repositories = []
+        for repository in home_repositories(target, require_url=False):
+            scope = repository["path"]
+            checkout = (target / scope).resolve()
+            if not checkout.is_relative_to(target):
+                msg = f"submodule path escapes the home repository: {scope}"
+                raise CommandError(msg)
+            repositories.append((scope, checkout))
+    nodes: dict[str, dict[str, Any]] = {}
+    edges: list[dict[str, Any]] = []
+    if current_profile == "home":
+        nodes[".:repository"] = {
+            "id": ".:repository",
+            "kind": "repository",
+            "name": ".",
+            "repository": ".",
+            "path": ".",
+            "profile": "home",
+        }
+    for scope, root in sorted(repositories):
+        available = (root / "flake.nix").is_file()
+        nodes[f"{scope}:repository"] = {
+            "id": f"{scope}:repository",
+            "kind": "repository",
+            "name": scope,
+            "repository": scope,
+            "path": ".",
+            "profile": "flake",
+            "available": available,
+        }
+        if current_profile == "home":
+            edges.append(
+                {
+                    "source": ".:repository",
+                    "target": f"{scope}:repository",
+                    "kind": "submodule",
+                },
+            )
+        if not available:
+            continue
+        packages = detect_packages(root)
+        for package in packages:
+            _overview_graph_package(scope, package, nodes, edges)
+        for collection, filename, kind in (
+            ("hosts", "configuration.nix", "host"),
+            ("checks", "default.nix", "check"),
+        ):
+            directory = root / collection
+            for source in sorted(directory.glob(f"*/{filename}")):
+                name = source.parent.name
+                path = f"{collection}/{name}"
+                identifier = f"{scope}:{path}"
+                nodes[identifier] = {
+                    "id": identifier,
+                    "kind": kind,
+                    "name": name,
+                    "repository": scope,
+                    "path": path,
+                }
+                edges.append(
+                    {
+                        "source": f"{scope}:repository",
+                        "target": identifier,
+                        "kind": "contains",
+                    },
+                )
+                if kind == "check":
+                    package_id = f"{scope}:packages/{name}"
+                    host_id = f"{scope}:hosts/{name.removesuffix('VmWithDisko')}"
+                    if package_id in nodes:
+                        edges.append(
+                            {
+                                "source": package_id,
+                                "target": identifier,
+                                "kind": "checked-by",
+                            },
+                        )
+                    elif host_id in nodes:
+                        edges.append(
+                            {
+                                "source": host_id,
+                                "target": identifier,
+                                "kind": "checked-by",
+                            },
+                        )
+    return {
+        "schema": "canonical.overview",
+        "schema_version": 1,
+        "analysis": "source-declarations",
+        "profile": current_profile,
+        "focus": focus,
+        "nodes": [nodes[key] for key in sorted(nodes)],
+        "edges": sorted(
+            edges,
+            key=lambda edge: (
+                edge["source"],
+                edge["target"],
+                edge["kind"],
+                json.dumps(edge, sort_keys=True),
+            ),
+        ),
+    }
 
 
 def _run_overview(target: Path, *, full: bool) -> None:
@@ -3613,8 +4037,41 @@ def parser() -> argparse.ArgumentParser:
     )
     overview = commands.add_parser(
         "overview",
-        help="browse package descriptions, help, arguments, and test names",
-        description="Show a package catalog or inspect one package in detail.",
+        help="browse package descriptions, arguments, dependencies, and tests",
+        description=(
+            "Show a package catalog or inspect package help, arguments, "
+            "same-repository dependencies, tests, and suppressions."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""JSON format (schema_version 1):
+  schema: canonical.overview; analysis: source-declarations
+  profile: home or flake; focus: requested package ID, otherwise null
+  nodes: sorted by id; edges: sorted by source, target, kind and declaration
+Nodes have id, kind, name, repository and path. IDs use REPOSITORY:RESOURCE:
+standalone flakes use '.'; home submodules use their .gitmodules paths.
+Node kinds are repository, package, package-reference, host and check.
+Repository nodes include profile and available=false for missing submodules.
+Package nodes include package_type, description, overview and dependencies.
+Missing local packages remain package-reference nodes.
+Dependencies have kind, target, expression, line and resolved. Only packages
+within the same repository are included; external and unresolved dependencies
+are omitted. Kinds are runtime, build, test, source and reference. Literal lists,
+simple lexical aliases, concatenation, with scopes, local package selectors and
+relative source paths are recognized without evaluating Nix. Comments and
+ordinary strings do not create references. Computed expressions, functions,
+overrides, generated names and imported lists are not guessed. Declarations in
+embedded derivations are included; this is not an evaluated dependency closure.
+Other local package references use reference/source kinds.
+Edges have source, target and kind. Dependency arrows run from provider to
+consumer. Their declaration has repository, path, line and expression.
+Structural edges use contains/submodule; checked-by edges link matching package
+checks and NAMEVmWithDisko host checks. Clients can derive dependants from edges.
+The Python overview_data(Path) API returns the same document. Both interfaces
+read the working tree without building packages, importing package Python or
+contacting services. Identical sources produce identical sorted JSON, without
+timestamps, absolute checkout paths or store hashes. Clients own filtering,
+layout, icons and runtime status. Match nodes by ID, allow unknown added fields
+and reject unsupported schema versions.""",
     )
     overview.add_argument(
         "target",
@@ -3627,6 +4084,14 @@ def parser() -> argparse.ArgumentParser:
         "--full",
         action="store_true",
         help="show full details for every package in a flake",
+    )
+    overview.add_argument(
+        "--json",
+        action="store_true",
+        help=(
+            "emit deterministic canonical.overview JSON (schema version 1) "
+            "for visualization clients; includes only same-repository dependencies"
+        ),
     )
     test.set_defaults(test_command=None, test_parser=test)
     test_commands = test.add_subparsers(dest="test_command", metavar="COMMAND")
@@ -3741,7 +4206,13 @@ def _dispatch_standalone_command(
     if options.command == "test":
         return _dispatch_test_command(options, cli)
     if options.command == "overview":
-        _run_overview(options.target.resolve(), full=options.full)
+        if options.json:
+            sys.stdout.write(
+                json.dumps(overview_data(options.target), indent=2, sort_keys=True)
+                + "\n",
+            )
+        else:
+            _run_overview(options.target.resolve(), full=options.full)
         return True
     if options.command != "init":
         return False

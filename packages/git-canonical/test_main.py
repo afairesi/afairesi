@@ -309,6 +309,7 @@ def test_cli_help_and_retired_commands(tmp_path: Path) -> None:
         ("rm",),
         ("init",),
         ("converge",),
+        ("overview",),
         ("test",),
         ("test", "names"),
         ("test", "coverage"),
@@ -1012,6 +1013,146 @@ def test_overview_lists_checked_out_home_flakes(home_repository: Path) -> None:
     output = _run(home_repository, "overview").stdout
     if output != ("forge.example/owner/demo:\npackages/example: Example package\n"):
         raise AssertionError(output)
+
+
+def test_overview_dependencies_resolve_aliases_sources_and_skip_comments(
+    repository: Path,
+) -> None:
+    """Parse Canonical references without evaluating Nix or importing package code."""
+    _run(repository, "add", "packages/consumer", "python", "Consumer")
+    _run(repository, "add", "packages/core", "nix", "Core")
+    source = """{ inputs, pkgs, ... }:
+let
+  python = pkgs.python3;
+  local = inputs.self.packages.${pkgs.stdenv.system};
+  pythonDeps = with python.pkgs; [ numpy local.core ];
+  nativeDeps = [ pkgs.makeWrapper ];
+in python.pkgs.buildPythonPackage {
+  propagatedBuildInputs = pythonDeps ++ [ pkgs.git ];
+  nativeBuildInputs = nativeDeps;
+  # propagatedBuildInputs = [ inputs.self.packages.${system}.fake ];
+  description = "inputs.self.packages.system.also_fake";
+  installPhase = "cp ${../core/main.py} result";
+}
+"""
+    package = repository / "packages/consumer"
+    (package / "default.nix").write_text(source, encoding="utf-8")
+    (package / "main.py").write_text(
+        "raise RuntimeError('must not run')\n",
+        encoding="utf-8",
+    )
+    detail = _run(repository, "overview", "packages/consumer").stdout
+    for expected in (
+        "Dependencies:",
+        "runtime: packages/core",
+        "source: packages/core",
+    ):
+        if expected not in detail:
+            raise AssertionError(detail)
+    if any(
+        excluded in detail
+        for excluded in (
+            "packages/fake",
+            "packages/also_fake",
+            "pkgs.python3.pkgs.numpy",
+            "pkgs.makeWrapper",
+            "runtime: pkgs.git",
+        )
+    ):
+        raise AssertionError(detail)
+    first = _run(repository, "overview", "--json").stdout
+    if _run(repository, "overview", "--json").stdout != first:
+        msg = "Identical source must produce byte-identical JSON"
+        raise AssertionError(msg)
+    data = json.loads(first)
+    if (
+        data["schema"] != "canonical.overview"
+        or data["analysis"] != "source-declarations"
+        or any(node["kind"] == "dependency" for node in data["nodes"])
+    ):
+        raise AssertionError(data)
+    if not any(
+        edge["source"] == ".:packages/core"
+        and edge["target"] == ".:packages/consumer"
+        and edge["kind"] == "runtime"
+        for edge in data["edges"]
+    ):
+        raise AssertionError(data)
+    if any(
+        not dependency["target"].startswith("packages/")
+        for node in data["nodes"]
+        for dependency in node.get("dependencies", [])
+    ):
+        raise AssertionError(data)
+    focus = json.loads(
+        _run(repository, "overview", "packages/consumer", "--json").stdout,
+    )
+    if focus["focus"] != ".:packages/consumer":
+        raise AssertionError(focus)
+    (package / "default.nix").write_text(
+        source.replace("local.core", "local.missing"),
+        encoding="utf-8",
+    )
+    changed = json.loads(_run(repository, "overview", "--json").stdout)
+    if not any(
+        node["id"] == ".:packages/missing" and node["kind"] == "package-reference"
+        for node in changed["nodes"]
+    ):
+        raise AssertionError(changed)
+
+
+def test_overview_dependency_cycles_and_computed_expressions_are_opaque(
+    repository: Path,
+) -> None:
+    """Avoid inventing active dependencies for recursive aliases and conditions."""
+    _run(repository, "add", "packages/computed", "nix", "Computed dependencies")
+    (repository / "packages/computed/default.nix").write_text(
+        """{ pkgs, ... }: let
+      one = two; two = one;
+    in { buildInputs = one;
+      nativeBuildInputs = if pkgs.stdenv.isLinux then [ pkgs.git ] else []; }
+    """,
+        encoding="utf-8",
+    )
+    detail = _run(repository, "overview", "packages/computed").stdout
+    if "Dependencies:\n  (none)" not in detail:
+        raise AssertionError(detail)
+    data = json.loads(_run(repository, "overview", "--json").stdout)
+    if any(node.get("dependencies") for node in data["nodes"]):
+        raise AssertionError(data)
+
+
+def test_overview_json_namespaces_home_packages_and_links_checks(
+    home_repository: Path,
+) -> None:
+    """Keep same-named packages distinct and expose Canonical check relationships."""
+    for relative in ("forge.example/owner/demo", "forge.example/owner/second"):
+        root = home_repository / relative
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "flake.nix").write_text("", encoding="utf-8")
+        (root / "packages/same").mkdir(parents=True)
+        (root / "packages/same/default.nix").write_text(
+            '{ meta.description = "Same"; }',
+            encoding="utf-8",
+        )
+        (root / "checks/same").mkdir(parents=True)
+        (root / "checks/same/default.nix").write_text("{}", encoding="utf-8")
+    with (home_repository / ".gitmodules").open("a", encoding="utf-8") as stream:
+        stream.write('[submodule "second"]\npath = forge.example/owner/second\n')
+    data = json.loads(_run(home_repository, "overview", "--json").stdout)
+    ids = {node["id"] for node in data["nodes"]}
+    for scope in ("forge.example/owner/demo", "forge.example/owner/second"):
+        if f"{scope}:packages/same" not in ids:
+            raise AssertionError(data)
+        if not any(
+            edge["source"] == f"{scope}:packages/same"
+            and edge["target"] == f"{scope}:checks/same"
+            and edge["kind"] == "checked-by"
+            for edge in data["edges"]
+        ):
+            raise AssertionError(data)
+    if len(ids) != len(data["nodes"]):
+        raise AssertionError(data)
 
 
 @pytest.mark.parametrize("explicit", [False, True])

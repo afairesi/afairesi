@@ -1168,6 +1168,45 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "HTML diff must compare the previous file contents"
                 raise AssertionError(msg)
 
+    def test_dependencies_appear_in_shared_overview_and_inline_changes(self) -> None:
+        """Show dependency declarations and edits using the shared summary."""
+        before = app.Viewer.package_summary(
+            "consumer",
+            {
+                "default.nix": (
+                    "{inputs, system, ...}: { buildInputs = ["
+                    "inputs.self.packages.${system}.core]; }"
+                ),
+            },
+        )
+        after = app.Viewer.package_summary(
+            "consumer",
+            {
+                "default.nix": (
+                    "{inputs, system, ...}: { buildInputs = ["
+                    "inputs.self.packages.${system}.engine]; }"
+                ),
+            },
+        )
+        dependencies = next(
+            node
+            for node in app.Viewer.summary_tree(after)
+            if node.title == "Dependencies"
+        )
+        if [node.title for node in dependencies.children or []] != [
+            "build: packages/engine",
+        ]:
+            raise AssertionError(dependencies)
+        for render in (app.Viewer.merged_summary_tree, app.Viewer.summary_changes):
+            changes = next(
+                node for node in render(before, after) if node.title == "Dependencies"
+            )
+            if {node.title for node in changes.children or []} != {
+                "- build: packages/core",
+                "+ build: packages/engine",
+            }:
+                raise AssertionError(changes)
+
     def test_unavailable_cli_summary_warns_on_collapsed_package(self) -> None:
         """Expose parser diagnostics without opening the package tree."""
         with tempfile.TemporaryDirectory() as directory:

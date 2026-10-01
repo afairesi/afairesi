@@ -883,7 +883,7 @@ class Viewer:  # noqa: D101
             len(lines),
         )
         fields = [TreeNode(line) for line in lines[:arguments_start]]
-        for group in ("Arguments", "Tests", "Suppressions"):
+        for group in ("Arguments", "Dependencies", "Tests", "Suppressions"):
             if f"{group}:" not in lines:
                 continue
             start = lines.index(f"{group}:")
@@ -930,6 +930,20 @@ class Viewer:  # noqa: D101
         )
         if argument_changes:
             changes.append(TreeNode("Arguments", argument_changes))
+        old_dependencies = cls.summary_group(previous, "Dependencies")
+        new_dependencies = cls.summary_group(current, "Dependencies")
+        dependency_changes = [
+            TreeNode(f"- {item}", style=31)
+            for item in old_dependencies
+            if item not in new_dependencies
+        ]
+        dependency_changes.extend(
+            TreeNode(f"+ {item}", style=32)
+            for item in new_dependencies
+            if item not in old_dependencies
+        )
+        if dependency_changes:
+            changes.append(TreeNode("Dependencies", dependency_changes))
         old_tests = cls.summary_group(previous, "Tests")
         new_tests = cls.summary_group(current, "Tests")
         test_changes = [
@@ -977,7 +991,7 @@ class Viewer:  # noqa: D101
                     result.append(TreeNode(f"- {before}", style=31))
                 if after is not None:
                     result.append(TreeNode(f"+ {after}", style=32))
-        for group in ("Arguments", "Tests", "Suppressions"):
+        for group in ("Arguments", "Dependencies", "Tests", "Suppressions"):
             old_entries = cls.summary_group(previous, group)
             new_entries = cls.summary_group(current, group)
             children = [
