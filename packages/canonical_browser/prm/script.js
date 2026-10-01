@@ -262,8 +262,12 @@ function updateCollapseState() {
     document.querySelector(".graph-stage details[open]") ||
     [...expanded.values()].some(Boolean),
   );
-  $("collapse").disabled = !canCollapse;
-  $("collapse").title = canCollapse ? "Collapse all" : "Nothing expanded";
+  const button = $("collapse");
+  const label = canCollapse ? "Collapse all" : "Expand all";
+  button.disabled = !canCollapse && !document.querySelector(".graph-stage details");
+  button.textContent = canCollapse ? "⊟" : "⊞";
+  button.title = label;
+  button.setAttribute("aria-label", label);
 }
 
 function bindExpansion(details, key, matchesSearch = false, changed = false) {
@@ -721,9 +725,15 @@ $("changes").addEventListener("change", (event) => {
 $("refresh").addEventListener("click", refresh);
 $("fit").addEventListener("click", fitGraph);
 $("collapse").addEventListener("click", () => {
+  const expand = $("collapse").title === "Expand all";
   expanded.clear();
-  for (const details of document.querySelectorAll(".graph-stage details"))
-    searchCollapsed.add(details.dataset.expansionKey);
+  for (const details of document.querySelectorAll(".graph-stage details")) {
+    const key = details.dataset.expansionKey;
+    if (expand) {
+      expanded.set(key, true);
+      searchCollapsed.delete(key);
+    } else searchCollapsed.add(key);
+  }
   openedEdge = null;
   selected = null;
   render();
