@@ -825,6 +825,58 @@ def test_python_library_convergence_removes_only_executable_packaging(
         raise AssertionError(msg)
 
 
+@pytest.mark.parametrize("executable", [False, True])
+def test_python_check_only_exposes_declared_executables(
+    tmp_path: Path,
+    *,
+    executable: bool,
+) -> None:
+    """Library checks omit a launcher and executable checks honor its name."""
+    subject = import_module("packages.git-canonical.main")
+    check = tmp_path / "example" / "default.nix"
+    check.parent.mkdir()
+    check.write_text(subject._current_python_test_source())  # noqa: SLF001
+    metadata = '{ mainProgram = "different-name"; }' if executable else "{}"
+    expression = (
+        'let pkgs = { stdenv.system = "test"; '
+        "runCommand = _: attrs: _: attrs; lib = { "
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
+        'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
+        'else abort "Library checks must not request an executable"; }; }; '
+        'package = { src = "/source"; propagatedBuildInputs = []; '
+        f'meta = {metadata}; python = {{ withPackages = _: "/python"; }}; }}; '
+        f"in import {json.dumps(str(check))} {{ inherit pkgs; "
+        "inputs.self.packages.test.example = package; }"
+    )
+    result = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "nix",
+            "eval",
+            "--store",
+            "dummy://",
+            "--extra-experimental-features",
+            "nix-command",
+            "--impure",
+            "--json",
+            "--expr",
+            expression,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode:
+        raise AssertionError(result.stderr)
+    attributes = json.loads(result.stdout)
+    if executable:
+        if attributes.get("PACKAGE_E2E_EXECUTABLE") != "/package/bin/different-name":
+            msg = "The check must use the declared executable name"
+            raise AssertionError(msg)
+    elif "PACKAGE_E2E_EXECUTABLE" in attributes:
+        msg = "Library checks must not expose a nonexistent executable"
+        raise AssertionError(msg)
+
+
 def test_args_keeps_unparsed_executables_unavailable(tmp_path: Path) -> None:
     """A main entry point without a declared parser is not an empty CLI."""
     package = _make_test_names_package(tmp_path, "example", "")
@@ -2453,6 +2505,7 @@ def _prepare_coverage_flake(
             f"outPath = builtins.path {{ path = ./prm/installed/{name}; "
             f'name = "{name}-installed"; }}; '
             f"pname = {json.dumps(module_name)}; cliName = {json.dumps(name)}; "
+            f"meta.mainProgram = {json.dumps(name)}; "
             "propagatedBuildInputs = []; python = { "
             f"sitePackages = {json.dumps(site_packages)}; "
             f"pkgs.coverage = {json.dumps(str(coverage_root))}; "
@@ -2482,6 +2535,7 @@ def _prepare_coverage_flake(
         "}) // { overrideAttrs = f: build (current // f current); }; "
         "in build (attrs // { inherit name; buildCommand = script; }); "
         "pkgs = { stdenv.system = system; runCommand = mkCheck; lib = { "
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
         "concatMap = f: xs: builtins.concatLists (map f xs); "
         'getExe = p: "${p}/bin/${p.cliName}"; }; }; '
         "packages = { "
