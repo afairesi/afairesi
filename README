@@ -2,14 +2,16 @@
 
 Canonical uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `git canonical` creates, inspects, and converges those repositories.
 
-Start here for the machine's conventions. Package names and descriptions show what is available; `git canonical args` shows interfaces; `git canonical test names` shows expected behavior. `git canonical overview` brings these views together. Read tests or source code when more detail is needed.
-
 ## Canonical state
 
 - Impermanent NixOS with Nix flakes enabled.
 - A Git-tracked `$HOME` with a whitelisted `.gitignore`.
 - Nix flake Git submodules under `$HOME` at `<hostname>/<repository-path>`, each with conventional `packages/`, `hosts/`, and `checks/` directories.
 - Package directories with conventional places for source, tests, tracked resources (`prm/`), and runtime output (`tmp/`) where applicable.
+- Package names and descriptions show what is available.
+- `git canonical args` shows interfaces.
+- `git canonical test names` shows expected behavior.
+- Read tests or source code when more detail is needed.
 
 ## Runtime constraints
 
