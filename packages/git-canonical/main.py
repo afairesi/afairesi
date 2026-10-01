@@ -845,13 +845,16 @@ let
   );
 in
 pkgs.runCommand packageName
-  ({
-    inherit (packageDrv) src;
-    nativeBuildInputs =
-      (packageDrv.nativeBuildInputs or [ ]) ++ packageDrv.propagatedBuildInputs ++ [ pythonEnv ];
-  } // pkgs.lib.optionalAttrs (packageDrv.meta ? mainProgram) {
-    PACKAGE_E2E_EXECUTABLE = pkgs.lib.getExe packageDrv;
-  })
+  (
+    {
+      inherit (packageDrv) src;
+      nativeBuildInputs =
+        (packageDrv.nativeBuildInputs or [ ]) ++ packageDrv.propagatedBuildInputs ++ [ pythonEnv ];
+    }
+    // pkgs.lib.optionalAttrs (packageDrv.meta ? mainProgram) {
+      PACKAGE_E2E_EXECUTABLE = pkgs.lib.getExe packageDrv;
+    }
+  )
   ''
     export src PACKAGE_E2E_EXECUTABLE
     export HOME="$(mktemp -d)"
