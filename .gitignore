@@ -27,6 +27,8 @@
 !/packages/canonical_browser/
 !/packages/canonical_browser/default.nix
 !/packages/canonical_browser/main.py
+!/packages/canonical_browser/prm/
+!/packages/canonical_browser/prm/**
 !/packages/canonical_browser/test_main.py
 !/packages/canonical_browser_video/
 !/packages/canonical_browser_video/default.nix

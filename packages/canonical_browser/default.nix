@@ -19,7 +19,7 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Terminal browser for Canonical packages, interfaces, tests, and changes";
+    description = "Terminal and visual browser for Canonical packages, interfaces, tests, and changes";
     mainProgram = pname;
   };
   nativeBuildInputs = [ pkgs.makeWrapper ];

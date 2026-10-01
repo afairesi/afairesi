@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Browse Canonical packages, interfaces, tests, and changes in the terminal."""
+"""Browse Canonical packages, interfaces, tests, and changes in a terminal or GUI."""
 
 import argparse
 import contextlib
 import curses
+import json
 import re
 import sys
 import unicodedata
+import webbrowser
 from dataclasses import dataclass, replace
+from http import HTTPStatus
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, NamedTuple
 
@@ -17,12 +21,15 @@ from git_canonical import (
     detect_packages,
     git,
     home_repositories,
+    overview_data,
     package_cli,
     package_overview,
     source_cli_overview,
     source_package_overview,
 )
 from git_canonical import CommandError as GitCanonicalError
+
+MAX_PORT = 65535
 
 
 @dataclass
@@ -791,10 +798,120 @@ class Viewer:  # noqa: D101
                 self.navigate(key, page, rows)
 
 
+def gui_data(root: Path) -> dict[str, Any]:
+    """Combine the canonical graph with the terminal's semantic change tree."""
+    data: dict[str, Any] = overview_data(root)
+    scope = root.parent.parent if data.get("focus") else root
+    viewer = Viewer(scope)
+    viewer.refresh_overview()
+
+    def serialize(node: TreeNode) -> dict[str, Any]:
+        return {
+            "title": node.title,
+            "change": (
+                {31: "removed", 32: "added", 33: "modified"}.get(node.style)
+                if node.style is not None
+                else None
+            ),
+            "warning": node.warning,
+            "children": [serialize(child) for child in node.children or []],
+        }
+
+    data["tree"] = [serialize(node) for node in viewer.full_overview]
+    data["root"] = str(scope)
+    data["warning"] = viewer.status
+    return data
+
+
+def gui_server(root: Path, port: int = 0) -> HTTPServer:
+    """Serve only GUI assets and read-only repository data on loopback."""
+    assets = Path(__file__).parent / "prm"
+    routes = {
+        "/": ("index.html", "text/html; charset=utf-8"),
+        "/script.js": ("script.js", "text/javascript; charset=utf-8"),
+        "/style.css": ("style.css", "text/css; charset=utf-8"),
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            """Return an allowlisted asset or a fresh repository snapshot."""
+            route = self.path.partition("?")[0]
+            status = HTTPStatus.OK
+            if route == "/api/overview":
+                content_type = "application/json; charset=utf-8"
+                try:
+                    content = json.dumps(gui_data(root)).encode()
+                except (GitCanonicalError, ValueError, OSError) as exc:
+                    status = HTTPStatus.INTERNAL_SERVER_ERROR
+                    content = json.dumps({"error": str(exc)}).encode()
+            elif route in routes:
+                filename, content_type = routes[route]
+                content = (assets / filename).read_bytes()
+            else:
+                self.send_error(HTTPStatus.NOT_FOUND)
+                return
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "img-src 'self' data:; object-src 'none'; frame-ancestors 'none'",
+            )
+            self.end_headers()
+            self.wfile.write(content)
+
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            """Keep the launcher output focused on its URL."""
+
+    return HTTPServer(("127.0.0.1", port), Handler)
+
+
+def open_gui(root: Path, *, port: int, open_browser: bool) -> None:
+    """Launch the expandable repository graph until interrupted."""
+    with gui_server(root, port) as server:
+        url = f"http://127.0.0.1:{server.server_port}"
+        print(f"Canonical browser: {url}\nPress Ctrl+C to stop.", flush=True)  # noqa: T201
+        if open_browser:
+            webbrowser.open(url)
+        with contextlib.suppress(KeyboardInterrupt):
+            server.serve_forever()
+
+
 def main(argv: list[str] | None = None) -> None:
-    """Open the terminal browser in the startup directory."""
+    """Open the terminal browser or repository graph in the startup directory."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.parse_args(argv)
+    parser.add_argument(
+        "--gui",
+        action="store_true",
+        help="open the expandable repository and dependency graph",
+    )
+    parser.add_argument(
+        "--no-open",
+        action="store_true",
+        help="print the GUI URL without opening a browser",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8765,
+        help="GUI loopback port (default: 8765; 0 chooses a free port)",
+    )
+    args = parser.parse_args(argv)
+    if args.gui:
+        if not 0 <= args.port <= MAX_PORT:
+            parser.error("--port must be between 0 and 65535")
+        try:
+            open_gui(
+                Path.cwd().resolve(),
+                port=args.port,
+                open_browser=not args.no_open,
+            )
+        except OSError as exc:
+            parser.exit(1, f"GUI error: {exc}\n")
+        return
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.exit(
             1,

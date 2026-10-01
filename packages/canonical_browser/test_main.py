@@ -3,16 +3,21 @@
 """Verify package browsing, summary diffs, and terminal navigation."""
 
 import curses
+import http.client
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unicodedata
 import unittest
+from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from git_canonical import CliEntry, source_cli_overview
 
 from packages.canonical_browser import main as app
@@ -20,6 +25,126 @@ from packages.canonical_browser import main as app
 TEST_EXPECTED_BUILDS = 2
 TEST_PAGE_HEIGHT = 2
 TEST_EXPECTED_VISIBLE = 2
+TEST_PARSER_ERROR = 2
+
+
+class TestGui(unittest.TestCase):
+    """Verify the read-only GUI transport and shared semantic model."""
+
+    def test_gui_launch_bypasses_terminal_requirement(self) -> None:
+        """GUI mode opens a loopback browser independently of terminal streams."""
+        with (
+            patch.object(sys.stdin, "isatty", return_value=False),
+            patch.object(app, "open_gui") as launch,
+        ):
+            app.main(["--gui", "--no-open", "--port", "0"])
+        launch.assert_called_once_with(Path.cwd().resolve(), port=0, open_browser=False)
+        with pytest.raises(SystemExit) as error:
+            app.main(["--gui", "--port", "-1"])
+        if error.value.code != TEST_PARSER_ERROR:
+            msg = "Invalid ports must be rejected by the parser"
+            raise AssertionError(msg)
+
+    def test_gui_serves_assets_and_live_data_without_exposing_checkout(self) -> None:
+        """Assets ship with the package; traversal and writes cannot reach files."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with app.gui_server(root) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=5,
+                )
+                try:
+                    for route in ("/", "/script.js", "/style.css"):
+                        connection.request("GET", route)
+                        response = connection.getresponse()
+                        if response.status != HTTPStatus.OK or not response.read():
+                            msg = f"Missing packaged GUI asset: {route}"
+                            raise AssertionError(msg)
+                    with patch.object(
+                        app,
+                        "gui_data",
+                        side_effect=[{"root": "first"}, {"root": "second"}],
+                    ):
+                        for expected in ("first", "second"):
+                            connection.request("GET", "/api/overview")
+                            response = connection.getresponse()
+                            if (
+                                response.status != HTTPStatus.OK
+                                or json.loads(response.read())["root"] != expected
+                            ):
+                                msg = "Overview requests must read fresh data"
+                                raise AssertionError(msg)
+                    for route in ("/../main.py", "/.git/config", "/main.py"):
+                        connection.request("GET", route)
+                        response = connection.getresponse()
+                        if response.status != HTTPStatus.NOT_FOUND:
+                            msg = "The GUI must not serve checkout files"
+                            raise AssertionError(msg)
+                        response.read()
+                    connection.request("POST", "/api/overview", b"change")
+                    response = connection.getresponse()
+                    if response.status != HTTPStatus.NOT_IMPLEMENTED:
+                        msg = "GUI requests must not write repository data"
+                        raise AssertionError(msg)
+                    response.read()
+                    with patch.object(
+                        app,
+                        "gui_data",
+                        side_effect=ValueError("Invalid repository"),
+                    ):
+                        connection.request("GET", "/api/overview")
+                        response = connection.getresponse()
+                        if (
+                            response.status != HTTPStatus.INTERNAL_SERVER_ERROR
+                            or json.loads(response.read())
+                            != {"error": "Invalid repository"}
+                        ):
+                            msg = "Repository errors must return readable JSON"
+                            raise AssertionError(msg)
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    thread.join(timeout=5)
+
+    def test_gui_preserves_nested_change_nodes_and_package_focus(self) -> None:
+        """Package launches share the parent repository and preserve change colors."""
+        root = Path("/workspace/packages/sample")
+        nodes = [
+            app.TreeNode(
+                "packages/sample",
+                [
+                    app.TreeNode(
+                        "Tests",
+                        [
+                            app.TreeNode("+ test new", style=32),
+                            app.TreeNode("- test old", style=31),
+                        ],
+                    ),
+                ],
+            ),
+        ]
+        with (
+            patch.object(
+                app,
+                "overview_data",
+                return_value={"focus": ".:packages/sample"},
+            ),
+            patch.object(app.Viewer, "refresh_overview", autospec=True) as refresh,
+        ):
+            refresh.side_effect = lambda viewer: setattr(viewer, "full_overview", nodes)
+            snapshot = app.gui_data(root)
+        viewer = refresh.call_args.args[0]
+        if viewer.cwd != root.parent.parent or snapshot["focus"] != ".:packages/sample":
+            msg = "Package launches must retain focus within the repository"
+            raise AssertionError(msg)
+        leaves = snapshot["tree"][0]["children"][0]["children"]
+        if [node["change"] for node in leaves] != ["added", "removed"]:
+            msg = "Nested changes must retain their addition and removal status"
+            raise AssertionError(msg)
 
 
 class TestCli(unittest.TestCase):
