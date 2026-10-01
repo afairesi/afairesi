@@ -233,6 +233,11 @@ input[type="checkbox"] {
   background: var(--green);
   flex-shrink: 0;
 }
+.language-icon {
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
 .host .kind-dot {
   background: var(--blue);
 }

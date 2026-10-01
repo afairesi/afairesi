@@ -30,6 +30,47 @@ function svgElement(tag, attributes = {}, text) {
   return item;
 }
 
+function languageIcon(kind) {
+  const names = { python: "Python", html: "HTML", nix: "Nix", latex: "LaTeX" };
+  if (!names[kind]) return null;
+  const icon = svgElement("svg", {
+    class: "language-icon",
+    viewBox: "0 0 24 24",
+    role: "img",
+    "aria-label": names[kind],
+  });
+  icon.append(svgElement("title", {}, names[kind]));
+  if (kind === "python") {
+    const snake = "M12 2C6 2 6 3 6 6v3h7v1H4c-3 0-3 8 0 8h2v-3c0-3 2-4 5-4h5c2 0 3-1 3-3V6c0-3-2-4-7-4Z";
+    icon.append(
+      svgElement("path", { d: snake, fill: "#3776ab" }),
+      svgElement("path", { d: snake, fill: "#ffd343", transform: "rotate(180 12 12)" }),
+      svgElement("circle", { cx: 9, cy: 5, r: 1, fill: "white" }),
+      svgElement("circle", { cx: 15, cy: 19, r: 1, fill: "white" }),
+    );
+  } else if (kind === "html") {
+    icon.append(
+      svgElement("path", { d: "M3 2h18l-2 18-7 2-7-2Z", fill: "#e44d26" }),
+      svgElement("path", { d: "M7 6h10l-.2 3H10l.2 2h6.4l-.6 6-4 1-4-1-.3-3h3l.1 1 1.2.3 1.3-.3.2-2H7.6Z", fill: "white" }),
+    );
+  } else if (kind === "nix") {
+    for (let angle = 0; angle < 360; angle += 60)
+      icon.append(svgElement("path", {
+        d: "M12 12V2M12 6l-4-3M12 6l4-3",
+        transform: `rotate(${angle} 12 12)`,
+        stroke: angle % 120 ? "#5277c3" : "#7ebae4",
+        "stroke-width": 2,
+        fill: "none",
+      }));
+  } else {
+    icon.append(svgElement("text", {
+      x: 12, y: 16, "text-anchor": "middle", "font-family": "serif",
+      "font-size": 12, "font-weight": "bold", fill: "#008080",
+    }, "TeX"));
+  }
+  return icon;
+}
+
 function hasChange(tree) {
   return Boolean(tree.change) || (tree.children || []).some(hasChange);
 }
@@ -345,8 +386,9 @@ function resourceBlock(node, layout) {
   );
   const summary = element("summary", "resource-header");
   const title = element("div", "resource-title");
+  const icon = languageIcon(node.package_type);
   title.append(
-    element("i", "kind-dot"),
+    icon || element("i", "kind-dot"),
     element("strong", "", node.name),
     element("span", "chevron", "›"),
   );
@@ -744,6 +786,26 @@ $("collapse").addEventListener("click", () => {
 });
 window.addEventListener("resize", scheduleEdges);
 document.addEventListener("keydown", (event) => {
+  const direction = {
+    ArrowLeft: [1, 0],
+    ArrowRight: [-1, 0],
+    ArrowUp: [0, 1],
+    ArrowDown: [0, -1],
+  }[event.key];
+  if (
+    direction &&
+    !event.defaultPrevented &&
+    !event.ctrlKey &&
+    !event.metaKey &&
+    !event.altKey &&
+    !event.target.closest("input,textarea,select,button,summary,[contenteditable]")
+  ) {
+    event.preventDefault();
+    const step = event.shiftKey ? 160 : 40;
+    pan.x += direction[0] * step;
+    pan.y += direction[1] * step;
+    applyViewport();
+  }
   if (event.key === "/" && !["INPUT", "TEXTAREA"].includes(document.activeElement.tagName)) {
     event.preventDefault();
     $("search").focus();
