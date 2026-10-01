@@ -30,14 +30,17 @@ from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Self, cast
 
-from git_canonical import CommandError as GitCanonicalError
 from git_canonical import (
+    CliEntry,
     detect_packages,
     git,
     home_repositories,
+    package_cli,
     package_overview,
+    source_cli_overview,
     source_package_overview,
 )
+from git_canonical import CommandError as GitCanonicalError
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -818,10 +821,11 @@ class Viewer:  # noqa: D101
             "style.css",
         )
         current = package_overview(directory)
+        current_cli = package_cli(directory) if current else []
         if not diff:
             return TreeNode(
                 f"packages/{name}",
-                self.summary_tree(current) if current else None,
+                self.summary_tree(current, cli=current_cli) if current else None,
             )
         previous_files = {}
         for filename in filenames:
@@ -835,7 +839,15 @@ class Viewer:  # noqa: D101
         previous = self.package_summary(name, previous_files)
         if only_changes and previous == current:
             return None
-        summary_tree = self.merged_summary_tree(previous, current)
+        previous_cli = (
+            source_cli_overview(previous_files.get("main.py")) if previous else []
+        )
+        summary_tree = self.merged_summary_tree(
+            previous,
+            current,
+            previous_cli=previous_cli,
+            current_cli=current_cli,
+        )
         return TreeNode(f"packages/{name}", summary_tree or None)
 
     def home_package_entries(self, root: Path, *, diff: bool) -> list[TreeNode]:
@@ -875,7 +887,11 @@ class Viewer:  # noqa: D101
         return nodes(tree)
 
     @staticmethod
-    def summary_tree(summary: str) -> list[TreeNode]:
+    def summary_tree(
+        summary: str,
+        *,
+        cli: list[CliEntry] | None = None,
+    ) -> list[TreeNode]:
         """Convert the displayed summary into fields and grouped detail nodes."""
         lines = summary.splitlines()
         arguments_start = next(
@@ -899,6 +915,8 @@ class Viewer:  # noqa: D101
                 TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
                 for line in lines[start + 1 : end]
             ]
+            if group == "Arguments" and cli is not None:
+                children = Viewer.cli_tree(cli)
             fields.append(TreeNode(group, children))
         return fields
 
@@ -975,7 +993,14 @@ class Viewer:  # noqa: D101
         return changes
 
     @classmethod
-    def merged_summary_tree(cls, previous: str, current: str) -> list[TreeNode]:
+    def merged_summary_tree(
+        cls,
+        previous: str,
+        current: str,
+        *,
+        previous_cli: list[CliEntry] | None = None,
+        current_cli: list[CliEntry] | None = None,
+    ) -> list[TreeNode]:
         """Show summary changes inline at their existing field and group positions."""
         old_lines, new_lines = previous.splitlines(), current.splitlines()
         old_fields = {line.partition(":")[0]: line for line in old_lines if ":" in line}
@@ -1007,9 +1032,53 @@ class Viewer:  # noqa: D101
                 )
                 for item in new_entries
             )
+            if group == "Arguments" and current_cli is not None:
+                children = cls.cli_tree(current_cli, previous=previous_cli)
             if children or f"{group}:" in current:
                 result.append(TreeNode(group, children))
         return result
+
+    @staticmethod
+    def cli_tree(
+        current: list[CliEntry],
+        *,
+        previous: list[CliEntry] | None = None,
+    ) -> list[TreeNode]:
+        """Nest CLI entries by their source-discovered command paths."""
+        roots: list[TreeNode] = []
+        commands: dict[tuple[str, ...], TreeNode] = {}
+        old = set(previous or [])
+        new = set(current)
+        entries: list[tuple[CliEntry, int | None]] = [
+            (entry, 31) for entry in previous or [] if entry not in new
+        ]
+        entries.extend(
+            (entry, 32 if previous is not None and entry not in old else None)
+            for entry in current
+        )
+        for entry, style in entries:
+            children = roots
+            for depth, name in enumerate(entry.path, 1):
+                path = entry.path[:depth]
+                if path not in commands:
+                    node = TreeNode(name, [])
+                    commands[path] = node
+                    children.append(node)
+                node = commands[path]
+                children = node.children if node.children is not None else []
+            prefix = "" if style is None else {31: "- ", 32: "+ "}[style]
+            if entry.command:
+                node.title = prefix + entry.path[-1]
+                node.style = style
+            else:
+                children.append(
+                    TreeNode(
+                        prefix + entry.text,
+                        style=style,
+                        warning=entry.text.startswith("(unavailable:"),
+                    ),
+                )
+        return roots
 
     @staticmethod
     def summary_group(summary: str, name: str) -> list[str]:
@@ -1313,37 +1382,7 @@ class Viewer:  # noqa: D101
             self.status = f"Invalid pattern: {exc}"
             return
         if self.mode != "chat":
-            tree_candidates = [
-                index
-                for index, node in enumerate(self.overview_visible)
-                if pattern.search(self.safe(node.title))
-            ]
-            if not tree_candidates:
-                self.match = None
-                self.status = "Pattern not found"
-                return
-            ordered_tree = tree_candidates if direction > 0 else tree_candidates[::-1]
-            selected_index = next(
-                (
-                    index
-                    for index in ordered_tree
-                    if (
-                        index > self.selected
-                        if direction > 0
-                        else index < self.selected
-                    )
-                ),
-                ordered_tree[0],
-            )
-            self.selected = selected_index
-            self.status = ""
-            self.reveal(
-                next(
-                    i
-                    for i, row in enumerate(self.rows(self.width))
-                    if row.owner == self.selected
-                ),
-            )
+            self.search_overview(pattern, direction)
             return
         candidates = [
             (index, line, found.start())
@@ -1385,6 +1424,47 @@ class Viewer:  # noqa: D101
         self.reveal(
             next(i for i, row in enumerate(self.rows(self.width)) if self.matched(row)),
         )
+
+    def search_overview(self, pattern: re.Pattern[str], direction: int) -> None:
+        """Search every tree node and reveal a match through collapsed ancestors."""
+        nodes: list[tuple[TreeNode, tuple[TreeNode, ...]]] = []
+
+        def visit(children: list[TreeNode], ancestors: tuple[TreeNode, ...]) -> None:
+            for node in children:
+                nodes.append((node, ancestors))
+                visit(node.children or [], (*ancestors, node))
+
+        visit(self.overview, ())
+        self.overview_rows(self.width)
+        selected = (
+            self.overview_visible[self.selected]
+            if self.overview_visible and self.selected < len(self.overview_visible)
+            else None
+        )
+        anchor = next((i for i, (node, _) in enumerate(nodes) if node is selected), -1)
+        candidates = [
+            i
+            for i, (node, _) in enumerate(nodes)
+            if pattern.search(self.safe(node.title))
+        ]
+        if not candidates:
+            self.match = None
+            self.status = "Pattern not found"
+            return
+        ordered = candidates if direction > 0 else candidates[::-1]
+        index = next(
+            (i for i in ordered if (i > anchor if direction > 0 else i < anchor)),
+            ordered[0],
+        )
+        node, ancestors = nodes[index]
+        for ancestor in ancestors:
+            ancestor.expanded = True
+        rows = self.overview_rows(self.width)
+        self.selected = next(
+            i for i, item in enumerate(self.overview_visible) if item is node
+        )
+        self.status = ""
+        self.reveal(next(i for i, row in enumerate(rows) if row.owner == self.selected))
 
     def navigate(  # noqa: D102
         self,

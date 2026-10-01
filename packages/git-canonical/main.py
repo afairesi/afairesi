@@ -2184,10 +2184,47 @@ def _run_test_names(arguments: list[str]) -> int:
     return 0
 
 
-def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C901, PLR0915
+@dataclass(frozen=True)
+class CliEntry:
+    """One statically discovered command or parameter at a command path."""
+
+    path: tuple[str, ...]
+    text: str
+    command: bool = False
+
+    def render(self) -> str:
+        """Keep the established flat argument-review format."""
+        prefix = " ".join(self.path)
+        return (prefix + ": " if prefix else "") + self.text
+
+
+def source_package_args(source: bytes, filename: str) -> list[str]:
+    """Render the static CLI contract in the established text format."""
+    return [entry.render() for entry in source_package_cli(source, filename)]
+
+
+def package_cli(package: Path) -> list[CliEntry]:
+    """Read a package's static CLI contract, retaining discovery diagnostics."""
+    source = _read_regular(package / "main.py")
+    return source_cli_overview(source)
+
+
+def source_cli_overview(source: str | None) -> list[CliEntry]:
+    """Summarize a CLI, including absent or unsupported interfaces."""
+    if not source:
+        return [CliEntry((), "(not applicable)")]
+    try:
+        return source_package_cli(source.encode(), "main.py") or [
+            CliEntry((), "(none)"),
+        ]
+    except (SyntaxError, ValueError) as error:
+        return [CliEntry((), f"(unavailable: {error})")]
+
+
+def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # noqa: C901, PLR0915
     """Describe the supported static argparse declarations."""
     module = ast.parse(source, filename=filename)
-    lines: list[str] = []
+    lines: list[CliEntry] = []
     found = False
     constructors: set[str] = set()
     for node in ast.walk(module):
@@ -2218,7 +2255,7 @@ def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C
             unsupported(node)
         return None
 
-    def argument_row(call: ast.Call, path: str) -> str:
+    def argument_row(call: ast.Call) -> str:
         if not call.args or any(isinstance(arg, ast.Starred) for arg in call.args):
             unsupported(call)
         if any(
@@ -2273,20 +2310,13 @@ def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C
             for key, value in sorted(values.items())
             if key not in {"required", "help"}
         )
-        prefix = f"{path}: " if path else ""
         help_text = values.get("help", "")
         suffix = f"; help={help_text}" if help_text else ""
-        return (
-            prefix
-            + ", ".join(str(arg) for arg in names)
-            + "  "
-            + "; ".join(details)
-            + suffix
-        )
+        return ", ".join(str(arg) for arg in names) + "  " + "; ".join(details) + suffix
 
     def visit(  # noqa: C901, PLR0912
         statements: list[ast.stmt],
-        inherited: dict[str, str],
+        inherited: dict[str, tuple[str, ...]],
     ) -> None:
         nonlocal found
         owners = dict(inherited)
@@ -2323,7 +2353,7 @@ def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C
                 if isinstance(call.func, ast.Attribute)
                 else ""
             )
-            path = owners.get(parent, "")
+            path = owners.get(parent, ())
             if name in constructors:
                 found = True
                 if any(
@@ -2343,12 +2373,12 @@ def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C
                 if method == "add_parser":
                     if not call.args or not isinstance(literal(call.args[0]), str):
                         unsupported(call)
-                    path = (path + " " + str(literal(call.args[0]))).strip()
-                    lines.append(f"{path}: command")
+                    path = (*path, str(literal(call.args[0])))
+                    lines.append(CliEntry(path, "command", command=True))
                 elif method == "add_argument":
-                    row = argument_row(call, path)
+                    row = argument_row(call)
                     if row:
-                        lines.append(row)
+                        lines.append(CliEntry(path, row))
                     continue
             else:
                 continue
@@ -2381,10 +2411,10 @@ def _source_argparse_args(source: bytes, filename: str) -> list[str]:  # noqa: C
     return lines
 
 
-def source_package_args(  # noqa: C901, PLR0912, PLR0915
+def source_package_cli(  # noqa: C901, PLR0912, PLR0915
     source: bytes,
     filename: str,
-) -> list[str]:
+) -> list[CliEntry]:
     """Describe conventional CLI declarations without importing package code."""
     module = ast.parse(source, filename=filename)
     imports: set[str] = set()
@@ -2419,9 +2449,57 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
                 result.append(rendered)
         return result
 
-    lines: list[str] = []
+    lines: list[CliEntry] = []
     found = False
     if "click" in imports:
+        command_paths: dict[str, tuple[str, ...]] = {}
+        command_functions = {
+            node.name: node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        }
+
+        def click_path(
+            name: str,
+            visiting: frozenset[str] = frozenset(),
+        ) -> tuple[str, ...]:
+            if name in command_paths:
+                return command_paths[name]
+            if name in visiting:
+                raise unsupported(command_functions[name], "Click")
+            function = command_functions[name]
+            for decorator in function.decorator_list:
+                if not isinstance(decorator, ast.Call) or not isinstance(
+                    decorator.func,
+                    ast.Attribute,
+                ):
+                    continue
+                if decorator.func.attr not in {"command", "group"}:
+                    continue
+                label = next(
+                    (
+                        str(ast.literal_eval(value))
+                        for value in [
+                            *decorator.args[:1],
+                            *(
+                                keyword.value
+                                for keyword in decorator.keywords
+                                if keyword.arg == "name"
+                            ),
+                        ]
+                    ),
+                    name,
+                )
+                owner = _test_names_qualified_name(decorator.func.value)
+                parent = (
+                    click_path(owner, visiting | {name})
+                    if owner in command_functions
+                    else ()
+                )
+                command_paths[name] = (*parent, label)
+                return command_paths[name]
+            return (name,)
+
         for node in ast.walk(module):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -2433,7 +2511,7 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
             )
             if command:
                 found = True
-                lines.append(f"{node.name}: command")
+                lines.append(CliEntry(click_path(node.name), "command", command=True))
             for decorator in node.decorator_list:
                 if not isinstance(decorator, ast.Call) or not isinstance(
                     decorator.func,
@@ -2457,10 +2535,50 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
                     "",
                 )
                 suffix = f"  help={help_text}" if help_text else ""
-                lines.append(f"{node.name}: {', '.join(names)}{suffix}")
+                lines.append(
+                    CliEntry(click_path(node.name), f"{', '.join(names)}{suffix}"),
+                )
         if found:
             return lines
     if "typer" in imports:
+        applications: dict[str, tuple[str, str]] = {}
+        for call in ast.walk(module):
+            if (
+                isinstance(call, ast.Call)
+                and isinstance(call.func, ast.Attribute)
+                and call.func.attr == "add_typer"
+                and call.args
+                and isinstance(call.args[0], ast.Name)
+            ):
+                label = next(
+                    (item.value for item in call.keywords if item.arg == "name"),
+                    None,
+                )
+                if not isinstance(label, ast.Constant) or not isinstance(
+                    label.value,
+                    str,
+                ):
+                    raise unsupported(call, "Typer")
+                applications[call.args[0].id] = (
+                    _test_names_qualified_name(call.func.value),
+                    label.value,
+                )
+
+        def typer_path(
+            owner: str,
+            visiting: frozenset[str] = frozenset(),
+        ) -> tuple[str, ...]:
+            if owner not in applications:
+                return ()
+            if owner in visiting:
+                raise unsupported(module, "Typer")
+            parent, name = applications[owner]
+            return (*typer_path(parent, visiting | {owner}), name)
+
+        lines.extend(
+            CliEntry(typer_path(owner), "command", command=True)
+            for owner in applications
+        )
         functions = {
             node.name: node
             for node in module.body
@@ -2469,7 +2587,7 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
 
         def typer_function(  # noqa: C901, PLR0912
             node: ast.FunctionDef | ast.AsyncFunctionDef,
-            path: str,
+            path: tuple[str, ...],
         ) -> None:
             arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
             defaults: list[ast.expr | None] = [None] * (
@@ -2551,7 +2669,7 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
                 suffix = f"; {parameter_detail}; type={annotation_text}"
                 if help_text:
                     suffix += f"; help={help_text}"
-                lines.append(f"{path}: {name}  {suffix.lstrip('; ')}")
+                lines.append(CliEntry(path, f"{name}  {suffix.lstrip('; ')}"))
 
         run_targets = {
             call.args[0].id
@@ -2565,7 +2683,7 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
             if name not in functions:
                 continue
             found = True
-            typer_function(functions[name], "")
+            typer_function(functions[name], ())
         for node in ast.walk(module):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -2583,8 +2701,20 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
             for decorator in decorators:
                 if decorator.args and isinstance(decorator.args[0], ast.Constant):
                     command_name = str(decorator.args[0].value)
-            lines.append(f"{command_name}: command")
-            typer_function(node, command_name)
+                for keyword in decorator.keywords:
+                    if keyword.arg == "name" and isinstance(
+                        keyword.value,
+                        ast.Constant,
+                    ):
+                        command_name = str(keyword.value.value)
+            decorator = decorators[0]
+            typer_method = cast("ast.Attribute", decorator.func)
+            owner = _test_names_qualified_name(typer_method.value)
+            path = typer_path(owner)
+            if typer_method.attr == "command":
+                path = (*path, command_name)
+                lines.append(CliEntry(path, "command", command=True))
+            typer_function(node, path)
         if found:
             return lines
     if "fire" in imports:
@@ -2617,7 +2747,9 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
                         ) and not method.name.startswith("_"):
                             callable_node = method
                             method_name = method.name
-                            lines.append(f"{method_name}: command")
+                            lines.append(
+                                CliEntry((method_name,), "command", command=True),
+                            )
                             parameters = [
                                 *callable_node.args.posonlyargs,
                                 *callable_node.args.args,
@@ -2639,10 +2771,13 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
                                     else repr(ast.literal_eval(default))
                                 )
                                 lines.append(
-                                    f"{method_name}: {parameter.arg}  default={value}",
+                                    CliEntry(
+                                        (method_name,),
+                                        f"{parameter.arg}  default={value}",
+                                    ),
                                 )
                 else:
-                    lines.append(f"{name}: command")
+                    lines.append(CliEntry((name,), "command", command=True))
                     parameters = [*node.args.posonlyargs, *node.args.args]
                     function_defaults: list[ast.expr | None] = [None] * (
                         len(parameters) - len(node.args.defaults)
@@ -2658,7 +2793,9 @@ def source_package_args(  # noqa: C901, PLR0912, PLR0915
                             if default is None
                             else repr(ast.literal_eval(default))
                         )
-                        lines.append(f"{name}: {parameter.arg}  default={value}")
+                        lines.append(
+                            CliEntry((name,), f"{parameter.arg}  default={value}"),
+                        )
             return lines
     library = next(
         (name for name in ("click", "typer", "fire") if name in imports),

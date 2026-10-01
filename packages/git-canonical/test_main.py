@@ -837,6 +837,89 @@ def test_args_rejects_unsupported_interfaces(tmp_path: Path, source: str) -> Non
         raise AssertionError(message)
 
 
+@pytest.mark.parametrize(
+    ("source", "path", "parameter"),
+    [
+        (
+            (
+                "import argparse\n"
+                "p = argparse.ArgumentParser()\n"
+                "p.add_argument('--verbose')\n"
+                "commands = p.add_subparsers()\n"
+                "test = commands.add_parser('test')\n"
+                "children = test.add_subparsers()\n"
+                "coverage = children.add_parser('coverage')\n"
+                "coverage.add_argument('--jobs', default=2, type=int)\n"
+            ),
+            ("test", "coverage"),
+            "--jobs  optional; default=2; type=int",
+        ),
+        (
+            (
+                "import click\n"
+                "@click.group()\n"
+                "def cli(): pass\n"
+                "@cli.group(name='test')\n"
+                "def tests(): pass\n"
+                "@tests.command('coverage')\n"
+                "@click.option('--jobs')\n"
+                "def coverage(jobs): pass\n"
+            ),
+            ("cli", "test", "coverage"),
+            "--jobs",
+        ),
+        (
+            (
+                "import typer\n"
+                "app = typer.Typer()\n"
+                "tests = typer.Typer()\n"
+                "app.add_typer(tests, name='test')\n"
+                "@tests.callback()\n"
+                "def settings(verbose: bool = False): pass\n"
+                "@tests.command(name='coverage')\n"
+                "def coverage(jobs: int = 2): pass\n"
+            ),
+            ("test", "coverage"),
+            "--jobs  default=2; type=int",
+        ),
+        (
+            (
+                "import fire\n"
+                "class Tools:\n"
+                " def coverage(self, jobs=2): pass\n"
+                "fire.Fire(Tools)\n"
+            ),
+            ("coverage",),
+            "jobs  default=2",
+        ),
+    ],
+)
+def test_cli_records_retain_command_paths_without_executing_source(
+    source: str,
+    path: tuple[str, ...],
+    parameter: str,
+) -> None:
+    """Keep library-specific ownership in the shared static CLI contract."""
+    subject = import_module("packages.git-canonical.main")
+    entries = subject.source_package_cli(source.encode(), "main.py")
+    if subject.CliEntry(path, "command", command=True) not in entries:
+        msg = "Missing nested command path"
+        raise AssertionError(msg)
+    if subject.CliEntry(path, parameter) not in entries:
+        msg = "Parameter must belong to its declared command"
+        raise AssertionError(msg)
+    if source.startswith("import typer"):
+        if (
+            subject.CliEntry(("test",), "--verbose  default=False; type=bool")
+            not in entries
+        ):
+            msg = "Callback options must belong to their application"
+            raise AssertionError(msg)
+        if any(entry.path[-1:] == ("settings",) for entry in entries):
+            msg = "Callbacks must not become subcommands"
+            raise AssertionError(msg)
+
+
 def test_args_repository_continues_after_unsupported_package(tmp_path: Path) -> None:
     """Keep repository listings useful when some interfaces are unsupported."""
     _make_test_names_package(tmp_path, "alpha", "")

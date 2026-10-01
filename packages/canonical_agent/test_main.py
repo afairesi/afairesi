@@ -30,6 +30,7 @@ from typing import Any
 from unittest.mock import MagicMock, patch
 
 import pytest
+from git_canonical import CliEntry
 
 from packages.canonical_agent import main as app
 
@@ -1284,6 +1285,76 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             "build: --jobs  optional; default=2; type=int; help='Worker count'",
         ]:
             msg = f"Unexpected canonical CLI summary: {arguments!r}"
+            raise AssertionError(msg)
+
+    def test_overview_nests_commands_and_search_reveals_parameters(self) -> None:
+        """Keep root options visible and nested command parameters collapsible."""
+        source = (
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--verbose')\n"
+            "commands = p.add_subparsers()\n"
+            "test = commands.add_parser('test')\n"
+            "children = test.add_subparsers()\n"
+            "coverage = children.add_parser('coverage')\n"
+            "coverage.add_argument('--jobs', type=int, default=2)\n"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            (package / "main.py").write_text(source, encoding="utf-8")
+            viewer = app.Viewer(app.Agent(root))
+            viewer.mode = "high-level"
+            viewer.overview = viewer.package_entries()
+            entry = viewer.overview[0]
+            arguments = next(
+                node for node in entry.children or [] if node.title == "Arguments"
+            )
+            children = arguments.children or []
+            if [node.title for node in children] != ["--verbose  optional", "test"]:
+                msg = "Arguments must contain root options and command nodes"
+                raise AssertionError(msg)
+            test = children[1]
+            coverage = (test.children or [])[0]
+            if coverage.title != "coverage" or [
+                node.title for node in coverage.children or []
+            ] != ["--jobs  optional; default=2; type=int"]:
+                msg = "Nested command must own its parameters"
+                raise AssertionError(msg)
+            entry.expanded = arguments.expanded = True
+            visible = "\n".join(row.text for row in viewer.rows(100))
+            if "--jobs" in visible or "test: command" in visible:
+                msg = "Command details must stay collapsed without redundant labels"
+                raise AssertionError(msg)
+            viewer.pattern = "--jobs"
+            viewer.search(1)
+            visible = "\n".join(row.text for row in viewer.rows(100))
+            if "--jobs" not in visible or not test.expanded or not coverage.expanded:
+                msg = "Search must open every ancestor of a CLI parameter"
+                raise AssertionError(msg)
+
+    def test_nested_cli_diff_keeps_changes_under_their_commands(self) -> None:
+        """Show changed parameters and removed commands at their original paths."""
+        before = [
+            CliEntry(("test",), "command", command=True),
+            CliEntry(("test", "coverage"), "command", command=True),
+            CliEntry(("test", "coverage"), "--jobs  default=2"),
+            CliEntry(("retired",), "command", command=True),
+        ]
+        after = [*before[:2], CliEntry(("test", "coverage"), "--jobs  default=4")]
+        tree = app.Viewer.cli_tree(after, previous=before)
+        test = next(node for node in tree if node.title == "test")
+        coverage = (test.children or [])[0]
+        if [(node.title, node.style) for node in coverage.children or []] != [
+            ("- --jobs  default=2", 31),
+            ("+ --jobs  default=4", 32),
+        ]:
+            msg = "Changed CLI parameters must retain their path and colors"
+            raise AssertionError(msg)
+        retired = next(node for node in tree if node.title == "- retired")
+        if (retired.title, retired.style) != ("- retired", 31):
+            msg = "Removed commands must retain removal styling"
             raise AssertionError(msg)
 
     def test_high_level_diff_compares_summaries_not_source_code(self) -> None:  # noqa: D102, PLR0915
