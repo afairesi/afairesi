@@ -4,9 +4,7 @@ let
   python = pkgs.python3;
   runtimeInputs = [
     inputs.self.packages.${pkgs.stdenv.system}.git-canonical
-    pkgs.bash
     pkgs.git
-    pkgs.nix
   ];
 in
 python.pkgs.buildPythonPackage {
@@ -21,7 +19,7 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Minimal interactive coding agent for a local llama.cpp server";
+    description = "Terminal browser for Canonical packages, interfaces, tests, and changes";
     mainProgram = pname;
   };
   nativeBuildInputs = [ pkgs.makeWrapper ];
