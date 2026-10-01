@@ -1001,6 +1001,74 @@ def _nix_binding_edits(
     return edits
 
 
+def _nix_remove_binding_edits(
+    document: nix_syntax.Document,
+    container: Node,
+    path: tuple[str, ...],
+) -> list[tuple[int, int, bytes]]:
+    """Remove a scoped metadata binding while retaining neighboring fields."""
+    if container.type == "parenthesized_expression":
+        return _nix_remove_binding_edits(
+            document,
+            nix_syntax.field(container, "expression"),
+            path,
+        )
+    bindings = next(
+        (node for node in container.named_children if node.type == "binding_set"),
+        None,
+    )
+    edits = []
+    for binding in [] if bindings is None else bindings.named_children:
+        attrpath = nix_syntax.field(binding, "attrpath")
+        expression = nix_syntax.field(binding, "expression")
+        if attrpath is not None and expression is not None:
+            names = nix_syntax.static_attrpath(document, attrpath)
+            if names == path:
+                edits.append((binding.start_byte, binding.end_byte, b""))
+            elif names and path[: len(names)] == names:
+                edits.extend(
+                    _nix_remove_binding_edits(
+                        document,
+                        expression,
+                        path[len(names) :],
+                    ),
+                )
+        elif len(path) == 1 and (attrs := nix_syntax.field(binding, "attrs")):
+            edits.extend(
+                (attr.start_byte, attr.end_byte, b"")
+                for attr in attrs.named_children
+                if document.text(attr) == path[0]
+            )
+    return edits
+
+
+def source_python_has_main(source: str | None) -> bool:
+    """Recognize the module-level main binding used by canonical wrappers."""
+    if not source:
+        return True
+    module = ast.parse(source, filename="main.py")
+    return any(
+        (
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "main"
+        )
+        or (
+            isinstance(node, (ast.Import, ast.ImportFrom))
+            and any((alias.asname or alias.name) == "main" for alias in node.names)
+        )
+        or (
+            isinstance(node, (ast.Assign, ast.AnnAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == "main"
+                for target in (
+                    node.targets if isinstance(node, ast.Assign) else [node.target]
+                )
+            )
+        )
+        for node in module.body
+    )
+
+
 def _python_required_edits(
     package: Package,
     source: str,
@@ -1042,19 +1110,38 @@ def _python_required_edits(
     if install_phase is None:
         msg = "Python scaffold omitted its install phase"
         raise AssertionError(msg)
+    executable = source_python_has_main(_read_regular(package.root / "main.py"))
+    if not executable:
+        install_phase = "\n".join(
+            line
+            for line in install_phase.split("\n")
+            if not any(
+                marker in line
+                for marker in ('mkdir -p "$out/bin"', "printf '%s", "chmod 755")
+            )
+        )
     required = {
         "pname": "pname",
         "installPhase": install_phase,
-        "meta.mainProgram": "baseNameOf ./." if "-" in package.name else "pname",
         "passthru.python": "python",
         "pyproject": "false",
         "src": "./.",
         "strictDeps": "true",
     }
+    if executable:
+        required["meta.mainProgram"] = (
+            "baseNameOf ./." if "-" in package.name else "pname"
+        )
     edits = {
         name: _nix_binding_edits(document, argument, tuple(name.split(".")), value)
         for name, value in required.items()
     }
+    if not executable:
+        edits["library metadata"] = _nix_remove_binding_edits(
+            document,
+            argument,
+            ("meta", "mainProgram"),
+        )
     pname = (
         'builtins.replaceStrings [ "-" ] [ "_" ] (baseNameOf ./.)'
         if "-" in package.name
@@ -1548,7 +1635,7 @@ pkgs.writeTextFile {
     files: dict[Path, str] = {root / "default.nix": default}
     if kind == "python":
         files[root / "main.py"] = (
-            f'''#!/usr/bin/env python3\n{description!r}\n\ndef main() -> None:\n    """Run {name}."""\n\n\nif __name__ == "__main__":\n    main()\n'''  # noqa: E501
+            f'''#!/usr/bin/env python3\n{description!r}\n\nimport argparse\n\n\ndef parser() -> argparse.ArgumentParser:\n    """Declare the command-line interface."""\n    return argparse.ArgumentParser(description={description!r})\n\n\ndef main(argv: list[str] | None = None) -> None:\n    """Run {name}."""\n    parser().parse_args(argv)\n\n\nif __name__ == "__main__":\n    main()\n'''  # noqa: E501
         )
     elif kind == "html":
         files.update(
@@ -2333,7 +2420,7 @@ def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # no
                 continue
             call = (
                 statement.value
-                if isinstance(statement, (ast.Assign, ast.Expr))
+                if isinstance(statement, (ast.Assign, ast.Expr, ast.Return))
                 else None
             )
             if not isinstance(call, ast.Call):
@@ -2803,7 +2890,17 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
     )
     if library:
         raise unsupported(module, library)
-    msg = f"unsupported CLI interface in {filename}: no supported static parser found"
+    if not source_python_has_main(source.decode()) and not any(
+        (isinstance(node, ast.Attribute) and node.attr == "argv")
+        or (isinstance(node, ast.Name) and node.id == "argv")
+        or (isinstance(node, ast.Constant) and node.value == "__main__")
+        for node in ast.walk(module)
+    ):
+        return [CliEntry((), "(not applicable)")]
+    msg = (
+        f"unsupported CLI interface in {filename}: no supported static parser found; "
+        "declare parser() for executable packages"
+    )
     raise ValueError(msg)
 
 

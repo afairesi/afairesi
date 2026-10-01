@@ -13,7 +13,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from git_canonical import CliEntry
+from git_canonical import CliEntry, source_cli_overview
 
 from packages.canonical_browser import main as app
 
@@ -509,6 +509,42 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         tests = app.Viewer.summary_group(summary, "Tests")
         if tests != ["test top level", "test method case"]:
             msg = f"Unexpected canonical test names: {tests!r}"
+            raise AssertionError(msg)
+
+    def test_resolved_cli_diagnostic_does_not_warn_in_inline_history(self) -> None:
+        """Keep removed diagnostics visible without marking a fixed package."""
+        before = "def main():\n    pass\n"
+        after = (
+            "import argparse\ndef parser():\n"
+            "    return argparse.ArgumentParser()\n"
+            "def main():\n    parser().parse_args()\n"
+        )
+        tree = app.Viewer.merged_summary_tree(
+            app.Viewer.package_summary("sample", {"main.py": before}),
+            app.Viewer.package_summary("sample", {"main.py": after}),
+            previous_cli=source_cli_overview(before),
+            current_cli=source_cli_overview(after),
+        )
+        entry = app.TreeNode("packages/sample", tree)
+        if app.Viewer.has_warning(entry):
+            msg = "Historical diagnostics must not keep a resolved warning active"
+            raise AssertionError(msg)
+        arguments = next(node for node in tree if node.title == "Arguments")
+        if not any(
+            node.title.startswith("- (unavailable:")
+            for node in arguments.children or []
+        ):
+            msg = "Resolved diagnostics must remain visible as removals"
+            raise AssertionError(msg)
+        current = app.TreeNode(
+            "packages/sample",
+            app.Viewer.cli_tree(
+                source_cli_overview(before),
+                previous=source_cli_overview(after),
+            ),
+        )
+        if not app.Viewer.has_warning(current):
+            msg = "New diagnostics must still mark the package as unavailable"
             raise AssertionError(msg)
 
     def test_package_summary_uses_canonical_cli_parser(self) -> None:  # noqa: D102

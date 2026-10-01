@@ -733,6 +733,108 @@ def test_args_prefers_conventional_public_parser(tmp_path: Path) -> None:
         raise AssertionError(msg)
 
 
+def test_args_accepts_an_empty_parser_returned_directly(tmp_path: Path) -> None:
+    """Fixed workflows can return an empty parser without a temporary binding."""
+    package = _make_test_names_package(tmp_path, "example", "")
+    (package / "main.py").write_text(
+        "import argparse\ndef parser():\n"
+        "    return argparse.ArgumentParser(description='Fixed workflow')\n"
+        "def main(argv=None):\n    parser().parse_args(argv)\n",
+    )
+    if _run(package, "args").stdout:
+        msg = "An empty parser must produce an empty argument contract"
+        raise AssertionError(msg)
+    if "Arguments:\n  (none)" not in _run(package, "overview").stdout:
+        msg = "An empty parser must remain available in the overview"
+        raise AssertionError(msg)
+
+
+def test_python_scaffold_declares_an_empty_cli(repository: Path) -> None:
+    """New executables expose help and reject arguments without running work."""
+    _run(repository, "add", "packages/example", "python")
+    package = repository / "packages/example"
+    if _run(package, "args").stdout:
+        msg = "A fixed workflow must have no custom arguments"
+        raise AssertionError(msg)
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(package / "main.py"), "--help"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode or "--help" not in result.stdout:
+        msg = "The generated executable must provide standard help"
+        raise AssertionError(msg)
+    result = subprocess.run(  # noqa: S603
+        [sys.executable, str(package / "main.py"), "unexpected"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 2 or "unrecognized arguments" not in result.stderr:  # noqa: PLR2004
+        msg = "The generated executable must reject unexpected arguments"
+        raise AssertionError(msg)
+
+
+@pytest.mark.parametrize("dotted_metadata", [False, True])
+def test_python_library_convergence_removes_only_executable_packaging(
+    repository: Path,
+    *,
+    dotted_metadata: bool,
+) -> None:
+    """Libraries retain resources and metadata across repeated convergence."""
+    _run(repository, "add", "packages/example", "python")
+    package = repository / "packages/example"
+    (package / "main.py").write_text('"""An importable library."""\nVALUE = 1\n')
+    resource = package / "prm" / "asset.txt"
+    resource.parent.mkdir()
+    resource.write_text("preserve this asset")
+    default = package / "default.nix"
+    source = default.read_text()
+    if dotted_metadata:
+        source = source.replace("    mainProgram = pname;", "")
+        source = source.replace(
+            "  passthru.python",
+            "  meta.mainProgram = pname;\n  passthru.python",
+        )
+    default.write_text(source)
+    _run(repository, "converge")
+    source = default.read_text()
+    if "mainProgram" in source or "$out/bin" in source:
+        msg = "Libraries must not install executable wrappers"
+        raise AssertionError(msg)
+    if "description" not in source or "cp -R prm/" not in source:
+        msg = "Library convergence lost metadata or resources"
+        raise AssertionError(msg)
+    if _run(package, "args").stdout != "(not applicable)\n":
+        msg = "Library arguments must be marked not applicable"
+        raise AssertionError(msg)
+    if "Arguments:\n  (not applicable)" not in _run(package, "overview").stdout:
+        msg = "Library overview disagrees with argument discovery"
+        raise AssertionError(msg)
+    _run(repository, "converge", "--dry-run")
+    (package / "main.py").write_text(
+        "import argparse\ndef main():\n    argparse.ArgumentParser().parse_args()\n",
+    )
+    _run(repository, "converge")
+    if (
+        "mainProgram" not in default.read_text()
+        or "$out/bin" not in default.read_text()
+    ):
+        msg = "Adding a main entry point must restore executable packaging"
+        raise AssertionError(msg)
+
+
+def test_args_keeps_unparsed_executables_unavailable(tmp_path: Path) -> None:
+    """A main entry point without a declared parser is not an empty CLI."""
+    package = _make_test_names_package(tmp_path, "example", "")
+    (package / "main.py").write_text("def main():\n    pass\n")
+    result = _run(package, "args", code=1)
+    if "declare parser()" not in result.stderr:
+        msg = "Executables need an actionable parser diagnostic"
+        raise AssertionError(msg)
+
+
 @pytest.mark.parametrize(
     ("imports", "constructor"),
     [

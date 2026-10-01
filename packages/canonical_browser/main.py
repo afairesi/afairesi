@@ -423,7 +423,7 @@ class Viewer:  # noqa: D101
                     TreeNode(
                         prefix + entry.text,
                         style=style,
-                        warning=entry.text.startswith("(unavailable:"),
+                        warning=entry in new and entry.text.startswith("(unavailable:"),
                     ),
                 )
         return roots
