@@ -155,7 +155,9 @@ class TestGui(unittest.TestCase):
             (package / "test_main.py").write_bytes(b"")
             resources = package / "prm/web"
             resources.mkdir(parents=True)
-            (resources / "script.js").write_bytes(b"// Example\n\nrun();\n")
+            (resources / "script.js").write_bytes(
+                b"// eslint-disable-next-line\n\nrun();\n",
+            )
             (resources / "picture.png").write_bytes(b"binary\n")
             (resources / "linked.py").symlink_to(package / "main.py")
             (package / "tmp").mkdir()
@@ -185,17 +187,11 @@ class TestGui(unittest.TestCase):
                 "lines": {
                     "default.nix": 1,
                     "main.py": 3,
-                    "prm/web/script.js": 3,
                     "test_main.py": 0,
                 },
-                "suppressions": {
-                    "noqa (global)": 0,
-                    "noqa (local)": 0,
-                    "type: ignore (global)": 0,
-                    "type: ignore (local)": 0,
-                },
+                "suppressions": {},
             }:
-                msg = "Metrics must include current source lines and zero counts"
+                msg = "Metrics must exclude prm sources and zero suppression counts"
                 raise AssertionError(msg)
             if snapshot["tree"][0]["children"][0] != record["tree"]:
                 msg = "Source line counts must be shared by the GUI and TUI"
@@ -640,7 +636,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             sources = app.package_sources(package)
             metrics = app.source_metrics(sources)
             app.package_file_tree(package, tree, sources)
-            if metrics["suppressions"]["noqa (global)"] != 0:
+            if metrics["suppressions"].get("noqa (global)", 0) != 0:
                 msg = "Current metrics must ignore suppression diff baselines"
                 raise AssertionError(msg)
             files = {
@@ -653,13 +649,11 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             if main["Arguments"] is not arguments or "Example." not in main:
                 msg = "Arguments and documentation must belong to main.py"
                 raise AssertionError(msg)
-            if [node.title for node in files["main.py"].children or []][:6] != [
+            if [node.title for node in files["main.py"].children or []][:4] != [
                 "Example.",
                 "Lines: 2",
-                "noqa (global): 1 → 2",
                 "noqa (local): 1",
-                "type: ignore (global): 0",
-                "type: ignore (local): 0",
+                "noqa (global): 1 → 2",
             ]:
                 msg = "Documentation, lines, and flat Python counts must stay ordered"
                 raise AssertionError(msg)

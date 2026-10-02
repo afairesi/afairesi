@@ -919,6 +919,7 @@ def machine_resource(
         "id": ".:machine",
         "kind": "machine",
         "name": name,
+        "home": str(Path.home().resolve()),
         "repository": ".",
         "path": "/",
         "icon": release.get("ID"),
@@ -1043,14 +1044,6 @@ def package_sources(directory: Path) -> list[TreeNode]:
         else:
             children = [TreeNode(f"Lines: {len(content.splitlines())}")]
             counts = source_suppressions(name, content.decode(errors="replace"))
-            if path.suffix == ".py":
-                defaults = {
-                    ("noqa", "local"): 0,
-                    ("noqa", "global"): 0,
-                    ("type: ignore", "local"): 0,
-                    ("type: ignore", "global"): 0,
-                }
-                counts.update(defaults)
             children.extend(
                 TreeNode(f"{kind} ({scope}): {count}")
                 for (kind, scope), count in sorted(counts.items())
@@ -1064,6 +1057,8 @@ def source_metrics(sources: list[TreeNode]) -> dict[str, dict[str, int]]:
     lines = {}
     suppressions: dict[str, int] = {}
     for source in sources:
+        if Path(source.title).parts[0] == "prm":
+            continue
         for child in source.children or []:
             label, separator, count = child.title.rpartition(": ")
             if not separator or not count.isdecimal():
@@ -1118,6 +1113,19 @@ def package_storage(directory: Path) -> list[TreeNode]:
     if output.is_dir() and not output.is_symlink():
         nodes.append(TreeNode("tmp/", directory=output.resolve()))
     return nodes
+
+
+def ordered_source(source: TreeNode, documentation: list[TreeNode]) -> TreeNode:
+    """Place source documentation and counters before interfaces and dependencies."""
+    children = sorted(
+        source.children or [],
+        key=lambda child: (
+            child not in documentation,
+            not child.title.startswith("Lines:"),
+            not re.search(r"\((?:local|global)\):", child.title),
+        ),
+    )
+    return replace(source, children=children)
 
 
 def package_file_tree(  # noqa: C901 - move each declaration to its source file
@@ -1182,7 +1190,10 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
     if documentation:
         parent = source("main.py")
         parent.children = [*documentation, *(parent.children or [])]
-    tree.children = [*fields, *(files[name] for name in sorted(files))]
+    tree.children = [
+        *fields,
+        *(ordered_source(files[name], documentation) for name in sorted(files)),
+    ]
     tree.children.extend(package_storage(directory))
     return tree
 

@@ -38,7 +38,8 @@ function highlightEdges() {
 function viewportArea() {
   const canvas = $("canvas").getBoundingClientRect();
   const controls = document.querySelector(".graph-controls").getBoundingClientRect();
-  const top = Math.max(16, controls.bottom - canvas.top + 16);
+  const path = $("cwd").getBoundingClientRect();
+  const top = Math.max(16, Math.max(controls.bottom, path.bottom) - canvas.top + 16);
   return {
     left: 16,
     top,
@@ -437,7 +438,7 @@ function directoryMetrics(item) {
       lines.set(name, (lines.get(name) || 0) + count);
     }
     for (const [name, count] of Object.entries(node.source_metrics.suppressions))
-      suppressions.set(name, (suppressions.get(name) || 0) + count);
+      if (count) suppressions.set(name, (suppressions.get(name) || 0) + count);
   }
   function rows(entries) {
     const list = element("dl", "metric-rows");
@@ -603,7 +604,16 @@ function bindExpansion(details, key, matchesSearch = false, changed = false) {
 }
 
 function behaviorTree(tree, key, filterChanges) {
-  const children = tree.children || [];
+  const sourceLines = tree.source_file
+    ? (tree.children || []).find((child) => /^Lines: \d+$/.test(child.title))
+    : null;
+  const children = (tree.children || []).filter((child) => child !== sourceLines &&
+    !/\((?:local|global)\): 0$/.test(child.title));
+  function appendLines(row) {
+    if (!sourceLines) return;
+    const count = Number(sourceLines.title.slice(7));
+    row.append(element("span", "source-lines", `${count.toLocaleString()} ${count === 1 ? "line" : "lines"}`));
+  }
   if (!children.length) {
     const matches = query && tree.title.toLowerCase().includes(query);
     const leaf = element(
@@ -617,12 +627,15 @@ function behaviorTree(tree, key, filterChanges) {
       leaf.rel = "noopener";
       leaf.title = `Browse ${tree.directory}`;
     }
+    if (tree.source_file) leaf.classList.add("source-row");
+    appendLines(leaf);
     return leaf;
   }
   const details = element("details", `behavior-group${hasChange(tree) ? " changed" : ""}`);
   const visible = children.filter((child) => !filterChanges || hasChange(child));
   bindExpansion(details, key, flattenText(tree).toLowerCase().includes(query), hasChange(tree));
   const summary = element("summary", "", tree.title);
+  appendLines(summary);
   if (!tree.source_file)
     summary.append(
       element("span", "count", String(visible.reduce((sum, child) => sum + countLeaves(child), 0))),
@@ -787,7 +800,7 @@ function render() {
   }
   const directoryBox = container(hierarchy);
   const machine = data.machine;
-  if (machine) {
+  if (machine && data.root === machine.home) {
     const wrapper = element("section", "machine-box");
     const info = element("details", "machine-info");
     const heading = element("summary", "repository-heading");
@@ -1023,6 +1036,9 @@ async function refresh(nextDirectory = directory, force = true) {
     directorySnapshots.set(snapshot.root, snapshot);
     data = prepareData(snapshot);
     directory = data.root;
+    $("cwd").textContent = directory;
+    $("cwd").title = directory;
+    $("cwd").hidden = false;
     const url = new URL(location.href);
     url.searchParams.set("directory", directory);
     history.replaceState(null, "", url);
@@ -1135,8 +1151,17 @@ document.addEventListener("keydown", (event) => {
   }
 });
 let drag = null;
+let suppressClick = false;
+function cancelDraggedClick(event) {
+  if (!suppressClick || event.detail === 0) return;
+  event.preventDefault();
+  event.stopImmediatePropagation();
+  suppressClick = false;
+}
+$("canvas").addEventListener("click", cancelDraggedClick, true);
+$("canvas").addEventListener("auxclick", cancelDraggedClick, true);
 $("canvas").addEventListener("pointerdown", (event) => {
-  if (event.button === 0 && event.target.closest("details,button,input,a")) return;
+  suppressClick = false;
   if (![0, 1, 2].includes(event.button)) return;
   event.preventDefault();
   const outer = document.querySelector(".graph-stage > section")?.getBoundingClientRect();
@@ -1149,16 +1174,19 @@ $("canvas").addEventListener("pointerdown", (event) => {
     left: pan.x,
     top: pan.y,
     moved: false,
-    directory: event.button === 0 && !event.target.closest(".edge-group")
+    pointerId: event.pointerId,
+    directory: event.button === 0 && !event.target.closest(".edge-group,details,button,input,a")
       ? container?.dataset.directory || (outside ? data?.parent : null)
       : null,
   };
-  $("canvas").setPointerCapture(event.pointerId);
-  $("canvas").classList.add("panning");
 });
 $("canvas").addEventListener("pointermove", (event) => {
   if (drag) {
-    if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 5) drag.moved = true;
+    if (!drag.moved && Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 5) {
+      drag.moved = true;
+      $("canvas").setPointerCapture(drag.pointerId);
+      $("canvas").classList.add("panning");
+    }
     if (!drag.moved) return;
     pan.x = drag.left + event.clientX - drag.x;
     pan.y = drag.top + event.clientY - drag.y;
@@ -1173,6 +1201,8 @@ $("canvas").addEventListener("pointerup", (event) => {
   const destination = drag?.directory;
   const clicked = drag && !drag.moved &&
     Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= 5;
+  suppressClick = Boolean(drag?.moved);
+  if (suppressClick) event.preventDefault();
   endDrag();
   if (clicked && destination && destination !== data.root) navigateDirectory(destination);
 });
