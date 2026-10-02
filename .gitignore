@@ -36,6 +36,8 @@
 !/packages/git-canonical/
 !/packages/git-canonical/default.nix
 !/packages/git-canonical/main.py
+!/packages/git-canonical/prm/
+!/packages/git-canonical/prm/**
 !/packages/git-canonical/test_main.py
 !/packages/nix_alphabetize/
 !/packages/nix_alphabetize/default.nix

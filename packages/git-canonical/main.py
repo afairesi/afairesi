@@ -914,26 +914,9 @@ pkgs.runCommand packageName
 
 
 def _current_host_check_source() -> str:
-    """Render the canonical host VM check definition."""
-    return """{ inputs, pkgs, ... }:
-let
-  configuration = inputs.self.nixosConfigurations.${host};
-  diskoDevices = configuration.config.disko.devices or { };
-  host = pkgs.lib.removeSuffix "VmWithDisko" (baseNameOf ./.);
-  vm =
-    if builtins.attrNames diskoDevices == [ ] then
-      configuration.config.system.build.vm
-    else
-      configuration.config.system.build.vmWithDisko;
-in
-pkgs.runCommand (baseNameOf ./.)
-  {
-    buildInputs = [ vm ];
-  }
-  ''
-    touch "$out"
-  ''
-"""
+    """Render the canonical host boot and reboot check definition."""
+    template = Path(__file__).parent / "prm" / "host-check.nix"
+    return template.read_text(encoding="utf-8")
 
 
 def _python_static_template_issues(package: Package, source: str) -> list[str]:
