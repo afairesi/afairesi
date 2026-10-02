@@ -36,6 +36,19 @@ from git_canonical import CommandError as GitCanonicalError
 MAX_PORT = 65535
 MOUNT_FIELDS = 3
 EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
+SOURCE_SUFFIXES = {
+    ".nix",
+    ".py",
+    ".html",
+    ".js",
+    ".mjs",
+    ".css",
+    ".tex",
+    ".sh",
+    ".ts",
+    ".tsx",
+    ".jsx",
+}
 
 
 @dataclass
@@ -996,6 +1009,42 @@ def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
     return tree
 
 
+def package_sources(directory: Path) -> list[TreeNode]:
+    """Count physical lines in package sources and source assets under prm/."""
+    if not directory.is_dir() or directory.is_symlink():
+        return []
+    candidates = list(directory.iterdir())
+    resources = directory / "prm"
+    if resources.is_dir() and not resources.is_symlink():
+        for parent, children, files in os.walk(resources, followlinks=False):
+            children[:] = [
+                child
+                for child in children
+                if not child.startswith(".") and not (Path(parent) / child).is_symlink()
+            ]
+            candidates.extend(Path(parent) / filename for filename in files)
+    result = []
+    for path in sorted(candidates):
+        if (
+            path.suffix not in SOURCE_SUFFIXES
+            or path.is_symlink()
+            or not path.is_file()
+        ):
+            continue
+        name = str(path.relative_to(directory))
+        try:
+            count = len(path.read_bytes().splitlines())
+        except OSError as error:
+            result.append(
+                TreeNode(f"{name}: (unavailable: {error.strerror})", warning=True),
+            )
+        else:
+            result.append(
+                TreeNode(f"{name}: {count} {'line' if count == 1 else 'lines'}"),
+            )
+    return result
+
+
 def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationships
     root: Path,
     semantic_tree: list[TreeNode],
@@ -1048,6 +1097,10 @@ def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationsh
             record,
             resources.get(identifier, TreeNode(record["path"], [])),
         )
+        if record["kind"] == "package":
+            sources = package_sources(root / record["repository"] / record["path"])
+            if sources:
+                tree.children = [*(tree.children or []), TreeNode("Sources", sources)]
         links = [
             TreeNode(
                 f"{edge['kind']}: {edge['source']} → {edge['target']}",

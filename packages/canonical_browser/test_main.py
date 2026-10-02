@@ -33,6 +33,44 @@ TEST_REPOSITORY_FIELDS = 3
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
 
+    def test_package_sources_count_lines_and_exclude_runtime_output(self) -> None:
+        """Count blank lines and unterminated last lines, including prm sources."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            (package / "default.nix").write_bytes(b"{}\n")
+            (package / "main.py").write_bytes(b'"""Help."""\r\n\r\nvalue = 1')
+            (package / "test_main.py").write_bytes(b"")
+            resources = package / "prm/web"
+            resources.mkdir(parents=True)
+            (resources / "script.js").write_bytes(b"// Example\n\nrun();\n")
+            (resources / "picture.png").write_bytes(b"binary\n")
+            (resources / "linked.py").symlink_to(package / "main.py")
+            (package / "tmp").mkdir()
+            (package / "tmp/generated.py").write_bytes(b"runtime\n")
+            snapshot = app.gui_data(root)
+            record = next(
+                node for node in snapshot["nodes"] if node["kind"] == "package"
+            )
+            sources = next(
+                child
+                for child in record["tree"]["children"]
+                if child["title"] == "Sources"
+            )
+            if [child["title"] for child in sources["children"]] != [
+                "default.nix: 1 line",
+                "main.py: 3 lines",
+                "prm/web/script.js: 3 lines",
+                "test_main.py: 0 lines",
+            ]:
+                msg = "Source counts must exclude output, binary assets, and links"
+                raise AssertionError(msg)
+            if snapshot["tree"][0]["children"][0] != record["tree"]:
+                msg = "Source line counts must be shared by the GUI and TUI"
+                raise AssertionError(msg)
+
     def test_directory_scope_matches_gui_and_terminal(self) -> None:
         """Intermediate directories and package directories show only their contents."""
         with tempfile.TemporaryDirectory() as temporary:

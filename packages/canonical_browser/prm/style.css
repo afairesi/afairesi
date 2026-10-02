@@ -385,6 +385,26 @@ input[type="checkbox"] {
   stroke-width: 1.6;
   opacity: 0.75;
   pointer-events: none;
+  vector-effect: non-scaling-stroke;
+}
+.edge-hit {
+  fill: none;
+  stroke: transparent;
+  stroke-width: 12px;
+  vector-effect: non-scaling-stroke;
+  pointer-events: stroke;
+}
+.edge-group.highlighted .graph-edge {
+  stroke-width: 3;
+  opacity: 1;
+}
+.edge-group.highlighted .edge-label {
+  fill: var(--green);
+  font-weight: 700;
+}
+.resource-block.edge-related {
+  outline: 2px solid #81a589;
+  outline-offset: 2px;
 }
 .graph-edge.related {
   stroke-width: 2.4;
@@ -408,7 +428,7 @@ input[type="checkbox"] {
   stroke: #f9faf6;
   stroke-width: 4px;
   paint-order: stroke;
-  pointer-events: none;
+  pointer-events: visiblePainted;
 }
 .edge-label.removed {
   fill: var(--red);

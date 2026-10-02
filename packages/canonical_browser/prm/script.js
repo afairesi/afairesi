@@ -20,6 +20,20 @@ let layoutPromise = Promise.resolve();
 const edgeRoutes = new Map();
 const directorySnapshots = new Map();
 let requestGeneration = 0;
+let hoveredResource = null;
+let hoveredEdge = null;
+
+function highlightEdges() {
+  const relatedNodes = new Set();
+  for (const group of document.querySelectorAll(".edge-group")) {
+    const endpoints = [group.dataset.source, group.dataset.target];
+    const hovered = endpoints.includes(hoveredResource) || group.dataset.edgeId === hoveredEdge;
+    group.classList.toggle("highlighted", hovered);
+    group.querySelector(".graph-edge").classList.toggle("related", hovered || endpoints.includes(selected));
+    if (hovered) for (const id of endpoints) relatedNodes.add(id);
+  }
+  for (const [id, block] of blocks) block.classList.toggle("edge-related", relatedNodes.has(id));
+}
 
 function viewportArea() {
   const canvas = $("canvas").getBoundingClientRect();
@@ -390,11 +404,11 @@ function prepareData(snapshot) {
 }
 
 function relationships() {
-  return data.edges.filter((edge) => !["contains", "submodule"].includes(edge.kind));
+  return data.edges.filter((edge) => !["contains", "submodule", "checked-by"].includes(edge.kind));
 }
 
 function visibleNodes() {
-  const resources = data.nodes.filter((node) => node.kind !== "repository");
+  const resources = data.nodes.filter((node) => !["repository", "check"].includes(node.kind));
   const matches = new Set(
     resources
       .filter(
@@ -576,7 +590,8 @@ function resourceBlock(node, layout) {
   );
   summary.append(title);
   if (node.description) summary.append(element("p", "resource-description", node.description));
-  summary.append(element("div", "resource-path", node.path));
+  if (!["package", "package-reference"].includes(node.kind))
+    summary.append(element("div", "resource-path", node.path));
   const meta = element("div", "resource-meta");
   if (!icon) meta.append(element("span", "kind-tag", node.kind));
   if (node.context) details.classList.add("context");
@@ -626,6 +641,7 @@ function resourceBlock(node, layout) {
 
 function collection(items, kind, edges) {
   const box = element("section", `collection-box ${kind}-collection`);
+  if (["packages", "hosts"].includes(kind)) box.dataset.directory = `${items[0].directory}/${kind}`;
   const heading = element("h3", "collection-heading", `${kind}/`);
   heading.append(element("span", "", `${items.length} resources`));
   box.append(heading);
@@ -641,6 +657,7 @@ function render() {
   if (layoutObserver) layoutObserver.disconnect();
   ++layoutGeneration;
   edgeRoutes.clear();
+  hoveredResource = hoveredEdge = null;
   blocks.clear();
   currentNodes = visibleNodes();
   const canvas = $("canvas");
@@ -691,6 +708,7 @@ function render() {
     const heading = element("h2", "repository-heading");
     const link = element("button", "directory-link", `◫ ${item.name}`);
     const destination = item.path === "." ? data.root : `${data.root}/${item.path}`;
+    box.dataset.directory = destination;
     link.title = `Open ${destination}`;
     link.addEventListener("click", () => navigateDirectory(destination));
     heading.append(link);
@@ -703,7 +721,6 @@ function render() {
     for (const [kinds, kind] of [
       [["package", "package-reference"], "packages"],
       [["host"], "hosts"],
-      [["check"], "checks"],
       [["machine"], "resources"],
     ]) {
       const items = resources.filter((node) => kinds.includes(node.kind));
@@ -837,8 +854,17 @@ function drawEdges() {
       { x: lx, y: ly, "text-anchor": "middle", class: `edge-label ${edge.change || ""}` },
       `${edge.change === "removed" ? "− " : edge.change === "added" ? "+ " : ""}${edge.kind}`,
     );
-    svg.append(line, label);
+    const group = svgElement("g", {
+      class: "edge-group",
+      "data-source": edge.source,
+      "data-target": edge.target,
+      "data-edge-id": edgeId(edge),
+    });
+    const hit = svgElement("path", { d: path, class: "edge-hit" });
+    group.append(hit, line, label);
+    svg.append(group);
   });
+  highlightEdges();
 }
 
 function applyViewport() {
@@ -1042,14 +1068,18 @@ $("canvas").addEventListener("pointerdown", (event) => {
   if (![0, 1, 2].includes(event.button)) return;
   event.preventDefault();
   const outer = document.querySelector(".graph-stage > section")?.getBoundingClientRect();
+  const outside = !outer || event.clientX < outer.left || event.clientX > outer.right ||
+    event.clientY < outer.top || event.clientY > outer.bottom;
+  const container = event.target.closest("[data-directory]");
   drag = {
     x: event.clientX,
     y: event.clientY,
     left: pan.x,
     top: pan.y,
     moved: false,
-    parentClick: event.button === 0 && (!outer || event.clientX < outer.left ||
-      event.clientX > outer.right || event.clientY < outer.top || event.clientY > outer.bottom),
+    directory: event.button === 0 && !event.target.closest(".edge-group")
+      ? container?.dataset.directory || (outside ? data?.parent : null)
+      : null,
   };
   $("canvas").setPointerCapture(event.pointerId);
   $("canvas").classList.add("panning");
@@ -1068,13 +1098,24 @@ function endDrag() {
   $("canvas").classList.remove("panning");
 }
 $("canvas").addEventListener("pointerup", (event) => {
-  const parentClick = drag?.parentClick && !drag.moved &&
+  const destination = drag?.directory;
+  const clicked = drag && !drag.moved &&
     Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= 5;
   endDrag();
-  if (parentClick && data?.parent) navigateDirectory(data.parent);
+  if (clicked && destination && destination !== data.root) navigateDirectory(destination);
 });
 $("canvas").addEventListener("pointercancel", endDrag);
 $("canvas").addEventListener("contextmenu", (event) => event.preventDefault());
+$("canvas").addEventListener("pointerover", (event) => {
+  hoveredResource = event.target.closest(".resource-block")?.dataset.nodeId || null;
+  hoveredEdge = event.target.closest(".edge-group")?.dataset.edgeId || null;
+  highlightEdges();
+});
+$("canvas").addEventListener("pointerout", (event) => {
+  hoveredResource = event.relatedTarget?.closest?.(".resource-block")?.dataset.nodeId || null;
+  hoveredEdge = event.relatedTarget?.closest?.(".edge-group")?.dataset.edgeId || null;
+  highlightEdges();
+});
 $("canvas").addEventListener(
   "wheel",
   (event) => {
