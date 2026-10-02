@@ -408,6 +408,40 @@ class TestCli(unittest.TestCase):
 
 
 class TestViewer(unittest.TestCase):  # noqa: D101
+    def test_directory_navigation_reuses_source_snapshot_until_refresh(self) -> None:
+        """Parent navigation rescopes declarations; Refresh reads new evidence."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text("{}\n")
+            (package / "main.py").write_text('"""Before."""\n')
+            viewer = app.Viewer(package)
+            with patch.object(
+                app,
+                "browser_snapshot",
+                wraps=app.browser_snapshot,
+            ) as build:
+                viewer.ensure_overview()
+                (package / "main.py").write_text('"""After."""\n')
+                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+                if viewer.cwd != root or build.call_count != 1:
+                    msg = "Navigating within a repository must reuse its declarations"
+                    raise AssertionError(msg)
+                serialized = json.dumps(viewer.snapshot)
+                if "Before." not in serialized or "After." in serialized:
+                    msg = "Navigation must retain the snapshot until explicit Refresh"
+                    raise AssertionError(msg)
+                viewer.refresh_overview()
+                if build.call_count != TEST_EXPECTED_BUILDS:
+                    msg = "Refresh must reread declarations"
+                    raise AssertionError(msg)
+                if "After." not in json.dumps(viewer.snapshot):
+                    msg = "Refresh must display the new declarations"
+                    raise AssertionError(msg)
+
     def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
         """Placeholder declarations are neither entries nor semantic changes."""
         empty = (

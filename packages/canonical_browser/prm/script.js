@@ -18,6 +18,20 @@ let layoutGeneration = 0;
 let layoutFrame = null;
 let layoutPromise = Promise.resolve();
 const edgeRoutes = new Map();
+const directorySnapshots = new Map();
+let requestGeneration = 0;
+
+function viewportArea() {
+  const canvas = $("canvas").getBoundingClientRect();
+  const controls = document.querySelector(".graph-controls").getBoundingClientRect();
+  const top = Math.max(16, controls.bottom - canvas.top + 16);
+  return {
+    left: 16,
+    top,
+    width: Math.max(1, canvas.width - 32),
+    height: Math.max(1, canvas.height - top - 16),
+  };
+}
 
 function edgeId(edge) {
   return JSON.stringify([edge.source, edge.target, edge.kind]);
@@ -38,11 +52,9 @@ function scheduleLayout() {
 async function layoutGraph(generation) {
   const stage = document.querySelector(".graph-stage");
   if (!stage || generation !== layoutGeneration) return;
-  const aspectRatio = Math.max(
-    0.5,
-    Math.min(2, window.innerWidth / Math.max(240, window.innerHeight - 88)),
-  );
-  const direction = window.innerWidth <= 760 ? "DOWN" : "RIGHT";
+  const viewport = viewportArea();
+  const aspectRatio = viewport.width / viewport.height;
+  const direction = viewport.width < viewport.height ? "DOWN" : "RIGHT";
   const elements = new Map();
   const routes = new Map();
   let serial = 0;
@@ -837,20 +849,16 @@ function applyViewport() {
 function fitGraph() {
   const stage = document.querySelector(".graph-stage");
   if (!stage) return;
-  const width = $("canvas").clientWidth,
-    height = $("canvas").clientHeight;
-  zoom = Math.max(
-    0.1,
-    Math.min(1, (width - 32) / stage.offsetWidth, (height - 88) / stage.offsetHeight),
-  );
-  pan.x = (width - stage.offsetWidth * zoom) / 2;
-  pan.y = 72 + (height - 72 - stage.offsetHeight * zoom) / 2;
+  const viewport = viewportArea();
+  zoom = Math.min(1, viewport.width / stage.offsetWidth, viewport.height / stage.offsetHeight);
+  pan.x = viewport.left + (viewport.width - stage.offsetWidth * zoom) / 2;
+  pan.y = viewport.top + (viewport.height - stage.offsetHeight * zoom) / 2;
   applyViewport();
   scheduleEdges();
 }
 
 function setZoom(value, x = $("canvas").clientWidth / 2, y = $("canvas").clientHeight / 2) {
-  const next = Math.min(4, Math.max(0.1, value));
+  const next = Math.min(4, Math.max(Math.min(zoom, 0.01), value));
   pan.x = x - ((x - pan.x) / zoom) * next;
   pan.y = y - ((y - pan.y) / zoom) * next;
   zoom = next;
@@ -869,13 +877,49 @@ function reveal(item) {
   applyViewport();
 }
 
-async function refresh(nextDirectory = directory) {
+function cachedDirectory(nextDirectory) {
+  if (directorySnapshots.has(nextDirectory)) return directorySnapshots.get(nextDirectory);
+  for (const snapshot of directorySnapshots.values()) {
+    if (!nextDirectory.startsWith(`${snapshot.root}/`)) continue;
+    if (snapshot.nodes.every((node) => node.profile === "directory")) continue;
+    const nodes = snapshot.nodes.flatMap((node) => {
+      if (node.kind === "machine") return [];
+      const repository = node.directory;
+      if (!repository) return [];
+      if (repository === nextDirectory || repository.startsWith(`${nextDirectory}/`))
+        return [{ ...node, repository: repository === nextDirectory ? "." : repository.slice(nextDirectory.length + 1) }];
+      if (!nextDirectory.startsWith(`${repository}/`) || node.profile === "home") return [];
+      const path = node.path === "." ? repository : `${repository}/${node.path}`;
+      if (node.kind !== "repository" && path !== nextDirectory && !path.startsWith(`${nextDirectory}/`)) return [];
+      return [{ ...node, repository: "." }];
+    });
+    const ids = new Set(nodes.map((node) => node.id));
+    return {
+      ...snapshot,
+      root: nextDirectory,
+      parent: nextDirectory.slice(0, nextDirectory.lastIndexOf("/")) || "/",
+      focus: null,
+      nodes,
+      edges: snapshot.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)),
+    };
+  }
+  return null;
+}
+
+async function refresh(nextDirectory = directory, force = true) {
+  const generation = ++requestGeneration;
   $("refresh").disabled = true;
   $("refresh").textContent = "…";
   try {
-    const response = await fetch(nextDirectory ? `/api/overview?directory=${encodeURIComponent(nextDirectory)}` : "/api/overview");
-    const snapshot = await response.json();
-    if (!response.ok) throw new Error(snapshot.error || `HTTP ${response.status}`);
+    let snapshot = force ? null : cachedDirectory(nextDirectory);
+    if (!snapshot) {
+      const response = await fetch(nextDirectory ? `/api/overview?directory=${encodeURIComponent(nextDirectory)}` : "/api/overview");
+      snapshot = await response.json();
+      if (!response.ok) throw new Error(snapshot.error || `HTTP ${response.status}`);
+    }
+    if (generation !== requestGeneration) return;
+    if (force) directorySnapshots.clear();
+    directorySnapshots.set(snapshot.root, snapshot);
     data = prepareData(snapshot);
     directory = data.root;
     $("parent").disabled = !data.parent;
@@ -893,14 +937,17 @@ async function refresh(nextDirectory = directory) {
     $("message").textContent = data.warning || "";
     render();
   } catch (error) {
+    if (generation !== requestGeneration) return;
     $("message").hidden = false;
     $("message").textContent =
       `Could not read repository: ${error.message}. Use Refresh to try again.`;
     if (!data)
       $("canvas").replaceChildren(element("p", "empty", "Repository data is unavailable."));
   } finally {
-    $("refresh").disabled = false;
-    $("refresh").textContent = "↻";
+    if (generation === requestGeneration) {
+      $("refresh").disabled = false;
+      $("refresh").textContent = "↻";
+    }
   }
 }
 
@@ -910,7 +957,7 @@ function navigateDirectory(nextDirectory) {
   selected = null;
   initialFocusApplied = false;
   fitPending = true;
-  refresh(nextDirectory);
+  refresh(nextDirectory, false);
 }
 
 $("search").addEventListener("input", (event) => {
@@ -953,7 +1000,10 @@ $("collapse").addEventListener("click", () => {
     if (first) reveal(first.querySelector(".resource-header"));
   });
 });
-window.addEventListener("resize", scheduleLayout);
+window.addEventListener("resize", () => {
+  fitPending = true;
+  scheduleLayout();
+});
 document.addEventListener("keydown", (event) => {
   const direction = {
     ArrowLeft: [1, 0],
@@ -991,17 +1041,23 @@ $("canvas").addEventListener("pointerdown", (event) => {
   if (event.button === 0 && event.target.closest("details,button,input")) return;
   if (![0, 1, 2].includes(event.button)) return;
   event.preventDefault();
+  const outer = document.querySelector(".graph-stage > section")?.getBoundingClientRect();
   drag = {
     x: event.clientX,
     y: event.clientY,
     left: pan.x,
     top: pan.y,
+    moved: false,
+    parentClick: event.button === 0 && (!outer || event.clientX < outer.left ||
+      event.clientX > outer.right || event.clientY < outer.top || event.clientY > outer.bottom),
   };
   $("canvas").setPointerCapture(event.pointerId);
   $("canvas").classList.add("panning");
 });
 $("canvas").addEventListener("pointermove", (event) => {
   if (drag) {
+    if (Math.hypot(event.clientX - drag.x, event.clientY - drag.y) > 5) drag.moved = true;
+    if (!drag.moved) return;
     pan.x = drag.left + event.clientX - drag.x;
     pan.y = drag.top + event.clientY - drag.y;
     applyViewport();
@@ -1011,7 +1067,12 @@ function endDrag() {
   drag = null;
   $("canvas").classList.remove("panning");
 }
-$("canvas").addEventListener("pointerup", endDrag);
+$("canvas").addEventListener("pointerup", (event) => {
+  const parentClick = drag?.parentClick && !drag.moved &&
+    Math.hypot(event.clientX - drag.x, event.clientY - drag.y) <= 5;
+  endDrag();
+  if (parentClick && data?.parent) navigateDirectory(data.parent);
+});
 $("canvas").addEventListener("pointercancel", endDrag);
 $("canvas").addEventListener("contextmenu", (event) => event.preventDefault());
 $("canvas").addEventListener(
@@ -1028,4 +1089,4 @@ $("canvas").addEventListener(
 $("canvas").addEventListener("focusin", (event) => {
   if (event.target !== $("canvas")) requestAnimationFrame(() => reveal(event.target));
 });
-refresh();
+refresh(directory, false);

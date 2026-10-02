@@ -12,6 +12,7 @@ import re
 import sys
 import unicodedata
 import webbrowser
+from copy import deepcopy
 from dataclasses import dataclass, replace
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -71,18 +72,26 @@ class Viewer:  # noqa: D101
         self.overview_loaded = False
         self.overview_visible: list[TreeNode] = []
         self.overview_parents: list[int | None] = []
+        self.source_snapshots: dict[Path, tuple[dict[str, Any], str]] = {}
 
     def refresh_overview(self) -> None:
         """Rebuild the package overview from the current working tree."""
+        self.source_snapshots.clear()
+        self.load_overview()
+
+    def load_overview(self) -> None:
+        """Navigate within cached source snapshots without rereading declarations."""
         self.status = ""
         root = browser_root(self.cwd)
-        source = Viewer(root) if root != self.cwd else self
-        self.full_overview = source.package_entries(diff=False)
-        self.status = source.status
-        self.snapshot, self.full_overview = browser_snapshot(
-            root,
-            self.full_overview,
-        )
+        if root not in self.source_snapshots:
+            source = Viewer(root) if root != self.cwd else self
+            self.full_overview = source.package_entries(diff=False)
+            self.snapshot, self.full_overview = browser_snapshot(
+                root,
+                self.full_overview,
+            )
+            self.source_snapshots[root] = deepcopy(self.snapshot), source.status
+        self.snapshot, self.status = deepcopy(self.source_snapshots[root])
         self.snapshot, self.full_overview = scope_snapshot(self.snapshot, self.cwd)
         self.diff_overview = self.changed_nodes(self.full_overview)
         self.select_overview()
@@ -645,13 +654,13 @@ class Viewer:  # noqa: D101
         self.height = height
         if key in ("\x08", curses.KEY_BACKSPACE, "\x7f"):
             self.cwd = self.cwd.parent
-            self.refresh_overview()
+            self.load_overview()
             return
         if key in ("\n", "\r", curses.KEY_ENTER) and self.overview_visible:
             directory = self.overview_visible[self.selected].directory
             if directory is not None:
                 self.cwd = directory
-                self.refresh_overview()
+                self.load_overview()
                 return
         if not rows:
             return
