@@ -1146,6 +1146,179 @@ def test_args_git_views_compare_interfaces(repository: Path) -> None:
         raise AssertionError(message)
 
 
+def test_overview_details_preserve_documentation_and_source_facts(
+    repository: Path,
+) -> None:
+    """Expose structured declarations independently of terminal labels and layout."""
+    subject = import_module("packages.git-canonical.main")
+    package = repository / "packages/example"
+    package.mkdir(parents=True)
+    help_text = (
+        "First paragraph.\n\nArguments:\n  Documentation text.\n"
+        "Description: Still documentation."
+    )
+    (package / "default.nix").write_text('{ meta.description = "Example"; }\n')
+    (package / "main.py").write_text(
+        f'"""{help_text}"""\nimport argparse\n'
+        'raise RuntimeError("must not execute")\n'
+        "p = argparse.ArgumentParser()\ncommands = p.add_subparsers()\n"
+        'command = commands.add_parser("build")\n'
+        'command.add_argument("--jobs", default=2)\n',
+    )
+    (package / "test_main.py").write_text(
+        'raise RuntimeError("must not execute")\ndef test_result(): pass\n',
+    )
+    asset = package / "prm/nested/script.js"
+    asset.parent.mkdir(parents=True)
+    asset.write_text("/* eslint-disable no-alert */\n\n")
+    (asset.parent / "picture.png").write_bytes(b"binary\n")
+    (asset.parent / "linked.py").symlink_to(package / "main.py")
+    (package / "tmp").mkdir()
+    (package / "tmp/generated.py").write_text("runtime\n")
+    data = subject.overview_data(repository)
+    record = next(node for node in data["nodes"] if node["kind"] == "package")
+    details = record["details"]
+    if details["help"] != help_text or details["tests"] != ["test result"]:
+        msg = "Documentation and test sentences must be preserved as separate facts"
+        raise AssertionError(msg)
+    if details["cli"] != [
+        {"path": ["build"], "text": "command", "command": True},
+        {"path": ["build"], "text": "--jobs  optional; default=2", "command": False},
+    ]:
+        msg = "Structured CLI entries must retain their command ownership"
+        raise AssertionError(msg)
+    sources = {source["path"]: source for source in details["sources"]}
+    if set(sources) != {
+        "default.nix",
+        "main.py",
+        "test_main.py",
+        "prm/nested/script.js",
+    }:
+        msg = "Source inventories must exclude binary assets, links, and runtime output"
+        raise AssertionError(msg)
+    expected_lines = 2
+    if sources["prm/nested/script.js"]["lines"] != expected_lines or sources[
+        "prm/nested/script.js"
+    ]["suppressions"] != [
+        {"kind": "eslint-disable", "scope": "global", "count": 1},
+    ]:
+        msg = "Asset line counts and suppressions must be structured source facts"
+        raise AssertionError(msg)
+    if (
+        record["overview"] != subject.render_resource_overview(details)
+        or subject.overview_data(repository) != data
+    ):
+        msg = "Terminal summaries and deterministic snapshots must use the same facts"
+        raise AssertionError(msg)
+
+
+def test_overview_revision_sources_preserve_the_checkout_and_cover_all_resources(
+    repository: Path,
+) -> None:
+    """Read historical regular blobs with the same inventory as current sources."""
+    subject = import_module("packages.git-canonical.main")
+    for relative, content in (
+        ("packages/tool/default.nix", "{}\n"),
+        ("packages/tool/main.py", '"""Original help."""\n'),
+        ("packages/tool/prm/nested/script.js", "/* eslint-disable */\n"),
+        (
+            "hosts/laptop/configuration.nix",
+            (
+                "{ inputs, system, ... }: { environment.systemPackages = [ "
+                "inputs.self.packages.${system}.tool ]; }\n"
+            ),
+        ),
+        ("checks/laptopVmWithDisko/default.nix", "{}\n"),
+    ):
+        path = repository / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    (repository / "packages/tool/prm/linked.py").symlink_to("../main.py")
+    _git(repository, "add", ".")
+    _git(
+        repository,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "baseline",
+    )
+    baseline = subject.overview_data(repository)
+    historical = subject.overview_data(repository, revision="HEAD")
+    for before, after in zip(baseline["nodes"], historical["nodes"], strict=True):
+        if before.get("details") != after.get("details"):
+            msg = "Historical and current inventories must agree for identical sources"
+            raise AssertionError(msg)
+    (repository / "packages/tool/main.py").write_text('"""Changed help."""\n')
+    (repository / "packages/tool/prm/nested/script.js").unlink()
+    (repository / "hosts/laptop/configuration.nix").unlink()
+    (repository / "checks/laptopVmWithDisko/default.nix").unlink()
+    status = _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
+    head = _git(repository, "rev-parse", "HEAD")
+    if subject.overview_data(repository, revision="HEAD") != historical:
+        msg = "Historical snapshots must retain removed resources and source assets"
+        raise AssertionError(msg)
+    current = subject.overview_data(repository)
+    if any(node["kind"] in {"host", "check"} for node in current["nodes"]):
+        msg = "Current snapshots must reflect removed resource sources"
+        raise AssertionError(msg)
+    with pytest.raises(subject.CommandError, match="could not read revision"):
+        subject.overview_data(repository, revision="does-not-exist")
+    with pytest.raises(subject.CommandError, match="could not read revision"):
+        subject.overview_data(repository, revision="--help")
+    if (
+        _git(repository, "status", "--porcelain=v1", "--untracked-files=all") != status
+        or _git(repository, "rev-parse", "HEAD") != head
+    ):
+        msg = "Source inspection must preserve the index, working tree, and refs"
+        raise AssertionError(msg)
+    output = _run(repository, "overview", "--json", "--revision", "HEAD")
+    if json.loads(output.stdout) != historical:
+        msg = "Python and CLI revision snapshots must share their public contract"
+        raise AssertionError(msg)
+    _run(repository, "overview", "--revision", "HEAD", code=2)
+    (repository / "packages/tool/default.nix").unlink()
+    focused = subject.overview_data(repository / "packages/tool", revision="HEAD")
+    if focused["focus"] != ".:packages/tool" or focused["nodes"] != historical["nodes"]:
+        msg = "Historical focus must work when current package markers are removed"
+        raise AssertionError(msg)
+
+
+def test_overview_empty_home_roots_and_missing_history_are_explicit(
+    tmp_path: Path,
+) -> None:
+    """Recognize initialized home policy and distinguish absent HEAD from errors."""
+    subject = import_module("packages.git-canonical.main")
+    (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
+    child = tmp_path / "forge.example"
+    child.mkdir()
+    if (
+        subject.canonical_root(child) != tmp_path
+        or subject.overview_data(tmp_path)["profile"] != "home"
+    ):
+        msg = "Root discovery must recognize home policy before any submodules exist"
+        raise AssertionError(msg)
+    (tmp_path / ".gitignore").unlink()
+    (tmp_path / "flake.nix").write_text("{}\n")
+    historical = subject.overview_data(tmp_path, revision="HEAD")
+    if historical["nodes"] != [
+        {
+            "id": ".:repository",
+            "kind": "repository",
+            "name": ".",
+            "repository": ".",
+            "path": ".",
+            "profile": "flake",
+            "available": False,
+            "revision_available": False,
+        },
+    ]:
+        msg = "Missing history must remain explicit without inventing resources"
+        raise AssertionError(msg)
+
+
 def test_overview_moves_from_catalog_to_package_behavior(repository: Path) -> None:
     """Expose the reading path without executing the package or its tests."""
     _run(repository, "add", "packages/alpha", "python", "Alpha package")

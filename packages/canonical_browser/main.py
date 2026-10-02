@@ -22,34 +22,18 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 
 from git_canonical import (
     CliEntry,
-    detect_packages,
-    git,
-    home_repositories,
+    ResourceData,
+    canonical_root,
     overview_data,
-    package_cli,
-    package_overview,
-    source_cli_overview,
-    source_package_overview,
-    source_suppressions,
+    profile,
+    resource_data,
+    source_resource_data,
 )
 from git_canonical import CommandError as GitCanonicalError
 
 MAX_PORT = 65535
 MOUNT_FIELDS = 3
 EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
-SOURCE_SUFFIXES = {
-    ".nix",
-    ".py",
-    ".html",
-    ".js",
-    ".mjs",
-    ".css",
-    ".tex",
-    ".sh",
-    ".ts",
-    ".tsx",
-    ".jsx",
-}
 
 
 @dataclass
@@ -82,47 +66,46 @@ class RepositoryBrowser:
         """Scope cached declarations to the current directory."""
         root = browser_root(self.cwd)
         if root not in self.source_snapshots:
-            source = RepositoryBrowser(root)
-            snapshot, _ = browser_snapshot(root, source.package_entries())
-            self.source_snapshots[root] = deepcopy(snapshot), source.status
+            snapshot, _ = browser_snapshot(root)
+            self.source_snapshots[root] = deepcopy(snapshot), ""
         snapshot, self.status = deepcopy(self.source_snapshots[root])
         self.snapshot, _ = scope_snapshot(snapshot, self.cwd)
 
     def package_entries(self, *, diff: bool = False) -> list[TreeNode]:
         """Build a collapsible package tree with high-level changes."""
-        root = self.cwd
-        if (root / ".gitmodules").is_file() and not (root / "packages").is_dir():
-            return self.home_package_entries(root, diff=diff)
-        packages = root / "packages"
         try:
-            current_names = {package.name for package in detect_packages(root)}
+            current = overview_data(self.cwd)
+            previous = overview_data(self.cwd, revision="HEAD")
         except GitCanonicalError as exc:
             self.status = str(exc)
             return []
-        if not packages.is_dir():
-            return [TreeNode("packages/ (not found)")]
-        names = current_names
-        historic = git(
-            root,
-            ["ls-tree", "-d", "--name-only", "HEAD:packages"],
-            check=False,
-        )
-        has_history = diff or historic.returncode == 0
-        if historic.returncode == 0:
-            names = current_names | set(historic.stdout.splitlines())
-        return [
-            entry
-            for name in sorted(names)
-            if (
-                entry := self.package_entry(
-                    root,
-                    name,
-                    diff=has_history,
-                    only_changes=diff,
-                )
-            )
-            is not None
-        ]
+        validate_overview(current)
+        validate_overview(previous)
+        records = merge_overviews(current, previous)["nodes"]
+        tree: dict[str, Any] = {}
+        for record in records:
+            if record["kind"] != "package":
+                continue
+            entry = self.resource_entry(record)
+            if diff:
+                entry.children = self.changed_nodes(entry.children or [])
+                if not entry.children and entry.change is None:
+                    continue
+            branch = tree
+            for part in Path(record["repository"]).parts:
+                branch = branch.setdefault(part, {})
+            branch.setdefault("", []).append(entry)
+
+        def nodes(branch: dict[str, Any]) -> list[TreeNode]:
+            result = []
+            for name, children in sorted(branch.items()):
+                if name == "":
+                    result.extend(children)
+                else:
+                    result.append(TreeNode(name, nodes(children)))
+            return result
+
+        return nodes(tree)
 
     def package_entry(
         self,
@@ -134,45 +117,43 @@ class RepositoryBrowser:
     ) -> TreeNode | None:
         """Build one package summary or its high-level changes."""
         directory = root / "packages" / name
-        filenames = (
-            "default.nix",
-            "main.py",
-            "test_main.py",
-            "index.html",
-            "script.js",
-            "style.css",
-        )
-        current = package_overview(directory)
-        current_cli = package_cli(directory) if current else []
+        current = resource_data(directory)
         if not diff:
             return TreeNode(
                 f"packages/{name}",
-                self.summary_tree(current, cli=current_cli) if current else None,
+                self.details_tree(current) if current["sources"] else None,
             )
-        previous_files = {}
-        for filename in filenames:
-            completed = git(
-                root,
-                ["show", f"HEAD:packages/{name}/{filename}"],
-                check=False,
-            )
-            if completed.returncode == 0:
-                previous_files[filename] = completed.stdout
-        previous = self.package_summary(name, previous_files)
-        if only_changes and previous == current:
-            return None
-        previous_cli = (
-            source_cli_overview(previous_files.get("main.py")) if previous else []
+        snapshot = overview_data(root, revision="HEAD")
+        validate_overview(snapshot)
+        previous = next(
+            (
+                record["details"]
+                for record in snapshot["nodes"]
+                if record["id"] == f".:packages/{name}"
+            ),
+            source_resource_data(name, {}),
         )
-        summary_tree = self.merged_summary_tree(
-            previous,
-            current,
-            previous_cli=previous_cli,
-            current_cli=current_cli,
-        )
+        summary_tree = self.merged_details_tree(previous, current)
         if only_changes:
             summary_tree = self.changed_nodes(summary_tree)
+            if not summary_tree:
+                return None
         return TreeNode(f"packages/{name}", summary_tree or None)
+
+    @classmethod
+    def resource_entry(cls, record: dict[str, Any]) -> TreeNode:
+        """Render a resource identity and its structured source comparison."""
+        current = record.get(
+            "details",
+            source_resource_data(record["name"], {}, path=record["path"]),
+        )
+        previous = record.get("previous_details")
+        children = (
+            cls.merged_details_tree(previous, current)
+            if previous is not None
+            else cls.details_tree(current)
+        )
+        return TreeNode(record["path"], children, change=record.get("change"))
 
     @classmethod
     def changed_nodes(cls, nodes: list[TreeNode]) -> list[TreeNode]:
@@ -186,96 +167,43 @@ class RepositoryBrowser:
                 result.append(replace(node, children=children))
         return result
 
-    def home_package_entries(self, root: Path, *, diff: bool) -> list[TreeNode]:
-        """Build repository summaries beneath their home-repository paths."""
-        try:
-            repositories = home_repositories(root, require_url=False)
-        except GitCanonicalError as exc:
-            self.status = str(exc)
-            return []
-        tree: dict[str, Any] = {}
-        for item in repositories:
-            relative = item["path"]
-            repository = root / relative
-            if not (repository / "packages").is_dir():
-                continue
-            viewer = RepositoryBrowser(repository)
-            entries = viewer.package_entries(diff=diff)
-            if viewer.status:
-                self.status = viewer.status
-            if not entries:
-                continue
-            branch = tree
-            parts = Path(relative).parts
-            for part in parts[:-1]:
-                branch = branch.setdefault(part, {})
-            branch[parts[-1]] = {"": entries}
-
-        def nodes(branch: dict[str, Any]) -> list[TreeNode]:
-            result = []
-            for name, children in sorted(branch.items()):
-                if name == "":
-                    result.extend(children)
-                else:
-                    result.append(TreeNode(name, nodes(children)))
-            return result
-
-        return nodes(tree)
-
     @staticmethod
-    def summary_tree(
-        summary: str,
+    def details_tree(
+        data: ResourceData,
         *,
         cli: list[CliEntry] | None = None,
     ) -> list[TreeNode]:
-        """Convert the displayed summary into fields and grouped detail nodes."""
-        lines = summary.splitlines()
-        arguments_start = next(
-            (index for index, line in enumerate(lines) if line == "Arguments:"),
-            len(lines),
-        )
-        fields = [TreeNode(line) for line in lines[:arguments_start]]
-        for group in ("Arguments", "Dependencies", "Tests", "Suppressions"):
-            if f"{group}:" not in lines:
-                continue
-            start = lines.index(f"{group}:")
-            end = next(
-                (
-                    index
-                    for index in range(start + 1, len(lines))
-                    if not lines[index].startswith("  ")
-                ),
-                len(lines),
-            )
-            children = [
-                TreeNode(line.strip(), warning=line.strip().startswith("(unavailable:"))
-                for line in lines[start + 1 : end]
-            ]
-            if group == "Suppressions":
-                children = RepositoryBrowser.suppression_tree(summary, summary)
-            if group == "Arguments" and cli is not None:
-                children = RepositoryBrowser.cli_tree(cli)
-            children = RepositoryBrowser.declared_children(children)
-            if children:
-                fields.append(TreeNode(group, children))
-        return fields
+        """Render source facts without parsing the terminal overview."""
+        return RepositoryBrowser.merged_details_tree(data, data, current_cli=cli)
 
     @classmethod
-    def merged_summary_tree(
+    def merged_details_tree(
         cls,
-        previous: str,
-        current: str,
+        previous: ResourceData,
+        current: ResourceData,
         *,
         previous_cli: list[CliEntry] | None = None,
         current_cli: list[CliEntry] | None = None,
     ) -> list[TreeNode]:
-        """Show summary changes inline at their existing field and group positions."""
-        old_lines, new_lines = previous.splitlines(), current.splitlines()
-        old_fields = {line.partition(":")[0]: line for line in old_lines if ":" in line}
-        new_fields = {line.partition(":")[0]: line for line in new_lines if ":" in line}
+        """Show changes to structured facts at their existing field positions."""
         result = []
-        for field in ("Name", "Description", "Help"):
-            before, after = old_fields.get(field), new_fields.get(field)
+        for field, old, new, fallback in (
+            ("Name", previous["name"], current["name"], ""),
+            (
+                "Description",
+                previous["description"],
+                current["description"],
+                "(not declared)",
+            ),
+            (
+                "Help",
+                previous["help"],
+                current["help"],
+                "(module docstring not declared)",
+            ),
+        ):
+            before = f"{field}: {old or fallback}" if previous["sources"] else None
+            after = f"{field}: {new or fallback}" if current["sources"] else None
             if before == after:
                 if after is not None:
                     result.append(TreeNode(after))
@@ -285,8 +213,8 @@ class RepositoryBrowser:
                 if after is not None:
                     result.append(TreeNode(f"+ {after}", change="added"))
         for group in ("Arguments", "Dependencies", "Tests", "Suppressions"):
-            old_entries = cls.summary_group(previous, group)
-            new_entries = cls.summary_group(current, group)
+            old_entries = cls.detail_group(previous, group)
+            new_entries = cls.detail_group(current, group)
             children = [
                 TreeNode(f"- {item}", change="removed")
                 for item in old_entries
@@ -302,8 +230,13 @@ class RepositoryBrowser:
             )
             if group == "Suppressions":
                 children = cls.suppression_tree(previous, current)
-            if group == "Arguments" and current_cli is not None:
-                children = cls.cli_tree(current_cli, previous=previous_cli)
+            if group == "Arguments":
+                children = cls.cli_tree(
+                    cls.cli_entries(current) if current_cli is None else current_cli,
+                    previous=cls.cli_entries(previous)
+                    if previous_cli is None
+                    else previous_cli,
+                )
             children = cls.declared_children(children)
             if children:
                 result.append(TreeNode(group, children))
@@ -319,22 +252,26 @@ class RepositoryBrowser:
         ]
 
     @classmethod
-    def suppression_tree(cls, previous: str, current: str) -> list[TreeNode]:
+    def suppression_tree(
+        cls,
+        previous: ResourceData,
+        current: ResourceData,
+    ) -> list[TreeNode]:
         """Group suppression counts and their changes beneath each source filename."""
 
-        def counts(summary: str) -> dict[str, int]:
-            result = {}
-            for entry in cls.summary_group(summary, "Suppressions"):
-                label, separator, count = entry.rpartition(": ")
-                if separator and count.isdecimal():
-                    result[label] = int(count)
-            return result
+        def counts(data: ResourceData) -> dict[tuple[str, str, str], int]:
+            return {
+                (source["path"], item["kind"], item["scope"]): item["count"]
+                for source in data["sources"]
+                for item in source["suppressions"]
+            }
 
         before, after = counts(previous), counts(current)
         files: dict[str, list[TreeNode]] = {}
-        for label in sorted(before.keys() | after.keys()):
-            old, new = before.get(label, 0), after.get(label, 0)
-            filename, _, kind = label.partition(": ")
+        for key in sorted(before.keys() | after.keys()):
+            old, new = before.get(key, 0), after.get(key, 0)
+            filename, kind, scope = key
+            kind = f"{kind} ({scope})"
             children = files.setdefault(filename, [])
             if old == new:
                 children.append(TreeNode(f"{kind}: {new}"))
@@ -390,27 +327,37 @@ class RepositoryBrowser:
         return roots
 
     @staticmethod
-    def summary_group(summary: str, name: str) -> list[str]:
-        """Return indented entries in a named summary group."""
-        lines = summary.splitlines()
-        start = next(
-            (index for index, line in enumerate(lines) if line == f"{name}:"),
-            len(lines),
-        )
-        if start == len(lines):
-            return []
-        entries = []
-        for line in lines[start + 1 :]:
-            if line and not line.startswith("  "):
-                break
-            if line.startswith("  "):
-                entries.append(line.strip())
-        return entries
+    def cli_entries(data: ResourceData) -> list[CliEntry]:
+        """Adapt the shared command records to the browser's nested rendering."""
+        if error := data["diagnostics"].get("cli"):
+            return [CliEntry((), f"(unavailable: {error})")]
+        return [
+            CliEntry(tuple(row["path"]), row["text"], row["command"])
+            for row in data["cli"]
+        ]
 
     @staticmethod
-    def package_summary(name: str, files: dict[str, str]) -> str:
-        """Render the user-facing package fields from source file contents."""
-        return source_package_overview(name, files) if files else ""
+    def detail_group(data: ResourceData, name: str) -> list[str]:
+        """Format a structured group only when creating display nodes."""
+        key = {
+            "Arguments": "cli",
+            "Dependencies": "dependencies",
+            "Tests": "tests",
+        }.get(name)
+        if key and (error := data["diagnostics"].get(key)):
+            return [f"(unavailable: {error})"]
+        if name == "Arguments":
+            return [entry.render() for entry in RepositoryBrowser.cli_entries(data)]
+        if name == "Dependencies":
+            return [
+                f"{item['kind']}: {item['target']}" for item in data["dependencies"]
+            ]
+        return data["tests"] if name == "Tests" else []
+
+    @staticmethod
+    def package_data(name: str, files: dict[str, str]) -> ResourceData:
+        """Use the backend's structured analysis for source snapshots."""
+        return source_resource_data(name, files)
 
     @classmethod
     def has_warning(cls, node: TreeNode) -> bool:
@@ -496,57 +443,74 @@ def machine_resource(
     }
 
 
-def merge_dependency_changes(
-    data: dict[str, Any],
-    resources: dict[str, TreeNode],
-) -> None:
-    """Attach semantic dependency changes to the graph's relationships."""
-    known = {node["id"] for node in data["nodes"]}
-    for identifier, tree in resources.items():
-        repository = identifier.split(":", 1)[0]
-        dependencies = next(
-            (child for child in tree.children or [] if child.title == "Dependencies"),
-            None,
+def validate_overview(data: dict[str, Any]) -> None:
+    """Reject incompatible source contracts before interpreting their records."""
+    version = data.get("schema_version")
+    if (
+        data.get("schema") != "canonical.overview"
+        or type(version) is not int
+        or version != 1
+    ):
+        msg = (
+            f"Unsupported Canonical overview schema: {data.get('schema')!r}, "
+            f"version {version!r}"
         )
-        for child in dependencies.children or [] if dependencies else []:
-            match = re.fullmatch(r"[-+] ([^:]+): (packages/\S+)", child.title)
-            if not match or child.change not in ("removed", "added"):
-                continue
-            source = f"{repository}:{match[2]}"
-            change = child.change
-            edge = next(
-                (
-                    edge
-                    for edge in data["edges"]
-                    if edge["source"] == source
-                    and edge["target"] == identifier
-                    and edge["kind"] == match[1]
-                ),
-                None,
+        raise ValueError(msg)
+
+
+def merge_overviews(
+    current: dict[str, Any],
+    previous: dict[str, Any],
+) -> dict[str, Any]:
+    """Annotate resource and relationship changes using their structured identities."""
+    validate_overview(current)
+    validate_overview(previous)
+    data = deepcopy(current)
+    old = {node["id"]: node for node in previous["nodes"]}
+    new = {node["id"]: node for node in data["nodes"]}
+    historical = {
+        node["repository"]
+        for node in previous["nodes"]
+        if node["kind"] == "repository" and node.get("revision_available", False)
+    }
+    for identifier in sorted(old.keys() | new.keys()):
+        before, after = old.get(identifier), new.get(identifier)
+        record = after if after is not None else deepcopy(before)
+        if record is None or record["repository"] not in historical:
+            continue
+        if after is None:
+            record["removed"] = True
+            record["change"] = "removed"
+            data["nodes"].append(record)
+        elif before is None and record["kind"] in {"package", "host", "check"}:
+            record["change"] = "added"
+        if record["kind"] in {"package", "host", "check"}:
+            empty = source_resource_data(record["name"], {}, path=record["path"])
+            record["previous_details"] = (
+                before["details"] if before is not None else empty
             )
-            if edge is not None:
-                edge["change"] = change
-                continue
-            if source not in known:
-                data["nodes"].append(
-                    {
-                        "id": source,
-                        "kind": "package-reference",
-                        "repository": repository,
-                        "path": match[2],
-                        "name": match[2].removeprefix("packages/"),
-                        "removed": change == "removed",
-                    },
-                )
-                known.add(source)
-            data["edges"].append(
-                {
-                    "source": source,
-                    "target": identifier,
-                    "kind": match[1],
-                    "change": change,
-                },
-            )
+            if after is None:
+                record["details"] = empty
+
+    def key(edge: dict[str, Any]) -> tuple[str, str, str]:
+        return edge["source"], edge["target"], edge["kind"]
+
+    old_edges = {key(edge) for edge in previous["edges"]}
+    new_edges = {key(edge) for edge in data["edges"]}
+    repositories = {node["id"]: node["repository"] for node in data["nodes"]}
+    for edge in data["edges"]:
+        if (
+            repositories.get(edge["target"]) in historical
+            and key(edge) not in old_edges
+        ):
+            edge["change"] = "added"
+    data["edges"].extend(
+        {**deepcopy(edge), "change": "removed"}
+        for edge in previous["edges"]
+        if key(edge) not in new_edges and repositories.get(edge["target"]) in historical
+    )
+    data["nodes"].sort(key=lambda record: record["id"])
+    return data
 
 
 def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
@@ -557,7 +521,7 @@ def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
         tree.children = [TreeNode(detail) for detail in record["details"]]
     elif record["kind"] == "host":
         record["icon"] = "nixos"
-        tree.children = [TreeNode("OS: NixOS (configuration)")]
+        tree.children = [TreeNode("OS: NixOS (configuration)"), *(tree.children or [])]
     elif record["kind"] == "repository":
         tree.title = record["repository"]
         tree.children = [TreeNode(f"Profile: {record.get('profile', 'flake')}")]
@@ -565,59 +529,26 @@ def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
 
 
 def package_sources(directory: Path) -> list[TreeNode]:
-    """Count physical lines in package sources and source assets under prm/."""
-    if not directory.is_dir() or directory.is_symlink():
-        return []
-    candidates = list(directory.iterdir())
-    resources = directory / "prm"
-    if resources.is_dir() and not resources.is_symlink():
-        for parent, folders, files in os.walk(resources, followlinks=False):
-            folders[:] = [
-                child
-                for child in folders
-                if not child.startswith(".") and not (Path(parent) / child).is_symlink()
-            ]
-            candidates.extend(Path(parent) / filename for filename in files)
+    """Render the backend's conventional source inventory."""
+    return source_nodes(resource_data(directory))
+
+
+def source_nodes(data: ResourceData) -> list[TreeNode]:
+    """Convert physical source records into browser detail rows."""
     result = []
-    for path in sorted(candidates):
-        if (
-            path.suffix not in SOURCE_SUFFIXES
-            or path.is_symlink()
-            or not path.is_file()
-        ):
-            continue
-        name = str(path.relative_to(directory))
-        try:
-            content = path.read_bytes()
-        except OSError as error:
-            children = [TreeNode(f"(unavailable: {error.strerror})", warning=True)]
+    for source in data["sources"]:
+        if source["diagnostic"]:
+            children = [
+                TreeNode(f"(unavailable: {source['diagnostic']})", warning=True),
+            ]
         else:
-            children = [TreeNode(f"Lines: {len(content.splitlines())}")]
-            counts = source_suppressions(name, content.decode(errors="replace"))
+            children = [TreeNode(f"Lines: {source['lines']}")]
             children.extend(
-                TreeNode(f"{kind} ({scope}): {count}")
-                for (kind, scope), count in sorted(counts.items())
+                TreeNode(f"{item['kind']} ({item['scope']}): {item['count']}")
+                for item in source["suppressions"]
             )
-        result.append(TreeNode(name, children, source_file=True))
+        result.append(TreeNode(source["path"], children, source_file=True))
     return result
-
-
-def source_metrics(sources: list[TreeNode]) -> dict[str, dict[str, int]]:
-    """Keep current physical source totals independent of semantic diff rows."""
-    lines = {}
-    suppressions: dict[str, int] = {}
-    for source in sources:
-        if Path(source.title).parts[0] == "prm":
-            continue
-        for child in source.children or []:
-            label, separator, count = child.title.rpartition(": ")
-            if not separator or not count.isdecimal():
-                continue
-            if label == "Lines":
-                lines[source.title] = int(count)
-            else:
-                suppressions[label] = suppressions.get(label, 0) + int(count)
-    return {"lines": lines, "suppressions": suppressions}
 
 
 def directory_disk_size(directory: Path) -> int:
@@ -682,6 +613,8 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
     directory: Path,
     tree: TreeNode,
     sources: list[TreeNode] | None = None,
+    *,
+    dependency_source: str = "default.nix",
 ) -> TreeNode:
     """Organize declarations beneath their source files, preserving semantic diffs."""
     files = {
@@ -728,7 +661,7 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
             name = {
                 "Arguments": "main.py",
                 "Tests": "test_main.py",
-                "Dependencies": "default.nix",
+                "Dependencies": dependency_source,
             }[node.title]
             attach(name, node)
         elif title.startswith("Help:"):
@@ -748,45 +681,20 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
     return tree
 
 
-def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationships
+def browser_snapshot(
     root: Path,
-    semantic_tree: list[TreeNode],
 ) -> tuple[dict[str, Any], list[TreeNode]]:
     """Build the machine and repository model for the web browser."""
     try:
-        data = overview_data(root)
+        current = overview_data(root)
     except GitCanonicalError:
-        if any(
-            (root / name).exists()
-            for name in ("flake.nix", ".gitmodules", "packages", "hosts", "checks")
-        ):
+        if profile(root, "directory") != "directory":
             raise
         return directory_snapshot(root)
+    validate_overview(current)
+    previous = overview_data(root, revision="HEAD")
+    data = merge_overviews(current, previous)
     resources: dict[str, TreeNode] = {}
-
-    def index(nodes: list[TreeNode], path: tuple[str, ...] = ()) -> None:
-        for node in nodes:
-            if node.title.startswith("packages/"):
-                resources[f"{'/'.join(path) or '.'}:{node.title}"] = node
-            else:
-                index(node.children or [], (*path, node.title))
-
-    index(semantic_tree)
-    known = {node["id"] for node in data["nodes"]}
-    for identifier in resources:
-        if identifier not in known:
-            repository, path = identifier.split(":", 1)
-            data["nodes"].append(
-                {
-                    "id": identifier,
-                    "kind": "package",
-                    "name": path.removeprefix("packages/"),
-                    "path": path,
-                    "repository": repository,
-                    "removed": True,
-                },
-            )
-    merge_dependency_changes(data, resources)
     machine = machine_resource()
     data["machine"] = machine
     data["nodes"].insert(0, machine)
@@ -799,14 +707,20 @@ def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationsh
         identifier = record["id"]
         tree = resource_tree(
             record,
-            resources.get(identifier, TreeNode(record["path"], [])),
+            RepositoryBrowser.resource_entry(record)
+            if record["kind"] in {"package", "host", "check"}
+            else TreeNode(record["path"], [], change=record.get("change")),
         )
-        if record["kind"] in {"package", "host"}:
+        if record["kind"] in {"package", "host", "check"}:
             directory = root / record["repository"] / record["path"]
-            sources = package_sources(directory)
-            record["source_metrics"] = source_metrics(sources)
-            if record["kind"] == "package":
-                tree = package_file_tree(directory, tree, sources)
+            details = record["details"]
+            record["source_metrics"] = details["source_metrics"]
+            tree = package_file_tree(
+                directory,
+                tree,
+                source_nodes(details),
+                dependency_source=details["dependency_source"],
+            )
         links = [
             TreeNode(
                 f"{edge['kind']}: {edge['source']} → {edge['target']}",
@@ -851,14 +765,7 @@ def gui_data(root: Path) -> dict[str, Any]:
 
 def browser_root(directory: Path) -> Path:
     """Find the nearest Canonical source root for a directory-scoped view."""
-    return next(
-        (
-            parent
-            for parent in (directory, *directory.parents)
-            if any((parent / name).exists() for name in ("flake.nix", ".gitmodules"))
-        ),
-        directory,
-    )
+    return canonical_root(directory)
 
 
 def browser_parent(directory: Path) -> Path | None:
@@ -1173,7 +1080,7 @@ def main(argv: list[str] | None = None) -> None:
         "directory",
         nargs="?",
         type=Path,
-        default=Path.cwd(),
+        default=Path(),
         help="initial directory (default: current directory)",
     )
     parser.add_argument(

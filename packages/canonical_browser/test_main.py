@@ -18,13 +18,258 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 import pytest
-from git_canonical import CliEntry, source_cli_overview
+from git_canonical import (
+    CliEntry,
+    overview_data,
+    resource_data,
+    source_cli_overview,
+    source_package_cli,
+)
 
 from packages.canonical_browser import main as app
 
 TEST_MODIFIED_CHANGE = "modified"
 TEST_PARSER_ERROR = 2
 TEST_REPOSITORY_FIELDS = 3
+
+
+def commit_sources(root: Path) -> None:
+    """Record an isolated baseline without changing the user's Git configuration."""
+    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(root),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "-qm",
+            "baseline",
+        ],
+        check=True,
+    )
+
+
+class TestBoundary(unittest.TestCase):
+    """Verify the source contract through complete browser snapshots."""
+
+    def test_multiline_help_changes_remain_under_the_source_file(self) -> None:
+        """Documentation containing summary labels must retain every paragraph."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            source = root / "packages/example/main.py"
+            source.parent.mkdir(parents=True)
+            before = (
+                "First paragraph.\n\nDependencies:\n"
+                "  Documentation, not declarations.\nOriginal last paragraph."
+            )
+            source.write_text(
+                f'"""{before}"""\nraise RuntimeError("must not execute")\n',
+            )
+            commit_sources(root)
+            after = before.replace("Original", "Changed")
+            source.write_text(
+                f'"""{after}"""\nraise RuntimeError("must not execute")\n',
+            )
+            snapshot = app.gui_data(root)
+        package = next(node for node in snapshot["nodes"] if node["kind"] == "package")
+        file = next(
+            child
+            for child in package["tree"]["children"]
+            if child["title"] == "main.py"
+        )
+        documentation = [
+            (child["title"], child["change"])
+            for child in file["children"]
+            if child["change"]
+        ]
+        if documentation != [("- " + before, "removed"), ("+ " + after, "added")]:
+            msg = "Multiline documentation must be compared as a complete source fact"
+            raise AssertionError(msg)
+        if any(child["title"] == "Dependencies" for child in file["children"]):
+            msg = "Documentation labels must not become declaration groups"
+            raise AssertionError(msg)
+
+    def test_prm_suppression_edits_and_deleted_sources_keep_changes(self) -> None:
+        """Current and historical asset inventories must use the same source rules."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text("{}\n")
+            asset = package / "prm/nested/script.js"
+            asset.parent.mkdir(parents=True)
+            asset.write_text("/* eslint-disable no-alert */\n")
+            commit_sources(root)
+            asset.write_text(
+                "/* eslint-disable no-alert */\n/* eslint-disable no-console */\n",
+            )
+            changed = app.gui_data(root)
+            asset.unlink()
+            removed = app.gui_data(root)
+        for snapshot, transition, change in (
+            (changed, "1 → 2", "modified"),
+            (removed, "1 → 0", "removed"),
+        ):
+            package = next(
+                node for node in snapshot["nodes"] if node["kind"] == "package"
+            )
+            source_node = next(
+                child
+                for child in package["tree"]["children"]
+                if child["title"] == "prm/nested/script.js"
+            )
+            if not any(
+                child["title"] == f"eslint-disable (global): {transition}"
+                and child["change"] == change
+                for child in source_node["children"]
+            ):
+                msg = (
+                    "Tracked asset suppression changes must retain their source parents"
+                )
+                raise AssertionError(msg)
+        if any(
+            child["title"].startswith("Lines:") for child in source_node["children"]
+        ):
+            msg = "A removed source must not claim current line counts"
+            raise AssertionError(msg)
+
+    def test_empty_home_and_host_only_flake_have_no_fabricated_packages(self) -> None:
+        """Only backend resource identities may appear in the browser graph."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
+            child = root / "forge.example"
+            child.mkdir()
+            if app.browser_root(child) != root:
+                msg = "Empty home layouts must share the backend's root recognition"
+                raise AssertionError(msg)
+            home = app.gui_data(root)
+            (root / ".gitignore").unlink()
+            (root / "flake.nix").write_text("{}\n")
+            source = root / "hosts/laptop/configuration.nix"
+            source.parent.mkdir(parents=True)
+            source.write_text("{}\n")
+            flake = app.gui_data(root)
+        if [node["id"] for node in home["nodes"]] != [".:repository"]:
+            msg = "An empty home must not fabricate a removed packages directory"
+            raise AssertionError(msg)
+        if any(node["kind"] == "package" for node in flake["nodes"]):
+            msg = "Host-only flakes must not fabricate package resources"
+            raise AssertionError(msg)
+
+    def test_host_dependency_removals_and_deleted_hosts_and_checks_are_visible(
+        self,
+    ) -> None:
+        """Historical source comparisons must cover every Canonical resource kind."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            host = root / "hosts/laptop/configuration.nix"
+            host.parent.mkdir(parents=True)
+            host.write_text(
+                "{ inputs, system, ... }: { environment.systemPackages = [ "
+                "inputs.self.packages.${system}.tool ]; }\n",
+            )
+            check = root / "checks/laptopVmWithDisko/default.nix"
+            check.parent.mkdir(parents=True)
+            check.write_text("{}\n")
+            commit_sources(root)
+            host.write_text("{}\n")
+            changed = app.gui_data(root)
+            host.unlink()
+            check.unlink()
+            removed = app.gui_data(root)
+        edge = next(edge for edge in changed["edges"] if edge["kind"] == "runtime")
+        if (
+            edge["change"] != "removed"
+            or edge["declaration"]["path"] != "hosts/laptop/configuration.nix"
+        ):
+            msg = "Host dependency removals must retain their declaration metadata"
+            raise AssertionError(msg)
+        host_record = next(node for node in changed["nodes"] if node["kind"] == "host")
+        if "- runtime: packages/tool" not in json.dumps(host_record["tree"]):
+            msg = "Host dependency removals must appear in the source details"
+            raise AssertionError(msg)
+        records = {node["id"]: node for node in removed["nodes"]}
+        for identifier in (".:hosts/laptop", ".:checks/laptopVmWithDisko"):
+            if (
+                not records[identifier]["removed"]
+                or records[identifier]["tree"]["change"] != "removed"
+            ):
+                msg = (
+                    "Deleted hosts and checks must remain visible as removed resources"
+                )
+                raise AssertionError(msg)
+        host_tree = records[".:hosts/laptop"]["tree"]
+        source = next(
+            child
+            for child in host_tree["children"]
+            if child["title"] == "configuration.nix"
+        )
+        if not any(child["title"] == "Dependencies" for child in source["children"]):
+            msg = "Removed host dependencies must retain their original source filename"
+            raise AssertionError(msg)
+
+    def test_schema_versions_are_checked_and_added_fields_are_allowed(self) -> None:
+        """Reject incompatible documents before rendering, without mutating inputs."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            current = overview_data(root)
+            previous = overview_data(root, revision="HEAD")
+            for version in (None, 0, 2, "1", True):
+                with (
+                    self.subTest(version=version),
+                    patch.object(
+                        app,
+                        "overview_data",
+                        return_value={**current, "schema_version": version},
+                    ),
+                    pytest.raises(
+                        ValueError,
+                        match="Unsupported Canonical overview schema",
+                    ),
+                ):
+                    app.browser_snapshot(root)
+            with (
+                patch.object(
+                    app,
+                    "overview_data",
+                    side_effect=[current, {**previous, "schema": "other.overview"}],
+                ),
+                pytest.raises(
+                    ValueError,
+                    match="Unsupported Canonical overview schema",
+                ),
+            ):
+                app.browser_snapshot(root)
+            current["future_field"] = {"optional": True}
+            original = json.dumps(current)
+            with patch.object(app, "overview_data", side_effect=[current, previous]):
+                snapshot, _ = app.browser_snapshot(root)
+            if (
+                snapshot["future_field"] != {"optional": True}
+                or json.dumps(current) != original
+            ):
+                msg = "Optional fields must survive without modifying backend snapshots"
+                raise AssertionError(msg)
+
+    def test_browser_cli_is_statically_discoverable(self) -> None:
+        """The browser's own interface must remain visible to Canonical inspection."""
+        entries = source_package_cli(Path(app.__file__).read_bytes(), "main.py")
+        if not all(
+            any(entry.text.startswith(name) for entry in entries)
+            for name in ("directory", "--no-open", "--port")
+        ):
+            msg = "Canonical inspection must discover every browser CLI parameter"
+            raise AssertionError(msg)
 
 
 class TestGui(unittest.TestCase):
@@ -349,42 +594,20 @@ class TestGui(unittest.TestCase):
                     raise AssertionError(msg)
 
     def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
-        """Both renderers retain removed providers and their relationships."""
-        tree = [
-            app.TreeNode(
-                "packages/consumer",
-                [
-                    app.TreeNode(
-                        "Dependencies",
-                        [
-                            app.TreeNode("- build: packages/old", change="removed"),
-                        ],
-                    ),
-                ],
-            ),
-        ]
-        with patch.object(
-            app,
-            "overview_data",
-            return_value={
-                "nodes": [
-                    {
-                        "id": ".:repository",
-                        "kind": "repository",
-                        "repository": ".",
-                        "path": ".",
-                    },
-                    {
-                        "id": ".:packages/consumer",
-                        "kind": "package",
-                        "repository": ".",
-                        "path": "packages/consumer",
-                    },
-                ],
-                "edges": [],
-            },
-        ):
-            snapshot, nodes = app.browser_snapshot(Path("/workspace"), tree)
+        """Retain removed providers and declaration metadata in both views."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/consumer"
+            package.mkdir(parents=True)
+            source = package / "default.nix"
+            source.write_text(
+                "{ inputs, system, ... }: { buildInputs = [ "
+                "inputs.self.packages.${system}.old ]; }\n",
+            )
+            commit_sources(root)
+            source.write_text("{}\n")
+            snapshot = app.gui_data(root)
         records = {record["id"]: record for record in snapshot["nodes"]}
         if not records[".:packages/old"]["removed"]:
             msg = "Removed dependency providers must remain in the shared snapshot"
@@ -393,8 +616,12 @@ class TestGui(unittest.TestCase):
         if connections["children"][0]["change"] != "removed":
             msg = "Connections must retain the same change colors as GUI arrows"
             raise AssertionError(msg)
-        if snapshot["edges"][0]["change"] != "removed" or not nodes:
-            msg = "Both the tree and graphical relationship must preserve removal"
+        edge = next(edge for edge in snapshot["edges"] if edge["kind"] == "build")
+        if (
+            edge["change"] != "removed"
+            or edge["declaration"]["path"] != "packages/consumer/default.nix"
+        ):
+            msg = "Removed arrows must preserve their source declarations"
             raise AssertionError(msg)
 
     def test_web_browser_launch_and_port_validation(self) -> None:
@@ -486,73 +713,29 @@ class TestGui(unittest.TestCase):
                     thread.join(timeout=5)
 
     def test_gui_preserves_shared_resource_details_and_changes(self) -> None:
-        """Both representations use the same machine, resources, and change colors."""
-        root = Path("/workspace")
-        nodes = [
-            app.TreeNode(
-                "packages/sample",
-                [
-                    app.TreeNode(
-                        "Tests",
-                        [
-                            app.TreeNode("+ test new", change="added"),
-                            app.TreeNode("- test old", change="removed"),
-                        ],
-                    ),
-                ],
-            ),
-        ]
-        with (
-            patch.object(
-                app,
-                "overview_data",
-                return_value={
-                    "nodes": [
-                        {
-                            "id": ".:repository",
-                            "kind": "repository",
-                            "repository": ".",
-                            "path": ".",
-                            "profile": "flake",
-                        },
-                        {
-                            "id": ".:packages/sample",
-                            "kind": "package",
-                            "repository": ".",
-                            "path": "packages/sample",
-                            "name": "sample",
-                            "package_type": "python",
-                        },
-                        {
-                            "id": ".:hosts/laptop",
-                            "kind": "host",
-                            "repository": ".",
-                            "path": "hosts/laptop",
-                            "name": "laptop",
-                        },
-                        {
-                            "id": ".:checks/sample",
-                            "kind": "check",
-                            "repository": ".",
-                            "path": "checks/sample",
-                            "name": "sample",
-                        },
-                    ],
-                    "edges": [
-                        {
-                            "source": ".:packages/sample",
-                            "target": ".:checks/sample",
-                            "kind": "checked-by",
-                        },
-                    ],
-                },
-            ),
-            patch.object(app.RepositoryBrowser, "package_entries", return_value=nodes),
-        ):
+        """Both representations use the same resources and structured changes."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            for relative, source in (
+                ("packages/sample/default.nix", "{}\n"),
+                ("packages/sample/test_main.py", "def test_old(): pass\n"),
+                ("hosts/laptop/configuration.nix", "{}\n"),
+                ("checks/sample/default.nix", "{}\n"),
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+            commit_sources(root)
+            (root / "packages/sample/test_main.py").write_text("def test_new(): pass\n")
             snapshot = app.gui_data(root)
         records = {record["id"]: record for record in snapshot["nodes"]}
         repository = snapshot["tree"][0]
-        package = repository["children"][0]
+        package = next(
+            child
+            for child in repository["children"]
+            if child["resource_id"] == ".:packages/sample"
+        )
         if package != records[".:packages/sample"]["tree"]:
             msg = "Package details must match their resource record"
             raise AssertionError(msg)
@@ -565,8 +748,8 @@ class TestGui(unittest.TestCase):
         file = next(
             child for child in package["children"] if child["title"] == "test_main.py"
         )
-        leaves = file["children"][0]["children"]
-        if [node["change"] for node in leaves] != ["added", "removed"]:
+        tests = next(child for child in file["children"] if child["title"] == "Tests")
+        if [node["change"] for node in tests["children"]] != ["removed", "added"]:
             msg = "Nested changes must retain their addition and removal status"
             raise AssertionError(msg)
 
@@ -644,7 +827,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 ],
             )
             sources = app.package_sources(package)
-            metrics = app.source_metrics(sources)
+            metrics = resource_data(package)["source_metrics"]
             app.package_file_tree(package, tree, sources)
             if metrics["suppressions"].get("noqa (global)", 0) != 0:
                 msg = "Current metrics must ignore suppression diff baselines"
@@ -696,34 +879,37 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
 
     def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
         """Placeholder declarations are neither entries nor semantic changes."""
-        empty = (
-            "Name: sample\nArguments:\n  (not applicable)\n"
-            "Dependencies:\n  (not declared)\nTests:\n  (none)\n"
-            "Suppressions:\n  (none)\n"
-        )
+        empty = app.RepositoryBrowser.package_data("sample", {"test_main.py": ""})
         for tree in (
-            app.RepositoryBrowser.summary_tree(
+            app.RepositoryBrowser.details_tree(
                 empty,
                 cli=[CliEntry((), "(not applicable)")],
             ),
-            app.RepositoryBrowser.merged_summary_tree(empty, empty),
+            app.RepositoryBrowser.merged_details_tree(empty, empty),
         ):
-            if [node.title for node in tree] != ["Name: sample"]:
+            if [node.title for node in tree] != [
+                "Name: sample",
+                "Description: (not declared)",
+                "Help: (module docstring not declared)",
+            ]:
                 msg = "Empty declaration groups must be omitted in both views"
                 raise AssertionError(msg)
-        previous = empty.replace("Tests:\n  (none)", "Tests:\n  test existing")
-        changed = app.RepositoryBrowser.merged_summary_tree(previous, empty)
+        previous = app.RepositoryBrowser.package_data(
+            "sample",
+            {"test_main.py": "def test_existing(): pass\n"},
+        )
+        changed = app.RepositoryBrowser.merged_details_tree(previous, empty)
         tests = next(node for node in changed if node.title == "Tests")
         if [node.title for node in tests.children or []] != ["- test existing"]:
             msg = "Removing the last test must remain visible in the diff"
             raise AssertionError(msg)
-        diagnostic = empty.replace(
-            "Tests:\n  (none)",
-            "Tests:\n  (unavailable: syntax error)",
+        diagnostic = app.RepositoryBrowser.package_data(
+            "sample",
+            {"test_main.py": "def invalid(\n"},
         )
         tests = next(
             node
-            for node in app.RepositoryBrowser.summary_tree(diagnostic)
+            for node in app.RepositoryBrowser.details_tree(diagnostic)
             if node.title == "Tests"
         )
         if not app.RepositoryBrowser.has_warning(tests):
@@ -732,12 +918,21 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
 
     def test_diff_only_omits_unchanged_fields_and_keeps_command_ancestors(self) -> None:
         """Filtering removes unchanged details while retaining nested change context."""
-        before = (
-            "Name: sample\nDescription: Before\nArguments:\n"
-            "  --same\nTests:\n  test same"
+        before = app.RepositoryBrowser.package_data(
+            "sample",
+            {
+                "default.nix": '{ meta.description = "Before"; }',
+                "test_main.py": "def test_same(): pass\n",
+            },
         )
-        after = before.replace("Before", "After")
-        nodes = app.RepositoryBrowser.merged_summary_tree(before, after)
+        after = app.RepositoryBrowser.package_data(
+            "sample",
+            {
+                "default.nix": '{ meta.description = "After"; }',
+                "test_main.py": "def test_same(): pass\n",
+            },
+        )
+        nodes = app.RepositoryBrowser.merged_details_tree(before, after)
         nodes.append(
             app.TreeNode(
                 "command",
@@ -753,7 +948,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             msg = "Diff-only trees must contain changes and their command ancestors"
             raise AssertionError(msg)
 
-    def test_package_summary_fields_and_test_name_children(self) -> None:  # noqa: D102
+    def test_package_data_fields_and_test_name_children(self) -> None:  # noqa: D102
         files = {
             "default.nix": '{ meta.description = "Useful package"; }\n',
             "main.py": (
@@ -764,17 +959,13 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             ),
             "test_main.py": "def test_alpha(): pass\ndef test_beta(): pass\n",
         }
-        summary = app.RepositoryBrowser.package_summary("sample", files)
-        if not all(
-            value in summary
-            for value in (
-                "Name: sample",
-                "Description: Useful package",
-                "Help: Package help.",
-                "--input  optional; help='Input path'",
-                "  test alpha",
-                "  test beta",
-            )
+        summary = app.RepositoryBrowser.package_data("sample", files)
+        if (
+            summary["name"] != "sample"
+            or summary["description"] != "Useful package"
+            or summary["help"] != "Package help."
+            or summary["cli"][0]["text"] != "--input  optional; help='Input path'"
+            or summary["tests"] != ["test alpha", "test beta"]
         ):
             msg = "Package summary must show metadata and test names"
             raise AssertionError(msg)
@@ -785,8 +976,11 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             viewer = app.RepositoryBrowser(root)
             with patch.object(
                 app,
-                "package_overview",
-                return_value="Name: shared",
+                "resource_data",
+                return_value=app.RepositoryBrowser.package_data(
+                    "shared",
+                    {"main.py": '"""Shared."""\n'},
+                ),
             ) as read:
                 entry = viewer.package_entry(root, "sample", diff=False)
             read.assert_called_once_with(root / "packages/sample")
@@ -800,14 +994,14 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
 
     def test_suppression_diff_changes_counts_without_repeating_labels(self) -> None:
         """Include bare and tagged type ignores, excluding string contents."""
-        before = app.RepositoryBrowser.package_summary(
+        before = app.RepositoryBrowser.package_data(
             "sample",
             {
                 "main.py": "value = 1  # type: ignore[assignment]\n# noqa\n",
                 "test_main.py": "# type: ignore\n",
             },
         )
-        after = app.RepositoryBrowser.package_summary(
+        after = app.RepositoryBrowser.package_data(
             "sample",
             {
                 "main.py": (
@@ -819,7 +1013,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 "test_main.py": "",
             },
         )
-        tree = app.RepositoryBrowser.merged_summary_tree(before, after)
+        tree = app.RepositoryBrowser.merged_details_tree(before, after)
         group = next(node for node in tree if node.title == "Suppressions")
         files = {node.title: node for node in group.children or []}
         if list(files) != ["main.py", "test_main.py"]:
@@ -843,11 +1037,11 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
 
     def test_suppression_counts_appear_in_overview_and_diff(self) -> None:
         """Keep suppression counts visible in the shared package summary."""
-        before = app.RepositoryBrowser.package_summary(
+        before = app.RepositoryBrowser.package_data(
             "sample",
             {"index.html": "<main></main>\n"},
         )
-        after = app.RepositoryBrowser.package_summary(
+        after = app.RepositoryBrowser.package_data(
             "sample",
             {
                 "index.html": (
@@ -856,7 +1050,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 ),
             },
         )
-        tree = app.RepositoryBrowser.summary_tree(after)
+        tree = app.RepositoryBrowser.details_tree(after)
         suppressions = next(node for node in tree if node.title == "Suppressions")
         files = {node.title: node for node in suppressions.children or []}
         if list(files) != ["index.html"] or {
@@ -867,7 +1061,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
         }:
             msg = "Overview must distinguish global and local HTML directives"
             raise AssertionError(msg)
-        diff = app.RepositoryBrowser.merged_summary_tree(before, after)
+        diff = app.RepositoryBrowser.merged_details_tree(before, after)
         changes = next(node for node in diff if node.title == "Suppressions")
         if not any(
             child.title == "html-validate-disable (global): 0 → 1"
@@ -884,7 +1078,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             package.mkdir(parents=True)
             html = package / "index.html"
             html.write_text("<main></main>\n", encoding="utf-8")
-            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
             html.write_text("<!-- html-validate-disable -->\n", encoding="utf-8")
             viewer = app.RepositoryBrowser(root)
             entry = viewer.package_entry(root, "sample", diff=True)
@@ -908,7 +1102,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
 
     def test_dependencies_appear_in_shared_overview_and_inline_changes(self) -> None:
         """Show dependency declarations and edits using the shared summary."""
-        before = app.RepositoryBrowser.package_summary(
+        before = app.RepositoryBrowser.package_data(
             "consumer",
             {
                 "default.nix": (
@@ -917,7 +1111,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 ),
             },
         )
-        after = app.RepositoryBrowser.package_summary(
+        after = app.RepositoryBrowser.package_data(
             "consumer",
             {
                 "default.nix": (
@@ -928,14 +1122,14 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
         )
         dependencies = next(
             node
-            for node in app.RepositoryBrowser.summary_tree(after)
+            for node in app.RepositoryBrowser.details_tree(after)
             if node.title == "Dependencies"
         )
         if [node.title for node in dependencies.children or []] != [
             "build: packages/engine",
         ]:
             raise AssertionError(dependencies)
-        for render in (app.RepositoryBrowser.merged_summary_tree,):
+        for render in (app.RepositoryBrowser.merged_details_tree,):
             changes = next(
                 node for node in render(before, after) if node.title == "Dependencies"
             )
@@ -972,7 +1166,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 msg = "Warning must clear when the CLI summary becomes available"
                 raise AssertionError(msg)
 
-    def test_package_summary_uses_canonical_test_discovery(self) -> None:  # noqa: D102
+    def test_package_data_uses_canonical_test_discovery(self) -> None:  # noqa: D102
         files = {
             "test_main.py": (
                 "def test_top_level(): pass\n"
@@ -984,8 +1178,8 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 "    def test_not_a_case(self): pass\n"
             ),
         }
-        summary = app.RepositoryBrowser.package_summary("sample", files)
-        tests = app.RepositoryBrowser.summary_group(summary, "Tests")
+        summary = app.RepositoryBrowser.package_data("sample", files)
+        tests = app.RepositoryBrowser.detail_group(summary, "Tests")
         if tests != ["test top level", "test method case"]:
             msg = f"Unexpected canonical test names: {tests!r}"
             raise AssertionError(msg)
@@ -998,9 +1192,9 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             "    return argparse.ArgumentParser()\n"
             "def main():\n    parser().parse_args()\n"
         )
-        tree = app.RepositoryBrowser.merged_summary_tree(
-            app.RepositoryBrowser.package_summary("sample", {"main.py": before}),
-            app.RepositoryBrowser.package_summary("sample", {"main.py": after}),
+        tree = app.RepositoryBrowser.merged_details_tree(
+            app.RepositoryBrowser.package_data("sample", {"main.py": before}),
+            app.RepositoryBrowser.package_data("sample", {"main.py": after}),
             previous_cli=source_cli_overview(before),
             current_cli=source_cli_overview(after),
         )
@@ -1026,7 +1220,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             msg = "New diagnostics must still mark the package as unavailable"
             raise AssertionError(msg)
 
-    def test_package_summary_uses_canonical_cli_parser(self) -> None:  # noqa: D102
+    def test_package_data_uses_canonical_cli_parser(self) -> None:  # noqa: D102
         source = (
             "import argparse\n"
             "parser = argparse.ArgumentParser()\n"
@@ -1034,8 +1228,8 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             "build = commands.add_parser('build')\n"
             "build.add_argument('--jobs', type=int, default=2, help='Worker count')\n"
         )
-        arguments = app.RepositoryBrowser.summary_group(
-            app.RepositoryBrowser.package_summary("sample", {"main.py": source}),
+        arguments = app.RepositoryBrowser.detail_group(
+            app.RepositoryBrowser.package_data("sample", {"main.py": source}),
             "Arguments",
         )
         if arguments != [
@@ -1059,6 +1253,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "flake.nix").write_text("{}\n")
             package = root / "packages/sample"
             package.mkdir(parents=True)
             (package / "main.py").write_text(source, encoding="utf-8")
@@ -1105,6 +1300,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
     def test_high_level_diff_compares_summaries_not_source_code(self) -> None:  # noqa: D102
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "flake.nix").write_text("{}\n")
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.email", "test@example.com"],
@@ -1132,7 +1328,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 "def test_old(): pass\n",
                 encoding="utf-8",
             )
-            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
             subprocess.run(
                 ["git", "-C", str(root), "commit", "-qm", "baseline"],
                 check=True,
@@ -1217,6 +1413,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
             )
             package = root / "github.com/example/project/packages/sample"
             package.mkdir(parents=True)
+            (package.parent.parent / "flake.nix").write_text("{}\n")
             (package / "main.py").write_text('"""Sample help."""\n', encoding="utf-8")
             viewer = app.RepositoryBrowser(root)
             entries = viewer.package_entries()
@@ -1233,6 +1430,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
     def test_high_level_diff_omits_unchanged_summaries_and_colors_changes(self) -> None:  # noqa: D102
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
+            (root / "flake.nix").write_text("{}\n")
             subprocess.run(["git", "init", "-q", str(root)], check=True)
             subprocess.run(
                 ["git", "-C", str(root), "config", "user.email", "test@example.com"],
@@ -1252,7 +1450,7 @@ class TestRepositoryData(unittest.TestCase):  # noqa: D101
                 "def test_one(): pass\n",
                 encoding="utf-8",
             )
-            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            subprocess.run(["git", "-C", str(root), "add", "."], check=True)
             subprocess.run(
                 ["git", "-C", str(root), "commit", "-qm", "baseline"],
                 check=True,

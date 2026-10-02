@@ -60,6 +60,9 @@ python.pkgs.buildPythonPackage {
     mainProgram = baseNameOf ./.;
   };
   passthru.python = python;
+  postFixup = ''
+    touch "$out/${python.sitePackages}/$pname/py.typed"
+  '';
   propagatedBuildInputs = [
     cosmicRay
     inputs.self.packages.${pkgs.stdenv.system}.nix_syntax
