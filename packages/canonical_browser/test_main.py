@@ -1,8 +1,7 @@
 # Copyright (c) 2026 VALAB/ITI
 # ruff: noqa: S603, S607
-"""Verify package browsing, summary diffs, and terminal navigation."""
+"""Verify browser transport, directory scopes, and semantic package diffs."""
 
-import curses
 import http.client
 import json
 import os
@@ -12,11 +11,10 @@ import subprocess
 import sys
 import tempfile
 import threading
-import unicodedata
 import unittest
 from http import HTTPStatus
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 from urllib.parse import urlencode
 
 import pytest
@@ -24,10 +22,7 @@ from git_canonical import CliEntry, source_cli_overview
 
 from packages.canonical_browser import main as app
 
-TEST_MODIFIED_STYLE = 33
-TEST_EXPECTED_BUILDS = 2
-TEST_PAGE_HEIGHT = 2
-TEST_EXPECTED_VISIBLE = 2
+TEST_MODIFIED_CHANGE = "modified"
 TEST_PARSER_ERROR = 2
 TEST_REPOSITORY_FIELDS = 3
 
@@ -194,7 +189,7 @@ class TestGui(unittest.TestCase):
                 msg = "Metrics must exclude prm sources and zero suppression counts"
                 raise AssertionError(msg)
             if snapshot["tree"][0]["children"][0] != record["tree"]:
-                msg = "Source line counts must be shared by the GUI and TUI"
+                msg = "Source line counts must match current file contents"
                 raise AssertionError(msg)
             host = root / "hosts/example"
             host.mkdir(parents=True)
@@ -206,7 +201,7 @@ class TestGui(unittest.TestCase):
                 msg = "Host source files must contribute current metrics"
                 raise AssertionError(msg)
 
-    def test_directory_scope_matches_gui_and_terminal(self) -> None:
+    def test_directory_scope_excludes_sibling_resources(self) -> None:
         """Intermediate directories and package directories show only their contents."""
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -226,8 +221,8 @@ class TestGui(unittest.TestCase):
                     (package / "default.nix").write_text("{}\n")
                     (package / "main.py").write_text('"""Example."""\n')
             scoped = home / "github.com"
-            viewer = app.Viewer(scoped)
-            viewer.refresh_overview()
+            viewer = app.RepositoryBrowser(scoped)
+            viewer.refresh()
             snapshot = viewer.snapshot
             if snapshot["root"] != str(scoped) or snapshot["parent"] != str(home):
                 msg = "The current directory and its parent must define navigation"
@@ -235,11 +230,6 @@ class TestGui(unittest.TestCase):
             repositories = {node["repository"] for node in snapshot["nodes"]}
             if repositories != {"example/one"}:
                 msg = "A directory scope must exclude sibling repositories"
-                raise AssertionError(msg)
-            if snapshot["tree"] != [
-                app.serialize_node(node) for node in viewer.overview
-            ]:
-                msg = "The GUI and TUI must share the scoped hierarchy"
                 raise AssertionError(msg)
             package = scoped / "example/one/packages/first"
             snapshot = app.gui_data(package)
@@ -250,37 +240,45 @@ class TestGui(unittest.TestCase):
                 msg = "Starting inside a package must exclude other packages"
                 raise AssertionError(msg)
 
-    def test_terminal_directory_navigation_and_parent(self) -> None:
-        """Enter and Backspace navigate directories independently of tree expansion."""
+    def test_directory_scopes_reuse_data_until_refresh(self) -> None:
+        """Changing scopes must preserve cached declarations until explicit refresh."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            child = root / "child"
-            child.mkdir()
-            viewer = app.Viewer(root)
-            viewer.refresh_overview()
-            viewer.navigate("\n", 20, viewer.rows(80))
-            if viewer.cwd != child:
-                msg = "Enter must open the selected directory"
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            source = package / "main.py"
+            source.write_text('"""Before."""\n')
+            browser = app.RepositoryBrowser(root)
+            browser.load()
+            before = browser.snapshot
+            source.write_text('"""After."""\n')
+            browser.cwd = package
+            browser.load()
+            if "Before." not in json.dumps(browser.snapshot):
+                msg = "Child navigation must reuse the cached snapshot"
                 raise AssertionError(msg)
-            viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
-            if viewer.cwd != root:
-                msg = "Parent navigation must work even in an empty directory"
+            browser.cwd = root
+            browser.load()
+            if browser.snapshot != before:
+                msg = "Parent navigation must reuse the cached snapshot"
                 raise AssertionError(msg)
-            with (
-                patch.object(Path, "home", return_value=root),
-                patch.object(viewer, "load_overview") as load,
-            ):
-                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
-                load.assert_not_called()
-                if (
-                    viewer.cwd != root
-                    or app.directory_snapshot(root)[0]["parent"] is not None
-                ):
-                    msg = "Home must be the upper navigation boundary"
+            browser.refresh()
+            if "After." not in json.dumps(browser.snapshot):
+                msg = "Refresh must load new declarations"
+                raise AssertionError(msg)
+
+    def test_home_is_the_upper_navigation_boundary(self) -> None:
+        """Home scopes have no parent, including a home with a flake."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(Path, "home", return_value=root):
+                if app.directory_snapshot(root)[0]["parent"] is not None:
+                    msg = "Directory home must have no parent"
                     raise AssertionError(msg)
                 (root / "flake.nix").write_text("{}\n")
                 if app.gui_data(root)["parent"] is not None:
-                    msg = "Canonical home snapshots must also stop parent navigation"
+                    msg = "Flake home must have no parent"
                     raise AssertionError(msg)
 
     def test_gui_package_includes_offline_layout_engine(self) -> None:
@@ -289,18 +287,21 @@ class TestGui(unittest.TestCase):
         if not executable:
             self.skipTest("Nix package executable not supplied")
         version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        engine = (
-            Path(executable).parent.parent
-            / "lib"
-            / version
-            / "site-packages/canonical_browser/prm/elk.js"
-        )
-        if (
-            engine.read_bytes()
-            != Path(os.environ["CANONICAL_BROWSER_ELK"]).read_bytes()
-        ):
-            msg = "The packaged layout engine must match the pinned Nix dependency"
-            raise AssertionError(msg)
+        for name in ("g6",):
+            engine = (
+                Path(executable).parent.parent
+                / "lib"
+                / version
+                / f"site-packages/canonical_browser/prm/{name}.js"
+            )
+            if (
+                engine.read_bytes()
+                != Path(
+                    os.environ[f"CANONICAL_BROWSER_{name.upper()}"],
+                ).read_bytes()
+            ):
+                msg = "The packaged graph engine must match the pinned Nix dependency"
+                raise AssertionError(msg)
 
     def test_runtime_os_and_persistence_are_observations(self) -> None:
         """Detect running modules and report uncertainty about disk-backed roots."""
@@ -356,7 +357,7 @@ class TestGui(unittest.TestCase):
                     app.TreeNode(
                         "Dependencies",
                         [
-                            app.TreeNode("- build: packages/old", style=31),
+                            app.TreeNode("- build: packages/old", change="removed"),
                         ],
                     ),
                 ],
@@ -396,20 +397,20 @@ class TestGui(unittest.TestCase):
             msg = "Both the tree and graphical relationship must preserve removal"
             raise AssertionError(msg)
 
-    def test_gui_launch_bypasses_terminal_requirement(self) -> None:
-        """GUI mode opens a loopback browser independently of terminal streams."""
+    def test_web_browser_launch_and_port_validation(self) -> None:
+        """Startup opens a loopback browser with the requested port."""
         with (
             patch.object(sys.stdin, "isatty", return_value=False),
             patch.object(app, "open_gui") as launch,
         ):
-            app.main(["--gui", "--no-open", "--port", "0"])
+            app.main(["--no-open", "--port", "0"])
         launch.assert_called_once_with(
             Path.cwd().resolve(),
             port=0,
             open_browser=False,
         )
         with pytest.raises(SystemExit) as error:
-            app.main(["--gui", "--port", "-1"])
+            app.main(["--port", "-1"])
         if error.value.code != TEST_PARSER_ERROR:
             msg = "Invalid ports must be rejected by the parser"
             raise AssertionError(msg)
@@ -427,7 +428,12 @@ class TestGui(unittest.TestCase):
                     timeout=5,
                 )
                 try:
-                    for route in ("/", "/script.js", "/style.css", "/elk.js"):
+                    for route in (
+                        "/",
+                        "/script.js",
+                        "/style.css",
+                        "/g6.js",
+                    ):
                         connection.request("GET", route)
                         response = connection.getresponse()
                         if response.status != HTTPStatus.OK or not response.read():
@@ -489,8 +495,8 @@ class TestGui(unittest.TestCase):
                     app.TreeNode(
                         "Tests",
                         [
-                            app.TreeNode("+ test new", style=32),
-                            app.TreeNode("- test old", style=31),
+                            app.TreeNode("+ test new", change="added"),
+                            app.TreeNode("- test old", change="removed"),
                         ],
                     ),
                 ],
@@ -541,14 +547,14 @@ class TestGui(unittest.TestCase):
                     ],
                 },
             ),
-            patch.object(app.Viewer, "package_entries", return_value=nodes),
+            patch.object(app.RepositoryBrowser, "package_entries", return_value=nodes),
         ):
             snapshot = app.gui_data(root)
         records = {record["id"]: record for record in snapshot["nodes"]}
         repository = snapshot["tree"][0]
         package = repository["children"][0]
         if package != records[".:packages/sample"]["tree"]:
-            msg = "Terminal and GUI package details must be identical"
+            msg = "Package details must match their resource record"
             raise AssertionError(msg)
         if (
             records[".:hosts/laptop"]["icon"] != "nixos"
@@ -566,40 +572,28 @@ class TestGui(unittest.TestCase):
 
 
 class TestCli(unittest.TestCase):
-    """Verify direct browser startup and the terminal requirement."""
+    """Verify web-only startup."""
 
-    def test_terminal_opens_browser_directly(self) -> None:
-        """Startup opens the viewer without creating an agent or history."""
-        with (
-            patch.object(sys.stdin, "isatty", return_value=True),
-            patch.object(sys.stdout, "isatty", return_value=True),
-            patch.object(app.Viewer, "view") as view,
-        ):
+    def test_default_launch_opens_web_browser(self) -> None:
+        """The browser starts from cwd without a GUI mode flag."""
+        with patch.object(app, "open_gui") as launch:
             app.main([])
-        view.assert_called_once_with()
-
-    def test_nonterminal_executable_explains_text_alternative(self) -> None:
-        """Piped execution fails clearly instead of entering a prompt loop."""
-        executable = os.environ.get("PACKAGE_E2E_EXECUTABLE")
-        if not executable:
-            self.skipTest("Nix package executable not supplied")
-        result = subprocess.run(
-            [executable],
-            input="",
-            text=True,
-            capture_output=True,
-            timeout=10,
-            check=False,
+        launch.assert_called_once_with(
+            Path.cwd().resolve(),
+            port=8765,
+            open_browser=True,
         )
-        if result.returncode != 1 or "git canonical overview" not in result.stderr:
-            msg = "Expected a terminal error with the text-output alternative"
-            raise AssertionError(msg)
-        if result.stdout:
-            msg = "Nonterminal execution must not display a chat prompt"
+
+    def test_removed_terminal_flag_is_rejected(self) -> None:
+        """Legacy renderer selection cannot select a removed implementation."""
+        with pytest.raises(SystemExit) as error:
+            app.main(["--gui"])
+        if error.value.code != TEST_PARSER_ERROR:
+            msg = "Removed mode flags must be rejected"
             raise AssertionError(msg)
 
 
-class TestViewer(unittest.TestCase):  # noqa: D101
+class TestRepositoryData(unittest.TestCase):  # noqa: D101
     def test_package_details_belong_to_their_source_files(self) -> None:
         """Keep arguments, tests, documentation, and suppression diffs under sources."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -609,8 +603,14 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             (package / "prm/script.js").write_text(
                 "// eslint-disable-next-line\nrun();\n",
             )
-            arguments = app.TreeNode("Arguments", [app.TreeNode("+ --help", style=32)])
-            tests = app.TreeNode("Tests", [app.TreeNode("- test old", style=31)])
+            arguments = app.TreeNode(
+                "Arguments",
+                [app.TreeNode("+ --help", change="added")],
+            )
+            tests = app.TreeNode(
+                "Tests",
+                [app.TreeNode("- test old", change="removed")],
+            )
             tree = app.TreeNode(
                 "packages/example",
                 [
@@ -623,11 +623,21 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                         [
                             app.TreeNode(
                                 "main.py",
-                                [app.TreeNode("noqa (global): 1 → 2", style=33)],
+                                [
+                                    app.TreeNode(
+                                        "noqa (global): 1 → 2",
+                                        change="modified",
+                                    ),
+                                ],
                             ),
                             app.TreeNode(
                                 "test_main.py",
-                                [app.TreeNode("type: ignore (local): 1 → 0", style=31)],
+                                [
+                                    app.TreeNode(
+                                        "type: ignore (local): 1 → 0",
+                                        change="removed",
+                                    ),
+                                ],
                             ),
                         ],
                     ),
@@ -657,7 +667,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             ]:
                 msg = "Documentation, lines, and flat Python counts must stay ordered"
                 raise AssertionError(msg)
-            if main["noqa (global): 1 → 2"].style != TEST_MODIFIED_STYLE:
+            if main["noqa (global): 1 → 2"].change != TEST_MODIFIED_CHANGE:
                 msg = "Flat suppression rows must preserve semantic diff styling"
                 raise AssertionError(msg)
             test = {node.title: node for node in files["test_main.py"].children or []}
@@ -670,7 +680,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             if "eslint-disable (local): 1" not in script or "Suppressions" in script:
                 msg = "Source assets must have direct suppression rows"
                 raise AssertionError(msg)
-            changed = app.Viewer.changed_nodes([tree])[0]
+            changed = app.RepositoryBrowser.changed_nodes([tree])[0]
             if {node.title for node in changed.children or []} != {
                 "main.py",
                 "test_main.py",
@@ -684,40 +694,6 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 msg = "Informational line counts must not create semantic changes"
                 raise AssertionError(msg)
 
-    def test_directory_navigation_reuses_source_snapshot_until_refresh(self) -> None:
-        """Parent navigation rescopes declarations; Refresh reads new evidence."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            (package / "default.nix").write_text("{}\n")
-            (package / "main.py").write_text('"""Before."""\n')
-            viewer = app.Viewer(package)
-            with patch.object(
-                app,
-                "browser_snapshot",
-                wraps=app.browser_snapshot,
-            ) as build:
-                viewer.ensure_overview()
-                (package / "main.py").write_text('"""After."""\n')
-                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
-                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
-                if viewer.cwd != root or build.call_count != 1:
-                    msg = "Navigating within a repository must reuse its declarations"
-                    raise AssertionError(msg)
-                serialized = json.dumps(viewer.snapshot)
-                if "Before." not in serialized or "After." in serialized:
-                    msg = "Navigation must retain the snapshot until explicit Refresh"
-                    raise AssertionError(msg)
-                viewer.refresh_overview()
-                if build.call_count != TEST_EXPECTED_BUILDS:
-                    msg = "Refresh must reread declarations"
-                    raise AssertionError(msg)
-                if "After." not in json.dumps(viewer.snapshot):
-                    msg = "Refresh must display the new declarations"
-                    raise AssertionError(msg)
-
     def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
         """Placeholder declarations are neither entries nor semantic changes."""
         empty = (
@@ -726,14 +702,17 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             "Suppressions:\n  (none)\n"
         )
         for tree in (
-            app.Viewer.summary_tree(empty, cli=[CliEntry((), "(not applicable)")]),
-            app.Viewer.merged_summary_tree(empty, empty),
+            app.RepositoryBrowser.summary_tree(
+                empty,
+                cli=[CliEntry((), "(not applicable)")],
+            ),
+            app.RepositoryBrowser.merged_summary_tree(empty, empty),
         ):
             if [node.title for node in tree] != ["Name: sample"]:
                 msg = "Empty declaration groups must be omitted in both views"
                 raise AssertionError(msg)
         previous = empty.replace("Tests:\n  (none)", "Tests:\n  test existing")
-        changed = app.Viewer.merged_summary_tree(previous, empty)
+        changed = app.RepositoryBrowser.merged_summary_tree(previous, empty)
         tests = next(node for node in changed if node.title == "Tests")
         if [node.title for node in tests.children or []] != ["- test existing"]:
             msg = "Removing the last test must remain visible in the diff"
@@ -744,100 +723,11 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         )
         tests = next(
             node
-            for node in app.Viewer.summary_tree(diagnostic)
+            for node in app.RepositoryBrowser.summary_tree(diagnostic)
             if node.title == "Tests"
         )
-        if not app.Viewer.has_warning(tests):
+        if not app.RepositoryBrowser.has_warning(tests):
             msg = "Unavailable analysis must remain visible as a diagnostic"
-            raise AssertionError(msg)
-
-    def test_overview_is_cached_until_refreshed(self) -> None:  # noqa: D102
-        viewer = app.Viewer()
-        with (
-            patch.object(
-                viewer,
-                "package_entries",
-                side_effect=[[app.TreeNode("first")], [app.TreeNode("second")]],
-            ) as build,
-            patch.object(
-                app,
-                "browser_snapshot",
-                side_effect=lambda _root, tree: ({}, tree),
-            ),
-            patch.object(
-                app,
-                "scope_snapshot",
-                side_effect=lambda data, _directory: (data, viewer.full_overview),
-            ),
-        ):
-            viewer.ensure_overview()
-            viewer.ensure_overview()
-            if build.call_count != 1 or viewer.overview[0].title != "first":
-                msg = "The startup overview must be built only once"
-                raise AssertionError(msg)
-            viewer.selected = viewer.top = 3
-            viewer.refresh_overview()
-            if (
-                build.call_count != TEST_EXPECTED_BUILDS
-                or viewer.overview[0].title != "second"
-            ):
-                msg = "Refreshing must rebuild the overview"
-                raise AssertionError(msg)
-            if viewer.selected != 0 or viewer.top != 0:
-                msg = "Refreshing must reset navigation to the start"
-                raise AssertionError(msg)
-
-    def test_diff_key_uses_cached_views_and_refreshes_only_on_request(self) -> None:
-        """D switches cached trees, and r explicitly rebuilds the current snapshot."""
-        viewer = app.Viewer()
-        screen = MagicMock()
-        screen.getmaxyx.return_value = (12, 80)
-        screen.get_wch.side_effect = ["D", "r", "L", "D", "q"]
-        with (
-            patch.object(
-                viewer,
-                "package_entries",
-                return_value=[
-                    app.TreeNode(
-                        "packages/example",
-                        [
-                            app.TreeNode("unchanged"),
-                            app.TreeNode("+ changed", style=32),
-                        ],
-                    ),
-                ],
-            ) as build,
-            patch.object(curses, "has_colors", return_value=False),
-            patch.object(curses, "curs_set"),
-            patch.object(
-                app,
-                "browser_snapshot",
-                side_effect=lambda _root, tree: ({}, tree),
-            ),
-            patch.object(
-                app,
-                "scope_snapshot",
-                side_effect=lambda data, _directory: (data, viewer.full_overview),
-            ),
-        ):
-            viewer.ensure_overview()
-            viewer.screen(screen)
-        if [item.kwargs for item in build.call_args_list] != [
-            {"diff": False},
-            {"diff": False},
-        ] or viewer.mode != "high-level":
-            msg = "Only startup and r may recalculate the overview"
-            raise AssertionError(msg)
-        if any("high-level" in item.args[2] for item in screen.addnstr.call_args_list):
-            msg = "The footer must omit the view name"
-            raise AssertionError(msg)
-        if [node.title for node in viewer.full_overview[0].children or []] != [
-            "unchanged",
-            "+ changed",
-        ] or [node.title for node in viewer.diff_overview[0].children or []] != [
-            "+ changed",
-        ]:
-            msg = "Filtering must preserve the complete cached overview"
             raise AssertionError(msg)
 
     def test_diff_only_omits_unchanged_fields_and_keeps_command_ancestors(self) -> None:
@@ -847,65 +737,20 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             "  --same\nTests:\n  test same"
         )
         after = before.replace("Before", "After")
-        nodes = app.Viewer.merged_summary_tree(before, after)
+        nodes = app.RepositoryBrowser.merged_summary_tree(before, after)
         nodes.append(
             app.TreeNode(
                 "command",
-                [app.TreeNode("--same"), app.TreeNode("+ --new", style=32)],
+                [app.TreeNode("--same"), app.TreeNode("+ --new", change="added")],
             ),
         )
-        changes = app.Viewer.changed_nodes(nodes)
+        changes = app.RepositoryBrowser.changed_nodes(nodes)
         if [node.title for node in changes] != [
             "- Description: Before",
             "+ Description: After",
             "command",
         ] or [node.title for node in changes[-1].children or []] != ["+ --new"]:
             msg = "Diff-only trees must contain changes and their command ancestors"
-            raise AssertionError(msg)
-
-    def test_g_and_capital_g_move_cursor_to_viewport_edges(self) -> None:  # noqa: D102
-        for mode in ("high-level", "high-level diff"):
-            viewer = app.Viewer()
-            viewer.mode = mode
-            viewer.overview = [app.TreeNode(str(index)) for index in range(5)]
-            rows = viewer.rows(80)
-            viewer.navigate("G", TEST_PAGE_HEIGHT, rows)
-            if (
-                viewer.top != len(rows) - TEST_PAGE_HEIGHT
-                or viewer.selected != rows[-1].owner
-            ):
-                msg = f"G must place the cursor on the bottom row in {mode} mode"
-                raise AssertionError(msg)
-            viewer.navigate("g", TEST_PAGE_HEIGHT, viewer.rows(80))
-            if viewer.top != 0 or viewer.selected != 0:
-                msg = f"g must place the cursor on the top row in {mode} mode"
-                raise AssertionError(msg)
-
-    def test_overview_child_collapse_and_cursor_follow(self) -> None:  # noqa: D102
-        viewer = app.Viewer()
-        viewer.mode = "high-level"
-        leaf = app.TreeNode("leaf")
-        branch = app.TreeNode("branch", [leaf])
-        viewer.overview = [app.TreeNode("root", [branch])]
-        viewer.height = 2
-        viewer.navigate("l", 2, viewer.rows(80))
-        viewer.navigate("j", 2, viewer.rows(80))
-        viewer.navigate("l", 2, viewer.rows(80))
-        viewer.navigate("j", 2, viewer.rows(80))
-        visible = viewer.rows(80)
-        selected_row = next(
-            index for index, row in enumerate(visible) if row.owner == viewer.selected
-        )
-        if not viewer.top <= selected_row < viewer.top + viewer.height:
-            msg = "Moving down must scroll the selected tree row into view"
-            raise AssertionError(msg)
-        viewer.navigate("h", 2, visible)
-        visible = viewer.rows(80)
-        if (
-            viewer.overview_visible[viewer.selected].title != "branch"
-            or len(visible) != TEST_EXPECTED_VISIBLE
-        ):
-            msg = "h on a nested child must collapse its parent and select that parent"
             raise AssertionError(msg)
 
     def test_package_summary_fields_and_test_name_children(self) -> None:  # noqa: D102
@@ -919,7 +764,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             ),
             "test_main.py": "def test_alpha(): pass\ndef test_beta(): pass\n",
         }
-        summary = app.Viewer.package_summary("sample", files)
+        summary = app.RepositoryBrowser.package_summary("sample", files)
         if not all(
             value in summary
             for value in (
@@ -933,63 +778,11 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         ):
             msg = "Package summary must show metadata and test names"
             raise AssertionError(msg)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            package = root / "packages/sample"
-            package.mkdir(parents=True)
-            for filename, content in files.items():
-                (package / filename).write_text(content, encoding="utf-8")
-            viewer = app.Viewer(root)
-            viewer.mode = "high-level"
-            viewer.overview = viewer.package_entries()
-            if len(viewer.rows(80)) != 1:
-                msg = "Package children must be collapsed by default"
-                raise AssertionError(msg)
-            viewer.navigate("l", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "Tests" not in visible or "test_alpha" in visible:
-                msg = "Expanding a package must reveal a collapsed Tests group"
-                raise AssertionError(msg)
-            arguments_row = next(
-                row
-                for row in viewer.rows(80)
-                if row.text.rstrip().endswith("Arguments")
-            )
-            viewer.selected = arguments_row.owner
-            viewer.navigate("l", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "--input  optional; help='Input path'" not in visible:
-                msg = "Expanding Arguments must show declared options"
-                raise AssertionError(msg)
-            viewer.navigate("h", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "--input  optional; help='Input path'" in visible:
-                msg = "Collapsing Arguments must hide argument entries"
-                raise AssertionError(msg)
-            tests_row = next(
-                row for row in viewer.rows(80) if row.text.rstrip().endswith("Tests")
-            )
-            viewer.selected = tests_row.owner
-            viewer.navigate("l", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "test alpha" not in visible or "test beta" not in visible:
-                msg = "Expanding Tests must reveal each test name"
-                raise AssertionError(msg)
-            viewer.navigate("h", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "test alpha" in visible or "test beta" in visible:
-                msg = "Collapsing Tests must hide its test-name children"
-                raise AssertionError(msg)
-            viewer.selected = 0
-            viewer.navigate("h", 20, viewer.rows(80))
-            if len(viewer.rows(80)) != 1:
-                msg = "Collapsing a package must hide all package children"
-                raise AssertionError(msg)
 
     def test_current_package_view_uses_canonical_overview(self) -> None:  # noqa: D102
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            viewer = app.Viewer(root)
+            viewer = app.RepositoryBrowser(root)
             with patch.object(
                 app,
                 "package_overview",
@@ -1007,14 +800,14 @@ class TestViewer(unittest.TestCase):  # noqa: D101
 
     def test_suppression_diff_changes_counts_without_repeating_labels(self) -> None:
         """Include bare and tagged type ignores, excluding string contents."""
-        before = app.Viewer.package_summary(
+        before = app.RepositoryBrowser.package_summary(
             "sample",
             {
                 "main.py": "value = 1  # type: ignore[assignment]\n# noqa\n",
                 "test_main.py": "# type: ignore\n",
             },
         )
-        after = app.Viewer.package_summary(
+        after = app.RepositoryBrowser.package_summary(
             "sample",
             {
                 "main.py": (
@@ -1026,12 +819,10 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 "test_main.py": "",
             },
         )
-        tree = app.Viewer.merged_summary_tree(before, after)
+        tree = app.RepositoryBrowser.merged_summary_tree(before, after)
         group = next(node for node in tree if node.title == "Suppressions")
         files = {node.title: node for node in group.children or []}
-        if list(files) != ["main.py", "test_main.py"] or any(
-            node.expanded for node in files.values()
-        ):
+        if list(files) != ["main.py", "test_main.py"]:
             msg = "Suppression filenames must be separate, collapsed groups"
             raise AssertionError(msg)
         if [node.title for node in files["main.py"].children or []] != [
@@ -1042,34 +833,21 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         ]:
             msg = "Each filename must contain its own suppression count transitions"
             raise AssertionError(msg)
-        changes = app.Viewer.changed_nodes([group])[0]
+        changes = app.RepositoryBrowser.changed_nodes([group])[0]
         changed_files = {node.title: node for node in changes.children or []}
         if [node.title for node in changed_files["main.py"].children or []] != [
             "type: ignore (local): 1 → 2",
         ] or "test_main.py" not in changed_files:
             msg = "Diff-only views must keep file parents and omit unchanged counts"
             raise AssertionError(msg)
-        viewer = app.Viewer()
-        viewer.overview = [changes]
-        viewer.navigate("l", 20, viewer.rows(80))
-        if any("type: ignore" in row.text for row in viewer.rows(80)):
-            msg = "Suppression counts must stay hidden until their file is expanded"
-            raise AssertionError(msg)
-        viewer.navigate("j", 20, viewer.rows(80))
-        viewer.navigate("l", 20, viewer.rows(80))
-        if not any(
-            "type: ignore (local): 1 → 2" in row.text for row in viewer.rows(80)
-        ):
-            msg = "Expanding a file must reveal its count changes"
-            raise AssertionError(msg)
 
     def test_suppression_counts_appear_in_overview_and_diff(self) -> None:
         """Keep suppression counts visible in the shared package summary."""
-        before = app.Viewer.package_summary(
+        before = app.RepositoryBrowser.package_summary(
             "sample",
             {"index.html": "<main></main>\n"},
         )
-        after = app.Viewer.package_summary(
+        after = app.RepositoryBrowser.package_summary(
             "sample",
             {
                 "index.html": (
@@ -1078,7 +856,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 ),
             },
         )
-        tree = app.Viewer.summary_tree(after)
+        tree = app.RepositoryBrowser.summary_tree(after)
         suppressions = next(node for node in tree if node.title == "Suppressions")
         files = {node.title: node for node in suppressions.children or []}
         if list(files) != ["index.html"] or {
@@ -1089,7 +867,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         }:
             msg = "Overview must distinguish global and local HTML directives"
             raise AssertionError(msg)
-        diff = app.Viewer.merged_summary_tree(before, after)
+        diff = app.RepositoryBrowser.merged_summary_tree(before, after)
         changes = next(node for node in diff if node.title == "Suppressions")
         if not any(
             child.title == "html-validate-disable (global): 0 → 1"
@@ -1108,7 +886,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             html.write_text("<main></main>\n", encoding="utf-8")
             subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
             html.write_text("<!-- html-validate-disable -->\n", encoding="utf-8")
-            viewer = app.Viewer(root)
+            viewer = app.RepositoryBrowser(root)
             entry = viewer.package_entry(root, "sample", diff=True)
             actual = (
                 next(
@@ -1130,7 +908,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
 
     def test_dependencies_appear_in_shared_overview_and_inline_changes(self) -> None:
         """Show dependency declarations and edits using the shared summary."""
-        before = app.Viewer.package_summary(
+        before = app.RepositoryBrowser.package_summary(
             "consumer",
             {
                 "default.nix": (
@@ -1139,7 +917,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 ),
             },
         )
-        after = app.Viewer.package_summary(
+        after = app.RepositoryBrowser.package_summary(
             "consumer",
             {
                 "default.nix": (
@@ -1150,14 +928,14 @@ class TestViewer(unittest.TestCase):  # noqa: D101
         )
         dependencies = next(
             node
-            for node in app.Viewer.summary_tree(after)
+            for node in app.RepositoryBrowser.summary_tree(after)
             if node.title == "Dependencies"
         )
         if [node.title for node in dependencies.children or []] != [
             "build: packages/engine",
         ]:
             raise AssertionError(dependencies)
-        for render in (app.Viewer.merged_summary_tree, app.Viewer.summary_changes):
+        for render in (app.RepositoryBrowser.merged_summary_tree,):
             changes = next(
                 node for node in render(before, after) if node.title == "Dependencies"
             )
@@ -1177,29 +955,14 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 '"""Example."""\ndef main():\n    pass\n',
                 encoding="utf-8",
             )
-            viewer = app.Viewer(root)
+            viewer = app.RepositoryBrowser(root)
             entry = viewer.package_entry(root, "sample", diff=False)
             if entry is None:
                 msg = "Expected a package entry"
                 raise AssertionError(msg)
-            viewer.mode = "high-level"
-            viewer.overview = [entry]
-            rows = viewer.rows(80)
-            if not rows[0].text.endswith("packages/sample [!]"):
-                msg = "Collapsed package must show a warning marker"
-                raise AssertionError(msg)
-            if viewer.styles(rows[0]) != [33, 7]:
-                msg = "Package warning must be visible in the overview"
-                raise AssertionError(msg)
-            entry.expanded = True
-            arguments = next(
-                node for node in entry.children or [] if node.title == "Arguments"
-            )
-            arguments.expanded = True
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "(unavailable: unsupported CLI interface" not in visible:
-                msg = "Expanding Arguments must reveal the original diagnostic"
-                raise AssertionError(msg)
+            if not viewer.has_warning(entry):
+                msg_0 = "Unavailable CLI must retain its diagnostic"
+                raise AssertionError(msg_0)
             (package / "main.py").write_text(
                 "import argparse\nparser = argparse.ArgumentParser()\n",
                 encoding="utf-8",
@@ -1221,8 +984,8 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 "    def test_not_a_case(self): pass\n"
             ),
         }
-        summary = app.Viewer.package_summary("sample", files)
-        tests = app.Viewer.summary_group(summary, "Tests")
+        summary = app.RepositoryBrowser.package_summary("sample", files)
+        tests = app.RepositoryBrowser.summary_group(summary, "Tests")
         if tests != ["test top level", "test method case"]:
             msg = f"Unexpected canonical test names: {tests!r}"
             raise AssertionError(msg)
@@ -1235,14 +998,14 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             "    return argparse.ArgumentParser()\n"
             "def main():\n    parser().parse_args()\n"
         )
-        tree = app.Viewer.merged_summary_tree(
-            app.Viewer.package_summary("sample", {"main.py": before}),
-            app.Viewer.package_summary("sample", {"main.py": after}),
+        tree = app.RepositoryBrowser.merged_summary_tree(
+            app.RepositoryBrowser.package_summary("sample", {"main.py": before}),
+            app.RepositoryBrowser.package_summary("sample", {"main.py": after}),
             previous_cli=source_cli_overview(before),
             current_cli=source_cli_overview(after),
         )
         entry = app.TreeNode("packages/sample", tree)
-        if app.Viewer.has_warning(entry):
+        if app.RepositoryBrowser.has_warning(entry):
             msg = "Historical diagnostics must not keep a resolved warning active"
             raise AssertionError(msg)
         arguments = next(node for node in tree if node.title == "Arguments")
@@ -1254,12 +1017,12 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             raise AssertionError(msg)
         current = app.TreeNode(
             "packages/sample",
-            app.Viewer.cli_tree(
+            app.RepositoryBrowser.cli_tree(
                 source_cli_overview(before),
                 previous=source_cli_overview(after),
             ),
         )
-        if not app.Viewer.has_warning(current):
+        if not app.RepositoryBrowser.has_warning(current):
             msg = "New diagnostics must still mark the package as unavailable"
             raise AssertionError(msg)
 
@@ -1271,8 +1034,8 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             "build = commands.add_parser('build')\n"
             "build.add_argument('--jobs', type=int, default=2, help='Worker count')\n"
         )
-        arguments = app.Viewer.summary_group(
-            app.Viewer.package_summary("sample", {"main.py": source}),
+        arguments = app.RepositoryBrowser.summary_group(
+            app.RepositoryBrowser.package_summary("sample", {"main.py": source}),
             "Arguments",
         )
         if arguments != [
@@ -1282,7 +1045,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             msg = f"Unexpected canonical CLI summary: {arguments!r}"
             raise AssertionError(msg)
 
-    def test_overview_nests_commands_and_search_reveals_parameters(self) -> None:
+    def test_cli_parameters_belong_to_nested_commands(self) -> None:
         """Keep root options visible and nested command parameters collapsible."""
         source = (
             "import argparse\n"
@@ -1299,10 +1062,8 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             package = root / "packages/sample"
             package.mkdir(parents=True)
             (package / "main.py").write_text(source, encoding="utf-8")
-            viewer = app.Viewer(root)
-            viewer.mode = "high-level"
-            viewer.overview = viewer.package_entries()
-            entry = viewer.overview[0]
+            viewer = app.RepositoryBrowser(root)
+            entry = viewer.package_entries()[0]
             arguments = next(
                 node for node in entry.children or [] if node.title == "Arguments"
             )
@@ -1317,17 +1078,6 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             ] != ["--jobs  optional; default=2; type=int"]:
                 msg = "Nested command must own its parameters"
                 raise AssertionError(msg)
-            entry.expanded = arguments.expanded = True
-            visible = "\n".join(row.text for row in viewer.rows(100))
-            if "--jobs" in visible or "test: command" in visible:
-                msg = "Command details must stay collapsed without redundant labels"
-                raise AssertionError(msg)
-            viewer.pattern = "--jobs"
-            viewer.search(1)
-            visible = "\n".join(row.text for row in viewer.rows(100))
-            if "--jobs" not in visible or not test.expanded or not coverage.expanded:
-                msg = "Search must open every ancestor of a CLI parameter"
-                raise AssertionError(msg)
 
     def test_nested_cli_diff_keeps_changes_under_their_commands(self) -> None:
         """Show changed parameters and removed commands at their original paths."""
@@ -1338,21 +1088,21 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             CliEntry(("retired",), "command", command=True),
         ]
         after = [*before[:2], CliEntry(("test", "coverage"), "--jobs  default=4")]
-        tree = app.Viewer.cli_tree(after, previous=before)
+        tree = app.RepositoryBrowser.cli_tree(after, previous=before)
         test = next(node for node in tree if node.title == "test")
         coverage = (test.children or [])[0]
-        if [(node.title, node.style) for node in coverage.children or []] != [
-            ("- --jobs  default=2", 31),
-            ("+ --jobs  default=4", 32),
+        if [(node.title, node.change) for node in coverage.children or []] != [
+            ("- --jobs  default=2", "removed"),
+            ("+ --jobs  default=4", "added"),
         ]:
             msg = "Changed CLI parameters must retain their path and colors"
             raise AssertionError(msg)
         retired = next(node for node in tree if node.title == "- retired")
-        if (retired.title, retired.style) != ("- retired", 31):
+        if (retired.title, retired.change) != ("- retired", "removed"):
             msg = "Removed commands must retain removal styling"
             raise AssertionError(msg)
 
-    def test_high_level_diff_compares_summaries_not_source_code(self) -> None:  # noqa: D102, PLR0915
+    def test_high_level_diff_compares_summaries_not_source_code(self) -> None:  # noqa: D102
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             subprocess.run(["git", "init", "-q", str(root)], check=True)
@@ -1421,7 +1171,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 check=True,
             )
             shutil.rmtree(removed)
-            viewer = app.Viewer(root)
+            viewer = app.RepositoryBrowser(root)
             entries = {node.title: node for node in viewer.package_entries(diff=True)}
             sample_diff = entries["packages/sample"]
             changed_fields = {node.title for node in sample_diff.children or []}
@@ -1449,37 +1199,6 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             }:
                 msg = "Argument diff must show removed and added CLI options"
                 raise AssertionError(msg)
-            viewer.mode = "high-level diff"
-            viewer.overview = [sample_diff]
-            viewer.selected = 0
-            viewer.navigate("l", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "test old" in visible or "test new" in visible:
-                msg = "Test-name diff children must be collapsed under Tests"
-                raise AssertionError(msg)
-            if "--old" in visible or "--new" in visible:
-                msg = "Argument diff entries must be collapsed under Arguments"
-                raise AssertionError(msg)
-            arguments_row = next(
-                row
-                for row in viewer.rows(80)
-                if row.text.rstrip().endswith("Arguments")
-            )
-            viewer.selected = arguments_row.owner
-            viewer.navigate("l", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "--old" not in visible or "--new" not in visible:
-                msg = "Expanding Arguments in a diff must show changed options"
-                raise AssertionError(msg)
-            tests_row = next(
-                row for row in viewer.rows(80) if row.text.rstrip().endswith("Tests")
-            )
-            viewer.selected = tests_row.owner
-            viewer.navigate("l", 20, viewer.rows(80))
-            visible = "\n".join(row.text for row in viewer.rows(80))
-            if "test old" not in visible or "test new" not in visible:
-                msg = "Expanding Tests in a diff must show changed test names"
-                raise AssertionError(msg)
             if "packages/added" not in entries or "packages/removed" not in entries:
                 msg = "High-level diff must include added and removed packages"
                 raise AssertionError(msg)
@@ -1499,7 +1218,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             package = root / "github.com/example/project/packages/sample"
             package.mkdir(parents=True)
             (package / "main.py").write_text('"""Sample help."""\n', encoding="utf-8")
-            viewer = app.Viewer(root)
+            viewer = app.RepositoryBrowser(root)
             entries = viewer.package_entries()
             if [node.title for node in entries] != ["github.com"]:
                 msg = "Home overview must start with the repository path parent"
@@ -1542,7 +1261,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 '"""Help."""\nvalue = 2\n',
                 encoding="utf-8",
             )
-            viewer = app.Viewer(root)
+            viewer = app.RepositoryBrowser(root)
             overview = viewer.package_entries()
             if not overview or overview[0].title != "packages/same":
                 msg = "The regular high-level view must retain unchanged summaries"
@@ -1550,55 +1269,3 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             if viewer.package_entries(diff=True):
                 msg = "Source-only changes must not appear in a high-level diff"
                 raise AssertionError(msg)
-            viewer.mode = "high-level diff"
-            viewer.overview = [
-                app.TreeNode(
-                    "packages/change",
-                    [
-                        app.TreeNode("- old", style=31),
-                        app.TreeNode("+ new", style=32),
-                    ],
-                    expanded=True,
-                ),
-            ]
-            rows = viewer.rows(80)
-            if viewer.styles(rows[1]) != [31] or viewer.styles(rows[2]) != [32]:
-                msg = "Removed and added summary lines must be red and green"
-                raise AssertionError(msg)
-
-    def test_paging_at_last_parent_does_not_jump_backwards(self) -> None:  # noqa: D102
-        viewer = app.Viewer()
-        viewer.overview = [app.TreeNode(str(index)) for index in range(30)]
-        for _ in viewer.overview:
-            viewer.navigate("j", 10, viewer.rows(80))
-        top = viewer.top
-        viewer.navigate(" ", 10, viewer.rows(80))
-        if viewer.top < top:
-            msg = "Forward paging at the final parent must not scroll backwards"
-            raise AssertionError(msg)
-
-    def test_unicode_and_tiny_terminals(self) -> None:  # noqa: D102
-        viewer = app.Viewer()
-        viewer.overview = [app.TreeNode("界e\u0301界界")]
-        for width in (1, 2, 4, 20):
-            for _start, content in viewer.wrap("界e\u0301界界", width):
-                cells = sum(
-                    0
-                    if unicodedata.combining(char)
-                    else 2
-                    if unicodedata.east_asian_width(char) in {"W", "F"}
-                    else 1
-                    for char in content
-                )
-                if cells > width:
-                    msg = "Wide characters and indentation must fit the terminal"
-                    raise AssertionError(msg)
-
-    def test_wrapping_and_control_characters(self) -> None:  # noqa: D102
-        viewer = app.Viewer()
-        viewer.overview = [app.TreeNode("\x1b[31m" + "x" * 100)]
-        width = 20
-        rows = viewer.rows(width)
-        if any(len(row.text) > width or "\x1b" in row.text for row in rows):
-            msg = "Output must wrap and must not execute terminal escape sequences"
-            raise AssertionError(msg)

@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Canonical — Repository graph</title>
     <link rel="stylesheet" href="/style.css" />
-    <script src="/elk.js" defer></script>
+    <script src="/g6.js" defer></script>
     <script src="/script.js" defer></script>
   </head>
   <body>
@@ -14,9 +14,11 @@
       class="canvas"
       aria-label="Expandable repository and dependency graph"
       aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown"
-      title="Click empty container space to open it, or outside the outer container to go to its parent. Drag or use arrow keys to pan; Shift + arrow keys for larger steps"
+      title="Click directory titles to open them. Use the path above or Alt + Up to go to a parent. Drag empty space to pan."
       tabindex="0"
     ></div>
+    <div id="measure" aria-hidden="true"></div>
+    <nav id="directories" class="directory-navigation" aria-label="Directory navigation"></nav>
     <div class="graph-controls" role="toolbar" aria-label="Graph controls">
       <input id="search" type="search" placeholder="Search…" aria-label="Search graph" />
       <button id="refresh" class="quiet-button" title="Refresh graph" aria-label="Refresh graph">
@@ -26,7 +28,15 @@
         ⊟
       </button>
       <button id="fit" class="quiet-button" title="Fit screen" aria-label="Fit screen">
-        <svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round">
+        <svg
+          viewBox="0 0 24 24"
+          aria-hidden="true"
+          fill="none"
+          stroke="currentColor"
+          stroke-width="1.7"
+          stroke-linecap="round"
+          stroke-linejoin="round"
+        >
           <path d="M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5M8 8h8v8H8Z" />
         </svg>
       </button>
@@ -34,7 +44,7 @@
         ><input id="changes" type="checkbox" /><span>Δ</span></label
       >
     </div>
-    <div id="cwd" class="current-directory" aria-label="Current directory" hidden></div>
+    <nav id="cwd" class="current-directory" aria-label="Current directory" hidden></nav>
     <div id="message" role="status" hidden></div>
   </body>
 </html>

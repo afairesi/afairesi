@@ -4,11 +4,15 @@ let
   python = pkgs.python3;
   runtimeInputs = [
     inputs.self.packages.${pkgs.stdenv.system}.canonical_browser
-    pkgs.asciinema
-    pkgs.asciinema-agg
-    pkgs.dejavu_fonts
+    pkgs.chromium
     pkgs.ffmpeg
   ];
+  videoTools = pkgs.runCommand "playwright-video-tools" { } ''
+    mkdir -p "$out/ffmpeg-${pkgs.playwright-driver.browsersJSON.ffmpeg.revision}"
+    ln -s ${pkgs.ffmpeg}/bin/ffmpeg "$out/ffmpeg-${pkgs.playwright-driver.browsersJSON.ffmpeg.revision}/ffmpeg-${
+      if pkgs.stdenv.hostPlatform.isDarwin then "mac" else "linux"
+    }"
+  '';
 in
 python.pkgs.buildPythonPackage {
   inherit pname;
@@ -30,9 +34,10 @@ python.pkgs.buildPythonPackage {
   postFixup = ''
     wrapProgram "$out/bin/${pname}" \
       --prefix PATH : "${pkgs.lib.makeBinPath runtimeInputs}" \
-      --set CANONICAL_BROWSER_VIDEO_FONT_DIR "${pkgs.dejavu_fonts}/share/fonts/truetype"
+      --set PLAYWRIGHT_BROWSERS_PATH "${videoTools}" \
+      --set CANONICAL_BROWSER_VIDEO_CHROMIUM "${pkgs.chromium}/bin/chromium"
   '';
-  propagatedBuildInputs = runtimeInputs;
+  propagatedBuildInputs = runtimeInputs ++ [ python.pkgs.playwright ];
   pyproject = false;
   src = ./.;
   strictDeps = true;

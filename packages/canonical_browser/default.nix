@@ -1,18 +1,18 @@
 { inputs, pkgs, ... }:
 let
-  elk = pkgs.stdenvNoCC.mkDerivation {
+  g6 = pkgs.stdenvNoCC.mkDerivation {
     installPhase = ''
-      install -Dm644 lib/elk.bundled.js "$out/elk.js"
-      install -Dm644 LICENSE.md "$out/share/licenses/elkjs/LICENSE.md"
+      install -Dm644 dist/g6.min.js "$out/g6.js"
+      install -Dm644 LICENSE "$out/share/licenses/g6/LICENSE"
       mkdir -p "$out/nix-support"
-      printf 'export CANONICAL_BROWSER_ELK=%s/elk.js\n' "$out" > "$out/nix-support/setup-hook"
+      printf 'export CANONICAL_BROWSER_G6=%s/g6.js\n' "$out" > "$out/nix-support/setup-hook"
     '';
-    pname = "elkjs-browser";
+    pname = "g6-browser";
     src = pkgs.fetchurl {
-      hash = "sha256-wddxlyPgILEHJOPMvJNWlqKITx5402HN0DdmMJ6Ojio=";
-      url = "https://registry.npmjs.org/elkjs/-/elkjs-0.12.0.tgz";
+      hash = "sha256-CjGj0LKAJmCuskBlpHuqoKFnK0HokyR8gZwzr+ihRa4=";
+      url = "https://registry.npmjs.org/@antv/g6/-/g6-5.1.1.tgz";
     };
-    version = "0.12.0";
+    version = "5.1.1";
   };
   pname = baseNameOf ./.;
   python = pkgs.python3;
@@ -33,21 +33,21 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Terminal and visual browser for Canonical packages, interfaces, tests, and changes";
+    description = "Web diagram browser for Canonical directories, packages, hosts, and changes";
     mainProgram = pname;
   };
   nativeBuildInputs = [
-    elk
+    g6
     pkgs.makeWrapper
   ];
   passthru = {
-    elk = elk;
+    g6 = g6;
     python = python;
   };
   postFixup = ''
-    cp ${elk}/elk.js "$out/${python.sitePackages}/$pname/prm/elk.js"
+    cp ${g6}/g6.js "$out/${python.sitePackages}/$pname/prm/g6.js"
     mkdir -p "$out/share/licenses"
-    cp -R ${elk}/share/licenses/elkjs "$out/share/licenses/"
+    cp -R ${g6}/share/licenses/g6 "$out/share/licenses/"
     wrapProgram "$out/bin/${pname}" --prefix PATH : "${pkgs.lib.makeBinPath runtimeInputs}"
   '';
   propagatedBuildInputs = runtimeInputs;
