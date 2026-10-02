@@ -30,6 +30,7 @@ from git_canonical import (
     package_overview,
     source_cli_overview,
     source_package_overview,
+    source_suppressions,
 )
 from git_canonical import CommandError as GitCanonicalError
 
@@ -60,6 +61,7 @@ class TreeNode:  # noqa: D101
     warning: bool = False
     resource_id: str | None = None
     directory: Path | None = None
+    source_file: bool = False
 
 
 class Row(NamedTuple):  # noqa: D101
@@ -666,8 +668,10 @@ class Viewer:  # noqa: D101
     ) -> None:
         self.height = height
         if key in ("\x08", curses.KEY_BACKSPACE, "\x7f"):
-            self.cwd = self.cwd.parent
-            self.load_overview()
+            parent = browser_parent(self.cwd)
+            if parent is not None:
+                self.cwd = parent
+                self.load_overview()
             return
         if key in ("\n", "\r", curses.KEY_ENTER) and self.overview_visible:
             directory = self.overview_visible[self.selected].directory
@@ -870,6 +874,7 @@ def serialize_node(node: TreeNode) -> dict[str, Any]:
         ),
         "warning": node.warning,
         "resource_id": node.resource_id,
+        "source_file": node.source_file,
         "children": [serialize_node(child) for child in node.children or []],
     }
 
@@ -990,7 +995,7 @@ def merge_dependency_changes(
 
 
 def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
-    """Attach shared machine, OS, and language details to a resource."""
+    """Attach shared machine and OS details to a resource."""
     tree.resource_id = record["id"]
     if record["kind"] == "machine":
         tree.title = f"Machine: {record['name']}"
@@ -998,11 +1003,6 @@ def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
     elif record["kind"] == "host":
         record["icon"] = "nixos"
         tree.children = [TreeNode("OS: NixOS (configuration)")]
-    elif record.get("package_type"):
-        tree.children = [
-            TreeNode(f"Language: {record['package_type']}"),
-            *(tree.children or []),
-        ]
     elif record["kind"] == "repository":
         tree.title = record["repository"]
         tree.children = [TreeNode(f"Profile: {record.get('profile', 'flake')}")]
@@ -1016,10 +1016,10 @@ def package_sources(directory: Path) -> list[TreeNode]:
     candidates = list(directory.iterdir())
     resources = directory / "prm"
     if resources.is_dir() and not resources.is_symlink():
-        for parent, children, files in os.walk(resources, followlinks=False):
-            children[:] = [
+        for parent, folders, files in os.walk(resources, followlinks=False):
+            folders[:] = [
                 child
-                for child in children
+                for child in folders
                 if not child.startswith(".") and not (Path(parent) / child).is_symlink()
             ]
             candidates.extend(Path(parent) / filename for filename in files)
@@ -1033,16 +1033,65 @@ def package_sources(directory: Path) -> list[TreeNode]:
             continue
         name = str(path.relative_to(directory))
         try:
-            count = len(path.read_bytes().splitlines())
+            content = path.read_bytes()
         except OSError as error:
-            result.append(
-                TreeNode(f"{name}: (unavailable: {error.strerror})", warning=True),
-            )
+            children = [TreeNode(f"(unavailable: {error.strerror})", warning=True)]
         else:
-            result.append(
-                TreeNode(f"{name}: {count} {'line' if count == 1 else 'lines'}"),
-            )
+            children = [TreeNode(f"Lines: {len(content.splitlines())}")]
+            suppressions = [
+                TreeNode(f"{kind} ({scope}): {count}")
+                for (kind, scope), count in sorted(
+                    source_suppressions(name, content.decode(errors="replace")).items(),
+                )
+            ]
+            if suppressions:
+                children.append(TreeNode("Suppressions", suppressions))
+        result.append(TreeNode(name, children, source_file=True))
     return result
+
+
+def package_file_tree(  # noqa: C901 - move each declaration to its source file
+    directory: Path,
+    tree: TreeNode,
+) -> TreeNode:
+    """Organize declarations beneath their source files, preserving semantic diffs."""
+    files = {node.title: node for node in package_sources(directory)}
+    fields = []
+
+    def source(name: str) -> TreeNode:
+        return files.setdefault(name, TreeNode(name, [], source_file=True))
+
+    def attach(name: str, node: TreeNode) -> None:
+        parent = source(name)
+        parent.children = [
+            *(child for child in parent.children or [] if child.title != node.title),
+            node,
+        ]
+
+    for node in tree.children or []:
+        title = node.title.removeprefix("- ").removeprefix("+ ")
+        if title.startswith("Language:"):
+            continue
+        if node.title == "Suppressions":
+            for file in node.children or []:
+                if file.children:
+                    attach(file.title, TreeNode("Suppressions", file.children))
+        elif node.title in {"Arguments", "Tests", "Dependencies"}:
+            name = {
+                "Arguments": "main.py",
+                "Tests": "test_main.py",
+                "Dependencies": "default.nix",
+            }[node.title]
+            attach(name, node)
+        elif title.startswith("Help:"):
+            if title != "Help: (module docstring not declared)":
+                node.title = node.title.replace("Help:", "Documentation:", 1)
+                parent = source("main.py")
+                parent.children = [*(parent.children or []), node]
+        else:
+            fields.append(node)
+    tree.children = [*fields, *(files[name] for name in sorted(files))]
+    return tree
 
 
 def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationships
@@ -1098,9 +1147,7 @@ def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationsh
             resources.get(identifier, TreeNode(record["path"], [])),
         )
         if record["kind"] == "package":
-            sources = package_sources(root / record["repository"] / record["path"])
-            if sources:
-                tree.children = [*(tree.children or []), TreeNode("Sources", sources)]
+            tree = package_file_tree(root / record["repository"] / record["path"], tree)
         links = [
             TreeNode(
                 f"{edge['kind']}: {edge['source']} → {edge['target']}",
@@ -1155,6 +1202,13 @@ def browser_root(directory: Path) -> Path:
     )
 
 
+def browser_parent(directory: Path) -> Path | None:
+    """Stop upward navigation at home or the filesystem root."""
+    if directory == Path.home().resolve() or directory.parent == directory:
+        return None
+    return directory.parent
+
+
 def directory_snapshot(directory: Path) -> tuple[dict[str, Any], list[TreeNode]]:
     """Show immediate directory containers outside a Canonical repository."""
     children = [
@@ -1165,7 +1219,9 @@ def directory_snapshot(directory: Path) -> tuple[dict[str, Any], list[TreeNode]]
     nodes = [TreeNode(child.name, [], directory=child.resolve()) for child in children]
     return {
         "root": str(directory),
-        "parent": str(directory.parent) if directory.parent != directory else None,
+        "parent": str(parent_directory)
+        if (parent_directory := browser_parent(directory))
+        else None,
         "nodes": [
             {
                 "id": f"{child.name}:directory",
@@ -1225,7 +1281,11 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
         if edge["source"] in known and edge["target"] in known
     ]
     data["root"] = str(directory)
-    data["parent"] = str(directory.parent) if directory.parent != directory else None
+    data["parent"] = (
+        str(parent_directory)
+        if (parent_directory := browser_parent(directory))
+        else None
+    )
     result: list[TreeNode] = []
     containers: dict[str, TreeNode] = {}
 
@@ -1263,6 +1323,7 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
                 style={"removed": 31, "added": 32, "modified": 33}.get(tree["change"]),
                 warning=tree["warning"],
                 resource_id=tree["resource_id"],
+                source_file=tree.get("source_file", False),
             )
 
         if parent.children is not None:

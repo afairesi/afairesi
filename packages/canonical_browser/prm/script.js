@@ -87,8 +87,6 @@ async function layoutGraph(generation) {
   async function collectionModel(box) {
     const id = `collection-${serial++}`;
     elements.set(id, box);
-    const heading = box.querySelector(".collection-heading");
-    const top = Math.ceil(heading.offsetHeight) + 32;
     const children = [...box.querySelectorAll(".resource-block")].map((block) => {
       elements.set(block.dataset.nodeId, block);
       return {
@@ -152,7 +150,7 @@ async function layoutGraph(generation) {
       children,
       layoutOptions: {
         ...options("layered"),
-        "elk.padding": `[top=${top},left=16,bottom=16,right=16]`,
+        "elk.padding": "[top=0,left=0,bottom=0,right=0]",
       },
     };
   }
@@ -166,7 +164,7 @@ async function layoutGraph(generation) {
       item.style.top = `${child.y}px`;
       item.style.width = `${child.width}px`;
       if (item.classList.contains("packed-resources")) item.style.height = `${child.height}px`;
-      if (item.classList.contains("collection-box")) {
+      if (item.classList.contains("resource-layout")) {
         item.style.height = `${child.height}px`;
         apply(child, item.querySelector(".lanes"));
       }
@@ -182,7 +180,7 @@ async function layoutGraph(generation) {
     const body = box.querySelector(":scope > .repository-body");
     const children = [];
     for (const item of body.children) {
-      if (item.classList.contains("collection-box")) {
+      if (item.classList.contains("resource-layout")) {
         const model = await collectionModel(item);
         if (!model || generation !== layoutGeneration) return;
         children.push(model);
@@ -268,6 +266,28 @@ function svgElement(tag, attributes = {}, text) {
   for (const [name, value] of Object.entries(attributes)) item.setAttribute(name, value);
   if (text !== undefined) item.textContent = text;
   return item;
+}
+
+function kindIcon(kind) {
+  const names = { directory: "Directory", package: "Package", "package-reference": "Package", host: "Computer", machine: "Computer" };
+  const paths = {
+    directory: "M3 7V5h6l2 2h10v13H3Z",
+    package: "M12 3 3 7.5v9L12 21l9-4.5v-9ZM3 7.5l9 4.5 9-4.5M12 12v9M7.5 5.25l9 4.5",
+    host: "M3 4h18v13H3ZM8 21h8M12 17v4",
+  };
+  const icon = svgElement("svg", {
+    class: "kind-icon",
+    viewBox: "0 0 24 24",
+    role: "img",
+    "aria-label": names[kind] || kind,
+    fill: "none",
+    stroke: "currentColor",
+    "stroke-width": "1.7",
+    "stroke-linejoin": "round",
+    "stroke-linecap": "round",
+  });
+  icon.append(svgElement("path", { d: paths[kind] || paths[kind === "package-reference" ? "package" : "host"] }));
+  return icon;
 }
 
 function languageIcon(kind) {
@@ -553,9 +573,10 @@ function behaviorTree(tree, key, filterChanges) {
   const visible = children.filter((child) => !filterChanges || hasChange(child));
   bindExpansion(details, key, flattenText(tree).toLowerCase().includes(query), hasChange(tree));
   const summary = element("summary", "", tree.title);
-  summary.append(
-    element("span", "count", String(visible.reduce((sum, child) => sum + countLeaves(child), 0))),
-  );
+  if (!tree.source_file)
+    summary.append(
+      element("span", "count", String(visible.reduce((sum, child) => sum + countLeaves(child), 0))),
+    );
   if (hasChange(tree)) summary.append(changeTally(tree));
   details.append(summary);
   const content = element("div", "behavior-content");
@@ -584,16 +605,16 @@ function resourceBlock(node, layout) {
   const title = element("div", "resource-title");
   const icon = languageIcon(node.icon || node.package_type);
   title.append(
-    icon || element("i", "kind-dot"),
+    kindIcon(node.kind),
     element("strong", "", node.name),
     element("span", "chevron", "›"),
   );
+  if (icon) title.insertBefore(icon, title.querySelector(".chevron"));
   summary.append(title);
   if (node.description) summary.append(element("p", "resource-description", node.description));
   if (!["package", "package-reference"].includes(node.kind))
     summary.append(element("div", "resource-path", node.path));
   const meta = element("div", "resource-meta");
-  if (!icon) meta.append(element("span", "kind-tag", node.kind));
   if (node.context) details.classList.add("context");
   if (layout?.cyclic) meta.append(element("span", "change-badge", "dependency cycle"));
   if (node.changed)
@@ -639,12 +660,8 @@ function resourceBlock(node, layout) {
   return details;
 }
 
-function collection(items, kind, edges) {
-  const box = element("section", `collection-box ${kind}-collection`);
-  if (["packages", "hosts"].includes(kind)) box.dataset.directory = `${items[0].directory}/${kind}`;
-  const heading = element("h3", "collection-heading", `${kind}/`);
-  heading.append(element("span", "", `${items.length} resources`));
-  box.append(heading);
+function resourceLayout(items, edges) {
+  const box = element("div", "resource-layout");
   const levels = dependencyLevels(items, edges);
   const lanes = element("div", "lanes");
   for (const node of items) lanes.append(resourceBlock(node, levels.get(node.id)));
@@ -696,9 +713,6 @@ function render() {
     parent.repository = repository;
   }
   function container(item) {
-    const record = data.nodes.find(
-      (node) => node.kind === "repository" && node.repository === item.repository,
-    );
     const box = element(
       "section",
       item.repository !== undefined ? "repository-box" : "directory-box",
@@ -706,26 +720,17 @@ function render() {
     if (item.repository !== undefined) box.dataset.repository = item.repository;
     box.dataset.path = item.path;
     const heading = element("h2", "repository-heading");
-    const link = element("button", "directory-link", `◫ ${item.name}`);
+    const link = element("button", "directory-link");
+    link.append(kindIcon("directory"), element("span", "", item.name));
     const destination = item.path === "." ? data.root : `${data.root}/${item.path}`;
     box.dataset.directory = destination;
     link.title = `Open ${destination}`;
     link.addEventListener("click", () => navigateDirectory(destination));
     heading.append(link);
-    heading.append(
-      element("span", "scope", record ? `${record.profile.toUpperCase()} REPOSITORY` : "DIRECTORY"),
-    );
     box.append(heading);
     const body = element("div", "repository-body");
     const resources = currentNodes.filter((node) => node.repository === item.repository);
-    for (const [kinds, kind] of [
-      [["package", "package-reference"], "packages"],
-      [["host"], "hosts"],
-      [["machine"], "resources"],
-    ]) {
-      const items = resources.filter((node) => kinds.includes(node.kind));
-      if (items.length) body.append(collection(items, kind, visibleEdges()));
-    }
+    if (resources.length) body.append(resourceLayout(resources, visibleEdges()));
     for (const child of item.children.values()) body.append(container(child));
     box.append(body);
     return box;
@@ -948,8 +953,6 @@ async function refresh(nextDirectory = directory, force = true) {
     directorySnapshots.set(snapshot.root, snapshot);
     data = prepareData(snapshot);
     directory = data.root;
-    $("parent").disabled = !data.parent;
-    $("parent").title = data.parent ? `Go to ${data.parent}` : "No parent directory";
     const url = new URL(location.href);
     url.searchParams.set("directory", directory);
     history.replaceState(null, "", url);
@@ -1007,7 +1010,6 @@ $("changes").addEventListener("change", (event) => {
   render();
 });
 $("refresh").addEventListener("click", () => refresh());
-$("parent").addEventListener("click", () => navigateDirectory(data.parent));
 $("fit").addEventListener("click", () => requestAnimationFrame(() => layoutPromise.then(fitGraph)));
 $("collapse").addEventListener("click", () => {
   const expand = $("collapse").title === "Expand all";

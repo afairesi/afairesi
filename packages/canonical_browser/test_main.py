@@ -54,17 +54,17 @@ class TestGui(unittest.TestCase):
             record = next(
                 node for node in snapshot["nodes"] if node["kind"] == "package"
             )
-            sources = next(
-                child
+            sources = {
+                child["title"]: child["children"][0]["title"]
                 for child in record["tree"]["children"]
-                if child["title"] == "Sources"
-            )
-            if [child["title"] for child in sources["children"]] != [
-                "default.nix: 1 line",
-                "main.py: 3 lines",
-                "prm/web/script.js: 3 lines",
-                "test_main.py: 0 lines",
-            ]:
+                if child["source_file"]
+            }
+            if sources != {
+                "default.nix": "Lines: 1",
+                "main.py": "Lines: 3",
+                "prm/web/script.js": "Lines: 3",
+                "test_main.py": "Lines: 0",
+            }:
                 msg = "Source counts must exclude output, binary assets, and links"
                 raise AssertionError(msg)
             if snapshot["tree"][0]["children"][0] != record["tree"]:
@@ -131,6 +131,22 @@ class TestGui(unittest.TestCase):
             if viewer.cwd != root:
                 msg = "Parent navigation must work even in an empty directory"
                 raise AssertionError(msg)
+            with (
+                patch.object(Path, "home", return_value=root),
+                patch.object(viewer, "load_overview") as load,
+            ):
+                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+                load.assert_not_called()
+                if (
+                    viewer.cwd != root
+                    or app.directory_snapshot(root)[0]["parent"] is not None
+                ):
+                    msg = "Home must be the upper navigation boundary"
+                    raise AssertionError(msg)
+                (root / "flake.nix").write_text("{}\n")
+                if app.gui_data(root)["parent"] is not None:
+                    msg = "Canonical home snapshots must also stop parent navigation"
+                    raise AssertionError(msg)
 
     def test_gui_package_includes_offline_layout_engine(self) -> None:
         """The installed app must include the same engine served by source tests."""
@@ -405,7 +421,10 @@ class TestGui(unittest.TestCase):
         ):
             msg = "Hosts and checks must appear alongside packages"
             raise AssertionError(msg)
-        leaves = package["children"][1]["children"]
+        file = next(
+            child for child in package["children"] if child["title"] == "test_main.py"
+        )
+        leaves = file["children"][0]["children"]
         if [node["change"] for node in leaves] != ["added", "removed"]:
             msg = "Nested changes must retain their addition and removal status"
             raise AssertionError(msg)
@@ -446,6 +465,75 @@ class TestCli(unittest.TestCase):
 
 
 class TestViewer(unittest.TestCase):  # noqa: D101
+    def test_package_details_belong_to_their_source_files(self) -> None:
+        """Keep arguments, tests, documentation, and suppression diffs under sources."""
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            (package / "main.py").write_text('"""Example."""\n# noqa\n')
+            (package / "prm").mkdir()
+            (package / "prm/script.js").write_text(
+                "// eslint-disable-next-line\nrun();\n",
+            )
+            arguments = app.TreeNode("Arguments", [app.TreeNode("+ --help", style=32)])
+            tests = app.TreeNode("Tests", [app.TreeNode("- test old", style=31)])
+            tree = app.TreeNode(
+                "packages/example",
+                [
+                    app.TreeNode("Language: python"),
+                    app.TreeNode("Help: Example."),
+                    arguments,
+                    tests,
+                    app.TreeNode(
+                        "Suppressions",
+                        [
+                            app.TreeNode(
+                                "main.py",
+                                [app.TreeNode("noqa (global): 1 → 2", style=33)],
+                            ),
+                            app.TreeNode(
+                                "test_main.py",
+                                [app.TreeNode("type: ignore (local): 1 → 0", style=31)],
+                            ),
+                        ],
+                    ),
+                ],
+            )
+            app.package_file_tree(package, tree)
+            files = {node.title: node for node in tree.children or []}
+            if set(files) != {"main.py", "test_main.py", "prm/script.js"}:
+                msg = "Package details must be rooted at source files"
+                raise AssertionError(msg)
+            main = {node.title: node for node in files["main.py"].children or []}
+            if (
+                main["Arguments"] is not arguments
+                or "Documentation: Example." not in main
+            ):
+                msg = "Arguments and documentation must belong to main.py"
+                raise AssertionError(msg)
+            test = {node.title: node for node in files["test_main.py"].children or []}
+            if test["Tests"] is not tests or "Lines: 0" in test:
+                msg = "Removed files must retain test diffs without claiming zero lines"
+                raise AssertionError(msg)
+            script = {
+                node.title: node for node in files["prm/script.js"].children or []
+            }
+            if "Suppressions" not in script:
+                msg = "Source assets must have their own suppression counts"
+                raise AssertionError(msg)
+            changed = app.Viewer.changed_nodes([tree])[0]
+            if {node.title for node in changed.children or []} != {
+                "main.py",
+                "test_main.py",
+            }:
+                msg = "Diff filtering must preserve source ancestors of changed details"
+                raise AssertionError(msg)
+            if any(
+                "Lines:" in str(app.serialize_node(node))
+                for node in changed.children or []
+            ):
+                msg = "Informational line counts must not create semantic changes"
+                raise AssertionError(msg)
+
     def test_directory_navigation_reuses_source_snapshot_until_refresh(self) -> None:
         """Parent navigation rescopes declarations; Refresh reads new evidence."""
         with tempfile.TemporaryDirectory() as temporary:
