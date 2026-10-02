@@ -31,7 +31,7 @@ function svgElement(tag, attributes = {}, text) {
 }
 
 function languageIcon(kind) {
-  const names = { python: "Python", html: "HTML", nix: "Nix", latex: "LaTeX" };
+  const names = { python: "Python", html: "HTML", nix: "Nix", nixos: "NixOS", latex: "LaTeX" };
   if (!names[kind]) return null;
   const icon = svgElement("svg", {
     class: "language-icon",
@@ -53,7 +53,7 @@ function languageIcon(kind) {
       svgElement("path", { d: "M3 2h18l-2 18-7 2-7-2Z", fill: "#e44d26" }),
       svgElement("path", { d: "M7 6h10l-.2 3H10l.2 2h6.4l-.6 6-4 1-4-1-.3-3h3l.1 1 1.2.3 1.3-.3.2-2H7.6Z", fill: "white" }),
     );
-  } else if (kind === "nix") {
+  } else if (kind === "nix" || kind === "nixos") {
     for (let angle = 0; angle < 360; angle += 60)
       icon.append(svgElement("path", {
         d: "M12 12V2M12 6l-4-3M12 6l4-3",
@@ -126,56 +126,7 @@ function fieldComparison(children, field) {
 }
 
 function prepareData(snapshot) {
-  const trees = new Map();
-  function walk(nodes, path = []) {
-    for (const node of nodes) {
-      if (node.title.startsWith("packages/"))
-        trees.set(`${path.join("/") || "."}:${node.title}`, node);
-      else walk(node.children || [], [...path, node.title]);
-    }
-  }
-  walk(snapshot.tree || []);
-  const nodes = snapshot.nodes.map((node) => ({ ...node, tree: trees.get(node.id) }));
-  for (const [id, tree] of trees) {
-    if (!nodes.some((node) => node.id === id)) {
-      const [repository, name] = id.split(":packages/");
-      nodes.push({
-        id,
-        name,
-        path: `packages/${name}`,
-        repository,
-        kind: "package",
-        description: "Removed package",
-        tree,
-        removed: true,
-      });
-    }
-  }
-  const edges = snapshot.edges.map((edge) => ({ ...edge }));
-  for (const node of nodes) {
-    const dependencies = node.tree?.children.find((child) => child.title === "Dependencies");
-    for (const change of dependencies?.children || []) {
-      const match = change.title.match(/^[-+] ([^:]+): (packages\/\S+)$/);
-      if (!match || !change.change) continue;
-      const source = `${node.repository}:${match[2]}`;
-      const existing = edges.find(
-        (edge) => edge.source === source && edge.target === node.id && edge.kind === match[1],
-      );
-      if (existing) existing.change = change.change;
-      else if (change.change === "removed") {
-        if (!nodes.some((provider) => provider.id === source))
-          nodes.push({
-            id: source,
-            name: match[2].slice("packages/".length),
-            path: match[2],
-            repository: node.repository,
-            kind: "package-reference",
-            removed: true,
-          });
-        edges.push({ source, target: node.id, kind: match[1], change: "removed" });
-      }
-    }
-  }
+  const nodes = snapshot.nodes.map((node) => ({ ...node }));
   for (const node of nodes) {
     node.changed = node.tree ? hasChange(node.tree) : false;
     node.searchText = [
@@ -190,15 +141,15 @@ function prepareData(snapshot) {
       .join(" ")
       .toLowerCase();
   }
-  return { ...snapshot, nodes, edges };
+  return { ...snapshot, nodes };
 }
 
 function relationships() {
-  return data.edges.filter((edge) => !["contains", "submodule", "checked-by"].includes(edge.kind));
+  return data.edges.filter((edge) => !["contains", "submodule"].includes(edge.kind));
 }
 
 function visibleNodes() {
-  const resources = data.nodes.filter((node) => !["repository", "check"].includes(node.kind));
+  const resources = data.nodes.filter((node) => node.kind !== "repository");
   const matches = new Set(
     resources
       .filter(
@@ -386,7 +337,7 @@ function resourceBlock(node, layout) {
   );
   const summary = element("summary", "resource-header");
   const title = element("div", "resource-title");
-  const icon = languageIcon(node.package_type);
+  const icon = languageIcon(node.icon || node.package_type);
   title.append(
     icon || element("i", "kind-dot"),
     element("strong", "", node.name),
@@ -429,7 +380,8 @@ function resourceBlock(node, layout) {
       if (
         child.title.startsWith("Name:") ||
         child.title.startsWith("Description:") ||
-        child.title === "Dependencies"
+        child.title === "Dependencies" ||
+        child.title === "Connections"
       )
         return;
       const field = child.title.match(/^[-+] (Name|Description|Help):/);
@@ -490,7 +442,11 @@ function render() {
   }
   const stage = element("div", "graph-stage");
   stage.style.transform = `translate(${pan.x}px, ${pan.y}px) scale(${zoom})`;
-  for (const repository of new Set(currentNodes.map((node) => node.repository))) {
+  const repositories = new Set(currentNodes.map((node) => node.repository));
+  if (!query && !changesOnly)
+    for (const node of data.nodes)
+      if (node.kind === "repository") repositories.add(node.repository);
+  for (const repository of repositories) {
     const resources = currentNodes.filter((node) => node.repository === repository);
     const box = element("section", "repository-box");
     box.dataset.repository = repository;
@@ -499,13 +455,15 @@ function render() {
       "repository-heading",
       `◫ ${repository === "." ? data.root.split("/").pop() : repository}`,
     );
-    heading.append(element("span", "scope", "FLAKE REPOSITORY"));
+    const profile = data.nodes.find((node) => node.kind === "repository" && node.repository === repository)?.profile || "home";
+    heading.append(element("span", "scope", `${profile.toUpperCase()} REPOSITORY`));
     box.append(heading, element("div", "routing-space"));
     const body = element("div", "repository-body");
     const packages = resources.filter(
       (node) => node.kind === "package" || node.kind === "package-reference",
     );
     const hosts = resources.filter((node) => node.kind === "host");
+    const checks = resources.filter((node) => node.kind === "check");
 
     const other = resources.filter(
       (node) => !["package", "package-reference", "host", "check"].includes(node.kind),
@@ -513,6 +471,7 @@ function render() {
     for (const [items, kind] of [
       [packages, "packages"],
       [hosts, "hosts"],
+      [checks, "checks"],
       [other, "resources"],
     ])
       if (items.length) body.append(collection(items, kind, visibleEdges()));
@@ -611,12 +570,11 @@ function drawEdges() {
       "data-source": edge.source,
       "data-target": edge.target,
     });
-    const declaration = edge.declaration;
     line.append(
       svgElement(
         "title",
         {},
-        `${edge.kind}: ${edge.source} → ${edge.target}${declaration ? `\n${declaration.path}:${declaration.line}\n${declaration.expression}` : ""}`,
+        `${edge.kind}: ${edge.source} → ${edge.target}`,
       ),
     );
     const edgeKey = JSON.stringify([edge.source, edge.target, edge.kind]);
@@ -664,14 +622,6 @@ function drawEdges() {
         button.addEventListener("click", () => focusResource(id));
         note.append(button);
       }
-      if (declaration)
-        note.append(
-          element(
-            "div",
-            "detail-leaf",
-            `${declaration.repository}/${declaration.path}:${declaration.line}\n${declaration.expression}`,
-          ),
-        );
       notes.append(note);
     }
   });

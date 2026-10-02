@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import curses
 import json
+import platform
 import re
 import sys
 import unicodedata
@@ -30,6 +31,7 @@ from git_canonical import (
 from git_canonical import CommandError as GitCanonicalError
 
 MAX_PORT = 65535
+MOUNT_FIELDS = 3
 
 
 @dataclass
@@ -39,6 +41,7 @@ class TreeNode:  # noqa: D101
     expanded: bool = False
     style: int | None = None
     warning: bool = False
+    resource_id: str | None = None
 
 
 class Row(NamedTuple):  # noqa: D101
@@ -48,7 +51,8 @@ class Row(NamedTuple):  # noqa: D101
 
 class Viewer:  # noqa: D101
     def __init__(self, cwd: str | Path | None = None) -> None:  # noqa: D107
-        self.cwd = Path(cwd or Path.cwd()).resolve()
+        self.cwd = Path(cwd or Path.home()).resolve()
+        self.snapshot: dict[str, Any] = {}
         self.selected = 0
         self.top = 0
         self.pattern = ""
@@ -68,6 +72,10 @@ class Viewer:  # noqa: D101
         """Rebuild the package overview from the current working tree."""
         self.status = ""
         self.full_overview = self.package_entries(diff=False)
+        self.snapshot, self.full_overview = browser_snapshot(
+            self.cwd,
+            self.full_overview,
+        )
         self.diff_overview = self.changed_nodes(self.full_overview)
         self.select_overview()
         self.overview_loaded = True
@@ -798,27 +806,238 @@ class Viewer:  # noqa: D101
                 self.navigate(key, page, rows)
 
 
-def gui_data(root: Path) -> dict[str, Any]:
-    """Combine the canonical graph with the terminal's semantic change tree."""
-    data: dict[str, Any] = overview_data(root)
-    scope = root.parent.parent if data.get("focus") else root
-    viewer = Viewer(scope)
-    viewer.refresh_overview()
+def serialize_node(node: TreeNode) -> dict[str, Any]:
+    """Serialize the same resource details used by the terminal tree."""
+    return {
+        "title": node.title,
+        "change": (
+            {31: "removed", 32: "added", 33: "modified"}.get(node.style)
+            if node.style is not None
+            else None
+        ),
+        "warning": node.warning,
+        "resource_id": node.resource_id,
+        "children": [serialize_node(child) for child in node.children or []],
+    }
 
-    def serialize(node: TreeNode) -> dict[str, Any]:
-        return {
-            "title": node.title,
-            "change": (
-                {31: "removed", 32: "added", 33: "modified"}.get(node.style)
-                if node.style is not None
-                else None
+
+def read_text(path: Path) -> str:
+    """Read optional runtime evidence without failing the repository browser."""
+    try:
+        return path.read_text()
+    except OSError:
+        return ""
+
+
+def machine_resource(
+    system: Path | None = None,
+    mounts_path: Path | None = None,
+) -> dict[str, Any]:
+    """Describe the running OS and observed persistence mechanisms."""
+    try:
+        release = platform.freedesktop_os_release()
+    except OSError:
+        release = {}
+    mounts = [
+        line.split()
+        for line in read_text(mounts_path or Path("/proc/self/mounts")).splitlines()
+    ]
+    filesystems = {parts[1]: parts[2] for parts in mounts if len(parts) >= MOUNT_FIELDS}
+    root_fs = filesystems.get("/", "unknown")
+    system = system or Path("/run/current-system")
+    units = system / "etc/systemd/system"
+    preservation = (units / "preservation.target").exists() or (
+        system / "etc/tmpfiles.d/preservation.conf"
+    ).exists()
+    impermanence = "impermanence" in read_text(system / "activate") or any(
+        "impermanence" in read_text(unit) for unit in units.glob("persist-*.service")
+    )
+    name = platform.node()
+    return {
+        "id": ".:machine",
+        "kind": "machine",
+        "name": name,
+        "repository": ".",
+        "path": "/",
+        "icon": release.get("ID"),
+        "description": release.get("PRETTY_NAME", platform.system()),
+        "details": [
+            f"OS: {release.get('PRETTY_NAME', platform.system())}",
+            f"Hostname: {name}",
+            "Root: "
+            + (
+                f"ephemeral ({root_fs})"
+                if root_fs in {"tmpfs", "ramfs"}
+                else f"{root_fs}; reset on reboot not established"
             ),
-            "warning": node.warning,
-            "children": [serialize(child) for child in node.children or []],
-        }
+            "Preservation: "
+            + ("detected in running system" if preservation else "not detected"),
+            "Impermanence: "
+            + ("detected in running system" if impermanence else "not detected"),
+            *[
+                f"Filesystem {mount}: {filesystems[mount]}"
+                for mount in ("/home", "/nix", "/persistent", "/persist")
+                if mount in filesystems
+            ],
+        ],
+    }
 
-    data["tree"] = [serialize(node) for node in viewer.full_overview]
-    data["root"] = str(scope)
+
+def merge_dependency_changes(
+    data: dict[str, Any],
+    resources: dict[str, TreeNode],
+) -> None:
+    """Share added and removed dependency relationships with both renderers."""
+    known = {node["id"] for node in data["nodes"]}
+    for identifier, tree in resources.items():
+        repository = identifier.split(":", 1)[0]
+        dependencies = next(
+            (child for child in tree.children or [] if child.title == "Dependencies"),
+            None,
+        )
+        for child in dependencies.children or [] if dependencies else []:
+            match = re.fullmatch(r"[-+] ([^:]+): (packages/\S+)", child.title)
+            if not match or child.style not in (31, 32):
+                continue
+            source = f"{repository}:{match[2]}"
+            change = {31: "removed", 32: "added"}[child.style]
+            edge = next(
+                (
+                    edge
+                    for edge in data["edges"]
+                    if edge["source"] == source
+                    and edge["target"] == identifier
+                    and edge["kind"] == match[1]
+                ),
+                None,
+            )
+            if edge is not None:
+                edge["change"] = change
+                continue
+            if source not in known:
+                data["nodes"].append(
+                    {
+                        "id": source,
+                        "kind": "package-reference",
+                        "repository": repository,
+                        "path": match[2],
+                        "name": match[2].removeprefix("packages/"),
+                        "removed": change == "removed",
+                    },
+                )
+                known.add(source)
+            data["edges"].append(
+                {
+                    "source": source,
+                    "target": identifier,
+                    "kind": match[1],
+                    "change": change,
+                },
+            )
+
+
+def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
+    """Attach shared machine, OS, and language details to a resource."""
+    tree.resource_id = record["id"]
+    if record["kind"] == "machine":
+        tree.title = f"Machine: {record['name']}"
+        tree.children = [TreeNode(detail) for detail in record["details"]]
+    elif record["kind"] == "host":
+        record["icon"] = "nixos"
+        tree.children = [TreeNode("OS: NixOS (configuration)")]
+    elif record.get("package_type"):
+        tree.children = [
+            TreeNode(f"Language: {record['package_type']}"),
+            *(tree.children or []),
+        ]
+    elif record["kind"] == "repository":
+        tree.title = record["repository"]
+        tree.children = [TreeNode(f"Profile: {record.get('profile', 'flake')}")]
+    return tree
+
+
+def browser_snapshot(
+    root: Path,
+    semantic_tree: list[TreeNode],
+) -> tuple[dict[str, Any], list[TreeNode]]:
+    """Build one resource model for the terminal tree and graphical components."""
+    data = overview_data(root)
+    resources: dict[str, TreeNode] = {}
+
+    def index(nodes: list[TreeNode], path: tuple[str, ...] = ()) -> None:
+        for node in nodes:
+            if node.title.startswith("packages/"):
+                resources[f"{'/'.join(path) or '.'}:{node.title}"] = node
+            else:
+                index(node.children or [], (*path, node.title))
+
+    index(semantic_tree)
+    known = {node["id"] for node in data["nodes"]}
+    for identifier in resources:
+        if identifier not in known:
+            repository, path = identifier.split(":", 1)
+            data["nodes"].append(
+                {
+                    "id": identifier,
+                    "kind": "package",
+                    "name": path.removeprefix("packages/"),
+                    "path": path,
+                    "repository": repository,
+                    "removed": True,
+                },
+            )
+    merge_dependency_changes(data, resources)
+    machine = machine_resource()
+    data["nodes"].insert(0, machine)
+    data["edges"].extend(
+        {"source": machine["id"], "target": node["id"], "kind": "hostname-match"}
+        for node in data["nodes"]
+        if node["kind"] == "host" and node["name"] == machine["name"]
+    )
+    for record in data["nodes"]:
+        identifier = record["id"]
+        tree = resource_tree(
+            record,
+            resources.get(identifier, TreeNode(record["path"], [])),
+        )
+        links = [
+            TreeNode(
+                f"{edge['kind']}: {edge['source']} → {edge['target']}",
+                style={"added": 32, "removed": 31}.get(edge.get("change")),
+            )
+            for edge in data["edges"]
+            if edge["target"] == identifier
+            and edge["kind"] not in {"contains", "submodule"}
+        ]
+        if links:
+            tree.children = [*(tree.children or []), TreeNode("Connections", links)]
+        resources[identifier] = tree
+        record["tree"] = serialize_node(tree)
+    result = [resources[machine["id"]]]
+    for record in data["nodes"]:
+        if record["kind"] != "repository":
+            continue
+        tree = resources[record["id"]]
+        tree.children = [
+            *(tree.children or []),
+            *[
+                resources[node["id"]]
+                for node in data["nodes"]
+                if node["repository"] == record["repository"]
+                and node["kind"] not in {"machine", "repository"}
+            ],
+        ]
+        result.append(tree)
+    data["tree"] = [serialize_node(node) for node in result]
+    data["root"] = str(root)
+    return data, result
+
+
+def gui_data(root: Path) -> dict[str, Any]:
+    """Return the shared machine and repository snapshot used by the terminal."""
+    viewer = Viewer(root)
+    viewer.refresh_overview()
+    data = viewer.snapshot
     data["warning"] = viewer.status
     return data
 
@@ -881,7 +1100,7 @@ def open_gui(root: Path, *, port: int, open_browser: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Open the terminal browser or repository graph in the startup directory."""
+    """Open the terminal tree or graphical components rooted at home."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--gui",
@@ -905,7 +1124,7 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("--port must be between 0 and 65535")
         try:
             open_gui(
-                Path.cwd().resolve(),
+                Path.home().resolve(),
                 port=args.port,
                 open_browser=not args.no_open,
             )

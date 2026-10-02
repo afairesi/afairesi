@@ -6,6 +6,7 @@ import curses
 import http.client
 import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -26,10 +27,105 @@ TEST_EXPECTED_BUILDS = 2
 TEST_PAGE_HEIGHT = 2
 TEST_EXPECTED_VISIBLE = 2
 TEST_PARSER_ERROR = 2
+TEST_REPOSITORY_FIELDS = 4
 
 
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
+
+    def test_runtime_os_and_persistence_are_observations(self) -> None:
+        """Detect running modules and report uncertainty about disk-backed roots."""
+        with tempfile.TemporaryDirectory() as directory:
+            system = Path(directory)
+            units = system / "etc/systemd/system"
+            units.mkdir(parents=True)
+            mounts = system / "mounts"
+            mounts.write_text("tmpfs / tmpfs rw 0 0\n/dev/home /home ext4 rw 0 0\n")
+            (units / "preservation.target").write_text("[Unit]\n")
+            (units / "persist-files.service").write_text(
+                "ExecStart=/nix/store/example-impermanence-mount-file\n",
+            )
+            with patch.object(
+                platform,
+                "freedesktop_os_release",
+                return_value={"ID": "nixos", "PRETTY_NAME": "NixOS test"},
+            ):
+                record = app.machine_resource(system, mounts)
+                if (
+                    record["icon"] != "nixos"
+                    or record["details"][0] != "OS: NixOS test"
+                ):
+                    msg = (
+                        "The running OS must be read independently of host declarations"
+                    )
+                    raise AssertionError(msg)
+                for expected in (
+                    "Root: ephemeral (tmpfs)",
+                    "Preservation: detected in running system",
+                    "Impermanence: detected in running system",
+                    "Filesystem /home: ext4",
+                ):
+                    if expected not in record["details"]:
+                        raise AssertionError(expected)
+                (units / "preservation.target").unlink()
+                (units / "persist-files.service").unlink()
+                mounts.write_text("/dev/root / btrfs rw 0 0\n")
+                details = app.machine_resource(system, mounts)["details"]
+                if "Root: btrfs; reset on reboot not established" not in details:
+                    msg = "Disk-backed roots may still be reset on reboot"
+                    raise AssertionError(msg)
+                if "Preservation: not detected" not in details:
+                    msg = "Missing evidence must be reported as not detected"
+                    raise AssertionError(msg)
+
+    def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
+        """Both renderers retain removed providers and their relationships."""
+        tree = [
+            app.TreeNode(
+                "packages/consumer",
+                [
+                    app.TreeNode(
+                        "Dependencies",
+                        [
+                            app.TreeNode("- build: packages/old", style=31),
+                        ],
+                    ),
+                ],
+            ),
+        ]
+        with patch.object(
+            app,
+            "overview_data",
+            return_value={
+                "nodes": [
+                    {
+                        "id": ".:repository",
+                        "kind": "repository",
+                        "repository": ".",
+                        "path": ".",
+                    },
+                    {
+                        "id": ".:packages/consumer",
+                        "kind": "package",
+                        "repository": ".",
+                        "path": "packages/consumer",
+                    },
+                ],
+                "edges": [],
+            },
+        ):
+            snapshot, nodes = app.browser_snapshot(Path("/workspace"), tree)
+        records = {record["id"]: record for record in snapshot["nodes"]}
+        if not records[".:packages/old"]["removed"]:
+            msg = "Removed dependency providers must remain in the shared snapshot"
+            raise AssertionError(msg)
+        connections = records[".:packages/consumer"]["tree"]["children"][-1]
+        if connections["children"][0]["change"] != "removed":
+            msg = "Connections must retain the same change colors as GUI arrows"
+            raise AssertionError(msg)
+        if snapshot["edges"][0]["change"] != "removed" or not nodes:
+            msg = "Both the tree and graphical relationship must preserve removal"
+            raise AssertionError(msg)
 
     def test_gui_launch_bypasses_terminal_requirement(self) -> None:
         """GUI mode opens a loopback browser independently of terminal streams."""
@@ -38,7 +134,11 @@ class TestGui(unittest.TestCase):
             patch.object(app, "open_gui") as launch,
         ):
             app.main(["--gui", "--no-open", "--port", "0"])
-        launch.assert_called_once_with(Path.cwd().resolve(), port=0, open_browser=False)
+        launch.assert_called_once_with(
+            Path.home().resolve(),
+            port=0,
+            open_browser=False,
+        )
         with pytest.raises(SystemExit) as error:
             app.main(["--gui", "--port", "-1"])
         if error.value.code != TEST_PARSER_ERROR:
@@ -110,9 +210,9 @@ class TestGui(unittest.TestCase):
                     server.shutdown()
                     thread.join(timeout=5)
 
-    def test_gui_preserves_nested_change_nodes_and_package_focus(self) -> None:
-        """Package launches share the parent repository and preserve change colors."""
-        root = Path("/workspace/packages/sample")
+    def test_gui_preserves_shared_resource_details_and_changes(self) -> None:
+        """Both representations use the same machine, resources, and change colors."""
+        root = Path("/workspace")
         nodes = [
             app.TreeNode(
                 "packages/sample",
@@ -131,17 +231,63 @@ class TestGui(unittest.TestCase):
             patch.object(
                 app,
                 "overview_data",
-                return_value={"focus": ".:packages/sample"},
+                return_value={
+                    "nodes": [
+                        {
+                            "id": ".:repository",
+                            "kind": "repository",
+                            "repository": ".",
+                            "path": ".",
+                            "profile": "flake",
+                        },
+                        {
+                            "id": ".:packages/sample",
+                            "kind": "package",
+                            "repository": ".",
+                            "path": "packages/sample",
+                            "name": "sample",
+                            "package_type": "python",
+                        },
+                        {
+                            "id": ".:hosts/laptop",
+                            "kind": "host",
+                            "repository": ".",
+                            "path": "hosts/laptop",
+                            "name": "laptop",
+                        },
+                        {
+                            "id": ".:checks/sample",
+                            "kind": "check",
+                            "repository": ".",
+                            "path": "checks/sample",
+                            "name": "sample",
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "source": ".:packages/sample",
+                            "target": ".:checks/sample",
+                            "kind": "checked-by",
+                        },
+                    ],
+                },
             ),
-            patch.object(app.Viewer, "refresh_overview", autospec=True) as refresh,
+            patch.object(app.Viewer, "package_entries", return_value=nodes),
         ):
-            refresh.side_effect = lambda viewer: setattr(viewer, "full_overview", nodes)
             snapshot = app.gui_data(root)
-        viewer = refresh.call_args.args[0]
-        if viewer.cwd != root.parent.parent or snapshot["focus"] != ".:packages/sample":
-            msg = "Package launches must retain focus within the repository"
+        records = {record["id"]: record for record in snapshot["nodes"]}
+        repository = snapshot["tree"][1]
+        package = repository["children"][1]
+        if package != records[".:packages/sample"]["tree"]:
+            msg = "Terminal and GUI package details must be identical"
             raise AssertionError(msg)
-        leaves = snapshot["tree"][0]["children"][0]["children"]
+        if (
+            records[".:hosts/laptop"]["icon"] != "nixos"
+            or len(repository["children"]) != TEST_REPOSITORY_FIELDS
+        ):
+            msg = "Hosts and checks must appear alongside packages"
+            raise AssertionError(msg)
+        leaves = package["children"][1]["children"]
         if [node["change"] for node in leaves] != ["added", "removed"]:
             msg = "Nested changes must retain their addition and removal status"
             raise AssertionError(msg)
@@ -184,11 +330,18 @@ class TestCli(unittest.TestCase):
 class TestViewer(unittest.TestCase):  # noqa: D101
     def test_overview_is_cached_until_refreshed(self) -> None:  # noqa: D102
         viewer = app.Viewer()
-        with patch.object(
-            viewer,
-            "package_entries",
-            side_effect=[[app.TreeNode("first")], [app.TreeNode("second")]],
-        ) as build:
+        with (
+            patch.object(
+                viewer,
+                "package_entries",
+                side_effect=[[app.TreeNode("first")], [app.TreeNode("second")]],
+            ) as build,
+            patch.object(
+                app,
+                "browser_snapshot",
+                side_effect=lambda _root, tree: ({}, tree),
+            ),
+        ):
             viewer.ensure_overview()
             viewer.ensure_overview()
             if build.call_count != 1 or viewer.overview[0].title != "first":
@@ -228,6 +381,11 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             ) as build,
             patch.object(curses, "has_colors", return_value=False),
             patch.object(curses, "curs_set"),
+            patch.object(
+                app,
+                "browser_snapshot",
+                side_effect=lambda _root, tree: ({}, tree),
+            ),
         ):
             viewer.ensure_overview()
             viewer.screen(screen)
