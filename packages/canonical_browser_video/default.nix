@@ -6,6 +6,7 @@ let
     inputs.self.packages.${pkgs.stdenv.system}.canonical_browser
     pkgs.chromium
     pkgs.ffmpeg
+    pkgs.git
   ];
   videoTools = pkgs.runCommand "playwright-video-tools" { } ''
     mkdir -p "$out/ffmpeg-${pkgs.playwright-driver.browsersJSON.ffmpeg.revision}"

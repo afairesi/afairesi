@@ -113,9 +113,7 @@ def record(workspace: Path, recordings: Path) -> Path:
                 )
                 page = context.new_page()
                 page.goto(address)
-                page.wait_for_function(
-                    "document.querySelector('#canvas').dataset.layout === 'ready'",
-                )
+                page.locator('#canvas[data-layout="ready"]').wait_for()
                 page.wait_for_timeout(1500)
                 page.locator(".resource-block > summary").first.click()
                 page.wait_for_timeout(1500)
@@ -172,7 +170,14 @@ def generate() -> Path:
 
 def main(argv: list[str] | None = None) -> None:
     """Generate a demonstration of the web browser."""
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        epilog=(
+            "Saves to packages/canonical_browser_video/tmp/canonical_browser.mp4 "
+            "in the enclosing checkout or a checkout registered in $HOME/.gitmodules, "
+            "so it can run from any working directory."
+        ),
+    )
     parser.parse_args(argv)
     try:
         output = generate()
