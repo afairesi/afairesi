@@ -78,14 +78,16 @@ async function layoutGraph(generation) {
     "elk.aspectRatio": String(aspectRatio),
     "elk.direction": direction,
     "elk.padding": `[top=${top},left=0,bottom=0,right=0]`,
-    "elk.spacing.nodeNode": "24",
-    "elk.spacing.componentComponent": "24",
-    "elk.layered.spacing.nodeNodeBetweenLayers": "48",
+    "elk.spacing.nodeNode": "16",
+    "elk.spacing.componentComponent": "16",
+    "elk.layered.spacing.nodeNodeBetweenLayers": "32",
     "elk.layered.compaction.connectedComponents": "true",
+    "elk.layered.compaction.postCompaction.strategy": "EDGE_LENGTH",
+    "elk.rectpacking.packing.compaction.iterations": "3",
     "elk.edgeRouting": "ORTHOGONAL",
     "elk.randomSeed": "1",
   });
-  async function collectionModel(box) {
+  function collectionModel(box) {
     const id = `collection-${serial++}`;
     elements.set(id, box);
     const children = [...box.querySelectorAll(".resource-block")].map((block) => {
@@ -115,45 +117,50 @@ async function layoutGraph(generation) {
         layoutOptions: { "elk.portConstraints": "FIXED_POS" },
       };
     });
-    const connected = new Set(visibleEdges().flatMap((edge) => [edge.source, edge.target]));
-    const isolated = children.filter((child) => !connected.has(child.id));
-    if (isolated.length > 1) {
-      // Compound layering otherwise puts every unrelated package in one tall lane.
-      // Pack those cards as a fixed rectangle before arranging the dependency graph.
-      const groupId = `isolated-${serial++}`;
-      let group = box.querySelector(".packed-resources");
-      if (!group) {
-        group = element("div", "packed-resources");
-        box.querySelector(".lanes").append(group);
-      }
-      elements.set(groupId, group);
-      for (const child of isolated) {
-        const block = elements.get(child.id);
-        if (block.parentNode !== group) group.append(block);
-      }
-      const packed = await layoutEngine.layout({
-        id: groupId,
-        children: isolated,
-        layoutOptions: options("rectpacking"),
-      });
-      if (generation !== layoutGeneration) return null;
-      apply(packed, group);
-      const isolatedIds = new Set(isolated.map((child) => child.id));
-      children.splice(
-        0,
-        children.length,
-        ...children.filter((child) => !isolatedIds.has(child.id)),
-        { id: groupId, width: packed.width, height: packed.height },
-      );
-    }
     return {
       id,
       children,
-      layoutOptions: {
-        ...options("layered"),
-        "elk.padding": "[top=0,left=0,bottom=0,right=0]",
-      },
+      edges: visibleEdges()
+        .filter((edge) => children.some((child) => child.id === edge.source) && children.some((child) => child.id === edge.target))
+        .map((edge) => ({
+          id: edgeId(edge),
+          sources: [`${edge.source}:out`],
+          targets: [`${edge.target}:in`],
+          labels: [{ text: edge.kind, width: edge.kind.length * 6 + 8, height: 14 }],
+        })),
+      layoutOptions: options("layered"),
     };
+  }
+  async function bestLayout(model) {
+    const connected = Boolean(model.edges?.length);
+    const candidates = connected ? [
+      { "elk.layered.layering.strategy": "NETWORK_SIMPLEX", "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF" },
+      { "elk.layered.layering.strategy": "NETWORK_SIMPLEX", "elk.layered.nodePlacement.strategy": "SIMPLE" },
+      { "elk.layered.layering.strategy": "STRETCH_WIDTH", "elk.layered.nodePlacement.strategy": "BRANDES_KOEPF" },
+    ] : [
+      { "elk.rectpacking.widthApproximation.optimizationGoal": "MAX_SCALE_DRIVEN" },
+      { "elk.rectpacking.widthApproximation.optimizationGoal": "AREA_DRIVEN" },
+    ];
+    let best = null;
+    let bestScale = Infinity;
+    let bestArea = Infinity;
+    for (const candidate of candidates) {
+      const result = await layoutEngine.layout({
+        ...structuredClone(model),
+        layoutOptions: { ...model.layoutOptions, ...options(connected ? "layered" : "rectpacking"), ...candidate },
+      });
+      if (generation !== layoutGeneration) return null;
+      // Reserve room for the directory heading, borders, and stage padding. Among
+      // equally readable candidates prefer the smaller occupied bounding rectangle.
+      const scale = Math.max(1, (result.width + 98) / viewport.width, (result.height + 116) / viewport.height);
+      const area = result.width * result.height;
+      if (scale < bestScale - 0.001 || (Math.abs(scale - bestScale) <= 0.001 && area < bestArea)) {
+        best = result;
+        bestScale = scale;
+        bestArea = area;
+      }
+    }
+    return best;
   }
   function apply(model, body) {
     body.style.width = `${model.width}px`;
@@ -164,10 +171,8 @@ async function layoutGraph(generation) {
       item.style.left = `${child.x}px`;
       item.style.top = `${child.y}px`;
       item.style.width = `${child.width}px`;
-      if (item.classList.contains("packed-resources")) item.style.height = `${child.height}px`;
       if (item.classList.contains("resource-layout")) {
         item.style.height = `${child.height}px`;
-        apply(child, item.querySelector(".lanes"));
       }
     }
     for (const edge of model.edges || []) {
@@ -182,9 +187,12 @@ async function layoutGraph(generation) {
     const children = [];
     for (const item of body.children) {
       if (item.classList.contains("resource-layout")) {
-        const model = await collectionModel(item);
-        if (!model || generation !== layoutGeneration) return;
-        children.push(model);
+        const result = await bestLayout(collectionModel(item));
+        if (!result || generation !== layoutGeneration) return;
+        apply(result, item.querySelector(".lanes"));
+        item.style.width = `${result.width}px`;
+        item.style.height = `${result.height}px`;
+        children.push({ id: result.id, width: result.width, height: result.height });
       } else {
         await arrange(item);
         if (generation !== layoutGeneration) return;
@@ -193,39 +201,14 @@ async function layoutGraph(generation) {
         children.push({ id, width: item.offsetWidth, height: item.offsetHeight });
       }
     }
-    // A repository's compound graph routes package/host links together. Directory
-    // parents pack the already laid-out repositories as indivisible rectangles.
-    const ids = new Set(children.flatMap((child) => (child.children || []).map((node) => node.id)));
-    const edges = visibleEdges().filter((edge) => ids.has(edge.source) && ids.has(edge.target));
-    const graph = {
+    // Resource graphs keep their routes; directories pack those completed graphs
+    // and nested directories as fixed rectangles without introducing another layer.
+    const result = await bestLayout({
       id: `body-${serial++}`,
       children,
-      edges: edges.map((edge) => ({
-        id: edgeId(edge),
-        sources: [`${edge.source}:out`],
-        targets: [`${edge.target}:in`],
-        labels: [{ text: edge.kind, width: edge.kind.length * 6 + 8, height: 14 }],
-      })),
-      layoutOptions: {
-        ...options(edges.length ? "layered" : "rectpacking"),
-        "elk.hierarchyHandling": edges.length ? "INCLUDE_CHILDREN" : "SEPARATE_CHILDREN",
-      },
-    };
-    // Rectangle packing expects fixed rectangles; independently lay out collections
-    // when no cross-container dependency graph needs compound layout.
-    if (!edges.length) {
-      for (let index = 0; index < children.length; index += 1) {
-        if (!children[index].children) continue;
-        const result = await layoutEngine.layout(children[index]);
-        if (generation !== layoutGeneration) return;
-        apply(result, elements.get(result.id).querySelector(".lanes"));
-        elements.get(result.id).style.width = `${result.width}px`;
-        elements.get(result.id).style.height = `${result.height}px`;
-        children[index] = { id: result.id, width: result.width, height: result.height };
-      }
-    }
-    const result = await layoutEngine.layout(graph);
-    if (generation !== layoutGeneration) return;
+      layoutOptions: options("rectpacking"),
+    });
+    if (!result || generation !== layoutGeneration) return;
     apply(result, body);
     box.style.width = `${Math.max(320, result.width + 42)}px`;
   }
@@ -425,46 +408,22 @@ function prepareData(snapshot) {
 }
 
 function directoryMetrics(item) {
-  const panel = element("details", "directory-metrics");
   const current = data.nodes.filter((node) => !node.removed &&
     (item.path === "." || node.repository === item.path || node.repository.startsWith(`${item.path}/`)));
-  bindExpansion(panel, `metrics:${item.path}`);
-  const lines = new Map();
-  const suppressions = new Map();
-  for (const node of current) {
-    if (!["package", "host"].includes(node.kind) || !node.source_metrics) continue;
-    for (const [path, count] of Object.entries(node.source_metrics.lines)) {
-      const name = path.split("/").pop();
-      lines.set(name, (lines.get(name) || 0) + count);
-    }
-    for (const [name, count] of Object.entries(node.source_metrics.suppressions))
-      if (count) suppressions.set(name, (suppressions.get(name) || 0) + count);
-  }
-  function rows(entries) {
-    const list = element("dl", "metric-rows");
-    for (const [label, count] of entries) {
-      list.append(element("dt", "", label), element("dd", "", count.toLocaleString()));
-    }
-    return list;
-  }
   const repositories = current.filter((node) => node.kind === "repository" && node.profile !== "directory").length;
   const packages = current.filter((node) => node.kind === "package").length;
   const hosts = current.filter((node) => node.kind === "host").length;
-  const totalLines = [...lines.values()].reduce((total, count) => total + count, 0);
-  const summary = element("summary", "", `${repositories} ${repositories === 1 ? "repository" : "repositories"} · ${packages} ${packages === 1 ? "package" : "packages"} · ${hosts} ${hosts === 1 ? "host" : "hosts"} · ${totalLines.toLocaleString()} lines`);
-  panel.append(summary);
-  const content = element("div", "metrics-content");
-  if (lines.size) {
-    content.append(element("h3", "", "Source lines"));
-    content.append(rows([...lines].sort(([a], [b]) => a.localeCompare(b))));
-  }
-  if (suppressions.size) {
-    content.append(element("h3", "", "Suppressions"));
-    content.append(rows([...suppressions].sort(([a], [b]) => a.localeCompare(b))));
-  }
-  if (!content.childNodes.length) content.append(element("p", "", "No source files in this directory view."));
-  panel.append(content);
-  return panel;
+  const totalLines = current
+    .filter((node) => ["package", "host"].includes(node.kind) && node.source_metrics)
+    .reduce((total, node) => total + Object.values(node.source_metrics.lines).reduce((sum, count) => sum + count, 0), 0);
+  const counts = element("span", "directory-counts");
+  for (const [count, singular, plural] of [
+    [repositories, "repository", "repositories"],
+    [packages, "package", "packages"],
+    [hosts, "host", "hosts"],
+    [totalLines, "line", "lines"],
+  ]) counts.append(element("span", "", `${count.toLocaleString()} ${count === 1 ? singular : plural}`));
+  return counts;
 }
 
 function relationships() {
@@ -789,8 +748,8 @@ function render() {
     box.dataset.directory = destination;
     link.title = `Open ${destination}`;
     link.addEventListener("click", () => navigateDirectory(destination));
-    heading.append(link);
-    box.append(heading, directoryMetrics(item));
+    heading.append(link, directoryMetrics(item));
+    box.append(heading);
     const body = element("div", "repository-body");
     const resources = currentNodes.filter((node) => node.repository === item.repository);
     if (resources.length) body.append(resourceLayout(resources, visibleEdges()));

@@ -158,7 +158,6 @@ input[type="checkbox"] {
   z-index: 2;
 }
 .repository-body,
-.packed-resources,
 .lanes {
   position: relative;
   min-width: 260px;
@@ -585,40 +584,21 @@ input[type="checkbox"] {
   color: #9f6c20;
 }
 
-.directory-metrics {
-  margin: -6px 0 16px;
-  font-size: 10px;
-  color: var(--muted);
+.repository-heading {
+  flex-wrap: wrap;
 }
-.directory-metrics > summary {
-  cursor: pointer;
-  padding: 3px 0;
-}
-.metrics-content {
-  max-width: 340px;
-  padding: 8px 0;
-}
-.metrics-content h3 {
-  font-size: 10px;
-  font-weight: 550;
-  margin: 8px 0 6px;
-  color: var(--green);
-}
-.metric-rows {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+.directory-counts {
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
   gap: 4px 12px;
-  margin: 0 0 4px;
-  line-height: 1.4;
-}
-.metric-rows dt {
-  overflow-wrap: anywhere;
+  font-size: 10px;
+  font-weight: 400;
+  line-height: 1.5;
   color: var(--muted);
 }
-.metric-rows dd {
-  margin: 0;
-  text-align: right;
-  font-variant-numeric: tabular-nums;
+.directory-counts > span {
+  white-space: nowrap;
 }
 .machine-box {
   position: relative;
