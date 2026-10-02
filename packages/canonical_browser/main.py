@@ -4,20 +4,27 @@
 
 import argparse
 import contextlib
+import fcntl
 import json
 import mimetypes
 import os
 import platform
 import re
 import shutil
+import signal
+import stat
+import subprocess
+import tempfile
 import webbrowser
+from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Self
 from urllib.parse import parse_qs, urlencode, urlsplit
 
 from git_canonical import (
@@ -34,6 +41,7 @@ from git_canonical import CommandError as GitCanonicalError
 MAX_PORT = 65535
 MOUNT_FIELDS = 3
 EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
+OUTPUT_DIFF_TIMEOUT = 120
 
 
 @dataclass
@@ -45,6 +53,242 @@ class TreeNode:  # noqa: D101
     resource_id: str | None = None
     directory: Path | None = None
     source_file: bool = False
+
+
+@dataclass
+class OutputComparison:
+    """Keep one package's previous capture fixed for a browser session."""
+
+    output: Path
+    store: Path
+    previous: Path | None = None
+    current: Path | None = None
+    future: Future[None] | None = None
+    initialized: bool = False
+    changed: bool = False
+    error: str = ""
+
+
+def copy_output_file(source: str, destination: str) -> str:
+    """Copy file contents without reading devices or changing the live output."""
+    if not stat.S_ISREG(Path(source).lstat().st_mode):
+        msg = f"Cannot capture a special output file: {source}"
+        raise ValueError(msg)
+    return shutil.copyfile(source, destination)
+
+
+def copy_output(source: Path, destination: Path) -> None:
+    """Capture a directory or its absence, preserving links without following them."""
+    if source.is_symlink() or (source.exists() and not source.is_dir()):
+        msg = f"Not a regular output directory: {source}"
+        raise ValueError(msg)
+    if source.is_dir():
+        shutil.copytree(
+            source,
+            destination,
+            symlinks=True,
+            copy_function=copy_output_file,
+        )
+    else:
+        destination.mkdir()
+
+
+def compare_output(previous: Path, current: Path) -> bool:
+    """Generate an offline HTML report and bound the entire comparison process."""
+    executable = shutil.which("diffoscope")
+    if executable is None:
+        msg = "diffoscope is not installed"
+        raise FileNotFoundError(msg)
+    with (
+        (current / "diffoscope.log").open("wb") as log,
+        subprocess.Popen(  # noqa: S603 - fixed executable and argument list
+            [
+                executable,
+                "--html",
+                str(current / "report.html"),
+                "--jquery",
+                "disable",
+                "--no-progress",
+                "--new-file",
+                "--exclude-directory-metadata",
+                "yes",
+                str(previous / "output"),
+                str(current / "output"),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=log,
+            start_new_session=True,
+        ) as process,
+    ):
+        try:
+            result = process.wait(timeout=OUTPUT_DIFF_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+            raise
+    if result not in {0, 1}:
+        diagnostic = read_text(current / "diffoscope.log")[-2000:]
+        msg = f"diffoscope failed (exit {result}): {diagnostic}"
+        raise ValueError(msg)
+    if result == 1 and not (current / "report.html").is_file():
+        msg = "diffoscope did not produce an HTML report"
+        raise ValueError(msg)
+    return result == 1
+
+
+class OutputSnapshots:
+    """Capture package output in the background once per launch or explicit refresh."""
+
+    def __init__(self) -> None:
+        """Serialize capture jobs and hold package locks until the browser closes."""
+        self.comparisons: dict[Path, OutputComparison] = {}
+        self.executor = ThreadPoolExecutor(max_workers=1)
+        self.locks = contextlib.ExitStack()
+
+    def __enter__(self) -> Self:
+        """Keep snapshots available throughout the session."""
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        """Finish the active capture before releasing its history lock."""
+        self.close()
+
+    def close(self) -> None:
+        """Stop queued jobs and release package histories."""
+        self.executor.shutdown(wait=True, cancel_futures=True)
+        self.locks.close()
+
+    def observe(self, data: dict[str, Any], *, refresh: bool = False) -> None:
+        """Link reports and capture newly visited or refreshed packages."""
+        for record in data.get("nodes", []):
+            if record["kind"] != "package":
+                continue
+            package = Path(record["directory"]) / record["path"]
+            output = package / "tmp"
+            store = package.parent.parent / "tmp" / "canonical_browser" / package.name
+            if output not in self.comparisons:
+                if not output.is_dir() and not (store / "latest").is_file():
+                    continue
+                comparison = OutputComparison(output, store)
+                self.comparisons[output] = comparison
+            else:
+                comparison = self.comparisons[output]
+            if comparison.future is None or refresh:
+                comparison.future = self.executor.submit(self.capture, comparison)
+            record["output_diff"] = "/output-diff?" + urlencode({"path": str(output)})
+
+    def initialize(self, comparison: OutputComparison) -> None:
+        """Lock the history and retain the previous launch's last complete capture."""
+        if comparison.initialized:
+            return
+        store = comparison.store
+        for directory in (store.parent.parent, store.parent, store):
+            if directory.is_symlink():
+                msg = f"Output history must not be a symbolic link: {directory}"
+                raise ValueError(msg)
+            directory.mkdir(exist_ok=True)
+        if any((store / name).is_symlink() for name in ("lock", "latest")):
+            msg = "Output history metadata must not be a symbolic link"
+            raise ValueError(msg)
+        with contextlib.ExitStack() as acquired:
+            lock = acquired.enter_context((store / "lock").open("a"))
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                msg = (
+                    "Output history is in use by another browser. Close it and Refresh."
+                )
+                raise ValueError(msg) from exc
+            latest = store / "latest"
+            if latest.exists():
+                name = latest.read_text().strip()
+                previous = store / name
+                if (
+                    re.fullmatch(r"capture-[a-zA-Z0-9_-]+", name) is None
+                    or previous.is_symlink()
+                    or (previous / "output").is_symlink()
+                    or (previous / "timestamp").is_symlink()
+                    or not (previous / "output").is_dir()
+                    or not (previous / "timestamp").is_file()
+                ):
+                    msg = f"Invalid output capture: {latest}"
+                    raise ValueError(msg)
+                comparison.previous = previous
+            self.locks.enter_context(acquired.pop_all())
+        comparison.initialized = True
+
+    def capture(self, comparison: OutputComparison) -> None:
+        """Publish complete copies, retain two captures, and compare their contents."""
+        capture: Path | None = None
+        comparison.error = ""
+        comparison.changed = False
+        try:
+            self.initialize(comparison)
+            capture = Path(tempfile.mkdtemp(prefix="capture-", dir=comparison.store))
+            copy_output(comparison.output, capture / "output")
+            (capture / "timestamp").write_text(datetime.now(UTC).isoformat())
+            latest = capture / "latest"
+            latest.write_text(capture.name)
+            latest.replace(comparison.store / "latest")
+            comparison.current = capture
+            for old in comparison.store.glob("capture-*"):
+                if old not in {comparison.previous, capture} and not old.is_symlink():
+                    shutil.rmtree(old)
+            if comparison.previous is not None:
+                comparison.changed = compare_output(comparison.previous, capture)
+        except subprocess.TimeoutExpired:
+            comparison.error = f"diffoscope exceeded {OUTPUT_DIFF_TIMEOUT} seconds"
+        except (OSError, ValueError) as exc:
+            comparison.error = str(exc)
+        finally:
+            if capture is not None and capture != comparison.current:
+                shutil.rmtree(capture, ignore_errors=True)
+
+
+def output_diff_page(comparison: OutputComparison) -> bytes:
+    """Serve the saved report with capture times or await its background job."""
+    pending = comparison.future is not None and not comparison.future.done()
+    title = escape(str(comparison.output))
+    heading = f"<section><h1>{title} changes</h1>"
+    for label, capture in (
+        ("Previous capture", comparison.previous),
+        ("Current capture", comparison.current),
+    ):
+        if capture is not None:
+            heading += f"<p>{label}: {escape(read_text(capture / 'timestamp'))}</p>"
+    heading += "</section>"
+    if pending:
+        message = (
+            "Capturing output and comparing changes… This page updates automatically."
+        )
+    elif comparison.error:
+        message = f"Could not compare output: {comparison.error}"
+    elif comparison.previous is None:
+        message = (
+            "Initial capture saved. "
+            "Changes will be available after the next browser launch."
+        )
+    elif comparison.changed and comparison.current is not None:
+        report = (comparison.current / "report.html").read_bytes()
+        return re.sub(
+            rb"(<body[^>]*>)",
+            lambda match: match[0] + heading.encode(),
+            report,
+            count=1,
+        )
+    else:
+        message = "No output changes since the previous capture."
+    return (
+        '<!doctype html><html lang="en"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        + ('<meta http-equiv="refresh" content="2">' if pending else "")
+        + f"<title>{title} changes</title>"
+        + "<style>body{font:14px system-ui;margin:32px;color:#202e29;}"
+        + "h1{font-size:18px;overflow-wrap:anywhere;}</style>"
+        + heading
+        + f"<p>{escape(message)}</p></html>"
+    ).encode()
 
 
 class RepositoryBrowser:
@@ -925,7 +1169,7 @@ def output_path(requested: str) -> tuple[Path, Path]:
     return root, target
 
 
-def output_index(root: Path, directory: Path) -> bytes:
+def output_index(root: Path, directory: Path, diff_url: str | None = None) -> bytes:
     """Build a browser directory listing without exposing paths outside tmp/."""
     entries = []
     if directory != root:
@@ -955,7 +1199,14 @@ def output_index(root: Path, directory: Path) -> bytes:
         "<style>body{font:14px system-ui;margin:32px;color:#202e29;}"
         "h1{font-size:18px;overflow-wrap:anywhere;}li{margin:10px 0;}"
         "a{color:#276850;}</style>"
-        f"<h1>{title}</h1><ul>{links}</ul>"
+        f"<h1>{title}</h1>"
+        + (
+            f'<p><a href="{escape(diff_url, quote=True)}">'
+            "View changes since previous capture</a></p>"
+            if diff_url is not None
+            else ""
+        )
+        + f"<ul>{links}</ul>"
         + ("" if entries else "<p>This directory is empty.</p>")
         + "</html>"
     ).encode()
@@ -965,8 +1216,9 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     root: Path,
     port: int = 0,
 ) -> HTTPServer:
-    """Serve only GUI assets and read-only repository data on loopback."""
+    """Serve the graph and output reports, retaining captures outside package output."""
     assets = Path(__file__).parent / "prm"
+    outputs = OutputSnapshots()
     routes = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/script.js": ("script.js", "text/javascript; charset=utf-8"),
@@ -978,12 +1230,15 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     }
 
     def requested_data(query: str) -> dict[str, Any]:
-        requested = parse_qs(query).get("directory", [str(root)])[0]
+        parameters = parse_qs(query)
+        requested = parameters.get("directory", [str(root)])[0]
         directory = Path(requested).resolve()
         if not directory.is_dir():
             msg = f"Directory not found: {directory}"
             raise ValueError(msg)
-        return gui_data(directory)
+        data = gui_data(directory)
+        outputs.observe(data, refresh=parameters.get("refresh") == ["1"])
+        return data
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
@@ -994,7 +1249,19 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
             if route == "/output":
                 self.serve_output(parse_qs(request.query).get("path", [""])[0])
                 return
-            if route == "/api/overview":
+            if route == "/output-diff":
+                requested = parse_qs(request.query).get("path", [""])[0]
+                comparison = outputs.comparisons.get(Path(requested))
+                if comparison is None:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Output capture not found")
+                    return
+                content_type = "text/html; charset=utf-8"
+                try:
+                    content = output_diff_page(comparison)
+                except OSError:
+                    self.send_error(HTTPStatus.NOT_FOUND, "Output report not found")
+                    return
+            elif route == "/api/overview":
                 content_type = "application/json; charset=utf-8"
                 try:
                     content = json.dumps(requested_data(request.query)).encode()
@@ -1025,7 +1292,12 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
             try:
                 root, target = output_path(requested)
                 if target.is_dir():
-                    content = output_index(root, target)
+                    diff_url = (
+                        "/output-diff?" + urlencode({"path": str(root)})
+                        if root in outputs.comparisons
+                        else None
+                    )
+                    content = output_index(root, target, diff_url)
                     content_type = "text/html; charset=utf-8"
                     length = len(content)
                 else:
@@ -1059,7 +1331,19 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             """Keep the launcher output focused on its URL."""
 
-    return HTTPServer(("127.0.0.1", port), Handler)
+    class Server(HTTPServer):
+        def server_close(self) -> None:
+            """Finish output capture and release locks when this launch ends."""
+            super().server_close()
+            outputs.close()
+
+    server = Server(("127.0.0.1", port), Handler)
+    try:
+        requested_data("")
+    except (GitCanonicalError, ValueError, OSError):
+        server.server_close()
+        raise
+    return server
 
 
 def open_gui(root: Path, *, port: int, open_browser: bool) -> None:

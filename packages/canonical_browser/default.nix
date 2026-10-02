@@ -18,6 +18,7 @@ let
   python = pkgs.python3;
   runtimeInputs = [
     inputs.self.packages.${pkgs.stdenv.system}.git-canonical
+    pkgs.diffoscope
     pkgs.git
   ];
 in

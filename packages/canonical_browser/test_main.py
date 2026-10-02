@@ -6,12 +6,14 @@ import http.client
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
 import unittest
+import zipfile
 from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import patch
@@ -52,6 +54,268 @@ def commit_sources(root: Path) -> None:
         ],
         check=True,
     )
+
+
+def require_output(
+    condition: bool,  # noqa: FBT001 - assertion helper
+    message: str = "Unexpected output snapshot or report",
+) -> None:
+    """Fail a behavioral check with a readable explanation."""
+    if not condition:
+        raise AssertionError(message)
+
+
+class TestOutputSnapshots(unittest.TestCase):
+    """Exercise saved output across browser launches and explicit refreshes."""
+
+    def setUp(self) -> None:
+        """Create an isolated package with runtime output."""
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        (self.root / "flake.nix").write_text("{}\n")
+        self.output = self.root / "packages/example/tmp"
+        self.output.mkdir(parents=True)
+        (self.output.parent / "main.py").write_text('"""Example."""\n')
+
+    def capture(
+        self,
+        snapshots: app.OutputSnapshots,
+        *,
+        refresh: bool = False,
+    ) -> app.OutputComparison:
+        """Wait for one capture as the report page would."""
+        data = app.gui_data(self.root)
+        snapshots.observe(data, refresh=refresh)
+        comparison = snapshots.comparisons[self.output]
+        if comparison.future is None:
+            msg = "Output capture was not scheduled"
+            raise AssertionError(msg)
+        comparison.future.result(timeout=20)
+        return comparison
+
+    def test_launches_compare_output_and_refresh_keeps_previous_capture(self) -> None:
+        """HTML reports compare two launches, retaining the same baseline on refresh."""
+        value = self.output / "value.json"
+        value.write_text('{"value": "before"}\n')
+        removed = self.output / "removed.txt"
+        removed.write_text("old output\n")
+        archive = self.output / "archive.zip"
+        with zipfile.ZipFile(archive, "w") as stream:
+            stream.writestr("nested.txt", "old archive content\n")
+        with app.OutputSnapshots() as snapshots:
+            first = self.capture(snapshots)
+            require_output(first.error == "", first.error)
+            require_output(b"Initial capture saved" in app.output_diff_page(first))
+            baseline = first.current
+        value.write_text('{"value": "after"}\n')
+        removed.unlink()
+        (self.output / "added.txt").write_text("new output\n")
+        with zipfile.ZipFile(archive, "w") as stream:
+            stream.writestr("nested.txt", "new archive content\n")
+        with app.OutputSnapshots() as snapshots:
+            second = self.capture(snapshots)
+            require_output(second.error == "", second.error)
+            require_output(second.previous == baseline)
+            require_output(second.changed)
+            for text in (
+                b"before",
+                b"after",
+                b"removed.txt",
+                b"added.txt",
+                b"nested.txt",
+                b"Previous capture:",
+                b"Current capture:",
+            ):
+                require_output(
+                    text in re.sub(b"<[^>]+>", b"", app.output_diff_page(second)),
+                )
+            current = second.current
+            value.write_text('{"value": "refreshed"}\n')
+            self.capture(snapshots)
+            require_output(second.current == current)
+            self.capture(snapshots, refresh=True)
+            require_output(second.previous == baseline)
+            require_output(second.current != current)
+            require_output(second.error == "", second.error)
+            require_output(
+                b"refreshed" in re.sub(b"<[^>]+>", b"", app.output_diff_page(second)),
+            )
+            require_output(
+                set(second.store.glob("capture-*"))
+                == {second.previous, second.current},
+            )
+            latest = second.current
+        with app.OutputSnapshots() as snapshots:
+            third = self.capture(snapshots)
+            require_output(third.previous == latest)
+            require_output(third.error == "", third.error)
+            require_output(not third.changed)
+            require_output(b"No output changes" in app.output_diff_page(third))
+
+    def test_metadata_is_ignored_and_missing_output_reports_removals(self) -> None:
+        """Ignore metadata changes and report the removal of a whole output tree."""
+        value = self.output / "value.txt"
+        value.write_text("retained contents\n")
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        value.chmod(0o700)
+        os.utime(value, (1, 1))
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            require_output(comparison.error == "", comparison.error)
+            require_output(not comparison.changed)
+            value.unlink()
+            self.output.rmdir()
+            self.capture(snapshots, refresh=True)
+            require_output(comparison.error == "", comparison.error)
+            require_output(comparison.changed)
+            require_output(b"retained" in app.output_diff_page(comparison))
+
+    def test_failed_copy_preserves_history_and_other_browsers_cannot_rotate_it(
+        self,
+    ) -> None:
+        """Failed captures and concurrent browsers preserve the last complete output."""
+        (self.output / "value.txt").write_text("before\n")
+        with app.OutputSnapshots() as first, app.OutputSnapshots() as second:
+            comparison = self.capture(first)
+            latest = (comparison.store / "latest").read_text()
+            concurrent = self.capture(second)
+            require_output("another browser" in concurrent.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            with patch.object(shutil, "copytree", side_effect=OSError("copy failed")):
+                self.capture(first, refresh=True)
+            require_output("copy failed" in comparison.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
+            first.close()
+            self.capture(second, refresh=True)
+            require_output(concurrent.error == "", concurrent.error)
+            require_output(not concurrent.changed)
+
+    def test_capture_preserves_symlinks_without_reading_external_targets(self) -> None:
+        """Compare symlink destinations without exposing external file contents."""
+        secret = self.root / "private.txt"
+        secret.write_text("PRIVATE-CONTENT-MUST-NOT-APPEAR\n")
+        link = self.output / "link"
+        link.symlink_to(secret)
+        with app.OutputSnapshots() as snapshots:
+            first = self.capture(snapshots)
+            require_output(first.error == "", first.error)
+            if first.current is None:
+                msg = "Expected a complete initial capture"
+                raise AssertionError(msg)
+            require_output((first.current / "output/link").is_symlink())
+        link.unlink()
+        link.symlink_to(self.root / "missing.txt")
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            require_output(comparison.error == "", comparison.error)
+            report = re.sub(rb"<[^>]+>", b"", app.output_diff_page(comparison))
+            require_output(b"private.txt" in report)
+            require_output(b"missing.txt" in report)
+            require_output(b"PRIVATE-CONTENT-MUST-NOT-APPEAR" not in report)
+
+    def test_comparison_failures_and_timeouts_are_visible_and_refresh_can_retry(
+        self,
+    ) -> None:
+        """Show tool failures and timeouts while retaining captures for retry."""
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        tools = self.root / "tools"
+        tools.mkdir()
+        executable = tools / "diffoscope"
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            "sys.stderr.write('<failed>')\nsys.exit(2)\n",
+        )
+        executable.chmod(0o700)
+        with app.OutputSnapshots() as snapshots:
+            with patch.dict(os.environ, {"PATH": f"{tools}:{os.environ['PATH']}"}):
+                comparison = self.capture(snapshots)
+                require_output("exit 2" in comparison.error)
+                require_output(b"&lt;failed&gt;" in app.output_diff_page(comparison))
+                previous = comparison.previous
+                executable.write_text(
+                    f"#!{sys.executable}\nimport time\ntime.sleep(10)\n",
+                )
+                with patch.object(app, "OUTPUT_DIFF_TIMEOUT", 0.05):
+                    self.capture(snapshots, refresh=True)
+                require_output("exceeded" in comparison.error)
+                require_output(comparison.previous == previous)
+            self.capture(snapshots, refresh=True)
+            require_output(comparison.error == "", comparison.error)
+            require_output(b"No output changes" in app.output_diff_page(comparison))
+
+    def test_report_requests_reuse_captures_while_the_server_stays_responsive(
+        self,
+    ) -> None:
+        """Reuse captures for reports and keep browsing during a comparison."""
+        value = self.output / "value.txt"
+        value.write_text("before\n")
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        value.write_text("after\n")
+        started = threading.Event()
+        release = threading.Event()
+        original = app.compare_output
+
+        def delayed(previous: Path, current: Path) -> bool:
+            started.set()
+            if not release.wait(10):
+                msg = "Comparison was not released"
+                raise ValueError(msg)
+            return original(previous, current)
+
+        with (
+            app.OutputSnapshots() as snapshots,
+            patch.object(app, "OutputSnapshots", return_value=snapshots),
+            patch.object(app, "compare_output", side_effect=delayed) as compare,
+            app.gui_server(self.root) as server,
+        ):
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            connection = http.client.HTTPConnection(
+                "127.0.0.1",
+                server.server_port,
+                timeout=5,
+            )
+            try:
+                require_output(started.wait(10))
+                connection.request("GET", "/api/overview")
+                response = connection.getresponse()
+                data = json.loads(response.read())
+                package = next(
+                    node for node in data["nodes"] if node["kind"] == "package"
+                )
+                route = package["output_diff"]
+                comparison = snapshots.comparisons[self.output]
+                for _ in range(2):
+                    connection.request("GET", route)
+                    response = connection.getresponse()
+                    require_output(response.status == HTTPStatus.OK)
+                    require_output(b"updates automatically" in response.read())
+                connection.request(
+                    "GET",
+                    "/output-diff?" + urlencode({"path": str(self.root)}),
+                )
+                response = connection.getresponse()
+                require_output(response.status == HTTPStatus.NOT_FOUND)
+                response.read()
+                release.set()
+                if comparison.future is not None:
+                    comparison.future.result(timeout=20)
+                connection.request("GET", route)
+                response = connection.getresponse()
+                report = re.sub(rb"<[^>]+>", b"", response.read())
+                require_output(b"before" in report)
+                require_output(b"after" in report)
+                compare.assert_called_once()
+            finally:
+                release.set()
+                connection.close()
+                server.shutdown()
+                thread.join(timeout=5)
 
 
 class TestBoundary(unittest.TestCase):

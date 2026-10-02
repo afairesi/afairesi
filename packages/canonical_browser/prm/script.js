@@ -427,6 +427,17 @@ function resourceBlock(node) {
     });
   }
   if (node.expression) body.append(element("div", "detail-leaf", node.expression));
+  if (node.output_diff) {
+    const link = element(
+      "a",
+      "detail-leaf directory-leaf",
+      "View tmp/ changes since previous capture",
+    );
+    link.href = node.output_diff;
+    link.target = "_blank";
+    link.rel = "noopener";
+    body.append(link);
+  }
   details.append(body);
   blocks.set(node.id, details);
   return details;
@@ -995,11 +1006,10 @@ async function refresh(
   try {
     let snapshot = force ? null : cachedDirectory(nextDirectory);
     if (!snapshot) {
-      const response = await fetch(
-        nextDirectory
-          ? `/api/overview?directory=${encodeURIComponent(nextDirectory)}`
-          : "/api/overview",
-      );
+      const parameters = new URLSearchParams();
+      if (nextDirectory) parameters.set("directory", nextDirectory);
+      if (force) parameters.set("refresh", "1");
+      const response = await fetch(`/api/overview?${parameters}`);
       snapshot = await response.json();
       if (!response.ok) throw new Error(snapshot.error || `HTTP ${response.status}`);
     }
