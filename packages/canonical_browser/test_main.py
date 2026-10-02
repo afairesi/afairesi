@@ -27,11 +27,91 @@ TEST_EXPECTED_BUILDS = 2
 TEST_PAGE_HEIGHT = 2
 TEST_EXPECTED_VISIBLE = 2
 TEST_PARSER_ERROR = 2
-TEST_REPOSITORY_FIELDS = 4
+TEST_REPOSITORY_FIELDS = 3
 
 
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
+
+    def test_directory_scope_matches_gui_and_terminal(self) -> None:
+        """Intermediate directories and package directories show only their contents."""
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            (home / ".gitmodules").write_text(
+                '[submodule "github.com/example/one"]\n'
+                "path = github.com/example/one\n"
+                '[submodule "other.example/two"]\n'
+                "path = other.example/two\n",
+            )
+            for relative in ("github.com/example/one", "other.example/two"):
+                repository = home / relative
+                repository.mkdir(parents=True)
+                (repository / "flake.nix").write_text("{}\n")
+                for name in ("first", "second"):
+                    package = repository / "packages" / name
+                    package.mkdir(parents=True)
+                    (package / "default.nix").write_text("{}\n")
+                    (package / "main.py").write_text('"""Example."""\n')
+            scoped = home / "github.com"
+            viewer = app.Viewer(scoped)
+            viewer.refresh_overview()
+            snapshot = viewer.snapshot
+            if snapshot["root"] != str(scoped) or snapshot["parent"] != str(home):
+                msg = "The current directory and its parent must define navigation"
+                raise AssertionError(msg)
+            repositories = {node["repository"] for node in snapshot["nodes"]}
+            if repositories != {"example/one"}:
+                msg = "A directory scope must exclude sibling repositories"
+                raise AssertionError(msg)
+            if snapshot["tree"] != [
+                app.serialize_node(node) for node in viewer.overview
+            ]:
+                msg = "The GUI and TUI must share the scoped hierarchy"
+                raise AssertionError(msg)
+            package = scoped / "example/one/packages/first"
+            snapshot = app.gui_data(package)
+            names = [
+                node["name"] for node in snapshot["nodes"] if node["kind"] == "package"
+            ]
+            if names != ["first"]:
+                msg = "Starting inside a package must exclude other packages"
+                raise AssertionError(msg)
+
+    def test_terminal_directory_navigation_and_parent(self) -> None:
+        """Enter and Backspace navigate directories independently of tree expansion."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = root / "child"
+            child.mkdir()
+            viewer = app.Viewer(root)
+            viewer.refresh_overview()
+            viewer.navigate("\n", 20, viewer.rows(80))
+            if viewer.cwd != child:
+                msg = "Enter must open the selected directory"
+                raise AssertionError(msg)
+            viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+            if viewer.cwd != root:
+                msg = "Parent navigation must work even in an empty directory"
+                raise AssertionError(msg)
+
+    def test_gui_package_includes_offline_layout_engine(self) -> None:
+        """The installed app must include the same engine served by source tests."""
+        executable = os.environ.get("PACKAGE_E2E_EXECUTABLE")
+        if not executable:
+            self.skipTest("Nix package executable not supplied")
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        engine = (
+            Path(executable).parent.parent
+            / "lib"
+            / version
+            / "site-packages/canonical_browser/prm/elk.js"
+        )
+        if (
+            engine.read_bytes()
+            != Path(os.environ["CANONICAL_BROWSER_ELK"]).read_bytes()
+        ):
+            msg = "The packaged layout engine must match the pinned Nix dependency"
+            raise AssertionError(msg)
 
     def test_runtime_os_and_persistence_are_observations(self) -> None:
         """Detect running modules and report uncertainty about disk-backed roots."""
@@ -135,7 +215,7 @@ class TestGui(unittest.TestCase):
         ):
             app.main(["--gui", "--no-open", "--port", "0"])
         launch.assert_called_once_with(
-            Path.home().resolve(),
+            Path.cwd().resolve(),
             port=0,
             open_browser=False,
         )
@@ -158,7 +238,7 @@ class TestGui(unittest.TestCase):
                     timeout=5,
                 )
                 try:
-                    for route in ("/", "/script.js", "/style.css"):
+                    for route in ("/", "/script.js", "/style.css", "/elk.js"):
                         connection.request("GET", route)
                         response = connection.getresponse()
                         if response.status != HTTPStatus.OK or not response.read():
@@ -276,8 +356,8 @@ class TestGui(unittest.TestCase):
         ):
             snapshot = app.gui_data(root)
         records = {record["id"]: record for record in snapshot["nodes"]}
-        repository = snapshot["tree"][1]
-        package = repository["children"][1]
+        repository = snapshot["tree"][0]
+        package = repository["children"][0]
         if package != records[".:packages/sample"]["tree"]:
             msg = "Terminal and GUI package details must be identical"
             raise AssertionError(msg)
@@ -328,6 +408,39 @@ class TestCli(unittest.TestCase):
 
 
 class TestViewer(unittest.TestCase):  # noqa: D101
+    def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
+        """Placeholder declarations are neither entries nor semantic changes."""
+        empty = (
+            "Name: sample\nArguments:\n  (not applicable)\n"
+            "Dependencies:\n  (not declared)\nTests:\n  (none)\n"
+            "Suppressions:\n  (none)\n"
+        )
+        for tree in (
+            app.Viewer.summary_tree(empty, cli=[CliEntry((), "(not applicable)")]),
+            app.Viewer.merged_summary_tree(empty, empty),
+        ):
+            if [node.title for node in tree] != ["Name: sample"]:
+                msg = "Empty declaration groups must be omitted in both views"
+                raise AssertionError(msg)
+        previous = empty.replace("Tests:\n  (none)", "Tests:\n  test existing")
+        changed = app.Viewer.merged_summary_tree(previous, empty)
+        tests = next(node for node in changed if node.title == "Tests")
+        if [node.title for node in tests.children or []] != ["- test existing"]:
+            msg = "Removing the last test must remain visible in the diff"
+            raise AssertionError(msg)
+        diagnostic = empty.replace(
+            "Tests:\n  (none)",
+            "Tests:\n  (unavailable: syntax error)",
+        )
+        tests = next(
+            node
+            for node in app.Viewer.summary_tree(diagnostic)
+            if node.title == "Tests"
+        )
+        if not app.Viewer.has_warning(tests):
+            msg = "Unavailable analysis must remain visible as a diagnostic"
+            raise AssertionError(msg)
+
     def test_overview_is_cached_until_refreshed(self) -> None:  # noqa: D102
         viewer = app.Viewer()
         with (
@@ -340,6 +453,11 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 app,
                 "browser_snapshot",
                 side_effect=lambda _root, tree: ({}, tree),
+            ),
+            patch.object(
+                app,
+                "scope_snapshot",
+                side_effect=lambda data, _directory: (data, viewer.full_overview),
             ),
         ):
             viewer.ensure_overview()
@@ -385,6 +503,11 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                 app,
                 "browser_snapshot",
                 side_effect=lambda _root, tree: ({}, tree),
+            ),
+            patch.object(
+                app,
+                "scope_snapshot",
+                side_effect=lambda data, _directory: (data, viewer.full_overview),
             ),
         ):
             viewer.ensure_overview()

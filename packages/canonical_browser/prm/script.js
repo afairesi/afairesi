@@ -6,11 +6,226 @@ let query = "";
 let changesOnly = false;
 let selected = null;
 let initialFocusApplied = false;
+let fitPending = true;
+let directory = new URLSearchParams(location.search).get("directory");
 let zoom = 1;
 const pan = { x: 0, y: 0 };
 let currentNodes = [];
 let frame = null;
 let layoutObserver = null;
+const layoutEngine = new ELK();
+let layoutGeneration = 0;
+let layoutFrame = null;
+let layoutPromise = Promise.resolve();
+const edgeRoutes = new Map();
+
+function edgeId(edge) {
+  return JSON.stringify([edge.source, edge.target, edge.kind]);
+}
+
+function scheduleLayout() {
+  if (layoutFrame !== null) cancelAnimationFrame(layoutFrame);
+  const generation = ++layoutGeneration;
+  const stage = document.querySelector(".graph-stage");
+  if (stage) stage.dataset.layout = "pending";
+  layoutFrame = requestAnimationFrame(() => {
+    layoutFrame = null;
+    // Serialize engine calls and discard results from obsolete renders.
+    layoutPromise = layoutPromise.catch(() => {}).then(() => layoutGraph(generation));
+  });
+}
+
+async function layoutGraph(generation) {
+  const stage = document.querySelector(".graph-stage");
+  if (!stage || generation !== layoutGeneration) return;
+  const aspectRatio = Math.max(
+    0.5,
+    Math.min(2, window.innerWidth / Math.max(240, window.innerHeight - 88)),
+  );
+  const direction = window.innerWidth <= 760 ? "DOWN" : "RIGHT";
+  const elements = new Map();
+  const routes = new Map();
+  let serial = 0;
+  const options = (algorithm, top = 0) => ({
+    "elk.algorithm": algorithm,
+    "elk.aspectRatio": String(aspectRatio),
+    "elk.direction": direction,
+    "elk.padding": `[top=${top},left=0,bottom=0,right=0]`,
+    "elk.spacing.nodeNode": "24",
+    "elk.spacing.componentComponent": "24",
+    "elk.layered.spacing.nodeNodeBetweenLayers": "48",
+    "elk.layered.compaction.connectedComponents": "true",
+    "elk.edgeRouting": "ORTHOGONAL",
+    "elk.randomSeed": "1",
+  });
+  async function collectionModel(box) {
+    const id = `collection-${serial++}`;
+    elements.set(id, box);
+    const heading = box.querySelector(".collection-heading");
+    const top = Math.ceil(heading.offsetHeight) + 32;
+    const children = [...box.querySelectorAll(".resource-block")].map((block) => {
+      elements.set(block.dataset.nodeId, block);
+      return {
+        id: block.dataset.nodeId,
+        width: block.offsetWidth,
+        height: block.offsetHeight,
+        ports: [
+          {
+            id: `${block.dataset.nodeId}:out`,
+            x: direction === "RIGHT" ? block.offsetWidth : block.offsetWidth / 2,
+            y: direction === "RIGHT" ? 26 : block.offsetHeight,
+            width: 0,
+            height: 0,
+            layoutOptions: { "elk.port.side": direction === "RIGHT" ? "EAST" : "SOUTH" },
+          },
+          {
+            id: `${block.dataset.nodeId}:in`,
+            x: direction === "RIGHT" ? 0 : block.offsetWidth / 2,
+            y: direction === "RIGHT" ? 26 : 0,
+            width: 0,
+            height: 0,
+            layoutOptions: { "elk.port.side": direction === "RIGHT" ? "WEST" : "NORTH" },
+          },
+        ],
+        layoutOptions: { "elk.portConstraints": "FIXED_POS" },
+      };
+    });
+    const connected = new Set(visibleEdges().flatMap((edge) => [edge.source, edge.target]));
+    const isolated = children.filter((child) => !connected.has(child.id));
+    if (isolated.length > 1) {
+      // Compound layering otherwise puts every unrelated package in one tall lane.
+      // Pack those cards as a fixed rectangle before arranging the dependency graph.
+      const groupId = `isolated-${serial++}`;
+      let group = box.querySelector(".packed-resources");
+      if (!group) {
+        group = element("div", "packed-resources");
+        box.querySelector(".lanes").append(group);
+      }
+      elements.set(groupId, group);
+      for (const child of isolated) {
+        const block = elements.get(child.id);
+        if (block.parentNode !== group) group.append(block);
+      }
+      const packed = await layoutEngine.layout({
+        id: groupId,
+        children: isolated,
+        layoutOptions: options("rectpacking"),
+      });
+      if (generation !== layoutGeneration) return null;
+      apply(packed, group);
+      const isolatedIds = new Set(isolated.map((child) => child.id));
+      children.splice(
+        0,
+        children.length,
+        ...children.filter((child) => !isolatedIds.has(child.id)),
+        { id: groupId, width: packed.width, height: packed.height },
+      );
+    }
+    return {
+      id,
+      children,
+      layoutOptions: {
+        ...options("layered"),
+        "elk.padding": `[top=${top},left=16,bottom=16,right=16]`,
+      },
+    };
+  }
+  function apply(model, body) {
+    body.style.width = `${model.width}px`;
+    body.style.height = `${model.height}px`;
+    for (const child of model.children || []) {
+      const item = elements.get(child.id);
+      item.style.position = "absolute";
+      item.style.left = `${child.x}px`;
+      item.style.top = `${child.y}px`;
+      item.style.width = `${child.width}px`;
+      if (item.classList.contains("packed-resources")) item.style.height = `${child.height}px`;
+      if (item.classList.contains("collection-box")) {
+        item.style.height = `${child.height}px`;
+        apply(child, item.querySelector(".lanes"));
+      }
+    }
+    for (const edge of model.edges || []) {
+      // ELK may keep an edge on an ancestor while giving its sections coordinates
+      // relative to the lowest common container of its endpoints.
+      const owner = elements.get(edge.container);
+      routes.set(edge.id, { edge, body: owner?.querySelector(":scope > .lanes") || body });
+    }
+  }
+  async function arrange(box) {
+    const body = box.querySelector(":scope > .repository-body");
+    const children = [];
+    for (const item of body.children) {
+      if (item.classList.contains("collection-box")) {
+        const model = await collectionModel(item);
+        if (!model || generation !== layoutGeneration) return;
+        children.push(model);
+      } else {
+        await arrange(item);
+        if (generation !== layoutGeneration) return;
+        const id = `container-${serial++}`;
+        elements.set(id, item);
+        children.push({ id, width: item.offsetWidth, height: item.offsetHeight });
+      }
+    }
+    // A repository's compound graph routes package/host links together. Directory
+    // parents pack the already laid-out repositories as indivisible rectangles.
+    const ids = new Set(children.flatMap((child) => (child.children || []).map((node) => node.id)));
+    const edges = visibleEdges().filter((edge) => ids.has(edge.source) && ids.has(edge.target));
+    const graph = {
+      id: `body-${serial++}`,
+      children,
+      edges: edges.map((edge) => ({
+        id: edgeId(edge),
+        sources: [`${edge.source}:out`],
+        targets: [`${edge.target}:in`],
+        labels: [{ text: edge.kind, width: edge.kind.length * 6 + 8, height: 14 }],
+      })),
+      layoutOptions: {
+        ...options(edges.length ? "layered" : "rectpacking"),
+        "elk.hierarchyHandling": edges.length ? "INCLUDE_CHILDREN" : "SEPARATE_CHILDREN",
+      },
+    };
+    // Rectangle packing expects fixed rectangles; independently lay out collections
+    // when no cross-container dependency graph needs compound layout.
+    if (!edges.length) {
+      for (let index = 0; index < children.length; index += 1) {
+        if (!children[index].children) continue;
+        const result = await layoutEngine.layout(children[index]);
+        if (generation !== layoutGeneration) return;
+        apply(result, elements.get(result.id).querySelector(".lanes"));
+        elements.get(result.id).style.width = `${result.width}px`;
+        elements.get(result.id).style.height = `${result.height}px`;
+        children[index] = { id: result.id, width: result.width, height: result.height };
+      }
+    }
+    const result = await layoutEngine.layout(graph);
+    if (generation !== layoutGeneration) return;
+    apply(result, body);
+    box.style.width = `${Math.max(320, result.width + 42)}px`;
+  }
+  try {
+    await arrange(stage.querySelector(":scope > section"));
+    if (generation !== layoutGeneration || !stage.isConnected) return;
+    edgeRoutes.clear();
+    for (const [id, route] of routes) edgeRoutes.set(id, route);
+    stage.dataset.layout = "ready";
+    drawEdges();
+    if (fitPending) {
+      fitPending = false;
+      fitGraph();
+    } else if (selected) {
+      const header = blocks.get(selected)?.querySelector(".resource-header");
+      if (header) reveal(header);
+    }
+  } catch (error) {
+    if (generation !== layoutGeneration) return;
+    $("message").hidden = false;
+    $("message").textContent =
+      `Could not arrange graph: ${error.message}. Use Refresh to try again.`;
+  }
+}
+
 const expanded = new Map();
 const searchCollapsed = new Set();
 const blocks = new Map();
@@ -40,7 +255,8 @@ function languageIcon(kind) {
   });
   icon.append(svgElement("title", {}, names[kind]));
   if (kind === "python") {
-    const snake = "M12 2C6 2 6 3 6 6v3h7v1H4c-3 0-3 8 0 8h2v-3c0-3 2-4 5-4h5c2 0 3-1 3-3V6c0-3-2-4-7-4Z";
+    const snake =
+      "M12 2C6 2 6 3 6 6v3h7v1H4c-3 0-3 8 0 8h2v-3c0-3 2-4 5-4h5c2 0 3-1 3-3V6c0-3-2-4-7-4Z";
     icon.append(
       svgElement("path", { d: snake, fill: "#3776ab" }),
       svgElement("path", { d: snake, fill: "#ffd343", transform: "rotate(180 12 12)" }),
@@ -50,22 +266,38 @@ function languageIcon(kind) {
   } else if (kind === "html") {
     icon.append(
       svgElement("path", { d: "M3 2h18l-2 18-7 2-7-2Z", fill: "#e44d26" }),
-      svgElement("path", { d: "M7 6h10l-.2 3H10l.2 2h6.4l-.6 6-4 1-4-1-.3-3h3l.1 1 1.2.3 1.3-.3.2-2H7.6Z", fill: "white" }),
+      svgElement("path", {
+        d: "M7 6h10l-.2 3H10l.2 2h6.4l-.6 6-4 1-4-1-.3-3h3l.1 1 1.2.3 1.3-.3.2-2H7.6Z",
+        fill: "white",
+      }),
     );
   } else if (kind === "nix" || kind === "nixos") {
     for (let angle = 0; angle < 360; angle += 60)
-      icon.append(svgElement("path", {
-        d: "M12 12V2M12 6l-4-3M12 6l4-3",
-        transform: `rotate(${angle} 12 12)`,
-        stroke: angle % 120 ? "#5277c3" : "#7ebae4",
-        "stroke-width": 2,
-        fill: "none",
-      }));
+      icon.append(
+        svgElement("path", {
+          d: "M12 12V2M12 6l-4-3M12 6l4-3",
+          transform: `rotate(${angle} 12 12)`,
+          stroke: angle % 120 ? "#5277c3" : "#7ebae4",
+          "stroke-width": 2,
+          fill: "none",
+        }),
+      );
   } else {
-    icon.append(svgElement("text", {
-      x: 12, y: 16, "text-anchor": "middle", "font-family": "serif",
-      "font-size": 12, "font-weight": "bold", fill: "#008080",
-    }, "TeX"));
+    icon.append(
+      svgElement(
+        "text",
+        {
+          x: 12,
+          y: 16,
+          "text-anchor": "middle",
+          "font-family": "serif",
+          "font-size": 12,
+          "font-weight": "bold",
+          fill: "#008080",
+        },
+        "TeX",
+      ),
+    );
   }
   return icon;
 }
@@ -75,6 +307,8 @@ function hasChange(tree) {
 }
 
 function countLeaves(tree) {
+  if (/^(?:[-+] )?\((none|not applicable|not declared|unavailable:.*)\)$/.test(tree.title))
+    return 0;
   return tree.children?.length
     ? tree.children.reduce((sum, child) => sum + countLeaves(child), 0)
     : 1;
@@ -144,11 +378,11 @@ function prepareData(snapshot) {
 }
 
 function relationships() {
-  return data.edges.filter((edge) => !["contains", "submodule", "checked-by"].includes(edge.kind));
+  return data.edges.filter((edge) => !["contains", "submodule"].includes(edge.kind));
 }
 
 function visibleNodes() {
-  const resources = data.nodes.filter((node) => !["repository", "check"].includes(node.kind));
+  const resources = data.nodes.filter((node) => node.kind !== "repository");
   const matches = new Set(
     resources
       .filter(
@@ -249,8 +483,7 @@ function scheduleEdges() {
 
 function updateCollapseState() {
   const canCollapse = Boolean(
-    document.querySelector(".graph-stage details[open]") ||
-    [...expanded.values()].some(Boolean),
+    document.querySelector(".graph-stage details[open]") || [...expanded.values()].some(Boolean),
   );
   const button = $("collapse");
   const label = canCollapse ? "Collapse all" : "Expand all";
@@ -276,7 +509,7 @@ function bindExpansion(details, key, matchesSearch = false, changed = false) {
       previous = details.open;
     }
     updateCollapseState();
-    scheduleEdges();
+    scheduleLayout();
   });
 }
 
@@ -333,7 +566,7 @@ function resourceBlock(node, layout) {
   if (node.description) summary.append(element("p", "resource-description", node.description));
   summary.append(element("div", "resource-path", node.path));
   const meta = element("div", "resource-meta");
-  meta.append(element("span", "kind-tag", node.package_type || node.kind));
+  if (!icon) meta.append(element("span", "kind-tag", node.kind));
   if (node.context) details.classList.add("context");
   if (layout?.cyclic) meta.append(element("span", "change-badge", "dependency cycle"));
   if (node.changed)
@@ -341,16 +574,7 @@ function resourceBlock(node, layout) {
       element("span", "change-badge", node.removed ? "− Removed" : "◉ Changed"),
       changeTally(node.tree),
     );
-  const tests = node.tree?.children.find((child) => child.title === "Tests");
-  if (tests)
-    meta.append(
-      element(
-        "span",
-        "resource-count",
-        `${tests.children.filter((child) => !child.title.startsWith("(")).length} tests`,
-      ),
-    );
-  summary.append(meta);
+  if (meta.childNodes.length) summary.append(meta);
   summary.addEventListener("click", () => {
     selected = node.id;
     for (const [id, other] of blocks) other.classList.toggle("selected", id === node.id);
@@ -395,13 +619,7 @@ function collection(items, kind, edges) {
   box.append(heading);
   const levels = dependencyLevels(items, edges);
   const lanes = element("div", "lanes");
-  const maxDepth = Math.max(0, ...[...levels.values()].map((layout) => layout.depth));
-  for (let depth = 0; depth <= maxDepth; depth += 1) {
-    const lane = element("div", "lane");
-    for (const node of items.filter((item) => levels.get(item.id).depth === depth))
-      lane.append(resourceBlock(node, levels.get(node.id)));
-    lanes.append(lane);
-  }
+  for (const node of items) lanes.append(resourceBlock(node, levels.get(node.id)));
   box.append(lanes);
   return box;
 }
@@ -409,12 +627,14 @@ function collection(items, kind, edges) {
 function render() {
   if (!data) return;
   if (layoutObserver) layoutObserver.disconnect();
+  ++layoutGeneration;
+  edgeRoutes.clear();
   blocks.clear();
   currentNodes = visibleNodes();
   const canvas = $("canvas");
   canvas.replaceChildren();
   updateCollapseState();
-  if (!currentNodes.length) {
+  if (!currentNodes.length && (query || changesOnly || !data.nodes.some((node) => node.kind === "repository"))) {
     canvas.append(
       element(
         "p",
@@ -450,17 +670,28 @@ function render() {
     const record = data.nodes.find(
       (node) => node.kind === "repository" && node.repository === item.repository,
     );
-    const box = element("section", item.repository !== undefined ? "repository-box" : "directory-box");
+    const box = element(
+      "section",
+      item.repository !== undefined ? "repository-box" : "directory-box",
+    );
     if (item.repository !== undefined) box.dataset.repository = item.repository;
     box.dataset.path = item.path;
-    const heading = element("h2", "repository-heading", `◫ ${item.name}`);
-    heading.append(element("span", "scope", record ? `${record.profile.toUpperCase()} REPOSITORY` : "DIRECTORY"));
-    box.append(heading, element("div", "routing-space"));
+    const heading = element("h2", "repository-heading");
+    const link = element("button", "directory-link", `◫ ${item.name}`);
+    const destination = item.path === "." ? data.root : `${data.root}/${item.path}`;
+    link.title = `Open ${destination}`;
+    link.addEventListener("click", () => navigateDirectory(destination));
+    heading.append(link);
+    heading.append(
+      element("span", "scope", record ? `${record.profile.toUpperCase()} REPOSITORY` : "DIRECTORY"),
+    );
+    box.append(heading);
     const body = element("div", "repository-body");
     const resources = currentNodes.filter((node) => node.repository === item.repository);
     for (const [kinds, kind] of [
       [["package", "package-reference"], "packages"],
       [["host"], "hosts"],
+      [["check"], "checks"],
       [["machine"], "resources"],
     ]) {
       const items = resources.filter((node) => kinds.includes(node.kind));
@@ -477,11 +708,23 @@ function render() {
   });
   stage.prepend(overlay);
   canvas.append(stage);
-  layoutObserver = new ResizeObserver(scheduleEdges);
-  layoutObserver.observe(stage);
-  for (const block of blocks.values()) layoutObserver.observe(block);
+  const sizes = new WeakMap();
+  const size = (block) => `${block.offsetWidth}:${block.offsetHeight}`;
+  layoutObserver = new ResizeObserver((entries) => {
+    let changed = false;
+    for (const { target } of entries) {
+      const next = size(target);
+      if (sizes.get(target) !== next) changed = true;
+      sizes.set(target, next);
+    }
+    if (changed) scheduleLayout();
+  });
+  for (const block of blocks.values()) {
+    sizes.set(block, size(block));
+    layoutObserver.observe(block);
+  }
   updateCollapseState();
-  scheduleEdges();
+  scheduleLayout();
 }
 
 function drawEdges() {
@@ -526,29 +769,48 @@ function drawEdges() {
     if (!source || !target) return;
     const from = rect(source.querySelector(".resource-header")),
       to = rect(target.querySelector(".resource-header"));
-    const sx = from.right + 1,
-      sy = from.top + 26,
-      tx = to.left - 2,
-      ty = to.top + 26;
     let path, lx, ly;
-    if (tx > sx && tx - sx < 180) {
-      const middle = (sx + tx) / 2 + ((index % 3) - 1) * 7;
-      path = `M${sx},${sy} H${middle} V${ty} H${tx}`;
-      lx = (sx + tx) / 2;
-      ly = (sy + ty) / 2 - 6;
-    } else if (Math.abs(from.left - to.left) < 5) {
-      const gutter = Math.max(from.right, to.right) + 16 + (index % 3) * 9;
-      path = `M${sx},${sy} H${gutter} V${ty} H${to.right + 2}`;
-      lx = gutter + 24;
-      ly = (sy + ty) / 2 - 6;
+    const route = edgeRoutes.get(edgeId(edge));
+    if (route?.edge.sections?.length) {
+      const offset = rect(route.body);
+      path = route.edge.sections
+        .map((section) => {
+          const points = [section.startPoint, ...(section.bendPoints || []), section.endPoint];
+          return points
+            .map(
+              (point, index) =>
+                `${index ? "L" : "M"}${point.x + offset.left},${point.y + offset.top}`,
+            )
+            .join(" ");
+        })
+        .join(" ");
+      const label = route.edge.labels?.[0];
+      lx = offset.left + (label?.x || 0) + (label?.width || 0) / 2;
+      ly = offset.top + (label?.y || 0) + 11;
     } else {
-      const repository = rect(source.closest(".repository-box"));
-      const channel = repository.top + 65 + (index % 4) * 12;
-      const exit = sx + 18 + (index % 3) * 9,
-        entry = tx - 18 - (index % 3) * 9;
-      path = `M${sx},${sy} H${exit} V${channel} H${entry} V${ty} H${tx}`;
-      lx = (exit + entry) / 2;
-      ly = channel - 5;
+      const sx = from.right + 1,
+        sy = from.top + 26,
+        tx = to.left - 2,
+        ty = to.top + 26;
+      if (tx > sx && tx - sx < 180) {
+        const middle = (sx + tx) / 2 + ((index % 3) - 1) * 7;
+        path = `M${sx},${sy} H${middle} V${ty} H${tx}`;
+        lx = (sx + tx) / 2;
+        ly = (sy + ty) / 2 - 6;
+      } else if (Math.abs(from.left - to.left) < 5) {
+        const gutter = Math.max(from.right, to.right) + 16 + (index % 3) * 9;
+        path = `M${sx},${sy} H${gutter} V${ty} H${to.right + 2}`;
+        lx = gutter + 24;
+        ly = (sy + ty) / 2 - 6;
+      } else {
+        const repository = rect(source.closest(".repository-box"));
+        const channel = repository.top + 65 + (index % 4) * 12;
+        const exit = sx + 18 + (index % 3) * 9,
+          entry = tx - 18 - (index % 3) * 9;
+        path = `M${sx},${sy} H${exit} V${channel} H${entry} V${ty} H${tx}`;
+        lx = (exit + entry) / 2;
+        ly = channel - 5;
+      }
     }
     const line = svgElement("path", {
       d: path,
@@ -557,20 +819,13 @@ function drawEdges() {
       "data-source": edge.source,
       "data-target": edge.target,
     });
-    line.append(
-      svgElement(
-        "title",
-        {},
-        `${edge.kind}: ${edge.source} → ${edge.target}`,
-      ),
-    );
+    line.append(svgElement("title", {}, `${edge.kind}: ${edge.source} → ${edge.target}`));
     const label = svgElement(
       "text",
       { x: lx, y: ly, "text-anchor": "middle", class: `edge-label ${edge.change || ""}` },
       `${edge.change === "removed" ? "− " : edge.change === "added" ? "+ " : ""}${edge.kind}`,
     );
     svg.append(line, label);
-
   });
 }
 
@@ -614,14 +869,21 @@ function reveal(item) {
   applyViewport();
 }
 
-async function refresh() {
+async function refresh(nextDirectory = directory) {
   $("refresh").disabled = true;
   $("refresh").textContent = "…";
   try {
-    const response = await fetch("/api/overview");
+    const response = await fetch(nextDirectory ? `/api/overview?directory=${encodeURIComponent(nextDirectory)}` : "/api/overview");
     const snapshot = await response.json();
     if (!response.ok) throw new Error(snapshot.error || `HTTP ${response.status}`);
     data = prepareData(snapshot);
+    directory = data.root;
+    $("parent").disabled = !data.parent;
+    $("parent").title = data.parent ? `Go to ${data.parent}` : "No parent directory";
+    const url = new URL(location.href);
+    url.searchParams.set("directory", directory);
+    history.replaceState(null, "", url);
+    document.title = `Canonical — ${directory}`;
     if (!initialFocusApplied && data.focus) {
       selected = data.focus;
       expanded.set(selected, true);
@@ -642,6 +904,15 @@ async function refresh() {
   }
 }
 
+function navigateDirectory(nextDirectory) {
+  expanded.clear();
+  searchCollapsed.clear();
+  selected = null;
+  initialFocusApplied = false;
+  fitPending = true;
+  refresh(nextDirectory);
+}
+
 $("search").addEventListener("input", (event) => {
   query = event.target.value.trim().toLowerCase();
   searchCollapsed.clear();
@@ -658,11 +929,13 @@ $("search").addEventListener("input", (event) => {
 });
 $("changes").addEventListener("change", (event) => {
   changesOnly = event.target.checked;
+  fitPending = true;
   searchCollapsed.clear();
   render();
 });
-$("refresh").addEventListener("click", refresh);
-$("fit").addEventListener("click", fitGraph);
+$("refresh").addEventListener("click", () => refresh());
+$("parent").addEventListener("click", () => navigateDirectory(data.parent));
+$("fit").addEventListener("click", () => requestAnimationFrame(() => layoutPromise.then(fitGraph)));
 $("collapse").addEventListener("click", () => {
   const expand = $("collapse").title === "Expand all";
   expanded.clear();
@@ -680,7 +953,7 @@ $("collapse").addEventListener("click", () => {
     if (first) reveal(first.querySelector(".resource-header"));
   });
 });
-window.addEventListener("resize", scheduleEdges);
+window.addEventListener("resize", scheduleLayout);
 document.addEventListener("keydown", (event) => {
   const direction = {
     ArrowLeft: [1, 0],
@@ -715,11 +988,7 @@ document.addEventListener("keydown", (event) => {
 });
 let drag = null;
 $("canvas").addEventListener("pointerdown", (event) => {
-  if (
-    event.button === 0 &&
-    event.target.closest("details,button,input")
-  )
-    return;
+  if (event.button === 0 && event.target.closest("details,button,input")) return;
   if (![0, 1, 2].includes(event.button)) return;
   event.preventDefault();
   drag = {

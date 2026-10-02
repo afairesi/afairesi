@@ -105,7 +105,6 @@ input[type="checkbox"] {
   position: relative;
   padding: 88px 28px 28px;
   width: max-content;
-  min-width: 100%;
   transform-origin: top left;
 }
 .repository-box,
@@ -118,13 +117,25 @@ input[type="checkbox"] {
   width: max-content;
   min-width: 320px;
 }
+.directory-link {
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  padding: 0;
+  cursor: pointer;
+  text-align: left;
+}
+.directory-link:hover {
+  text-decoration: underline;
+}
 .repository-heading {
   display: flex;
   align-items: center;
   gap: 10px;
   font-size: 13px;
   color: var(--green);
-  margin: 0 0 18px;
+  margin: 0 0 16px;
   font-weight: 550;
   position: relative;
   z-index: 2;
@@ -136,21 +147,25 @@ input[type="checkbox"] {
   margin-left: auto;
   padding-left: 20px;
 }
-.routing-space {
-  height: 70px;
-}
-.repository-body {
-  display: flex;
-  align-items: flex-start;
-  gap: 48px;
+.repository-body,
+.packed-resources,
+.lanes {
+  position: relative;
+  min-width: 260px;
 }
 .collection-box {
+  min-width: 292px;
+  position: relative;
   border: 1px solid #d7e1cf;
   border-radius: 9px;
-  padding: 16px;
+  padding: 0;
   background: #ffffff66;
 }
 .collection-heading {
+  position: absolute;
+  top: 16px;
+  left: 16px;
+  right: 16px;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -162,19 +177,6 @@ input[type="checkbox"] {
 .collection-heading span {
   font-size: 9px;
   color: #9ba798;
-}
-.lanes {
-  display: flex;
-  align-items: flex-start;
-  gap: 64px;
-}
-.lane {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: flex-start;
-  gap: 22px;
-  width: max-content;
-  max-width: 824px;
 }
 .resource-block {
   width: 260px;
@@ -432,28 +434,6 @@ input[type="checkbox"] {
   text-align: center;
   color: var(--muted);
   font-size: 12px;
-}
-@media (max-width: 760px) {
-  .repository-body,
-  .lanes,
-  .lane {
-    flex-direction: column;
-    gap: 24px;
-  }
-  .lane {
-    max-width: 260px;
-  }
-  .repository-box,
-  .directory-box {
-    padding: 12px;
-    min-width: 0;
-  }
-  .repository-heading {
-    flex-wrap: wrap;
-  }
-  .routing-space {
-    height: 32px;
-  }
 }
 @media (max-width: 560px) {
   .graph-controls {

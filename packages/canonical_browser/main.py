@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import curses
 import json
+import os
 import platform
 import re
 import sys
@@ -16,6 +17,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, NamedTuple
+from urllib.parse import parse_qs, urlsplit
 
 from git_canonical import (
     CliEntry,
@@ -32,6 +34,7 @@ from git_canonical import CommandError as GitCanonicalError
 
 MAX_PORT = 65535
 MOUNT_FIELDS = 3
+EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
 
 
 @dataclass
@@ -42,6 +45,7 @@ class TreeNode:  # noqa: D101
     style: int | None = None
     warning: bool = False
     resource_id: str | None = None
+    directory: Path | None = None
 
 
 class Row(NamedTuple):  # noqa: D101
@@ -51,7 +55,7 @@ class Row(NamedTuple):  # noqa: D101
 
 class Viewer:  # noqa: D101
     def __init__(self, cwd: str | Path | None = None) -> None:  # noqa: D107
-        self.cwd = Path(cwd or Path.home()).resolve()
+        self.cwd = Path(cwd or Path.cwd()).resolve()
         self.snapshot: dict[str, Any] = {}
         self.selected = 0
         self.top = 0
@@ -71,11 +75,15 @@ class Viewer:  # noqa: D101
     def refresh_overview(self) -> None:
         """Rebuild the package overview from the current working tree."""
         self.status = ""
-        self.full_overview = self.package_entries(diff=False)
+        root = browser_root(self.cwd)
+        source = Viewer(root) if root != self.cwd else self
+        self.full_overview = source.package_entries(diff=False)
+        self.status = source.status
         self.snapshot, self.full_overview = browser_snapshot(
-            self.cwd,
+            root,
             self.full_overview,
         )
+        self.snapshot, self.full_overview = scope_snapshot(self.snapshot, self.cwd)
         self.diff_overview = self.changed_nodes(self.full_overview)
         self.select_overview()
         self.overview_loaded = True
@@ -260,7 +268,9 @@ class Viewer:  # noqa: D101
                 children = Viewer.suppression_tree(summary, summary)
             if group == "Arguments" and cli is not None:
                 children = Viewer.cli_tree(cli)
-            fields.append(TreeNode(group, children))
+            children = Viewer.declared_children(children)
+            if children:
+                fields.append(TreeNode(group, children))
         return fields
 
     @classmethod
@@ -368,9 +378,19 @@ class Viewer:  # noqa: D101
                 children = cls.suppression_tree(previous, current)
             if group == "Arguments" and current_cli is not None:
                 children = cls.cli_tree(current_cli, previous=previous_cli)
-            if children or f"{group}:" in current:
+            children = cls.declared_children(children)
+            if children:
                 result.append(TreeNode(group, children))
         return result
+
+    @staticmethod
+    def declared_children(children: list[TreeNode]) -> list[TreeNode]:
+        """Omit empty declarations while retaining diagnostics and actual changes."""
+        return [
+            child
+            for child in children
+            if child.title.removeprefix("- ").removeprefix("+ ") not in EMPTY_ENTRIES
+        ]
 
     @classmethod
     def suppression_tree(cls, previous: str, current: str) -> list[TreeNode]:
@@ -623,6 +643,16 @@ class Viewer:  # noqa: D101
         rows: list[Row],
     ) -> None:
         self.height = height
+        if key in ("\x08", curses.KEY_BACKSPACE, "\x7f"):
+            self.cwd = self.cwd.parent
+            self.refresh_overview()
+            return
+        if key in ("\n", "\r", curses.KEY_ENTER) and self.overview_visible:
+            directory = self.overview_visible[self.selected].directory
+            if directory is not None:
+                self.cwd = directory
+                self.refresh_overview()
+                return
         if not rows:
             return
         self.navigate_overview(key, height, rows)
@@ -755,7 +785,8 @@ class Viewer:  # noqa: D101
                 or (
                     f"{'(END) ' if self.top + page >= len(rows) else ''}"
                     f"D diff {'on' if self.mode == 'high-level diff' else 'off'}  "
-                    "j/k node  l/h open/close  r refresh  "
+                    "j/k node  l/h open/close  Enter directory  "
+                    "Backspace parent  r refresh  "
                     "space/b page  "
                     "/? search  n/N next  q quit"
                 )
@@ -956,12 +987,20 @@ def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
     return tree
 
 
-def browser_snapshot(
+def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationships
     root: Path,
     semantic_tree: list[TreeNode],
 ) -> tuple[dict[str, Any], list[TreeNode]]:
     """Build one resource model for the terminal tree and graphical components."""
-    data = overview_data(root)
+    try:
+        data = overview_data(root)
+    except GitCanonicalError:
+        if any(
+            (root / name).exists()
+            for name in ("flake.nix", ".gitmodules", "packages", "hosts", "checks")
+        ):
+            raise
+        return directory_snapshot(root)
     resources: dict[str, TreeNode] = {}
 
     def index(nodes: list[TreeNode], path: tuple[str, ...] = ()) -> None:
@@ -1042,24 +1081,165 @@ def gui_data(root: Path) -> dict[str, Any]:
     return data
 
 
+def browser_root(directory: Path) -> Path:
+    """Find the nearest Canonical source root for a directory-scoped view."""
+    return next(
+        (
+            parent
+            for parent in (directory, *directory.parents)
+            if any((parent / name).exists() for name in ("flake.nix", ".gitmodules"))
+        ),
+        directory,
+    )
+
+
+def directory_snapshot(directory: Path) -> tuple[dict[str, Any], list[TreeNode]]:
+    """Show immediate directory containers outside a Canonical repository."""
+    children = [
+        child
+        for child in sorted(directory.iterdir())
+        if child.is_dir() and not child.name.startswith(".")
+    ]
+    nodes = [TreeNode(child.name, [], directory=child.resolve()) for child in children]
+    return {
+        "root": str(directory),
+        "parent": str(directory.parent) if directory.parent != directory else None,
+        "nodes": [
+            {
+                "id": f"{child.name}:directory",
+                "kind": "repository",
+                "repository": child.name,
+                "path": ".",
+                "profile": "directory",
+                "directory": str(child.resolve()),
+            }
+            for child in children
+        ],
+        "edges": [],
+        "tree": [serialize_node(node) for node in nodes],
+    }, nodes
+
+
+def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct containment
+    data: dict[str, Any],
+    directory: Path,
+) -> tuple[dict[str, Any], list[TreeNode]]:
+    """Restrict both views to a directory and preserve navigable containment."""
+    root = Path(data["root"])
+    if not data["nodes"] or all(
+        record.get("profile") == "directory" for record in data["nodes"]
+    ):
+        return data, [
+            TreeNode(record["repository"], [], directory=Path(record["directory"]))
+            for record in data["nodes"]
+        ]
+    nodes = []
+    for record in data["nodes"]:
+        repository = (root / record["repository"]).resolve()
+        location = repository / record["path"]
+        if record["kind"] == "machine":
+            if directory == Path.home().resolve():
+                nodes.append(record)
+            continue
+        if repository.is_relative_to(directory):
+            record["repository"] = str(repository.relative_to(directory))
+        elif directory.is_relative_to(repository):
+            if record.get("profile") == "home":
+                continue
+            if record["kind"] != "repository" and not location.is_relative_to(
+                directory,
+            ):
+                continue
+            record["repository"] = "."
+        else:
+            continue
+        record["directory"] = str(repository)
+        nodes.append(record)
+    known = {record["id"] for record in nodes}
+    data["nodes"] = nodes
+    data["edges"] = [
+        edge
+        for edge in data["edges"]
+        if edge["source"] in known and edge["target"] in known
+    ]
+    data["root"] = str(directory)
+    data["parent"] = str(directory.parent) if directory.parent != directory else None
+    result: list[TreeNode] = []
+    containers: dict[str, TreeNode] = {}
+
+    def container(relative: Path) -> TreeNode:
+        key = str(relative)
+        if key not in containers:
+            node = TreeNode(
+                directory.name if key == "." else relative.name,
+                [],
+                directory=directory / relative,
+            )
+            containers[key] = node
+            siblings = result if key == "." else container(relative.parent).children
+            if siblings is not None:
+                siblings.append(node)
+        return containers[key]
+
+    for record in nodes:
+        if record["kind"] == "machine":
+            result.append(
+                TreeNode(
+                    record["tree"]["title"],
+                    [TreeNode(detail) for detail in record["details"]],
+                ),
+            )
+            continue
+        parent = container(Path(record["repository"]))
+        if record["kind"] == "repository":
+            continue
+
+        def deserialize(tree: dict[str, Any]) -> TreeNode:
+            return TreeNode(
+                tree["title"],
+                [deserialize(child) for child in tree["children"]],
+                style={"removed": 31, "added": 32, "modified": 33}.get(tree["change"]),
+                warning=tree["warning"],
+                resource_id=tree["resource_id"],
+            )
+
+        if parent.children is not None:
+            parent.children.append(deserialize(record["tree"]))
+    data["tree"] = [serialize_node(node) for node in result]
+    return data, result
+
+
 def gui_server(root: Path, port: int = 0) -> HTTPServer:
     """Serve only GUI assets and read-only repository data on loopback."""
     assets = Path(__file__).parent / "prm"
     routes = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/script.js": ("script.js", "text/javascript; charset=utf-8"),
+        "/elk.js": (
+            os.environ.get("CANONICAL_BROWSER_ELK", "elk.js"),
+            "text/javascript; charset=utf-8",
+        ),
         "/style.css": ("style.css", "text/css; charset=utf-8"),
     }
+
+    def requested_data(query: str) -> dict[str, Any]:
+        requested = parse_qs(query).get("directory", [str(root)])[0]
+        directory = Path(requested).resolve()
+        if not directory.is_dir():
+            msg = f"Directory not found: {directory}"
+            raise ValueError(msg)
+        return gui_data(directory)
 
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self) -> None:
             """Return an allowlisted asset or a fresh repository snapshot."""
-            route = self.path.partition("?")[0]
+            request = urlsplit(self.path)
+            route = request.path
             status = HTTPStatus.OK
             if route == "/api/overview":
                 content_type = "application/json; charset=utf-8"
                 try:
-                    content = json.dumps(gui_data(root)).encode()
+                    content = json.dumps(requested_data(request.query)).encode()
                 except (GitCanonicalError, ValueError, OSError) as exc:
                     status = HTTPStatus.INTERNAL_SERVER_ERROR
                     content = json.dumps({"error": str(exc)}).encode()
@@ -1100,7 +1280,7 @@ def open_gui(root: Path, *, port: int, open_browser: bool) -> None:
 
 
 def main(argv: list[str] | None = None) -> None:
-    """Open the terminal tree or graphical components rooted at home."""
+    """Open the terminal tree or graphical components at the working directory."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--gui",
@@ -1124,7 +1304,7 @@ def main(argv: list[str] | None = None) -> None:
             parser.error("--port must be between 0 and 65535")
         try:
             open_gui(
-                Path.home().resolve(),
+                Path.cwd().resolve(),
                 port=args.port,
                 open_browser=not args.no_open,
             )
