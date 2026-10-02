@@ -493,7 +493,16 @@ function directoryCounts(relative) {
         node.repository.startsWith(`${relative}/`)),
   );
   const count = (kind) =>
-    nodes.filter((node) => node.kind === kind && node.profile !== "directory").length;
+    nodes.filter((node) => node.kind === kind && !["directory", "home"].includes(node.profile)).length;
+  if (
+    !nodes.some(
+      (node) =>
+        node.kind === "repository" && node.profile === "flake" && node.repository === relative,
+    )
+  ) {
+    const repositories = count("repository");
+    return `${repositories.toLocaleString()} ${repositories === 1 ? "repository" : "repositories"}`;
+  }
   const lines = nodes
     .filter((node) => ["package", "host"].includes(node.kind))
     .reduce(
@@ -502,7 +511,6 @@ function directoryCounts(relative) {
       0,
     );
   return [
-    [count("repository"), "repository", "repositories"],
     [count("package"), "package", "packages"],
     [count("host"), "host", "hosts"],
     [lines, "line", "lines"],
