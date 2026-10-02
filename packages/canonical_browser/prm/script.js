@@ -14,7 +14,6 @@ let layoutObserver = null;
 const expanded = new Map();
 const searchCollapsed = new Set();
 const blocks = new Map();
-let openedEdge = null;
 
 function element(tag, className, text) {
   const item = document.createElement(tag);
@@ -145,11 +144,11 @@ function prepareData(snapshot) {
 }
 
 function relationships() {
-  return data.edges.filter((edge) => !["contains", "submodule"].includes(edge.kind));
+  return data.edges.filter((edge) => !["contains", "submodule", "checked-by"].includes(edge.kind));
 }
 
 function visibleNodes() {
-  const resources = data.nodes.filter((node) => node.kind !== "repository");
+  const resources = data.nodes.filter((node) => !["repository", "check"].includes(node.kind));
   const matches = new Set(
     resources
       .filter(
@@ -250,7 +249,6 @@ function scheduleEdges() {
 
 function updateCollapseState() {
   const canCollapse = Boolean(
-    openedEdge ||
     document.querySelector(".graph-stage details[open]") ||
     [...expanded.values()].some(Boolean),
   );
@@ -308,18 +306,6 @@ function behaviorTree(tree, key, filterChanges) {
   });
   details.append(content);
   return details;
-}
-
-function focusResource(id) {
-  const block = blocks.get(id);
-  if (!block) return;
-  selected = id;
-  expanded.set(id, true);
-  searchCollapsed.delete(id);
-  block.open = true;
-  for (const [otherId, other] of blocks) other.classList.toggle("selected", otherId === id);
-  scheduleEdges();
-  requestAnimationFrame(() => reveal(block.querySelector(".resource-header")));
 }
 
 function resourceBlock(node, layout) {
@@ -446,44 +432,50 @@ function render() {
   if (!query && !changesOnly)
     for (const node of data.nodes)
       if (node.kind === "repository") repositories.add(node.repository);
-  for (const repository of repositories) {
-    const resources = currentNodes.filter((node) => node.repository === repository);
-    const box = element("section", "repository-box");
-    box.dataset.repository = repository;
-    const heading = element(
-      "h2",
-      "repository-heading",
-      `◫ ${repository === "." ? data.root.split("/").pop() : repository}`,
+  // Build real path containment, including intermediate directories and repositories
+  // that themselves contain another repository.
+  const hierarchy = { name: data.root.split("/").pop(), path: ".", children: new Map() };
+  for (const repository of [...repositories].sort()) {
+    let parent = hierarchy;
+    let path = "";
+    for (const name of repository === "." ? [] : repository.split("/")) {
+      path = path ? `${path}/${name}` : name;
+      if (!parent.children.has(name))
+        parent.children.set(name, { name, path, children: new Map() });
+      parent = parent.children.get(name);
+    }
+    parent.repository = repository;
+  }
+  function container(item) {
+    const record = data.nodes.find(
+      (node) => node.kind === "repository" && node.repository === item.repository,
     );
-    const profile = data.nodes.find((node) => node.kind === "repository" && node.repository === repository)?.profile || "home";
-    heading.append(element("span", "scope", `${profile.toUpperCase()} REPOSITORY`));
+    const box = element("section", item.repository !== undefined ? "repository-box" : "directory-box");
+    if (item.repository !== undefined) box.dataset.repository = item.repository;
+    box.dataset.path = item.path;
+    const heading = element("h2", "repository-heading", `◫ ${item.name}`);
+    heading.append(element("span", "scope", record ? `${record.profile.toUpperCase()} REPOSITORY` : "DIRECTORY"));
     box.append(heading, element("div", "routing-space"));
     const body = element("div", "repository-body");
-    const packages = resources.filter(
-      (node) => node.kind === "package" || node.kind === "package-reference",
-    );
-    const hosts = resources.filter((node) => node.kind === "host");
-    const checks = resources.filter((node) => node.kind === "check");
-
-    const other = resources.filter(
-      (node) => !["package", "package-reference", "host", "check"].includes(node.kind),
-    );
-    for (const [items, kind] of [
-      [packages, "packages"],
-      [hosts, "hosts"],
-      [checks, "checks"],
-      [other, "resources"],
-    ])
+    const resources = currentNodes.filter((node) => node.repository === item.repository);
+    for (const [kinds, kind] of [
+      [["package", "package-reference"], "packages"],
+      [["host"], "hosts"],
+      [["machine"], "resources"],
+    ]) {
+      const items = resources.filter((node) => kinds.includes(node.kind));
       if (items.length) body.append(collection(items, kind, visibleEdges()));
+    }
+    for (const child of item.children.values()) body.append(container(child));
     box.append(body);
-    stage.append(box);
+    return box;
   }
+  stage.append(container(hierarchy));
   const overlay = svgElement("svg", {
     class: "graph-edges",
-    "aria-label": "Dependency connections",
+    "aria-label": "Package and host references",
   });
   stage.prepend(overlay);
-  stage.append(element("div", "edge-notes-layer"));
   canvas.append(stage);
   layoutObserver = new ResizeObserver(scheduleEdges);
   layoutObserver.observe(stage);
@@ -527,8 +519,6 @@ function drawEdges() {
       width: bounds.width / zoom,
     };
   };
-  const notes = stage.querySelector(".edge-notes-layer");
-  notes.replaceChildren();
   const edges = visibleEdges();
   edges.forEach((edge, index) => {
     const source = blocks.get(edge.source),
@@ -564,9 +554,6 @@ function drawEdges() {
       d: path,
       class: `graph-edge ${edge.change || ""}${[edge.source, edge.target].includes(selected) ? " related" : ""}`,
       "marker-end": "url(#dependency-arrow)",
-      tabindex: 0,
-      role: "button",
-      "aria-label": `${edge.source} → ${edge.target}: ${edge.kind}`,
       "data-source": edge.source,
       "data-target": edge.target,
     });
@@ -577,53 +564,13 @@ function drawEdges() {
         `${edge.kind}: ${edge.source} → ${edge.target}`,
       ),
     );
-    const edgeKey = JSON.stringify([edge.source, edge.target, edge.kind]);
-    const toggleEdge = () => {
-      openedEdge = openedEdge === edgeKey ? null : edgeKey;
-      scheduleEdges();
-    };
-    line.addEventListener("click", toggleEdge);
-    line.addEventListener("keydown", (event) => {
-      if (event.key === "Enter" || event.key === " ") {
-        event.preventDefault();
-        toggleEdge();
-      }
-    });
     const label = svgElement(
       "text",
       { x: lx, y: ly, "text-anchor": "middle", class: `edge-label ${edge.change || ""}` },
       `${edge.change === "removed" ? "− " : edge.change === "added" ? "+ " : ""}${edge.kind}`,
     );
-    label.addEventListener("click", toggleEdge);
     svg.append(line, label);
-    if (openedEdge === edgeKey) {
-      const note = element("div", `edge-note ${edge.change || ""}`);
-      note.style.left = `${Math.max(12, Math.min(stage.offsetWidth - 320, lx - 140))}px`;
-      note.style.top = `${Math.max(12, ly + 10)}px`;
-      const heading = element(
-        "div",
-        "edge-note-heading",
-        `${edge.kind}${edge.change ? ` · ${edge.change}` : ""}`,
-      );
-      const close = element("button", "", "×");
-      close.setAttribute("aria-label", "Close dependency details");
-      close.addEventListener("click", toggleEdge);
-      heading.append(close);
-      note.append(heading);
-      for (const [id, arrow] of [
-        [edge.source, ""],
-        [edge.target, "→ "],
-      ]) {
-        const button = element(
-          "button",
-          "edge-resource",
-          arrow + (data.nodes.find((node) => node.id === id)?.name || id),
-        );
-        button.addEventListener("click", () => focusResource(id));
-        note.append(button);
-      }
-      notes.append(note);
-    }
+
   });
 }
 
@@ -726,7 +673,6 @@ $("collapse").addEventListener("click", () => {
       searchCollapsed.delete(key);
     } else searchCollapsed.add(key);
   }
-  openedEdge = null;
   selected = null;
   render();
   requestAnimationFrame(() => {
@@ -771,7 +717,7 @@ let drag = null;
 $("canvas").addEventListener("pointerdown", (event) => {
   if (
     event.button === 0 &&
-    event.target.closest("details,button,input,.graph-edge,.edge-label,.edge-note")
+    event.target.closest("details,button,input")
   )
     return;
   if (![0, 1, 2].includes(event.button)) return;

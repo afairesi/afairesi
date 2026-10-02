@@ -108,18 +108,15 @@ input[type="checkbox"] {
   min-width: 100%;
   transform-origin: top left;
 }
-.repository-box {
+.repository-box,
+.directory-box {
   position: relative;
   border: 1px solid #cbd9c5;
   border-radius: 13px;
   padding: 20px;
-  margin-bottom: 24px;
   background: #eef3e77a;
   width: max-content;
   min-width: 320px;
-}
-.repository-box:last-child {
-  margin-bottom: 0;
 }
 .repository-heading {
   display: flex;
@@ -144,8 +141,8 @@ input[type="checkbox"] {
 }
 .repository-body {
   display: flex;
-  align-items: stretch;
-  gap: 68px;
+  align-items: flex-start;
+  gap: 48px;
 }
 .collection-box {
   border: 1px solid #d7e1cf;
@@ -172,12 +169,16 @@ input[type="checkbox"] {
   gap: 64px;
 }
 .lane {
-  width: 260px;
   display: flex;
-  flex-direction: column;
+  flex-wrap: wrap;
+  align-items: flex-start;
   gap: 22px;
+  width: max-content;
+  max-width: 824px;
 }
 .resource-block {
+  width: 260px;
+  flex: 0 0 260px;
   border: 1px solid #cfdcca;
   border-radius: 9px;
   background: #fff;
@@ -381,15 +382,10 @@ input[type="checkbox"] {
   stroke: #81a589;
   stroke-width: 1.6;
   opacity: 0.75;
-  pointer-events: stroke;
-  cursor: pointer;
+  pointer-events: none;
 }
 .graph-edge.related {
   stroke-width: 2.4;
-  opacity: 1;
-}
-.graph-edge:hover {
-  stroke-width: 3;
   opacity: 1;
 }
 .graph-edge.removed {
@@ -410,60 +406,13 @@ input[type="checkbox"] {
   stroke: #f9faf6;
   stroke-width: 4px;
   paint-order: stroke;
-  pointer-events: auto;
-  cursor: pointer;
+  pointer-events: none;
 }
 .edge-label.removed {
   fill: var(--red);
 }
 .edge-label.added {
   fill: var(--green);
-}
-.edge-notes-layer {
-  position: absolute;
-  inset: 0;
-  z-index: 3;
-  pointer-events: none;
-}
-.edge-note {
-  position: absolute;
-  width: 300px;
-  padding: 12px;
-  background: white;
-  border: 1px solid #bdcdb7;
-  border-radius: 8px;
-  box-shadow: 0 6px 24px #253a2720;
-  pointer-events: auto;
-}
-.edge-note-heading {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 10px;
-  color: var(--muted);
-  margin-bottom: 8px;
-}
-.edge-note-heading button {
-  background: none;
-  border: none;
-  font-size: 18px;
-  padding: 0 3px;
-}
-.edge-resource {
-  display: block;
-  border: none;
-  background: none;
-  padding: 4px 0;
-  font-size: 11px;
-  color: var(--green);
-  text-align: left;
-  overflow-wrap: anywhere;
-}
-.edge-note.removed {
-  border-color: var(--red);
-}
-.edge-note.added {
-  border-color: var(--green);
 }
 #message {
   position: fixed;
@@ -483,6 +432,28 @@ input[type="checkbox"] {
   text-align: center;
   color: var(--muted);
   font-size: 12px;
+}
+@media (max-width: 760px) {
+  .repository-body,
+  .lanes,
+  .lane {
+    flex-direction: column;
+    gap: 24px;
+  }
+  .lane {
+    max-width: 260px;
+  }
+  .repository-box,
+  .directory-box {
+    padding: 12px;
+    min-width: 0;
+  }
+  .repository-heading {
+    flex-wrap: wrap;
+  }
+  .routing-space {
+    height: 32px;
+  }
 }
 @media (max-width: 560px) {
   .graph-controls {

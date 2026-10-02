@@ -3146,9 +3146,16 @@ def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax f
     return [(node, _dependency_parts(document, node))]
 
 
-def source_package_dependencies(source: str, name: str) -> list[DeclaredDependency]:
+def source_package_dependencies(
+    source: str,
+    name: str,
+    *,
+    path: str | None = None,
+) -> list[DeclaredDependency]:
     """Read dependencies on this repository's packages without evaluation."""
-    document = nix_syntax.parse(source, f"packages/{name}/default.nix")
+    path = path or f"packages/{name}/default.nix"
+    directory = posixpath.dirname(path)
+    document = nix_syntax.parse(source, path)
     records: list[DeclaredDependency] = []
     for binding in nix_syntax.walk(document.root):
         attrpath = (
@@ -3197,11 +3204,11 @@ def source_package_dependencies(source: str, name: str) -> list[DeclaredDependen
             and text.startswith(("./", "../"))
             and "${" not in text
         ):
-            target = posixpath.normpath(f"packages/{name}/{text}")
+            target = posixpath.normpath(f"{directory}/{text}")
             collection, separator, rest = target.partition("/")
             if collection == "packages" and separator and rest:
                 package = "packages/" + rest.split("/")[0]
-                if package != f"packages/{name}":
+                if package != directory:
                     records.append(
                         {
                             "kind": "source",
@@ -3322,6 +3329,24 @@ def _overview_graph_package(
     edges.append(
         {"source": f"{scope}:repository", "target": identifier, "kind": "contains"},
     )
+    _overview_graph_dependencies(
+        scope,
+        path + "/default.nix",
+        dependencies,
+        nodes,
+        edges,
+    )
+
+
+def _overview_graph_dependencies(
+    scope: str,
+    path: str,
+    dependencies: list[DeclaredDependency],
+    nodes: dict[str, dict[str, Any]],
+    edges: list[dict[str, Any]],
+) -> None:
+    """Connect declared local packages to their package or host consumer."""
+    identifier = f"{scope}:{posixpath.dirname(path)}"
     for dependency in dependencies:
         target = dependency["target"]
         target_id = f"{scope}:{target}"
@@ -3344,7 +3369,7 @@ def _overview_graph_package(
                 "kind": dependency["kind"],
                 "declaration": {
                     "repository": scope,
-                    "path": path + "/default.nix",
+                    "path": path,
                     "line": dependency["line"],
                     "expression": dependency["expression"],
                 },
@@ -3428,6 +3453,21 @@ def overview_data(target: Path) -> dict[str, Any]:  # noqa: C901, PLR0912 - trav
                         "kind": "contains",
                     },
                 )
+                if kind == "host":
+                    source_path = f"{path}/{filename}"
+                    dependencies = source_package_dependencies(
+                        _read_regular(source) or "",
+                        name,
+                        path=source_path,
+                    )
+                    nodes[identifier]["dependencies"] = dependencies
+                    _overview_graph_dependencies(
+                        scope,
+                        source_path,
+                        dependencies,
+                        nodes,
+                        edges,
+                    )
                 if kind == "check":
                     package_id = f"{scope}:packages/{name}"
                     host_id = f"{scope}:hosts/{name.removesuffix('VmWithDisko')}"
@@ -4290,6 +4330,7 @@ standalone flakes use '.'; home submodules use their .gitmodules paths.
 Node kinds are repository, package, package-reference, host and check.
 Repository nodes include profile and available=false for missing submodules.
 Package nodes include package_type, description, overview and dependencies.
+Host nodes include dependencies declared in configuration.nix.
 Missing local packages remain package-reference nodes.
 Dependencies have kind, target, expression, line and resolved. Only packages
 within the same repository are included; external and unresolved dependencies

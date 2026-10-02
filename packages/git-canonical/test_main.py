@@ -1392,6 +1392,54 @@ def test_overview_json_namespaces_home_packages_and_links_checks(
         raise AssertionError(data)
 
 
+def test_overview_host_packages_keep_scope_and_source_declarations(
+    home_repository: Path,
+) -> None:
+    """Link host package usage without confusing repositories or external inputs."""
+    scope = "forge.example/owner/demo"
+    root = home_repository / scope
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "flake.nix").write_text("", encoding="utf-8")
+    package = root / "packages/same"
+    package.mkdir(parents=True)
+    (package / "default.nix").write_text("{}", encoding="utf-8")
+    host = root / "hosts/same"
+    host.mkdir(parents=True)
+    (host / "configuration.nix").write_text(
+        "{ inputs, pkgs, ... }: let local = inputs.self.packages.${pkgs.system}; in {\n"
+        "  environment.systemPackages = [ local.same pkgs.git local.missing ];\n"
+        "  service.package = local.same;\n"
+        "  module = ../../packages/same;\n"
+        "  external = inputs.other.packages.${pkgs.system}.same;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    data = json.loads(_run(home_repository, "overview", "--json").stdout)
+    nodes = {node["id"]: node for node in data["nodes"]}
+    host_id = f"{scope}:hosts/same"
+    edges = [
+        edge
+        for edge in data["edges"]
+        if edge["target"] == host_id and edge["kind"] != "contains"
+    ]
+    if {(edge["source"], edge["kind"]) for edge in edges} != {
+        (f"{scope}:packages/same", "runtime"),
+        (f"{scope}:packages/same", "source"),
+        (f"{scope}:packages/missing", "runtime"),
+    }:
+        raise AssertionError(edges)
+    if nodes[f"{scope}:packages/missing"]["kind"] != "package-reference":
+        raise AssertionError(nodes)
+    if not nodes[host_id]["dependencies"]:
+        raise AssertionError(nodes[host_id])
+    if any(
+        edge["declaration"]["path"] != "hosts/same/configuration.nix"
+        or edge["declaration"]["line"] not in {2, 4}
+        for edge in edges
+    ):
+        raise AssertionError(edges)
+
+
 @pytest.mark.parametrize("explicit", [False, True])
 @pytest.mark.parametrize("package_name", ["example", "my-package"])
 def test_names_package_names_become_sentences_without_executing_source(
