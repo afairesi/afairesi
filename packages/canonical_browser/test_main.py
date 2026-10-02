@@ -17,12 +17,14 @@ import unittest
 from http import HTTPStatus
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlencode
 
 import pytest
 from git_canonical import CliEntry, source_cli_overview
 
 from packages.canonical_browser import main as app
 
+TEST_MODIFIED_STYLE = 33
 TEST_EXPECTED_BUILDS = 2
 TEST_PAGE_HEIGHT = 2
 TEST_EXPECTED_VISIBLE = 2
@@ -32,6 +34,114 @@ TEST_REPOSITORY_FIELDS = 3
 
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
+
+    def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
+        """Count prm allocation once per inode and preserve the runtime link."""
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary) / "packages/example"
+            resources = package / "prm"
+            resources.mkdir(parents=True)
+            original = resources / "asset.bin"
+            original.write_bytes(b"asset" * 1024)
+            (resources / "hardlink.bin").hardlink_to(original)
+            external = Path(temporary) / "external.bin"
+            external.write_bytes(b"outside" * 8192)
+            link = resources / "link.bin"
+            link.symlink_to(external)
+            expected = sum(
+                path.lstat().st_blocks * 512 for path in (resources, original, link)
+            )
+            if app.directory_disk_size(resources) != expected:
+                msg = "Disk usage must deduplicate hardlinks and ignore symlink targets"
+                raise AssertionError(msg)
+            output = package / "tmp"
+            output.mkdir()
+            storage = app.package_storage(package)
+            if [node.title for node in storage] != [
+                f"prm/: {app.format_bytes(expected)}",
+                "tmp/",
+            ] or storage[-1].directory != output.resolve():
+                msg = "Packages must show allocated prm size and existing tmp link"
+                raise AssertionError(msg)
+            output.rmdir()
+            if any(node.directory for node in app.package_storage(package)):
+                msg = "An absent output directory must not have a link"
+                raise AssertionError(msg)
+
+    def test_output_browser_serves_files_inside_tmp_only(self) -> None:
+        """List output, escape filenames, and reject traversal and symlink escapes."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "packages/example/tmp"
+            nested = output / "nested"
+            nested.mkdir(parents=True)
+            name = "report & <one>.txt"
+            (output / name).write_text("Generated output")
+            source = output.parent / "main.py"
+            source.write_text("Source must stay private")
+            (output / "escaped.py").symlink_to(source)
+            with app.gui_server(root) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=5,
+                )
+                try:
+                    connection.request(
+                        "GET",
+                        "/output?" + urlencode({"path": str(output)}),
+                    )
+                    response = connection.getresponse()
+                    listing = response.read().decode()
+                    if (
+                        response.status != HTTPStatus.OK
+                        or "report &amp; &lt;one&gt;.txt" not in listing
+                        or "escaped.py" in listing
+                    ):
+                        msg = "Output listings must escape names and omit escaped links"
+                        raise AssertionError(msg)
+                    connection.request(
+                        "GET",
+                        "/output?" + urlencode({"path": str(output / name)}),
+                    )
+                    response = connection.getresponse()
+                    if (
+                        response.status != HTTPStatus.OK
+                        or response.read() != b"Generated output"
+                    ):
+                        msg = "Output files must open directly in the web browser"
+                        raise AssertionError(msg)
+                    connection.request(
+                        "GET",
+                        "/output?" + urlencode({"path": str(nested)}),
+                    )
+                    response = connection.getresponse()
+                    if (
+                        response.status != HTTPStatus.OK
+                        or "../" not in response.read().decode()
+                    ):
+                        msg = "Nested output listings must link to their parent"
+                        raise AssertionError(msg)
+                    for path in (
+                        source,
+                        output / ".." / "main.py",
+                        output / "escaped.py",
+                    ):
+                        connection.request(
+                            "GET",
+                            "/output?" + urlencode({"path": str(path)}),
+                        )
+                        response = connection.getresponse()
+                        response.read()
+                        if response.status != HTTPStatus.NOT_FOUND:
+                            msg = "Output browsing must not expose source files"
+                            raise AssertionError(msg)
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    thread.join(timeout=5)
 
     def test_package_sources_count_lines_and_exclude_runtime_output(self) -> None:
         """Count blank lines and unterminated last lines, including prm sources."""
@@ -55,7 +165,11 @@ class TestGui(unittest.TestCase):
                 node for node in snapshot["nodes"] if node["kind"] == "package"
             )
             sources = {
-                child["title"]: child["children"][0]["title"]
+                child["title"]: next(
+                    item["title"]
+                    for item in child["children"]
+                    if item["title"].startswith("Lines:")
+                )
                 for child in record["tree"]["children"]
                 if child["source_file"]
             }
@@ -67,8 +181,33 @@ class TestGui(unittest.TestCase):
             }:
                 msg = "Source counts must exclude output, binary assets, and links"
                 raise AssertionError(msg)
+            if record["source_metrics"] != {
+                "lines": {
+                    "default.nix": 1,
+                    "main.py": 3,
+                    "prm/web/script.js": 3,
+                    "test_main.py": 0,
+                },
+                "suppressions": {
+                    "noqa (global)": 0,
+                    "noqa (local)": 0,
+                    "type: ignore (global)": 0,
+                    "type: ignore (local)": 0,
+                },
+            }:
+                msg = "Metrics must include current source lines and zero counts"
+                raise AssertionError(msg)
             if snapshot["tree"][0]["children"][0] != record["tree"]:
                 msg = "Source line counts must be shared by the GUI and TUI"
+                raise AssertionError(msg)
+            host = root / "hosts/example"
+            host.mkdir(parents=True)
+            (host / "configuration.nix").write_text("{}\n")
+            host_record = next(
+                node for node in app.gui_data(root)["nodes"] if node["kind"] == "host"
+            )
+            if host_record["source_metrics"]["lines"] != {"configuration.nix": 1}:
+                msg = "Host source files must contribute current metrics"
                 raise AssertionError(msg)
 
     def test_directory_scope_matches_gui_and_terminal(self) -> None:
@@ -498,17 +637,34 @@ class TestViewer(unittest.TestCase):  # noqa: D101
                     ),
                 ],
             )
-            app.package_file_tree(package, tree)
-            files = {node.title: node for node in tree.children or []}
+            sources = app.package_sources(package)
+            metrics = app.source_metrics(sources)
+            app.package_file_tree(package, tree, sources)
+            if metrics["suppressions"]["noqa (global)"] != 0:
+                msg = "Current metrics must ignore suppression diff baselines"
+                raise AssertionError(msg)
+            files = {
+                node.title: node for node in tree.children or [] if node.source_file
+            }
             if set(files) != {"main.py", "test_main.py", "prm/script.js"}:
                 msg = "Package details must be rooted at source files"
                 raise AssertionError(msg)
             main = {node.title: node for node in files["main.py"].children or []}
-            if (
-                main["Arguments"] is not arguments
-                or "Documentation: Example." not in main
-            ):
+            if main["Arguments"] is not arguments or "Example." not in main:
                 msg = "Arguments and documentation must belong to main.py"
+                raise AssertionError(msg)
+            if [node.title for node in files["main.py"].children or []][:6] != [
+                "Example.",
+                "Lines: 2",
+                "noqa (global): 1 → 2",
+                "noqa (local): 1",
+                "type: ignore (global): 0",
+                "type: ignore (local): 0",
+            ]:
+                msg = "Documentation, lines, and flat Python counts must stay ordered"
+                raise AssertionError(msg)
+            if main["noqa (global): 1 → 2"].style != TEST_MODIFIED_STYLE:
+                msg = "Flat suppression rows must preserve semantic diff styling"
                 raise AssertionError(msg)
             test = {node.title: node for node in files["test_main.py"].children or []}
             if test["Tests"] is not tests or "Lines: 0" in test:
@@ -517,8 +673,8 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             script = {
                 node.title: node for node in files["prm/script.js"].children or []
             }
-            if "Suppressions" not in script:
-                msg = "Source assets must have their own suppression counts"
+            if "eslint-disable (local): 1" not in script or "Suppressions" in script:
+                msg = "Source assets must have direct suppression rows"
                 raise AssertionError(msg)
             changed = app.Viewer.changed_nodes([tree])[0]
             if {node.title for node in changed.children or []} != {

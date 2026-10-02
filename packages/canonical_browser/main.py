@@ -6,19 +6,22 @@ import argparse
 import contextlib
 import curses
 import json
+import mimetypes
 import os
 import platform
 import re
+import shutil
 import sys
 import unicodedata
 import webbrowser
 from copy import deepcopy
 from dataclasses import dataclass, replace
+from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlencode, urlsplit
 
 from git_canonical import (
     CliEntry,
@@ -875,6 +878,7 @@ def serialize_node(node: TreeNode) -> dict[str, Any]:
         "warning": node.warning,
         "resource_id": node.resource_id,
         "source_file": node.source_file,
+        "directory": str(node.directory) if node.directory is not None else None,
         "children": [serialize_node(child) for child in node.children or []],
     }
 
@@ -1038,25 +1042,96 @@ def package_sources(directory: Path) -> list[TreeNode]:
             children = [TreeNode(f"(unavailable: {error.strerror})", warning=True)]
         else:
             children = [TreeNode(f"Lines: {len(content.splitlines())}")]
-            suppressions = [
+            counts = source_suppressions(name, content.decode(errors="replace"))
+            if path.suffix == ".py":
+                defaults = {
+                    ("noqa", "local"): 0,
+                    ("noqa", "global"): 0,
+                    ("type: ignore", "local"): 0,
+                    ("type: ignore", "global"): 0,
+                }
+                counts.update(defaults)
+            children.extend(
                 TreeNode(f"{kind} ({scope}): {count}")
-                for (kind, scope), count in sorted(
-                    source_suppressions(name, content.decode(errors="replace")).items(),
-                )
-            ]
-            if suppressions:
-                children.append(TreeNode("Suppressions", suppressions))
+                for (kind, scope), count in sorted(counts.items())
+            )
         result.append(TreeNode(name, children, source_file=True))
     return result
+
+
+def source_metrics(sources: list[TreeNode]) -> dict[str, dict[str, int]]:
+    """Keep current physical source totals independent of semantic diff rows."""
+    lines = {}
+    suppressions: dict[str, int] = {}
+    for source in sources:
+        for child in source.children or []:
+            label, separator, count = child.title.rpartition(": ")
+            if not separator or not count.isdecimal():
+                continue
+            if label == "Lines":
+                lines[source.title] = int(count)
+            else:
+                suppressions[label] = suppressions.get(label, 0) + int(count)
+    return {"lines": lines, "suppressions": suppressions}
+
+
+def directory_disk_size(directory: Path) -> int:
+    """Measure allocated bytes once per inode without following symbolic links."""
+    seen = set()
+    total = 0
+
+    def failed(error: OSError) -> None:
+        raise error
+
+    for parent, folders, files in os.walk(directory, followlinks=False, onerror=failed):
+        for path in [Path(parent), *(Path(parent) / name for name in folders + files)]:
+            metadata = path.lstat()
+            identity = metadata.st_dev, metadata.st_ino
+            if identity not in seen:
+                seen.add(identity)
+                total += getattr(metadata, "st_blocks", 0) * 512
+    return total
+
+
+def format_bytes(count: int) -> str:
+    """Format storage amounts with binary units."""
+    size = float(count)
+    unit_bytes = 1024
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if size < unit_bytes or unit == "TiB":
+            return f"{size:g} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= unit_bytes
+    return ""
+
+
+def package_storage(directory: Path) -> list[TreeNode]:
+    """Describe optional tracked storage and link to existing runtime output."""
+    nodes: list[TreeNode] = []
+    resources = directory / "prm"
+    if resources.is_dir() and not resources.is_symlink():
+        try:
+            size = format_bytes(directory_disk_size(resources))
+        except OSError:
+            size = "unavailable"
+        nodes.append(TreeNode(f"prm/: {size}"))
+    output = directory / "tmp"
+    if output.is_dir() and not output.is_symlink():
+        nodes.append(TreeNode("tmp/", directory=output.resolve()))
+    return nodes
 
 
 def package_file_tree(  # noqa: C901 - move each declaration to its source file
     directory: Path,
     tree: TreeNode,
+    sources: list[TreeNode] | None = None,
 ) -> TreeNode:
     """Organize declarations beneath their source files, preserving semantic diffs."""
-    files = {node.title: node for node in package_sources(directory)}
+    files = {
+        node.title: node
+        for node in (package_sources(directory) if sources is None else sources)
+    }
     fields = []
+    documentation = []
 
     def source(name: str) -> TreeNode:
         return files.setdefault(name, TreeNode(name, [], source_file=True))
@@ -1074,8 +1149,23 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
             continue
         if node.title == "Suppressions":
             for file in node.children or []:
-                if file.children:
-                    attach(file.title, TreeNode("Suppressions", file.children))
+                for suppression in file.children or []:
+                    parent = source(file.title)
+                    key = suppression.title.partition("):")[0]
+                    children = parent.children or []
+                    matching = next(
+                        (
+                            index
+                            for index, child in enumerate(children)
+                            if child.title.partition("):")[0] == key
+                        ),
+                        None,
+                    )
+                    if matching is None:
+                        children.append(suppression)
+                    else:
+                        children[matching] = suppression
+                    parent.children = children
         elif node.title in {"Arguments", "Tests", "Dependencies"}:
             name = {
                 "Arguments": "main.py",
@@ -1085,12 +1175,15 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
             attach(name, node)
         elif title.startswith("Help:"):
             if title != "Help: (module docstring not declared)":
-                node.title = node.title.replace("Help:", "Documentation:", 1)
-                parent = source("main.py")
-                parent.children = [*(parent.children or []), node]
+                node.title = node.title.replace("Help: ", "", 1)
+                documentation.append(node)
         else:
             fields.append(node)
+    if documentation:
+        parent = source("main.py")
+        parent.children = [*documentation, *(parent.children or [])]
     tree.children = [*fields, *(files[name] for name in sorted(files))]
+    tree.children.extend(package_storage(directory))
     return tree
 
 
@@ -1134,6 +1227,7 @@ def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationsh
             )
     merge_dependency_changes(data, resources)
     machine = machine_resource()
+    data["machine"] = machine
     data["nodes"].insert(0, machine)
     data["edges"].extend(
         {"source": machine["id"], "target": node["id"], "kind": "hostname-match"}
@@ -1146,8 +1240,12 @@ def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationsh
             record,
             resources.get(identifier, TreeNode(record["path"], [])),
         )
-        if record["kind"] == "package":
-            tree = package_file_tree(root / record["repository"] / record["path"], tree)
+        if record["kind"] in {"package", "host"}:
+            directory = root / record["repository"] / record["path"]
+            sources = package_sources(directory)
+            record["source_metrics"] = source_metrics(sources)
+            if record["kind"] == "package":
+                tree = package_file_tree(directory, tree, sources)
         links = [
             TreeNode(
                 f"{edge['kind']}: {edge['source']} → {edge['target']}",
@@ -1219,6 +1317,7 @@ def directory_snapshot(directory: Path) -> tuple[dict[str, Any], list[TreeNode]]
     nodes = [TreeNode(child.name, [], directory=child.resolve()) for child in children]
     return {
         "root": str(directory),
+        "machine": machine_resource(),
         "parent": str(parent_directory)
         if (parent_directory := browser_parent(directory))
         else None,
@@ -1324,6 +1423,7 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
                 warning=tree["warning"],
                 resource_id=tree["resource_id"],
                 source_file=tree.get("source_file", False),
+                directory=Path(tree["directory"]) if tree.get("directory") else None,
             )
 
         if parent.children is not None:
@@ -1332,7 +1432,71 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
     return data, result
 
 
-def gui_server(root: Path, port: int = 0) -> HTTPServer:
+def output_path(requested: str) -> tuple[Path, Path]:
+    """Resolve a requested output entry within a conventional package tmp directory."""
+    path = Path(requested)
+    root = next(
+        (
+            parent
+            for parent in (path, *path.parents)
+            if parent.name == "tmp" and parent.parent.parent.name == "packages"
+        ),
+        None,
+    )
+    if not path.is_absolute() or root is None or root.is_symlink():
+        msg = "Not a package output directory"
+        raise ValueError(msg)
+    target = path.resolve(strict=True)
+    root = root.resolve(strict=True)
+    if not target.is_relative_to(root) or not root.is_dir():
+        msg = "Output path escapes tmp"
+        raise ValueError(msg)
+    if not target.is_dir() and not target.is_file():
+        msg = "Output is not a regular file or directory"
+        raise ValueError(msg)
+    return root, target
+
+
+def output_index(root: Path, directory: Path) -> bytes:
+    """Build a browser directory listing without exposing paths outside tmp/."""
+    entries = []
+    if directory != root:
+        entries.append(("../", directory.parent))
+    for child in sorted(
+        directory.iterdir(),
+        key=lambda path: (not path.is_dir(), path.name),
+    ):
+        try:
+            output_path(str(child))
+        except (ValueError, OSError):
+            continue
+        entries.append((child.name + ("/" if child.is_dir() else ""), child))
+    links = "".join(
+        '<li><a href="/output?'
+        + escape(urlencode({"path": str(path)}), quote=True)
+        + '">'
+        + escape(name)
+        + "</a></li>"
+        for name, path in entries
+    )
+    title = escape(str(directory))
+    return (
+        '<!doctype html><html lang="en"><meta charset="utf-8">'
+        '<meta name="viewport" content="width=device-width,initial-scale=1">'
+        f"<title>{title}</title>"
+        "<style>body{font:14px system-ui;margin:32px;color:#202e29;}"
+        "h1{font-size:18px;overflow-wrap:anywhere;}li{margin:10px 0;}"
+        "a{color:#276850;}</style>"
+        f"<h1>{title}</h1><ul>{links}</ul>"
+        + ("" if entries else "<p>This directory is empty.</p>")
+        + "</html>"
+    ).encode()
+
+
+def gui_server(  # noqa: C901 - serve graph assets and package runtime output
+    root: Path,
+    port: int = 0,
+) -> HTTPServer:
     """Serve only GUI assets and read-only repository data on loopback."""
     assets = Path(__file__).parent / "prm"
     routes = {
@@ -1359,6 +1523,9 @@ def gui_server(root: Path, port: int = 0) -> HTTPServer:
             request = urlsplit(self.path)
             route = request.path
             status = HTTPStatus.OK
+            if route == "/output":
+                self.serve_output(parse_qs(request.query).get("path", [""])[0])
+                return
             if route == "/api/overview":
                 content_type = "application/json; charset=utf-8"
                 try:
@@ -1384,6 +1551,42 @@ def gui_server(root: Path, port: int = 0) -> HTTPServer:
             )
             self.end_headers()
             self.wfile.write(content)
+
+        def serve_output(self, requested: str) -> None:
+            """Serve a package output listing or file for viewing in a browser tab."""
+            try:
+                root, target = output_path(requested)
+                if target.is_dir():
+                    content = output_index(root, target)
+                    content_type = "text/html; charset=utf-8"
+                    length = len(content)
+                else:
+                    content = None
+                    content_type = (
+                        mimetypes.guess_type(target.name)[0]
+                        or "application/octet-stream"
+                    )
+                    length = target.stat().st_size
+            except (OSError, ValueError):
+                self.send_error(HTTPStatus.NOT_FOUND, "Output not found")
+                return
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(length))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "object-src 'none'; frame-ancestors 'none'",
+            )
+            self.end_headers()
+            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+                if content is not None:
+                    self.wfile.write(content)
+                else:
+                    with target.open("rb") as stream:
+                        shutil.copyfileobj(stream, self.wfile)
 
         def log_message(self, format: str, *args: object) -> None:  # noqa: A002
             """Keep the launcher output focused on its URL."""

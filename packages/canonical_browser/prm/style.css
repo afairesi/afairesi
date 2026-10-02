@@ -542,3 +542,150 @@ input[type="checkbox"] {
   letter-spacing: 0.5px;
   opacity: 0.8;
 }
+
+/* Package source details use compact, indented tree rows. */
+.package > .resource-body,
+.package-reference > .resource-body {
+  padding: 6px 12px 12px;
+}
+:is(.package, .package-reference) .behavior-group {
+  border: 0;
+  border-radius: 0;
+  margin: 2px 0;
+  background: transparent;
+  overflow: visible;
+}
+:is(.package, .package-reference) .behavior-group > summary {
+  padding: 4px 0;
+  gap: 6px;
+  line-height: 1.5;
+}
+:is(.package, .package-reference) .behavior-group[open] > summary {
+  border: 0;
+  background: transparent;
+}
+:is(.package, .package-reference) .behavior-content {
+  border-left: 1px solid var(--line);
+  padding: 0 0 0 12px;
+  margin-left: 4px;
+  background: transparent;
+}
+:is(.package, .package-reference) .detail-leaf {
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  padding: 2px 0;
+  margin: 0;
+  line-height: 1.5;
+}
+:is(.package, .package-reference) .detail-leaf.match {
+  background: #fff8dc;
+}
+:is(.package, .package-reference) .behavior-group.changed > summary {
+  color: #9f6c20;
+}
+
+.directory-metrics {
+  margin: -6px 0 16px;
+  font-size: 10px;
+  color: var(--muted);
+}
+.directory-metrics > summary {
+  cursor: pointer;
+  padding: 3px 0;
+}
+.metrics-content {
+  max-width: 340px;
+  padding: 8px 0;
+}
+.metrics-content h3 {
+  font-size: 10px;
+  font-weight: 550;
+  margin: 8px 0 6px;
+  color: var(--green);
+}
+.metric-rows {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 12px;
+  margin: 0 0 4px;
+  line-height: 1.4;
+}
+.metric-rows dt {
+  overflow-wrap: anywhere;
+  color: var(--muted);
+}
+.metric-rows dd {
+  margin: 0;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.machine-box {
+  position: relative;
+  padding: 20px;
+  border: 1px solid #c2d0e1;
+  border-radius: 15px;
+  background: #edf2f84d;
+  width: max-content;
+  min-width: 320px;
+}
+.machine-info > summary {
+  cursor: pointer;
+  list-style: none;
+}
+.machine-info > summary::-webkit-details-marker {
+  display: none;
+}
+.machine-info > summary::after {
+  content: "›";
+  margin-left: auto;
+  color: var(--muted);
+}
+.machine-info[open] > summary::after {
+  transform: rotate(90deg);
+}
+.machine-facts {
+  margin: 0 0 16px;
+  font: 10px/1.6 monospace;
+  color: var(--muted);
+}
+.directory-leaf {
+  display: block;
+  color: var(--green);
+  text-decoration: none;
+}
+.directory-leaf:hover {
+  text-decoration: underline;
+}
+.resource-block,
+.repository-box,
+.directory-box,
+.machine-box {
+  transition: background-color 120ms ease;
+}
+.resource-block:hover,
+.resource-block[open]:hover {
+  background-color: #f7faf4;
+}
+.resource-block.host:hover {
+  background-color: #f1f5fc;
+}
+.resource-block.changed:hover,
+.resource-block.changed[open]:hover {
+  background-color: #ffeacb;
+}
+.repository-box:hover:not(:has(.resource-block:hover, .repository-box:hover, .directory-box:hover)),
+.directory-box:hover:not(:has(.resource-block:hover, .repository-box:hover, .directory-box:hover)) {
+  background-color: #e9f0e2b3;
+}
+.machine-box:hover:not(:has(.resource-block:hover, .repository-box:hover, .directory-box:hover)) {
+  background-color: #e5edf780;
+}
+@media (prefers-reduced-motion: reduce) {
+  .resource-block,
+  .repository-box,
+  .directory-box,
+  .machine-box {
+    transition: none;
+  }
+}

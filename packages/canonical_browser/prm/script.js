@@ -423,12 +423,55 @@ function prepareData(snapshot) {
   return { ...snapshot, nodes };
 }
 
+function directoryMetrics(item) {
+  const panel = element("details", "directory-metrics");
+  const current = data.nodes.filter((node) => !node.removed &&
+    (item.path === "." || node.repository === item.path || node.repository.startsWith(`${item.path}/`)));
+  bindExpansion(panel, `metrics:${item.path}`);
+  const lines = new Map();
+  const suppressions = new Map();
+  for (const node of current) {
+    if (!["package", "host"].includes(node.kind) || !node.source_metrics) continue;
+    for (const [path, count] of Object.entries(node.source_metrics.lines)) {
+      const name = path.split("/").pop();
+      lines.set(name, (lines.get(name) || 0) + count);
+    }
+    for (const [name, count] of Object.entries(node.source_metrics.suppressions))
+      suppressions.set(name, (suppressions.get(name) || 0) + count);
+  }
+  function rows(entries) {
+    const list = element("dl", "metric-rows");
+    for (const [label, count] of entries) {
+      list.append(element("dt", "", label), element("dd", "", count.toLocaleString()));
+    }
+    return list;
+  }
+  const repositories = current.filter((node) => node.kind === "repository" && node.profile !== "directory").length;
+  const packages = current.filter((node) => node.kind === "package").length;
+  const hosts = current.filter((node) => node.kind === "host").length;
+  const totalLines = [...lines.values()].reduce((total, count) => total + count, 0);
+  const summary = element("summary", "", `${repositories} ${repositories === 1 ? "repository" : "repositories"} · ${packages} ${packages === 1 ? "package" : "packages"} · ${hosts} ${hosts === 1 ? "host" : "hosts"} · ${totalLines.toLocaleString()} lines`);
+  panel.append(summary);
+  const content = element("div", "metrics-content");
+  if (lines.size) {
+    content.append(element("h3", "", "Source lines"));
+    content.append(rows([...lines].sort(([a], [b]) => a.localeCompare(b))));
+  }
+  if (suppressions.size) {
+    content.append(element("h3", "", "Suppressions"));
+    content.append(rows([...suppressions].sort(([a], [b]) => a.localeCompare(b))));
+  }
+  if (!content.childNodes.length) content.append(element("p", "", "No source files in this directory view."));
+  panel.append(content);
+  return panel;
+}
+
 function relationships() {
   return data.edges.filter((edge) => !["contains", "submodule", "checked-by"].includes(edge.kind));
 }
 
 function visibleNodes() {
-  const resources = data.nodes.filter((node) => !["repository", "check"].includes(node.kind));
+  const resources = data.nodes.filter((node) => !["repository", "check", "machine"].includes(node.kind));
   const matches = new Set(
     resources
       .filter(
@@ -563,11 +606,18 @@ function behaviorTree(tree, key, filterChanges) {
   const children = tree.children || [];
   if (!children.length) {
     const matches = query && tree.title.toLowerCase().includes(query);
-    return element(
-      "div",
-      `detail-leaf ${tree.change || ""}${tree.warning ? " warning" : ""}${matches ? " match" : ""}`,
+    const leaf = element(
+      tree.directory ? "a" : "div",
+      `detail-leaf ${tree.directory ? "directory-leaf " : ""}${tree.change || ""}${tree.warning ? " warning" : ""}${matches ? " match" : ""}`,
       tree.title,
     );
+    if (tree.directory) {
+      leaf.href = `/output?path=${encodeURIComponent(tree.directory)}`;
+      leaf.target = "_blank";
+      leaf.rel = "noopener";
+      leaf.title = `Browse ${tree.directory}`;
+    }
+    return leaf;
   }
   const details = element("details", `behavior-group${hasChange(tree) ? " changed" : ""}`);
   const visible = children.filter((child) => !filterChanges || hasChange(child));
@@ -727,7 +777,7 @@ function render() {
     link.title = `Open ${destination}`;
     link.addEventListener("click", () => navigateDirectory(destination));
     heading.append(link);
-    box.append(heading);
+    box.append(heading, directoryMetrics(item));
     const body = element("div", "repository-body");
     const resources = currentNodes.filter((node) => node.repository === item.repository);
     if (resources.length) body.append(resourceLayout(resources, visibleEdges()));
@@ -735,7 +785,27 @@ function render() {
     box.append(body);
     return box;
   }
-  stage.append(container(hierarchy));
+  const directoryBox = container(hierarchy);
+  const machine = data.machine;
+  if (machine) {
+    const wrapper = element("section", "machine-box");
+    const info = element("details", "machine-info");
+    const heading = element("summary", "repository-heading");
+    heading.append(kindIcon("machine"));
+    const icon = languageIcon(machine.icon);
+    if (icon) heading.append(icon);
+    heading.append(element("span", "", `${machine.description} · ${machine.name}`));
+    info.append(heading);
+    const facts = element("div", "machine-facts");
+    for (const detail of machine.details) facts.append(element("div", "", detail));
+    info.append(facts);
+    info.addEventListener("toggle", scheduleLayout);
+    wrapper.append(info);
+    const body = element("div", "repository-body");
+    body.append(directoryBox);
+    wrapper.append(body);
+    stage.append(wrapper);
+  } else stage.append(directoryBox);
   const overlay = svgElement("svg", {
     class: "graph-edges",
     "aria-label": "Package and host references",
@@ -1066,7 +1136,7 @@ document.addEventListener("keydown", (event) => {
 });
 let drag = null;
 $("canvas").addEventListener("pointerdown", (event) => {
-  if (event.button === 0 && event.target.closest("details,button,input")) return;
+  if (event.button === 0 && event.target.closest("details,button,input,a")) return;
   if (![0, 1, 2].includes(event.button)) return;
   event.preventDefault();
   const outer = document.querySelector(".graph-stage > section")?.getBoundingClientRect();
