@@ -17,7 +17,7 @@ let
   pname = baseNameOf ./.;
   python = pkgs.python3;
   runtimeInputs = [
-    inputs.self.packages.${pkgs.stdenv.system}.git-canonical
+    inputs.self.packages.${pkgs.stdenv.system}.canonical
     pkgs.diffoscope
     pkgs.git
     pkgs.nix

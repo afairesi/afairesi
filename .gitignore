@@ -6,10 +6,10 @@
 !/LICENSE
 !/README
 !/checks/
+!/checks/canonical/
+!/checks/canonical/default.nix
 !/checks/canonical_browser/
 !/checks/canonical_browser/default.nix
-!/checks/git-canonical/
-!/checks/git-canonical/default.nix
 !/checks/nix_alphabetize/
 !/checks/nix_alphabetize/default.nix
 !/checks/nix_remove_defaults/
@@ -24,6 +24,10 @@
 !/flake.nix
 !/formatter.nix
 !/packages/
+!/packages/canonical/
+!/packages/canonical/default.nix
+!/packages/canonical/main.py
+!/packages/canonical/test_main.py
 !/packages/canonical_browser/
 !/packages/canonical_browser/default.nix
 !/packages/canonical_browser/main.py
@@ -33,10 +37,6 @@
 !/packages/canonical_browser_video/
 !/packages/canonical_browser_video/default.nix
 !/packages/canonical_browser_video/main.py
-!/packages/git-canonical/
-!/packages/git-canonical/default.nix
-!/packages/git-canonical/main.py
-!/packages/git-canonical/test_main.py
 !/packages/nix_alphabetize/
 !/packages/nix_alphabetize/default.nix
 !/packages/nix_alphabetize/main.py

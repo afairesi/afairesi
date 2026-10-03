@@ -243,9 +243,9 @@ let
   };
   wrapper = pkgs.writeShellApplication {
     name = "treefmt";
-    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.git-canonical ];
+    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.canonical ];
     text = ''
-      git canonical converge
+      canonical converge
       exec ${rawFormatter}/bin/treefmt "$@"
     '';
   };

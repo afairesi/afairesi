@@ -167,7 +167,7 @@ def test_host_check_convergence_after_formatting_is_idempotent(
 ) -> None:
     """Comment removal and layout formatting must not trigger check regeneration."""
     _run(repository, "add", "hosts/laptop")
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     syntax = subject.nix_syntax
     relative = "checks/laptopVmWithDisko/default.nix"
     check = repository / relative
@@ -247,7 +247,7 @@ def test_structure_validation_does_not_traverse_excluded_trees(
     package = repository / "packages/example"
     (package / "stray").write_text("unsupported")
     (package / "link").symlink_to(repository / "tmp", target_is_directory=True)
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     original_scandir = os.scandir
 
     def guarded_scandir(path: str | os.PathLike[str]) -> Iterator[os.DirEntry[str]]:
@@ -269,7 +269,7 @@ def test_structure_validation_does_not_traverse_excluded_trees(
 
 def test_html_template_keeps_prm_install_hook(repository: Path) -> None:
     """Keep bundled assets and package-specific resources across convergence."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     package_root = repository / "packages/viewer"
     package_root.mkdir(parents=True)
     (package_root / "index.html").write_text("<!doctype html>", encoding="utf-8")
@@ -318,7 +318,7 @@ def test_html_launcher_opens_only_for_desktop_sessions(
     expected: list[str],
 ) -> None:
     """Desktop runs open once, headless runs serve, and explicit options survive."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     generated = subject.scaffold("html", "viewer", None)[
         Path("packages/viewer/default.nix")
     ]
@@ -578,7 +578,7 @@ def test_init_flake_stages_home_whitelist_without_force(
         encoding="utf-8",
     )
     fake_nix.chmod(0o755)
-    monkeypatch.setenv("GIT_CANONICAL_NIX", str(fake_nix))
+    monkeypatch.setenv("CANONICAL_NIX", str(fake_nix))
     _run(tmp_path, "init", "home")
     _git(home, "commit", "--quiet", "-m", "Home policy")
     _run(tmp_path, "init", "flake", remote)
@@ -789,13 +789,13 @@ def test_dash_case_packages_normalize_nix_names(repository: Path, kind: str) -> 
     _run(repository, "rm", "packages/another-name")
 
 
-def test_git_discovers_canonical_subcommand(repository: Path) -> None:
-    """Expose the installed CLI through Git's external command lookup."""
+def test_canonical_is_available_on_path(repository: Path) -> None:
+    """Expose the installed CLI as a standalone command."""
     environment = dict(os.environ)
     executable_directory = os.path.dirname(environment["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     result = subprocess.run(
-        ["git", "canonical", "help"],  # noqa: S607
+        ["canonical", "help"],  # noqa: S607
         cwd=repository,
         env=environment,
         capture_output=True,
@@ -803,8 +803,8 @@ def test_git_discovers_canonical_subcommand(repository: Path) -> None:
         check=True,
         timeout=30,
     )
-    if "usage: git canonical" not in result.stdout:
-        msg = "Git did not discover the canonical CLI"
+    if "usage: canonical" not in result.stdout:
+        msg = "PATH did not expose the canonical CLI"
         raise AssertionError(msg)
 
 
@@ -949,7 +949,7 @@ def test_python_check_only_exposes_declared_executables(
     executable: bool,
 ) -> None:
     """Library checks omit a launcher and executable checks honor its name."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     check = tmp_path / "example" / "default.nix"
     check.parent.mkdir()
     check.write_text(subject._current_python_test_source())  # noqa: SLF001
@@ -1171,7 +1171,7 @@ def test_cli_records_retain_command_paths_without_executing_source(
     parameter: str,
 ) -> None:
     """Keep library-specific ownership in the shared static CLI contract."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     entries = subject.source_package_cli(source.encode(), "main.py")
     if subject.CliEntry(path, "command", command=True) not in entries:
         msg = "Missing nested command path"
@@ -1267,8 +1267,8 @@ def test_command_catalog_tracks_nested_parser_commands(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep client command menus synchronized when CLI commands are added."""
-    subject = import_module("packages.git-canonical.main")
-    cli = argparse.ArgumentParser(prog="git canonical")
+    subject = import_module("packages.canonical.main")
+    cli = argparse.ArgumentParser(prog="canonical")
     commands = cli.add_subparsers()
     added = commands.add_parser("future")
     added.add_argument("--visible", help="Public option")
@@ -1289,7 +1289,7 @@ def test_overview_details_preserve_documentation_and_source_facts(
     repository: Path,
 ) -> None:
     """Expose structured declarations independently of terminal labels and layout."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     package = repository / "packages/example"
     package.mkdir(parents=True)
     help_text = (
@@ -1355,7 +1355,7 @@ def test_overview_revision_sources_preserve_the_checkout_and_cover_all_resources
     repository: Path,
 ) -> None:
     """Read historical regular blobs with the same inventory as current sources."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     for relative, content in (
         ("packages/tool/default.nix", "{}\n"),
         ("packages/tool/main.py", '"""Original help."""\n'),
@@ -1429,7 +1429,7 @@ def test_overview_empty_home_roots_and_missing_history_are_explicit(
     tmp_path: Path,
 ) -> None:
     """Recognize initialized home policy and distinguish absent HEAD from errors."""
-    subject = import_module("packages.git-canonical.main")
+    subject = import_module("packages.canonical.main")
     (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
     child = tmp_path / "forge.example"
     child.mkdir()
@@ -1852,8 +1852,8 @@ def names_repository_continues_after_a_malformed_test_file(tmp_path: Path) -> No
     if "test still listed\n" not in result.stdout:
         msg = "Expectation failed: 'test still listed\\n' in result.stdout"
         raise AssertionError(msg)
-    if "git canonical test names: broken:" not in result.stderr:
-        msg = "Expectation failed: 'git canonical test names: broken:' in result.stderr"
+    if "canonical test names: broken:" not in result.stderr:
+        msg = "Expectation failed: 'canonical test names: broken:' in result.stderr"
         raise AssertionError(msg)
 
 
@@ -1875,8 +1875,8 @@ def test_names_invalid_test_files_return_failure(tmp_path: Path, layout: str) ->
     if result.returncode != 1:
         msg = "Expectation failed: result.returncode == 1"
         raise AssertionError(msg)
-    if "git canonical test names:" not in result.stderr:
-        msg = "Expectation failed: 'git canonical test names:' in result.stderr"
+    if "canonical test names:" not in result.stderr:
+        msg = "Expectation failed: 'canonical test names:' in result.stderr"
         raise AssertionError(msg)
     if result.stdout != "":
         msg = "Expectation failed: result.stdout == ''"
@@ -2098,7 +2098,7 @@ def test_names_git_preserves_exit_codes_and_reports_parse_and_revision_errors(
         raise AssertionError(missing)
     (names_repository / "packages/example/test_main.py").write_text("def invalid(")
     malformed = _run_test_names(names_repository, "diff")
-    if malformed.returncode == 0 or "git canonical test names:" not in malformed.stderr:
+    if malformed.returncode == 0 or "canonical test names:" not in malformed.stderr:
         raise AssertionError(malformed)
 
 
@@ -2301,17 +2301,17 @@ def test_names_git_views_preserve_definition_order_while_listings_remain_sorted(
 
 
 @pytest.mark.parametrize("arguments", [(), ("diff",), ("diff", "--staged"), ("show",)])
-def test_names_are_available_through_gits_canonical_subcommand(
+def test_names_are_available_through_canonical(
     names_repository: Path,
     arguments: tuple[str, ...],
 ) -> None:
-    """The public Git command preserves listing, patch output and exit status."""
+    """The public command preserves listing, patch output and exit status."""
     environment = dict(os.environ)
     executable_directory = os.path.dirname(environment["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     expected = _run_test_names(names_repository, *arguments)
     result = subprocess.run(  # noqa: S603
-        ["git", "canonical", "test", "names", *arguments],  # noqa: S607
+        ["canonical", "test", "names", *arguments],  # noqa: S607
         cwd=names_repository,
         env=environment,
         capture_output=True,
@@ -2394,12 +2394,12 @@ def _run_runner_cli(
     command: str,
     *arguments: str,
 ) -> subprocess.CompletedProcess[str]:
-    """Exercise test runners through Git's public external-command lookup."""
+    """Exercise test runners through the public standalone command."""
     environment = dict(environment)
     executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603
-        ["git", "canonical", "test", command, str(root), *arguments],  # noqa: S607
+        ["canonical", "test", command, str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
@@ -2763,22 +2763,22 @@ def test_runners_support_dash_case_and_execute_copied_git_subcommands(
     tmp_path: Path,
     command: str,
 ) -> None:
-    """A copied git-canonical executable must win over the installed command."""
+    """A copied Git subcommand must run from the isolated package."""
     root = tmp_path / "source with spaces"
     source = "def main():\n    print('isolated')\n"
     tests = (
         "import subprocess\n"
         "def test_copied_command():\n"
-        "    result = subprocess.run(['git', 'canonical'],\n"
+        "    result = subprocess.run(['git', 'example'],\n"
         "        capture_output=True, text=True)\n"
         "    assert result.returncode == 0\n"
         "    assert result.stdout == 'isolated\\n'\n"
     )
-    environment = _prepare_runner_flake(root, tests, source, name="git-canonical")
+    environment = _prepare_runner_flake(root, tests, source, name="git-example")
     result = _run_runner_cli(root, environment, command)
     if result.returncode or "1 passed, 0 failed, 0 skipped" not in result.stdout:
         raise AssertionError(result.stdout + result.stderr)
-    if (root / "packages/git-canonical/main.py").read_text() != source:
+    if (root / "packages/git-example/main.py").read_text() != source:
         message = "runner changed the original dash-case package"
         raise AssertionError(message)
 
@@ -3011,7 +3011,7 @@ def test_coverage_continues_after_failures_and_skips_packages_without_tests(
         raise AssertionError(result.stdout + result.stderr)
     if "z-last:" not in result.stdout or "/html/index.html" not in result.stdout:
         raise AssertionError(result.stdout)
-    if "git canonical test coverage: example:" not in result.stderr:
+    if "canonical test coverage: example:" not in result.stderr:
         raise AssertionError(result.stderr)
 
 

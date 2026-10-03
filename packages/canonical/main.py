@@ -140,8 +140,8 @@ def profile(root: Path, default: str | None = None) -> str:
         raise CommandError(msg)
     msg = (
         "cannot determine the repository type; run "
-        "'git canonical init home' or "
-        "'git canonical init flake REMOTE'"
+        "'canonical init home' or "
+        "'canonical init flake REMOTE'"
     )
     raise CommandError(msg)
 
@@ -2247,7 +2247,7 @@ def initialize_flake(remote: str) -> None:
         )
         (directory / "README").write_text(readme, encoding="utf-8")
         _run(
-            [os.environ.get("GIT_CANONICAL_NIX", "nix"), "flake", "lock"],
+            [os.environ.get("CANONICAL_NIX", "nix"), "flake", "lock"],
             cwd=directory,
         )
         detected_packages = detect_packages(directory)
@@ -2260,7 +2260,7 @@ def initialize_flake(remote: str) -> None:
             encoding="utf-8",
         )
         _run(
-            [os.environ.get("GIT_CANONICAL_NIX", "nix"), "fmt"],
+            [os.environ.get("CANONICAL_NIX", "nix"), "fmt"],
             cwd=directory,
         )
         git(directory, ["add", "--all"])
@@ -2401,7 +2401,7 @@ def _print_repository_test_names(root: Path) -> bool:
             _print_package_test_names(package)
         except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
             success = False
-            sys.stderr.write(f"git canonical test names: {package.name}: {error}\n")
+            sys.stderr.write(f"canonical test names: {package.name}: {error}\n")
     return success
 
 
@@ -2555,7 +2555,7 @@ def _run_test_names(arguments: list[str]) -> int:
         return _print_test_names_git(arguments[0], arguments[1:])
     if arguments[:1] == ["_textconv"]:
         converter_parser = argparse.ArgumentParser(
-            prog="git canonical test names _textconv",
+            prog="canonical test names _textconv",
         )
         converter_parser.add_argument("file", type=Path)
         for name in read_test_names(
@@ -2565,7 +2565,7 @@ def _run_test_names(arguments: list[str]) -> int:
             sys.stdout.write(name + "\n")
         return 0
     parser = argparse.ArgumentParser(
-        prog="git canonical test names",
+        prog="canonical test names",
         description="List Python test names as sentences or inspect their Git changes.",
         epilog=(
             "Repository targets list Python packages sequentially and skip packages "
@@ -4203,7 +4203,7 @@ def _run_package_args(arguments: list[str]) -> int:
     if arguments and arguments[0] in {"diff", "show"}:
         return _print_test_names_git(arguments[0], arguments[1:], package_args=True)
     cli = argparse.ArgumentParser(
-        prog="git canonical args",
+        prog="canonical args",
         description=(
             "List statically declared argparse, Click, Fire, or Typer interfaces "
             "without executing source."
@@ -4256,7 +4256,7 @@ def _run_package_args(arguments: list[str]) -> int:
             _print_package_args(package)
         except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
             status = 1
-            sys.stderr.write(f"git canonical args: {package.name}: {error}\n")
+            sys.stderr.write(f"canonical args: {package.name}: {error}\n")
     return status
 
 
@@ -4270,10 +4270,10 @@ def _dispatch_test_names(arguments: list[str], *, package_args: bool = False) ->
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)
     except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
-        sys.stderr.write(f"git canonical {label}: {error}\n")
+        sys.stderr.write(f"canonical {label}: {error}\n")
         sys.exit(1)
     except KeyboardInterrupt:
-        sys.stderr.write(f"git canonical {label}: interrupted\n")
+        sys.stderr.write(f"canonical {label}: interrupted\n")
         sys.exit(130)
     sys.exit(status)
 
@@ -4635,7 +4635,7 @@ def _run_test_repository(
             )
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"git canonical test {command}: {package.name}: {error}\n")
+            sys.stderr.write(f"canonical test {command}: {package.name}: {error}\n")
     sys.stdout.write("\nRepository summary:\n")
     for package_name, status in outcomes.items():
         sys.stdout.write(f"  {package_name}: {status}\n")
@@ -4668,11 +4668,11 @@ def _dispatch_test_runner(
         )
         success = runner(target, options.test_command, options.timeout, max_examples)
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-        sys.stderr.write(f"git canonical test {options.test_command}: {error}\n")
+        sys.stderr.write(f"canonical test {options.test_command}: {error}\n")
         sys.exit(1)
     except KeyboardInterrupt:
         sys.stderr.write(
-            f"git canonical test {options.test_command}: "
+            f"canonical test {options.test_command}: "
             "interrupted; diagnostics retained\n",
         )
         sys.exit(130)
@@ -4743,7 +4743,7 @@ def _build_package_coverage(package: Path, system: str) -> None:
     root = _test_target_root(package)
     check = root / "checks" / package.name / "default.nix"
     if not check.is_file():
-        message = f"missing {check}; run git canonical converge to generate checks"
+        message = f"missing {check}; run canonical converge to generate checks"
         raise CommandError(message)
     sys.stdout.write(f"Building coverage for {package.name}...\n")
     sys.stdout.flush()
@@ -4773,7 +4773,7 @@ def _build_package_coverage(package: Path, system: str) -> None:
     if not report.is_file():
         message = (
             f"coverage check produced no HTML report for {package.name}; "
-            "run git canonical converge to update the test checks"
+            "run canonical converge to update the test checks"
         )
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
@@ -4818,7 +4818,7 @@ def _run_coverage(target: Path) -> bool:
             outcomes[package.name] = "passed"
         except (CommandError, OSError) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"git canonical test coverage: {package.name}: {error}\n")
+            sys.stderr.write(f"canonical test coverage: {package.name}: {error}\n")
     if repository:
         sys.stdout.write("\nRepository summary:\n")
         for name, status in outcomes.items():
@@ -4836,7 +4836,7 @@ def _run_coverage(target: Path) -> bool:
 def parser() -> argparse.ArgumentParser:
     """Construct the public command-line parser."""
     result = argparse.ArgumentParser(
-        prog="git canonical",
+        prog="canonical",
         description="Manage canonical persistent state in HOME and flake repositories.",
     )
     commands = result.add_subparsers(
@@ -5128,7 +5128,7 @@ def _dispatch_test_command(
         try:
             success = _run_coverage(options.target.resolve())
         except KeyboardInterrupt:
-            sys.stderr.write("git canonical test coverage: interrupted\n")
+            sys.stderr.write("canonical test coverage: interrupted\n")
             sys.exit(130)
         sys.exit(0 if success else 1)
     if options.test_command in {"hypothesis", "mutation"}:
@@ -5210,7 +5210,7 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Dispatch the git canonical CLI."""
+    """Dispatch the canonical CLI."""
     arguments = _normalize_help_arguments(sys.argv[1:])
     package_args = arguments[:1] == ["args"]
     if package_args or arguments[:2] == ["test", "names"]:

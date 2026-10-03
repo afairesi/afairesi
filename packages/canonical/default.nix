@@ -40,7 +40,7 @@ let
     };
     version = "1.3.0";
   };
-  pname = builtins.replaceStrings [ "-" ] [ "_" ] (baseNameOf ./.);
+  pname = baseNameOf ./.;
   python = pkgs.python3;
 in
 python.pkgs.buildPythonPackage {
@@ -49,15 +49,15 @@ python.pkgs.buildPythonPackage {
   installPhase = ''
     install -Dm644 main.py "$out/${python.sitePackages}/$pname/__init__.py"
     mkdir -p "$out/bin"
-    printf '%s\n' '#!${python.interpreter}' "from $pname import main" 'main()' > "$out/bin/${baseNameOf ./.}"
-    chmod 755 "$out/bin/${baseNameOf ./.}"
+    printf '%s\n' '#!${python.interpreter}' "from $pname import main" 'main()' > "$out/bin/$pname"
+    chmod 755 "$out/bin/$pname"
     if [ -d prm ]; then
       cp -R prm/ "$out/${python.sitePackages}/$pname/"
     fi
   '';
   meta = {
     description = "Manage canonical persistent state in home and flake repositories";
-    mainProgram = baseNameOf ./.;
+    mainProgram = pname;
   };
   passthru.python = python;
   postFixup = ''

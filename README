@@ -1,6 +1,6 @@
 # Canonical
 
-Canonical uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `git canonical` creates, inspects, and converges those repositories.
+Canonical uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `canonical` creates, inspects, and converges those repositories.
 
 ## Canonical state
 
@@ -9,18 +9,18 @@ Canonical uses shared Git repository and Nix flake conventions to describe a mac
 - Nix flake Git submodules under `$HOME` at `<hostname>/<repository-path>`, each with conventional `packages/`, `hosts/`, and `checks/` directories.
 - Package directories with conventional places for source, tests, tracked resources (`prm/`), and runtime output (`tmp/`) where applicable.
 - Package names and descriptions show what is available.
-- `git canonical args` shows interfaces.
-- `git canonical test names` shows expected behavior.
+- `canonical args` shows interfaces.
+- `canonical test names` shows expected behavior.
 - Read tests or source code when more detail is needed.
 
 ## Runtime constraints
 
-- Use `git canonical` for persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
+- Use `canonical` for persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
 - Use `prm/` for tracked files that do not fit the conventional layout.
 
 ## Canonical state convergence
 
 - Reboot to restore impermanent NixOS state.
 - Run `nix flake check` and `nix fmt` for flake repositories.
-- Run `git canonical converge` for `$HOME` and flake repositories.
+- Run `canonical converge` for `$HOME` and flake repositories.
 - Use `git clean` to remove untracked state when intended; it is destructive.

@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Any, Self
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from git_canonical import (
+from canonical import (
     CliEntry,
     ResourceData,
     canonical_root,
@@ -41,7 +41,7 @@ from git_canonical import (
     resource_data,
     source_resource_data,
 )
-from git_canonical import CommandError as GitCanonicalError
+from canonical import CommandError as CanonicalError
 
 MAX_PORT = 65535
 MOUNT_FIELDS = 3
@@ -419,7 +419,7 @@ class RepositoryBrowser:
         try:
             current = overview_data(self.cwd)
             previous = overview_data(self.cwd, revision="HEAD")
-        except GitCanonicalError as exc:
+        except CanonicalError as exc:
             self.status = str(exc)
             return []
         validate_overview(current)
@@ -1137,7 +1137,7 @@ def browser_snapshot(
     """Build the machine and repository model for the web browser."""
     try:
         current = overview_data(root)
-    except GitCanonicalError:
+    except CanonicalError:
         if profile(root, "directory") != "directory":
             raise
         return directory_snapshot(root)
@@ -1483,7 +1483,7 @@ class PackageActions:
             raise ValueError(msg)
         repository, name, check = self.packages[package]
         if action in tests:
-            command = ["git", "canonical", *action.split(), *shlex.split(arguments)]
+            command = ["canonical", *action.split(), *shlex.split(arguments)]
         elif action == "check":
             if not check:
                 msg = "This package has no declared check"
@@ -1594,7 +1594,7 @@ class CanonicalActions(PackageActions):
         return self.launch(
             package,
             action,
-            ["git", "canonical", *action.split(), *shlex.split(arguments)],
+            ["canonical", *action.split(), *shlex.split(arguments)],
         )
 
 
@@ -1735,7 +1735,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
                 content_type = "application/json; charset=utf-8"
                 try:
                     content = json.dumps(requested_data(request.query)).encode()
-                except (GitCanonicalError, ValueError, OSError) as exc:
+                except (CanonicalError, ValueError, OSError) as exc:
                     status = HTTPStatus.INTERNAL_SERVER_ERROR
                     content = json.dumps({"error": str(exc)}).encode()
             elif route in routes:
@@ -1812,7 +1812,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     server = Server(("127.0.0.1", port), Handler)
     try:
         requested_data("")
-    except (GitCanonicalError, ValueError, OSError):
+    except (CanonicalError, ValueError, OSError):
         server.server_close()
         raise
     return server

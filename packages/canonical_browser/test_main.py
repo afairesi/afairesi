@@ -21,7 +21,7 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 import pytest
-from git_canonical import (
+from canonical import (
     CliEntry,
     command_catalog,
     overview_data,
@@ -593,12 +593,12 @@ class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
 
     def test_canonical_commands_and_package_tests_preserve_cli_arguments(self) -> None:
-        """Run every catalog entry and test action through Git without a shell."""
+        """Run every catalog entry and test action through Canonical without a shell."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = root / "packages/example"
             package.mkdir(parents=True)
-            executable = root / "git"
+            executable = root / "canonical"
             executable.write_text(
                 f"#!{sys.executable}\n"
                 "import json, os, sys, time\n"
@@ -644,7 +644,6 @@ class TestGui(unittest.TestCase):
                     require_output(
                         invocation["argv"]
                         == [
-                            "canonical",
                             *command.split(),
                             "two words",
                             "$(touch injected)",
@@ -656,8 +655,7 @@ class TestGui(unittest.TestCase):
                         invocation = json.loads(actions.status(str(package))["output"])
                         require_output(invocation["cwd"] == str(package))
                         require_output(
-                            invocation["argv"]
-                            == ["canonical", *command.split(), "--timeout", "12"],
+                            invocation["argv"] == [*command.split(), "--timeout", "12"],
                         )
                 require_output(not (root / "injected").exists())
                 commands.start(str(root), "test mutation", "--fail")
