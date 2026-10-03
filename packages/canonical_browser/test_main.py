@@ -153,6 +153,56 @@ class TestOutputSnapshots(unittest.TestCase):
             require_output(not third.changed)
             require_output(b"No output changes" in app.output_diff_page(third))
 
+    def test_output_tree_embeds_changes_and_reports_individual_entries(self) -> None:
+        """Keep nested output changes inline and scope reports to their entry."""
+        nested = self.output / "nested"
+        nested.mkdir()
+        changed = nested / "value.txt"
+        changed.write_text("before\n")
+        (self.output / "unchanged.txt").write_text("same\n")
+        removed = self.output / "removed.txt"
+        removed.write_text("removed\n")
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        changed.write_text("after\n")
+        removed.unlink()
+        (self.output / "added.txt").write_text("added\n")
+        (self.output / "binary").write_bytes(b"\0binary")
+        (self.output / "external").symlink_to(self.root)
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            data = app.gui_data(self.root)
+            snapshots.observe(data)
+            package = next(node for node in data["nodes"] if node["kind"] == "package")
+            tree = next(
+                child
+                for child in package["tree"]["children"]
+                if child["title"] == "tmp/"
+            )
+            require_output(tree["expandable"] and bool(tree["output_diff"]))
+            entries = {child["title"]: child for child in tree["children"]}
+            require_output(entries["removed.txt"]["change"] == "removed")
+            require_output(entries["added.txt"]["change"] == "added")
+            require_output(entries["unchanged.txt"]["output_diff"] is None)
+            require_output(entries["binary"]["text_diff"] is None)
+            require_output(not entries["external"]["children"])
+            value = entries["nested/"]["children"][0]
+            require_output(
+                "-before" in value["text_diff"] and "+after" in value["text_diff"],
+            )
+            report = snapshots.entry_report(comparison, "nested/value.txt")
+            if report.future is None:
+                self.fail("Entry report was not scheduled")
+            report.future.result(timeout=20)
+            require_output(report.error == "", report.error)
+            content = re.sub(b"<[^>]+>", b"", app.output_diff_page(report))
+            require_output(b"before" in content and b"after" in content)
+            require_output(b"unchanged.txt" not in content)
+            with pytest.raises(ValueError, match="Invalid output entry"):
+                snapshots.entry_report(comparison, "../timestamp")
+            with pytest.raises(ValueError, match="escapes capture"):
+                snapshots.entry_report(comparison, "external/flake.nix")
+
     def test_metadata_is_ignored_and_missing_output_reports_removals(self) -> None:
         """Ignore metadata changes and report the removal of a whole output tree."""
         value = self.output / "value.txt"

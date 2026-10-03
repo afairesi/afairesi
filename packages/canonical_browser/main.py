@@ -5,6 +5,8 @@
 import argparse
 import contextlib
 import fcntl
+import filecmp
+import hashlib
 import json
 import mimetypes
 import os
@@ -20,6 +22,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from difflib import unified_diff
 from html import escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -42,6 +45,7 @@ MAX_PORT = 65535
 MOUNT_FIELDS = 3
 EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
 OUTPUT_DIFF_TIMEOUT = 120
+OUTPUT_TEXT_LIMIT = 65536
 
 
 @dataclass
@@ -53,6 +57,9 @@ class TreeNode:  # noqa: D101
     resource_id: str | None = None
     directory: Path | None = None
     source_file: bool = False
+    output_diff: str | None = None
+    text_diff: str | None = None
+    expandable: bool = False
 
 
 @dataclass
@@ -67,6 +74,8 @@ class OutputComparison:
     initialized: bool = False
     changed: bool = False
     error: str = ""
+    entry: str = ""
+    report: str = "report.html"
 
 
 def copy_output_file(source: str, destination: str) -> str:
@@ -93,7 +102,13 @@ def copy_output(source: Path, destination: Path) -> None:
         destination.mkdir()
 
 
-def compare_output(previous: Path, current: Path) -> bool:
+def compare_output(
+    previous: Path,
+    current: Path,
+    *,
+    entry: str = "",
+    report: str = "report.html",
+) -> bool:
     """Generate an offline HTML report and bound the entire comparison process."""
     executable = shutil.which("diffoscope")
     if executable is None:
@@ -105,15 +120,15 @@ def compare_output(previous: Path, current: Path) -> bool:
             [
                 executable,
                 "--html",
-                str(current / "report.html"),
+                str(current / report),
                 "--jquery",
                 "disable",
                 "--no-progress",
                 "--new-file",
                 "--exclude-directory-metadata",
                 "yes",
-                str(previous / "output"),
-                str(current / "output"),
+                str(previous / "output" / entry),
+                str(current / "output" / entry),
             ],
             stdout=subprocess.DEVNULL,
             stderr=log,
@@ -131,7 +146,7 @@ def compare_output(previous: Path, current: Path) -> bool:
         diagnostic = read_text(current / "diffoscope.log")[-2000:]
         msg = f"diffoscope failed (exit {result}): {diagnostic}"
         raise ValueError(msg)
-    if result == 1 and not (current / "report.html").is_file():
+    if result == 1 and not (current / report).is_file():
         msg = "diffoscope did not produce an HTML report"
         raise ValueError(msg)
     return result == 1
@@ -143,6 +158,7 @@ class OutputSnapshots:
     def __init__(self) -> None:
         """Serialize capture jobs and hold package locks until the browser closes."""
         self.comparisons: dict[Path, OutputComparison] = {}
+        self.reports: dict[tuple[Path, Path, str], OutputComparison] = {}
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.locks = contextlib.ExitStack()
 
@@ -177,6 +193,86 @@ class OutputSnapshots:
             if comparison.future is None or refresh:
                 comparison.future = self.executor.submit(self.capture, comparison)
             record["output_diff"] = "/output-diff?" + urlencode({"path": str(output)})
+            pending = comparison.future is not None and not comparison.future.done()
+            data["output_pending"] = data.get("output_pending", False) or pending
+            tree = output_tree(
+                output,
+                comparison.previous / "output"
+                if comparison.previous and not pending
+                else None,
+                comparison.current / "output"
+                if comparison.current and not pending
+                else output,
+            )
+            if pending:
+                message = "Capturing and comparing output…"
+            elif comparison.error:
+                message = comparison.error
+            elif comparison.previous is None:
+                message = (
+                    "Initial capture saved; compare after the next browser launch."
+                )
+            else:
+                message = "Previous capture → Current capture"
+            tree.children = [
+                TreeNode(message, warning=bool(comparison.error)),
+                *(tree.children or []),
+            ]
+            children = record["tree"]["children"]
+            children[:] = [child for child in children if child["title"] != "tmp/"]
+            children.append(serialize_node(tree))
+
+    def entry_report(
+        self,
+        comparison: OutputComparison,
+        entry: str,
+    ) -> OutputComparison:
+        """Compare an allowlisted captured entry in the background."""
+        if not entry or comparison.current is None or comparison.previous is None:
+            return comparison
+        relative = Path(entry)
+        if relative.is_absolute() or ".." in relative.parts:
+            msg = "Invalid output entry"
+            raise ValueError(msg)
+        for capture in (comparison.previous, comparison.current):
+            path = capture / "output" / relative
+            if not path.parent.resolve().is_relative_to((capture / "output").resolve()):
+                msg = "Output entry escapes capture"
+                raise ValueError(msg)
+        if any(
+            (capture / "output" / relative).is_symlink()
+            for capture in (comparison.previous, comparison.current)
+        ):
+            return self.entry_report(
+                comparison,
+                str(relative.parent) if relative.parent != Path() else "",
+            )
+        key = comparison.output, comparison.current, entry
+        if key not in self.reports:
+            report = replace(
+                comparison,
+                entry=entry,
+                report=hashlib.sha256(entry.encode()).hexdigest() + ".html",
+                future=None,
+            )
+            report.future = self.executor.submit(self.compare_entry, report)
+            self.reports[key] = report
+        return self.reports[key]
+
+    @staticmethod
+    def compare_entry(comparison: OutputComparison) -> None:
+        """Generate a report for one entry without recapturing live output."""
+        if comparison.previous is None or comparison.current is None:
+            return
+        try:
+            comparison.changed = compare_output(
+                comparison.previous,
+                comparison.current,
+                entry=comparison.entry,
+                report=comparison.report,
+            )
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+            comparison.error = str(exc)
 
     def initialize(self, comparison: OutputComparison) -> None:
         """Lock the history and retain the previous launch's last complete capture."""
@@ -249,7 +345,7 @@ class OutputSnapshots:
 def output_diff_page(comparison: OutputComparison) -> bytes:
     """Serve the saved report with capture times or await its background job."""
     pending = comparison.future is not None and not comparison.future.done()
-    title = escape(str(comparison.output))
+    title = escape(str(comparison.output / comparison.entry))
     heading = f"<section><h1>{title} changes</h1>"
     for label, capture in (
         ("Previous capture", comparison.previous),
@@ -270,7 +366,7 @@ def output_diff_page(comparison: OutputComparison) -> bytes:
             "Changes will be available after the next browser launch."
         )
     elif comparison.changed and comparison.current is not None:
-        report = (comparison.current / "report.html").read_bytes()
+        report = (comparison.current / comparison.report).read_bytes()
         return re.sub(
             rb"(<body[^>]*>)",
             lambda match: match[0] + heading.encode(),
@@ -619,6 +715,9 @@ def serialize_node(node: TreeNode) -> dict[str, Any]:
         "warning": node.warning,
         "resource_id": node.resource_id,
         "source_file": node.source_file,
+        "output_diff": node.output_diff,
+        "text_diff": node.text_diff,
+        "expandable": node.expandable,
         "directory": str(node.directory) if node.directory is not None else None,
         "children": [serialize_node(child) for child in node.children or []],
     }
@@ -836,8 +935,112 @@ def package_storage(directory: Path) -> list[TreeNode]:
         nodes.append(TreeNode(f"prm/: {size}"))
     output = directory / "tmp"
     if output.is_dir() and not output.is_symlink():
-        nodes.append(TreeNode("tmp/", directory=output.resolve()))
+        nodes.append(output_tree(output, None, output))
     return nodes
+
+
+def output_kind(path: Path | None) -> str:
+    """Classify output without following symbolic links."""
+    if path is None:
+        return "missing"
+    if path.is_symlink():
+        return "link"
+    if path.is_dir():
+        return "directory"
+    return "file" if path.is_file() else "missing"
+
+
+def output_text(path: Path | None) -> str | None:
+    """Read bounded text or a link target for an inline diff."""
+    kind = output_kind(path)
+    if kind == "missing":
+        return ""
+    if path is None:
+        return None
+    if kind == "link":
+        return str(path.readlink()) + "\n"
+    if kind != "file" or path.stat().st_size > OUTPUT_TEXT_LIMIT:
+        return None
+    try:
+        value = path.read_text()
+    except UnicodeError:
+        return None
+    return None if "\0" in value else value
+
+
+def output_change(old: Path | None, new: Path | None) -> str | None:
+    """Compare entry content while ignoring directory metadata."""
+    before, after = output_kind(old), output_kind(new)
+    if before == "missing":
+        return "added" if after != "missing" else None
+    if after == "missing":
+        return "removed"
+    same = before == after
+    if same and before == "file" and old is not None and new is not None:
+        same = filecmp.cmp(old, new, shallow=False)
+    elif same and before == "link" and old is not None and new is not None:
+        same = old.readlink() == new.readlink()
+    return None if same else "modified"
+
+
+def output_entry(root: Path | None, relative: Path) -> Path | None:
+    """Treat descendants of missing directories or links as absent."""
+    if root is None:
+        return None
+    path = root
+    for part in relative.parts:
+        if output_kind(path) != "directory":
+            return None
+        path /= part
+    return path
+
+
+def output_tree(output: Path, previous: Path | None, current: Path) -> TreeNode:
+    """Merge output entries into a collapsible tree with captured changes."""
+
+    def build(relative: Path) -> TreeNode:
+        old = output_entry(previous, relative)
+        new = output_entry(current, relative)
+        before, after = output_kind(old), output_kind(new)
+        directory = "directory" in {before, after}
+        title = (
+            "tmp/" if relative == Path() else relative.name + ("/" if directory else "")
+        )
+        node = TreeNode(title, expandable=directory)
+        if after != "missing" and new is not None and not new.is_symlink():
+            with contextlib.suppress(ValueError, OSError):
+                _, node.directory = output_path(str(output / relative))
+        if directory:
+            names: set[str] = set()
+            for path in (old, new):
+                if output_kind(path) == "directory" and path is not None:
+                    names.update(child.name for child in path.iterdir())
+            node.children = [build(relative / name) for name in sorted(names)]
+        if previous is not None:
+            node.change = output_change(old, new)
+            if node.change or any(
+                child.change or child.output_diff for child in node.children or []
+            ):
+                node.output_diff = "/output-diff?" + urlencode(
+                    {
+                        "path": str(output),
+                        "entry": str(relative) if relative != Path() else "",
+                    },
+                )
+                if not directory:
+                    before_text, after_text = output_text(old), output_text(new)
+                    if before_text is not None and after_text is not None:
+                        node.text_diff = "".join(
+                            unified_diff(
+                                before_text.splitlines(keepends=True),
+                                after_text.splitlines(keepends=True),
+                                fromfile="Previous capture",
+                                tofile="Current capture",
+                            ),
+                        )[:16384]
+        return node
+
+    return build(Path())
 
 
 def ordered_source(source: TreeNode, documentation: list[TreeNode]) -> TreeNode:
@@ -1135,6 +1338,9 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
                 warning=tree["warning"],
                 resource_id=tree["resource_id"],
                 source_file=tree.get("source_file", False),
+                output_diff=tree.get("output_diff"),
+                text_diff=tree.get("text_diff"),
+                expandable=tree.get("expandable", False),
                 directory=Path(tree["directory"]) if tree.get("directory") else None,
             )
 
@@ -1257,8 +1463,12 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
                     return
                 content_type = "text/html; charset=utf-8"
                 try:
+                    comparison = outputs.entry_report(
+                        comparison,
+                        parse_qs(request.query).get("entry", [""])[0],
+                    )
                     content = output_diff_page(comparison)
-                except OSError:
+                except (OSError, ValueError):
                     self.send_error(HTTPStatus.NOT_FOUND, "Output report not found")
                     return
             elif route == "/api/overview":

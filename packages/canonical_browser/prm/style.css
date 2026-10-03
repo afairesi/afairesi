@@ -331,6 +331,28 @@ summary::-webkit-details-marker {
 .directory-leaf:hover {
   text-decoration: underline;
 }
+.output-row {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.diffoscope-button {
+  display: inline-block;
+  padding: 1px 5px;
+  border: 1px solid var(--muted);
+  border-radius: 4px;
+  color: var(--green);
+  font-size: 9px;
+  text-decoration: none;
+  margin-left: auto;
+}
+.output-text-diff {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: 10px;
+  max-height: 260px;
+  overflow: auto;
+}
 .match {
   background: #fff2c5;
   border-radius: 3px;

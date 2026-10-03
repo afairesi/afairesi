@@ -325,8 +325,19 @@ function behaviorTree(tree, key, filterChanges) {
       ),
     );
   }
-  if (!children.length) {
+  function appendDiffoscope(row) {
+    if (!tree.output_diff) return;
+    const link = element("a", "diffoscope-button", "Diffoscope");
+    link.href = tree.output_diff;
+    link.target = "_blank";
+    link.rel = "noopener";
+    link.title = `Compare ${tree.title} with the previous capture`;
+    link.addEventListener("click", (event) => event.stopPropagation());
+    row.append(link);
+  }
+  if (!children.length && !tree.expandable && !tree.text_diff) {
     const matches = query && tree.title.toLowerCase().includes(query);
+    const row = element("div", "output-row");
     const leaf = element(
       tree.directory ? "a" : "div",
       `detail-leaf ${tree.directory ? "directory-leaf " : ""}${tree.change || ""}${tree.warning ? " warning" : ""}${matches ? " match" : ""}`,
@@ -340,20 +351,32 @@ function behaviorTree(tree, key, filterChanges) {
     }
     if (tree.source_file) leaf.classList.add("source-row");
     appendLines(leaf);
-    return leaf;
+    if (!tree.output_diff) return leaf;
+    row.append(leaf);
+    appendDiffoscope(row);
+    return row;
   }
   const details = element("details", `behavior-group${hasChange(tree) ? " changed" : ""}`);
   const visible = children.filter((child) => !filterChanges || hasChange(child));
   bindExpansion(details, key, flattenText(tree).toLowerCase().includes(query), hasChange(tree));
   const summary = element("summary", "", tree.title);
   appendLines(summary);
-  if (!tree.source_file)
+  if (!tree.source_file && (tree.expandable || children.length))
     summary.append(
       element("span", "count", String(visible.reduce((sum, child) => sum + countLeaves(child), 0))),
     );
   if (hasChange(tree)) summary.append(changeTally(tree));
+  appendDiffoscope(summary);
   details.append(summary);
   const content = element("div", "behavior-content");
+  if (tree.text_diff) content.append(element("pre", "output-text-diff", tree.text_diff));
+  if (tree.directory && tree.expandable) {
+    const browse = element("a", "directory-leaf", "Browse output");
+    browse.href = `/output?path=${encodeURIComponent(tree.directory)}`;
+    browse.target = "_blank";
+    browse.rel = "noopener";
+    content.append(browse);
+  }
   children.forEach((child, index) => {
     if (!filterChanges || hasChange(child))
       content.append(behaviorTree(child, `${key}/${index}`, filterChanges));
@@ -403,7 +426,8 @@ function resourceBlock(node) {
   details.append(summary);
   const body = element("div", "resource-body");
   if (node.tree) {
-    if (node.changed) body.append(element("div", "diff-baseline", "HEAD → Working tree"));
+    if (node.tree.children.some((child) => child.title !== "tmp/" && hasChange(child)))
+      body.append(element("div", "diff-baseline", "HEAD → Working tree"));
     const compared = new Set();
     node.tree.children.forEach((child, index) => {
       // The name and unchanged description are already fully visible in the header.
@@ -427,17 +451,6 @@ function resourceBlock(node) {
     });
   }
   if (node.expression) body.append(element("div", "detail-leaf", node.expression));
-  if (node.output_diff) {
-    const link = element(
-      "a",
-      "detail-leaf directory-leaf",
-      "View tmp/ changes since previous capture",
-    );
-    link.href = node.output_diff;
-    link.target = "_blank";
-    link.rel = "noopener";
-    body.append(link);
-  }
   details.append(body);
   blocks.set(node.id, details);
   return details;
@@ -859,6 +872,7 @@ function renderBreadcrumbs() {
 
 let rebuildPending = false;
 let fitPending = false;
+let outputPoll = null;
 function scheduleLayout(rebuild = false, fit = false) {
   const focus = captureFocus();
   if (focus) {
@@ -1001,10 +1015,12 @@ async function refresh(
   view = null,
 ) {
   const current = ++requestGeneration;
+  clearTimeout(outputPoll);
   $("refresh").disabled = true;
   $("canvas").dataset.layout = "pending";
   try {
     let snapshot = force ? null : cachedDirectory(nextDirectory);
+    if (snapshot?.output_pending) snapshot = null;
     if (!snapshot) {
       const parameters = new URLSearchParams();
       if (nextDirectory) parameters.set("directory", nextDirectory);
@@ -1035,6 +1051,8 @@ async function refresh(
     if (!view?.viewport && focused && ["package", "host"].includes(focused.kind))
       expanded.set(focused.id, true);
     scheduleLayout(true, true);
+    if (snapshot.output_pending)
+      outputPoll = setTimeout(() => refresh(directory, false), 2000);
   } catch (error) {
     if (current === requestGeneration)
       showError(`Could not read the directory: ${error.message}. Use Refresh to try again.`);
