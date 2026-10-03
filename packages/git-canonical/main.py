@@ -939,7 +939,6 @@ let
       )
       ({ modulesPath, ... }: {
         imports = [ (modulesPath + "/testing/test-instrumentation.nix") ];
-        # Test instrumentation supplies root's password through a file.
         users.users.root.initialHashedPassword = lib.mkForce null;
       })
     ];
