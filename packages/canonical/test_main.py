@@ -24,9 +24,10 @@ def _run(
     root: Path,
     *arguments: str,
     code: int = 0,
+    executable: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
+        [executable or os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
         cwd=root,
         capture_output=True,
         text=True,
@@ -165,23 +166,20 @@ def test_convergence_preserves_source_and_scratch_and_is_idempotent(
 def test_host_check_convergence_after_formatting_is_idempotent(
     repository: Path,
 ) -> None:
-    """Comment removal and layout formatting must not trigger check regeneration."""
+    """The full formatting pipeline must not trigger check regeneration."""
     _run(repository, "add", "hosts/laptop")
-    subject = import_module("packages.canonical.main")
-    syntax = subject.nix_syntax
     relative = "checks/laptopVmWithDisko/default.nix"
     check = repository / relative
-    document = syntax.parse(check.read_bytes())
-    uncommented = syntax.apply_edits(
-        document.source,
-        [
-            (node.start_byte, node.end_byte, b"")
-            for node in syntax.walk(document.tree.root_node)
-            if node.type == "comment"
-        ],
-    ).decode()
-    formatted = syntax.compact(uncommented) + "\n"
-    check.write_text(formatted, encoding="utf-8")
+    for command in (
+        ["uncomment"],
+        ["remove_empty_lines"],
+        ["deadnix", "--edit"],
+        ["statix", "fix"],
+        ["nix_alphabetize"],
+        ["nixfmt"],
+    ):
+        _run(repository, *command[1:], relative, executable=command[0])
+    formatted = check.read_text(encoding="utf-8")
     _git(repository, "add", "--", relative)
     index = _git(repository, "ls-files", "--stage")
     result = _run(repository, "converge")

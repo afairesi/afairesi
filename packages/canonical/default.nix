@@ -45,7 +45,6 @@ let
 in
 python.pkgs.buildPythonPackage {
   inherit pname;
-  checkInputs = [ python.pkgs.coverage ];
   installPhase = ''
     install -Dm644 main.py "$out/${python.sitePackages}/$pname/__init__.py"
     mkdir -p "$out/bin"
@@ -59,7 +58,18 @@ python.pkgs.buildPythonPackage {
     description = "Manage canonical persistent state in home and flake repositories";
     mainProgram = pname;
   };
-  passthru.python = python;
+  passthru = {
+    checkInputs = [
+      inputs.self.packages.${pkgs.stdenv.system}.nix_alphabetize
+      inputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines
+      inputs.self.packages.${pkgs.stdenv.system}.uncomment
+      pkgs.deadnix
+      pkgs.nixfmt
+      pkgs.statix
+      python.pkgs.coverage
+    ];
+    python = python;
+  };
   postFixup = ''
     touch "$out/${python.sitePackages}/$pname/py.typed"
   '';

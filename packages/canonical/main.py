@@ -883,7 +883,10 @@ pkgs.runCommand packageName
     {
       inherit (packageDrv) src;
       nativeBuildInputs =
-        (packageDrv.nativeBuildInputs or [ ]) ++ packageDrv.propagatedBuildInputs ++ [ pythonEnv ];
+        (packageDrv.nativeBuildInputs or [ ])
+        ++ (packageDrv.checkInputs or [ ])
+        ++ packageDrv.propagatedBuildInputs
+        ++ [ pythonEnv ];
     }
     // pkgs.lib.optionalAttrs (packageDrv.meta ? mainProgram) {
       PACKAGE_E2E_EXECUTABLE = pkgs.lib.getExe packageDrv;
@@ -910,138 +913,151 @@ pkgs.runCommand packageName
     ]))
     PYTHON
   ''
-"""  # noqa: E501
+"""
 
 
 def _current_host_check_source() -> str:
     """Render the canonical host boot, persistence, and bootstrap check."""
-    return r"""{
-  inputs,
-  pkgs,
-  ...
-}:
+    return r"""{ inputs, pkgs, ... }:
 let
   inherit (pkgs) lib;
-  configuration = inputs.self.nixosConfigurations.${host};
-  hostConfig = configuration.config;
-  hasPreservation = hostConfig.preservation.enable or false;
-  hasBootstrap = hasPreservation && hostConfig.services.openssh.enable;
-  hasAge = hasBootstrap && builtins.attrNames (hostConfig.age.secrets or { }) != [ ];
-  storage = lib.mapAttrsToList (path: state: {
-    inherit path;
-    files = state.files;
-    directories = state.directories;
-  }) (hostConfig.preservation.preserveAt or { });
-  preservedFiles = lib.concatMap (state: map (file: {
-    inherit (file) file how;
-    persistent = state.path + file.file;
-  }) state.files) storage;
-  preservedDirectories = lib.concatMap (state: map (directory: {
-    inherit (directory) directory how;
-    persistent = state.path + directory.directory;
-  }) state.directories) storage;
-  keys = lib.imap0 (index: key:
-    let
-      files = builtins.filter (file:
-        key.path == file.file || key.path == file.persistent
-      ) preservedFiles;
-      directories = lib.sort (a: b:
-        builtins.stringLength a.directory > builtins.stringLength b.directory
-      ) (builtins.filter (directory:
-        lib.hasPrefix (directory.directory + "/") key.path
-        || lib.hasPrefix (directory.persistent + "/") key.path
-      ) preservedDirectories);
-      preserved =
-        if files != [ ] then (builtins.head files).persistent
-        else if directories != [ ] then
-          let directory = builtins.head directories;
-          in if lib.hasPrefix (directory.persistent + "/") key.path then key.path
-          else directory.persistent + lib.removePrefix directory.directory key.path
-        else throw "Canonical bootstrap check: SSH host key ${key.path} is not preserved";
-    in key // { inherit index preserved; }
-  ) hostConfig.services.openssh.hostKeys;
-  identityKeys = builtins.filter (key:
-    builtins.elem key.type [ "rsa" "ed25519" ]
-    && (builtins.elem key.path hostConfig.age.identityPaths
-      || builtins.elem key.preserved hostConfig.age.identityPaths)
-  ) keys;
-  fixture = pkgs.runCommand "${host}-disposable-bootstrap-identities" {
-    nativeBuildInputs = [ pkgs.openssh ] ++ lib.optional hasAge pkgs.age;
-  } ''
-    mkdir -p "$out"
-    ${lib.concatMapStrings (key: ''
-      ssh-keygen -q -t ${lib.escapeShellArg key.type} \
-        ${lib.optionalString (key ? bits) "-b ${toString key.bits}"} \
-        -N "" -C disposable-canonical-test -f "$out/key-${toString key.index}"
-    '') keys}
-    ${lib.optionalString hasAge ''
-      ${assert lib.assertMsg (identityKeys != [ ])
-        "Canonical bootstrap check: agenix needs a preserved SSH host identity"; ""}
-      printf 'canonical-bootstrap-ok\n' | age \
-        ${lib.concatMapStringsSep " " (key: "-R \"$out/key-${toString key.index}.pub\"") identityKeys} \
-        -o "$out/probe.age"
-    ''}
-  '';
-  bootstrapNode = seeded: { ... }: {
-    imports = [ inputs.preservation.nixosModules.default ]
+  bootstrapNode =
+    seeded: _:
+    {
+      boot.initrd.systemd = {
+        inherit (hostConfig.boot.initrd.systemd) enable;
+        storePaths = [ fixture ];
+      };
+      imports = [
+        inputs.preservation.nixosModules.default
+      ]
       ++ lib.optional hasAge inputs.agenix.nixosModules.default;
-    boot.initrd.systemd = {
-      inherit (hostConfig.boot.initrd.systemd) enable;
-      storePaths = [ fixture ];
-    };
-    preservation = {
-      enable = true;
-      preserveAt = lib.mapAttrs (path: state: {
-        files = map (file: {
-          inherit (file) configureParent createLinkTarget file group how
-            inInitrd mode mountOptions parent user;
-        }) (builtins.filter (file: lib.any (key:
-          path + file.file == key.preserved
-          || path + file.file == key.preserved + ".pub"
-        ) keys) state.files);
-        directories = map (directory: {
-          inherit (directory) configureParent createLinkTarget directory group how
-            inInitrd mode mountOptions parent user;
-        }) (builtins.filter (directory: lib.any (key:
-          lib.hasPrefix (path + directory.directory + "/") key.preserved
-        ) keys) state.directories);
-      }) hostConfig.preservation.preserveAt;
-    };
-    services.openssh = {
-      inherit (hostConfig.services.openssh) enable hostKeys;
-    };
-    systemd.services.sshd.preStart = lib.optionalString (hasAge && seeded) ''
-      ${pkgs.gnugrep}/bin/grep -qx canonical-bootstrap-ok /run/agenix/canonical-probe
-    '';
-    system.stateVersion = hostConfig.system.stateVersion;
-    testing.initrdBackdoor = true;
-    virtualisation = {
-      diskImage = null;
-      emptyDiskImages = lib.imap0 (index: _: {
-        size = 64;
-        driveConfig.deviceExtraOpts.serial = "preserved-${toString index}";
-      }) storage;
-      fileSystems = builtins.listToAttrs (lib.imap0 (index: state: {
-        name = state.path;
-        value = {
-          neededForBoot = hostConfig.fileSystems.${state.path}.neededForBoot or false;
-          autoFormat = true;
-          device = "/dev/disk/by-id/virtio-preserved-${toString index}";
-          fsType = "ext4";
+      preservation = {
+        enable = true;
+        preserveAt = lib.mapAttrs (path: state: {
+          directories =
+            map
+              (directory: {
+                inherit (directory)
+                  configureParent
+                  createLinkTarget
+                  directory
+                  group
+                  how
+                  inInitrd
+                  mode
+                  mountOptions
+                  parent
+                  user
+                  ;
+              })
+              (
+                builtins.filter (
+                  directory: lib.any (key: lib.hasPrefix (path + directory.directory + "/") key.preserved) keys
+                ) state.directories
+              );
+          files =
+            map
+              (file: {
+                inherit (file)
+                  configureParent
+                  createLinkTarget
+                  file
+                  group
+                  how
+                  inInitrd
+                  mode
+                  mountOptions
+                  parent
+                  user
+                  ;
+              })
+              (
+                builtins.filter (
+                  file:
+                  lib.any (key: path + file.file == key.preserved || path + file.file == key.preserved + ".pub") keys
+                ) state.files
+              );
+        }) hostConfig.preservation.preserveAt;
+      };
+      services.openssh = {
+        inherit (hostConfig.services.openssh) enable hostKeys;
+      };
+      system.stateVersion = hostConfig.system.stateVersion;
+      systemd.services.sshd.preStart = lib.optionalString (hasAge && seeded) ''
+        ${pkgs.gnugrep}/bin/grep -qx canonical-bootstrap-ok /run/agenix/canonical-probe
+      '';
+      testing.initrdBackdoor = true;
+      virtualisation = {
+        diskImage = null;
+        emptyDiskImages = lib.imap0 (index: _: {
+          driveConfig.deviceExtraOpts.serial = "preserved-${toString index}";
+          size = 64;
+        }) storage;
+        fileSystems = builtins.listToAttrs (
+          lib.imap0 (index: state: {
+            name = state.path;
+            value = {
+              autoFormat = true;
+              device = "/dev/disk/by-id/virtio-preserved-${toString index}";
+              fsType = "ext4";
+              neededForBoot = hostConfig.fileSystems.${state.path}.neededForBoot or false;
+            };
+          }) storage
+        );
+        memorySize = 1024;
+      };
+    }
+    // lib.optionalAttrs hasAge {
+      age = {
+        inherit (hostConfig.age) identityPaths;
+        secrets = lib.optionalAttrs seeded {
+          canonical-probe.file = "${fixture}/probe.age";
         };
-      }) storage);
-      memorySize = 1024;
-    };
-  } // lib.optionalAttrs hasAge {
-    age = {
-      inherit (hostConfig.age) identityPaths;
-      secrets = lib.optionalAttrs seeded {
-        canonical-probe.file = "${fixture}/probe.age";
       };
     };
-  };
+  configuration = inputs.self.nixosConfigurations.${host};
+  fixture =
+    pkgs.runCommand "${host}-disposable-bootstrap-identities"
+      {
+        nativeBuildInputs = [ pkgs.openssh ] ++ lib.optional hasAge pkgs.age;
+      }
+      ''
+        mkdir -p "$out"
+        ${lib.concatMapStrings (key: ''
+          ssh-keygen -q -t ${lib.escapeShellArg key.type} \
+            ${lib.optionalString (key ? bits) "-b ${toString key.bits}"} \
+            -N "" -C disposable-canonical-test -f "$out/key-${toString key.index}"
+        '') keys}
+        ${lib.optionalString hasAge ''
+          ${
+            assert lib.assertMsg (
+              identityKeys != [ ]
+            ) "Canonical bootstrap check: agenix needs a preserved SSH host identity";
+            ""
+          }
+          printf 'canonical-bootstrap-ok\n' | age \
+            ${lib.concatMapStringsSep " " (key: "-R \"$out/key-${toString key.index}.pub\"") identityKeys} \
+            -o "$out/probe.age"
+        ''}
+      '';
+  hasAge = hasBootstrap && builtins.attrNames (hostConfig.age.secrets or { }) != [ ];
+  hasBootstrap = hasPreservation && hostConfig.services.openssh.enable;
   hasDisko = builtins.attrNames (configuration.config.disko.devices or { }) != [ ];
+  hasPreservation = hostConfig.preservation.enable or false;
   host = lib.removeSuffix "VmWithDisko" (baseNameOf ./.);
+  hostConfig = configuration.config;
+  identityKeys = builtins.filter (
+    key:
+    builtins.elem key.type [
+      "rsa"
+      "ed25519"
+    ]
+    && (
+      builtins.elem key.path hostConfig.age.identityPaths
+      || builtins.elem key.preserved hostConfig.age.identityPaths
+    )
+  ) keys;
   instrumented = configuration.extendModules {
     modules = [
       (
@@ -1060,7 +1076,72 @@ let
       })
     ];
   };
+  keys = lib.imap0 (
+    index: key:
+    let
+      directories =
+        lib.sort (a: b: builtins.stringLength a.directory > builtins.stringLength b.directory)
+          (
+            builtins.filter (
+              directory:
+              lib.hasPrefix (directory.directory + "/") key.path
+              || lib.hasPrefix (directory.persistent + "/") key.path
+            ) preservedDirectories
+          );
+      files = builtins.filter (file: key.path == file.file || key.path == file.persistent) preservedFiles;
+      preserved =
+        if files != [ ] then
+          (builtins.head files).persistent
+        else if directories != [ ] then
+          let
+            directory = builtins.head directories;
+          in
+          if lib.hasPrefix (directory.persistent + "/") key.path then
+            key.path
+          else
+            directory.persistent + lib.removePrefix directory.directory key.path
+        else
+          throw "Canonical bootstrap check: SSH host key ${key.path} is not preserved";
+    in
+    key // { inherit index preserved; }
+  ) hostConfig.services.openssh.hostKeys;
   name = "${host}VmWithDisko";
+  preservedDirectories = lib.concatMap (
+    state:
+    map (directory: {
+      inherit (directory) directory how;
+      persistent = state.path + directory.directory;
+    }) state.directories
+  ) storage;
+  preservedFiles = lib.concatMap (
+    state:
+    map (file: {
+      inherit (file) file how;
+      persistent = state.path + file.file;
+    }) state.files
+  ) storage;
+  preservedPaths = lib.concatLists (
+    lib.mapAttrsToList (
+      path: state:
+      let
+        directories = state.directories ++ lib.concatMap (user: user.directories) users;
+        files = state.files ++ lib.concatMap (user: user.files) users;
+        users = builtins.attrValues state.users;
+      in
+      map (file: {
+        inherit (file) how;
+        directory = false;
+        path = file.file;
+        persistent = path + file.file;
+      }) files
+      ++ map (directory: {
+        inherit (directory) how;
+        directory = true;
+        path = directory.directory;
+        persistent = path + directory.directory;
+      }) (builtins.filter (directory: directory.how != "_intermediate") directories)
+    ) (vmConfig.preservation.preserveAt or { })
+  );
   startScript = pkgs.writeShellScript "start-${name}" (
     if hasDisko then
       ''
@@ -1077,38 +1158,26 @@ let
         exec ${vm}/bin/run-*-vm "$@"
       ''
   );
+  storage = lib.mapAttrsToList (path: state: {
+    inherit path;
+    inherit (state) files;
+    inherit (state) directories;
+  }) (hostConfig.preservation.preserveAt or { });
   vm = if hasDisko then vmConfig.system.build.vmWithDisko else vmConfig.system.build.vm;
   vmConfig =
     if hasDisko then
       instrumented.config.virtualisation.vmVariantWithDisko
     else
       instrumented.config.virtualisation.vmVariant;
-  preservedPaths = lib.concatLists (lib.mapAttrsToList (path: state:
-    let
-      users = builtins.attrValues state.users;
-      files = state.files ++ lib.concatMap (user: user.files) users;
-      directories = state.directories ++ lib.concatMap (user: user.directories) users;
-    in map (file: {
-      inherit (file) how;
-      path = file.file;
-      persistent = path + file.file;
-      directory = false;
-    }) files ++ map (directory: {
-      inherit (directory) how;
-      path = directory.directory;
-      persistent = path + directory.directory;
-      directory = true;
-    }) (builtins.filter (directory: directory.how != "_intermediate") directories)
-  ) (vmConfig.preservation.preserveAt or { }));
 in
 pkgs.testers.runNixOSTest {
   inherit name;
   globalTimeout = 600;
-  requiredFeatures.kvm = pkgs.stdenv.hostPlatform.isLinux;
   nodes = lib.optionalAttrs hasBootstrap {
     fresh = bootstrapNode false;
     seeded = bootstrapNode true;
   };
+  requiredFeatures.kvm = pkgs.stdenv.hostPlatform.isLinux;
   testScript = ''
     import json
     import shlex

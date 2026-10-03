@@ -113,6 +113,26 @@ function kindIcon(kind) {
   return icon;
 }
 
+function actionIcon(action) {
+  const paths = {
+    check: "M5 12l4 4L19 6",
+    run: "M7 4l14 8-14 8Z",
+    stop: "M5 5h14v14H5Z",
+  };
+  const icon = svgElement("svg", {
+    class: "action-icon",
+    viewBox: "0 0 24 24",
+    "aria-hidden": "true",
+    fill: "none",
+    stroke: "currentColor",
+    "stroke-width": "1.7",
+    "stroke-linejoin": "round",
+    "stroke-linecap": "round",
+  });
+  icon.append(svgElement("path", { d: paths[action] }));
+  return icon;
+}
+
 function languageIcon(kind) {
   const names = { python: "Python", html: "HTML", nix: "Nix", nixos: "NixOS", latex: "LaTeX" };
   if (!names[kind]) return null;
@@ -399,7 +419,10 @@ async function packageAction(packagePath, action = null) {
     actionStates.set(packagePath, state);
     actionViews.get(packagePath)?.(state);
     if (state.state === "running")
-      actionTimers.set(packagePath, setTimeout(() => packageAction(packagePath), 1000));
+      actionTimers.set(
+        packagePath,
+        setTimeout(() => packageAction(packagePath), 1000),
+      );
     else if (action || previous?.state === "running") {
       directorySnapshots.clear();
       refresh(directory, false);
@@ -421,10 +444,12 @@ function packageControls(node, meta, body, details) {
   );
   const buttons = {};
   for (const action of ["check", "run", "stop"]) {
-    const button = element("button", "package-action", action[0].toUpperCase() + action.slice(1));
+    const label = action[0].toUpperCase() + action.slice(1);
+    const button = element("button", "package-action");
     button.type = "button";
-    button.setAttribute("aria-label", `${button.textContent} ${node.name}`);
-    button.title = action === "check" && !node.actions.check ? "No declared check" : button.textContent;
+    button.setAttribute("aria-label", `${label} ${node.name}`);
+    button.title = action === "check" && !node.actions.check ? "No declared check" : label;
+    button.append(actionIcon(action));
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
@@ -439,7 +464,7 @@ function packageControls(node, meta, body, details) {
   const status = element("summary", "");
   const output = element("pre", "output-text-diff action-output");
   result.append(status, output);
-  result.open = true;
+  bindExpansion(result, `${node.id}/action-log`);
   result.setAttribute("aria-live", "polite");
   function update(state) {
     const running = state.state === "running";
@@ -594,7 +619,8 @@ function directoryCounts(relative) {
         node.repository.startsWith(`${relative}/`)),
   );
   const count = (kind) =>
-    nodes.filter((node) => node.kind === kind && !["directory", "home"].includes(node.profile)).length;
+    nodes.filter((node) => node.kind === kind && !["directory", "home"].includes(node.profile))
+      .length;
   if (
     !nodes.some(
       (node) =>
@@ -1128,8 +1154,7 @@ async function refresh(
     if (!view?.viewport && focused && ["package", "host"].includes(focused.kind))
       expanded.set(focused.id, true);
     scheduleLayout(true, true);
-    if (snapshot.output_pending)
-      outputPoll = setTimeout(() => refresh(directory, false), 2000);
+    if (snapshot.output_pending) outputPoll = setTimeout(() => refresh(directory, false), 2000);
   } catch (error) {
     if (current === requestGeneration)
       showError(`Could not read the directory: ${error.message}. Use Refresh to try again.`);
@@ -1197,40 +1222,47 @@ $("collapse").addEventListener("click", () => {
   scheduleLayout(true, true);
 });
 window.addEventListener("resize", () => scheduleLayout(true, true));
-document.addEventListener("keydown", (event) => {
-  if (event.altKey && event.key === "ArrowUp") {
-    event.preventDefault();
-    if (data?.parent) navigateDirectory(data.parent);
-    return;
-  }
-  if (event.key === "/" && !event.target.closest("input,textarea")) {
-    event.preventDefault();
-    $("search").focus();
-  }
-  if (event.key === "Escape" && event.target === $("search")) {
-    $("search").value = query = "";
-    searchCollapsed.clear();
-    scheduleLayout(true, true);
-  }
-  const direction = { ArrowLeft: [1, 0], ArrowRight: [-1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[
-    event.key
-  ];
-  if (
-    direction &&
-    !event.altKey &&
-    !event.ctrlKey &&
-    !event.metaKey &&
-    graph &&
-    !event.defaultPrevented &&
-    !event.target.closest("input,button,summary,a,select,textarea")
-  ) {
-    event.preventDefault();
-    graph.translateBy(
-      direction.map((value) => value * (event.shiftKey ? 160 : 40)),
-      false,
-    );
-  }
-});
+document.addEventListener(
+  "keydown",
+  (event) => {
+    if (event.altKey && event.key === "ArrowUp") {
+      event.preventDefault();
+      if (data?.parent) navigateDirectory(data.parent);
+      return;
+    }
+    if (event.key === "/" && !event.target.closest("input,textarea")) {
+      event.preventDefault();
+      $("search").focus();
+    }
+    if (event.key === "Escape" && event.target === $("search")) {
+      $("search").value = query = "";
+      searchCollapsed.clear();
+      scheduleLayout(true, true);
+    }
+    const direction = {
+      ArrowLeft: [1, 0],
+      ArrowRight: [-1, 0],
+      ArrowUp: [0, 1],
+      ArrowDown: [0, -1],
+    }[event.key];
+    if (
+      direction &&
+      !event.altKey &&
+      !event.ctrlKey &&
+      !event.metaKey &&
+      graph &&
+      !event.defaultPrevented
+    ) {
+      event.preventDefault();
+      event.stopPropagation();
+      graph.translateBy(
+        direction.map((value) => value * (event.shiftKey ? 160 : 40)),
+        false,
+      );
+    }
+  },
+  true,
+);
 $("canvas").addEventListener("pointerdown", (event) => {
   suppressClick = false;
   drag = { x: event.clientX, y: event.clientY, moved: false };

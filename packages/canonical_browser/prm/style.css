@@ -360,6 +360,9 @@ summary::-webkit-details-marker {
   margin-top: 5px;
 }
 .package-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   font: inherit;
   font-size: 10px;
   padding: 2px 7px;
@@ -368,6 +371,10 @@ summary::-webkit-details-marker {
   background: transparent;
   color: var(--green);
   cursor: pointer;
+}
+.action-icon {
+  width: 14px;
+  height: 14px;
 }
 .package-action:disabled {
   opacity: 0.5;
