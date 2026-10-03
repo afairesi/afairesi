@@ -413,15 +413,14 @@ function packageControls(node, meta, body, details) {
   const packagePath = node.actions.package;
   const controls = element("div", "package-controls");
   const argumentsInput = element("input", "run-arguments");
-  argumentsInput.placeholder = "Run or test arguments (optional)";
-  argumentsInput.setAttribute("aria-label", `Run or test arguments for ${node.name}`);
+  argumentsInput.placeholder = "Run arguments (optional)";
+  argumentsInput.setAttribute("aria-label", `Run arguments for ${node.name}`);
   argumentsInput.value = runArguments.get(packagePath) || "";
   argumentsInput.addEventListener("input", () =>
     runArguments.set(packagePath, argumentsInput.value),
   );
   const buttons = {};
-  const testCommands = (data.commands || []).map((entry) => entry.command).filter((command) => command.startsWith("test "));
-  for (const action of ["check", "run", ...testCommands, "stop"]) {
+  for (const action of ["check", "run", "stop"]) {
     const button = element("button", "package-action", action[0].toUpperCase() + action.slice(1));
     button.type = "button";
     button.setAttribute("aria-label", `${button.textContent} ${node.name}`);
@@ -445,7 +444,7 @@ function packageControls(node, meta, body, details) {
   function update(state) {
     const running = state.state === "running";
     buttons.check.disabled = running || !node.actions.check;
-    for (const action of ["run", ...testCommands]) buttons[action].disabled = running;
+    buttons.run.disabled = running;
     buttons.stop.hidden = !running;
     argumentsInput.disabled = running;
     result.hidden = state.state === "idle";
