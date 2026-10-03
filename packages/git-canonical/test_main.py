@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shutil
@@ -1207,6 +1208,28 @@ def test_args_git_views_compare_interfaces(repository: Path) -> None:
     if "+--new  optional" not in _run(repository, "args", "show", "HEAD").stdout:
         message = "Unexpected argument review result"
         raise AssertionError(message)
+
+
+def test_command_catalog_tracks_nested_parser_commands(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep client command menus synchronized when CLI commands are added."""
+    subject = import_module("packages.git-canonical.main")
+    cli = argparse.ArgumentParser(prog="git canonical")
+    commands = cli.add_subparsers()
+    added = commands.add_parser("future")
+    added.add_argument("--visible", help="Public option")
+    added.add_argument("--internal", help=argparse.SUPPRESS)
+    children = added.add_subparsers()
+    children.add_parser("nested").add_argument("target")
+    monkeypatch.setattr(subject, "parser", lambda: cli)
+    catalog = subject.command_catalog()
+    if [entry["command"] for entry in catalog] != ["future", "future nested"]:
+        msg = "Catalog must include new commands and their nested commands"
+        raise AssertionError(msg)
+    if "--visible" not in catalog[0]["help"] or "--internal" in catalog[0]["help"]:
+        msg = "Catalog must publish public parser help without hidden options"
+        raise AssertionError(msg)
 
 
 def test_overview_details_preserve_documentation_and_source_facts(

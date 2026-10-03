@@ -5076,6 +5076,22 @@ and reject unsupported schema versions.""",
     return result
 
 
+def command_catalog() -> list[dict[str, str]]:
+    """Describe public CLI commands for clients using the same parser as the CLI."""
+    entries: list[dict[str, str]] = []
+
+    def visit(command: argparse.ArgumentParser, path: tuple[str, ...]) -> None:
+        if path:
+            entries.append({"command": " ".join(path), "help": command.format_help()})
+        for action in command._actions:  # noqa: SLF001 - argparse exposes no public traversal API
+            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
+                for name, child in action.choices.items():
+                    visit(child, (*path, name))
+
+    visit(parser(), ())
+    return entries
+
+
 def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,

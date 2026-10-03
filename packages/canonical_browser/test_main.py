@@ -23,6 +23,7 @@ from urllib.parse import urlencode
 import pytest
 from git_canonical import (
     CliEntry,
+    command_catalog,
     overview_data,
     resource_data,
     source_cli_overview,
@@ -590,6 +591,147 @@ class TestBoundary(unittest.TestCase):
 
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
+
+    def test_canonical_commands_and_package_tests_preserve_cli_arguments(self) -> None:
+        """Run every catalog entry and test action through Git without a shell."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            executable = root / "git"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys, time\n"
+                "value = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
+                "print(json.dumps(value), flush=True)\n"
+                "if '--wait' in sys.argv: time.sleep(60)\n"
+                "sys.exit(7 if '--fail' in sys.argv else 0)\n",
+            )
+            executable.chmod(0o700)
+            data: dict[str, Any] = {
+                "root": str(root),
+                "nodes": [
+                    {
+                        "kind": "package",
+                        "directory": str(root),
+                        "path": "packages/example",
+                        "name": "example",
+                    },
+                ],
+            }
+            commands = app.CanonicalActions()
+            actions = app.PackageActions()
+            self.addCleanup(commands.close)
+            self.addCleanup(actions.close)
+            commands.observe(data)
+            actions.observe(data)
+            with patch.dict(
+                os.environ,
+                {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
+            ):
+                for entry in data["commands"]:
+                    command = entry["command"]
+                    commands.start(
+                        str(root),
+                        command,
+                        "'two words' '$(touch injected)'",
+                    )
+                    commands.jobs[str(root)].process.wait(timeout=10)
+                    state = commands.status(str(root))
+                    invocation = json.loads(state["output"])
+                    require_output(state["state"] == "passed")
+                    require_output(invocation["cwd"] == str(root))
+                    require_output(
+                        invocation["argv"]
+                        == [
+                            "canonical",
+                            *command.split(),
+                            "two words",
+                            "$(touch injected)",
+                        ],
+                    )
+                    if command.startswith("test "):
+                        actions.start(str(package), command, "--timeout 12")
+                        actions.jobs[str(package)].process.wait(timeout=10)
+                        invocation = json.loads(actions.status(str(package))["output"])
+                        require_output(invocation["cwd"] == str(package))
+                        require_output(
+                            invocation["argv"]
+                            == ["canonical", *command.split(), "--timeout", "12"],
+                        )
+                require_output(not (root / "injected").exists())
+                commands.start(str(root), "test mutation", "--fail")
+                commands.jobs[str(root)].process.wait(timeout=10)
+                require_output(
+                    commands.status(str(root))["exit_code"] == TEST_ACTION_FAILURE,
+                )
+                commands.start(str(root), "test hypothesis", "--wait")
+                with pytest.raises(ValueError, match="already running"):
+                    commands.start(str(root), "overview")
+                commands.start(str(root), "stop")
+                require_output(commands.status(str(root))["state"] == "stopped")
+            with pytest.raises(ValueError, match="Unknown directory"):
+                commands.start(str(package), "overview")
+            with pytest.raises(ValueError, match="Unknown Canonical command"):
+                commands.start(str(root), "not-a-command")
+            with pytest.raises(ValueError, match="No closing quotation"):
+                commands.start(str(root), "overview", "'")
+
+    def test_command_transport_rejects_cross_site_requests_and_unknown_directories(
+        self,
+    ) -> None:
+        """Protect command execution and publish the same catalog over HTTP."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with app.gui_server(root) as server:
+                thread = threading.Thread(target=server.serve_forever, daemon=True)
+                thread.start()
+                connection = http.client.HTTPConnection(
+                    "127.0.0.1",
+                    server.server_port,
+                    timeout=5,
+                )
+                try:
+                    connection.request("GET", "/api/overview")
+                    response = connection.getresponse()
+                    data = json.loads(response.read())
+                    require_output(data["commands"] == command_catalog())
+                    body = json.dumps({"package": str(root), "action": "overview"})
+                    connection.request(
+                        "POST",
+                        "/api/command",
+                        body,
+                        {
+                            "Content-Type": "application/json",
+                            "Origin": "https://example.com",
+                        },
+                    )
+                    response = connection.getresponse()
+                    require_output(response.status == HTTPStatus.FORBIDDEN)
+                    response.read()
+                    connection.request(
+                        "POST",
+                        "/api/command",
+                        json.dumps(
+                            {"package": str(root / "unknown"), "action": "overview"},
+                        ),
+                        {"Content-Type": "application/json"},
+                    )
+                    response = connection.getresponse()
+                    require_output(response.status == HTTPStatus.BAD_REQUEST)
+                    require_output(
+                        "Unknown directory" in json.loads(response.read())["error"],
+                    )
+                    connection.request(
+                        "GET",
+                        "/api/command?" + urlencode({"package": str(root)}),
+                    )
+                    response = connection.getresponse()
+                    require_output(json.loads(response.read())["state"] == "idle")
+                finally:
+                    connection.close()
+                    server.shutdown()
+                    thread.join(timeout=5)
 
     def test_package_actions_run_checks_arguments_failures_and_stop(self) -> None:
         """Execute fixed Nix commands and stop long-running commands on close."""

@@ -35,6 +35,7 @@ from git_canonical import (
     CliEntry,
     ResourceData,
     canonical_root,
+    command_catalog,
     overview_data,
     profile,
     resource_data,
@@ -1459,7 +1460,17 @@ class PackageActions:
 
     def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
         """Start an argument-list command, or stop the active process group."""
-        if package not in self.packages or action not in {"check", "run", "stop"}:
+        tests = {
+            entry["command"]
+            for entry in command_catalog()
+            if entry["command"].startswith("test ")
+        }
+        if package not in self.packages or action not in {
+            "check",
+            "run",
+            "stop",
+            *tests,
+        }:
             msg = "Unknown package or action"
             raise ValueError(msg)
         active = self.jobs.get(package)
@@ -1471,7 +1482,9 @@ class PackageActions:
             msg = "A command is already running for this package"
             raise ValueError(msg)
         repository, name, check = self.packages[package]
-        if action == "check":
+        if action in tests:
+            command = ["git", "canonical", *action.split(), *shlex.split(arguments)]
+        elif action == "check":
             if not check:
                 msg = "This package has no declared check"
                 raise ValueError(msg)
@@ -1492,6 +1505,10 @@ class PackageActions:
                 "--",
                 *shlex.split(arguments),
             ]
+        return self.launch(package, action, command)
+
+    def launch(self, package: str, action: str, command: list[str]) -> dict[str, Any]:
+        """Launch a command without a shell and retain its output and process group."""
         log = Path(self.storage.name) / (
             hashlib.sha256(package.encode()).hexdigest() + ".log"
         )
@@ -1548,6 +1565,39 @@ class PackageActions:
         self.storage.cleanup()
 
 
+class CanonicalActions(PackageActions):
+    """Expose the Canonical CLI in directories visited during this session."""
+
+    def observe(self, data: dict[str, Any]) -> None:
+        """Register the selected directory and publish the shared command catalog."""
+        directory = Path(data["root"])
+        self.packages[str(directory)] = directory, "", False
+        data["commands"] = command_catalog()
+
+    def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
+        """Execute a catalog command with CLI arguments in the selected directory."""
+        if package not in self.packages:
+            msg = "Unknown directory"
+            raise ValueError(msg)
+        if action == "stop":
+            job = self.jobs.get(package)
+            if job is not None and job.process.poll() is None:
+                self.stop(job)
+            return self.status(package)
+        if action not in {entry["command"] for entry in command_catalog()}:
+            msg = "Unknown Canonical command"
+            raise ValueError(msg)
+        active = self.jobs.get(package)
+        if active is not None and active.process.poll() is None:
+            msg = "A command is already running for this directory"
+            raise ValueError(msg)
+        return self.launch(
+            package,
+            action,
+            ["git", "canonical", *action.split(), *shlex.split(arguments)],
+        )
+
+
 def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     root: Path,
     port: int = 0,
@@ -1556,6 +1606,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     assets = Path(__file__).parent / "prm"
     outputs = OutputSnapshots()
     actions = PackageActions()
+    commands = CanonicalActions()
     routes = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/script.js": ("script.js", "text/javascript; charset=utf-8"),
@@ -1576,6 +1627,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
         data = gui_data(directory)
         outputs.observe(data, refresh=parameters.get("refresh") == ["1"])
         actions.observe(data)
+        commands.observe(data)
         return data
 
     class Handler(BaseHTTPRequestHandler):
@@ -1598,6 +1650,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
 
         def action_response(self, *, start: bool) -> None:
             """Serve local package actions through JSON requests."""
+            runner = commands if urlsplit(self.path).path == "/api/command" else actions
             try:
                 if start:
                     origin = self.headers.get("Origin")
@@ -1609,7 +1662,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
                         return
                     parameters = self.action_parameters()
                     package = parameters.get("package", "")
-                    state = actions.start(
+                    state = runner.start(
                         package,
                         parameters.get("action", ""),
                         parameters.get("args", ""),
@@ -1618,8 +1671,8 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
                     package = parse_qs(urlsplit(self.path).query).get("package", [""])[
                         0
                     ]
-                    state = actions.status(package)
-                job = actions.jobs.get(package)
+                    state = runner.status(package)
+                job = runner.jobs.get(package)
                 if (
                     job is not None
                     and job.process.poll() is not None
@@ -1646,7 +1699,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
 
         def do_POST(self) -> None:
             """Start package commands only through the action endpoint."""
-            if urlsplit(self.path).path == "/api/action":
+            if urlsplit(self.path).path in {"/api/action", "/api/command"}:
                 self.action_response(start=True)
             else:
                 self.send_error(HTTPStatus.NOT_IMPLEMENTED)
@@ -1656,7 +1709,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
             request = urlsplit(self.path)
             route = request.path
             status = HTTPStatus.OK
-            if route == "/api/action":
+            if route in {"/api/action", "/api/command"}:
                 self.action_response(start=False)
                 return
             if route == "/output":
@@ -1753,6 +1806,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
             """Finish output capture and release locks when this launch ends."""
             super().server_close()
             actions.close()
+            commands.close()
             outputs.close()
 
     server = Server(("127.0.0.1", port), Handler)
