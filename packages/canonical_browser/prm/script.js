@@ -13,8 +13,6 @@ const actionStates = new Map();
 const actionViews = new Map();
 const actionTimers = new Map();
 const runArguments = new Map();
-const commandStates = new Map();
-const commandTimers = new Map();
 let restoringFocus = false;
 let keyboardFocus = false;
 let pendingView = null;
@@ -408,65 +406,6 @@ async function packageAction(packagePath, action = null) {
     }
   } catch (error) {
     actionViews.get(packagePath)?.({ state: "failed", output: error.message });
-  }
-}
-
-function renderCommandState(state = { state: "idle" }) {
-  const running = state.state === "running";
-  $("command-run").disabled = running;
-  $("command-stop").hidden = !running;
-  $("command-name").disabled = running;
-  $("command-args").disabled = running;
-  $("command-status").textContent = `${state.action || "Command"}: ${state.state}${state.exit_code != null ? ` (exit ${state.exit_code})` : ""}`;
-  $("command-output").textContent = state.output || "";
-}
-
-function renderCommands() {
-  const select = $("command-name");
-  const selectedCommand = select.value || "overview";
-  select.replaceChildren();
-  for (const entry of data.commands || []) {
-    const option = element("option", "", entry.command);
-    option.value = entry.command;
-    select.append(option);
-  }
-  if ([...select.options].some((option) => option.value === selectedCommand))
-    select.value = selectedCommand;
-  $("command-help").textContent = data.commands?.find((entry) => entry.command === select.value)?.help || "";
-  renderCommandState(commandStates.get(directory));
-}
-
-async function canonicalCommand(path, action = null) {
-  clearTimeout(commandTimers.get(path));
-  try {
-    if (action && action !== "stop") {
-      // A cached navigation can show a directory the server has not visited yet.
-      const registration = await fetch(`/api/overview?directory=${encodeURIComponent(path)}`);
-      if (!registration.ok) throw new Error("Could not load the command directory");
-    }
-    const response = await fetch(
-      action ? "/api/command" : `/api/command?package=${encodeURIComponent(path)}`,
-      action ? {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ package: path, action, args: $("command-args").value }),
-      } : {},
-    );
-    const state = await response.json();
-    if (!response.ok) throw new Error(state.error || `HTTP ${response.status}`);
-    const previous = commandStates.get(path);
-    commandStates.set(path, state);
-    if (directory === path) renderCommandState(state);
-    if (state.state === "running")
-      commandTimers.set(path, setTimeout(() => canonicalCommand(path), 1000));
-    else if (action || previous?.state === "running") {
-      directorySnapshots.clear();
-      refresh(directory, true);
-    }
-  } catch (error) {
-    const state = { state: "failed", output: error.message };
-    commandStates.set(path, state);
-    if (directory === path) renderCommandState(state);
   }
 }
 
@@ -1177,7 +1116,6 @@ async function refresh(
     pendingView = view;
     data = prepareData(snapshot);
     directory = data.root;
-    renderCommands();
     renderBreadcrumbs();
     const url = new URL(location.href);
     url.searchParams.delete("renderer");
@@ -1235,15 +1173,6 @@ window.addEventListener("popstate", () =>
 );
 
 $("refresh").addEventListener("click", () => refresh());
-$("command-name").addEventListener("change", () => {
-  $("command-help").textContent = data.commands?.find((entry) => entry.command === $("command-name").value)?.help || "";
-});
-$("command-run").addEventListener("click", () => {
-  const action = $("command-name").value;
-  renderCommandState({ state: "running", action, output: "Starting…" });
-  canonicalCommand(directory, action);
-});
-$("command-stop").addEventListener("click", () => canonicalCommand(directory, "stop"));
 $("fit").addEventListener("click", () => scheduleLayout(false, true));
 $("search").addEventListener("input", (event) => {
   query = event.target.value.trim().toLowerCase();

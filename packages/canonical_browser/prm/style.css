@@ -384,33 +384,6 @@ summary::-webkit-details-marker {
 .package-action[hidden] {
   display: none;
 }
-.canonical-commands {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  z-index: 10;
-  width: min(440px, calc(100vw - 32px));
-  max-height: 65vh;
-  overflow: auto;
-  padding: 12px;
-  border: 1px solid var(--muted);
-  border-radius: 8px;
-  background: white;
-  font-size: 12px;
-}
-.canonical-commands label {
-  display: block;
-  margin: 8px 0;
-}
-.canonical-commands input,
-.canonical-commands select {
-  width: 100%;
-  box-sizing: border-box;
-}
-.canonical-commands pre {
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
 .match {
   background: #fff2c5;
   border-radius: 3px;

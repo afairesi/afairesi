@@ -45,17 +45,6 @@
       >
     </div>
     <nav id="cwd" class="current-directory" aria-label="Current directory" hidden></nav>
-    <details id="commands" class="canonical-commands">
-      <summary>git canonical commands</summary>
-      <p>Run in the current directory. Init uses your home directory, as in the CLI.</p>
-      <label>Command <select id="command-name"></select></label>
-      <label>Arguments <input id="command-args" placeholder="Arguments and options (optional)" /></label>
-      <button id="command-run" type="button">Run command</button>
-      <button id="command-stop" type="button" hidden>Stop</button>
-      <details><summary>Command help</summary><pre id="command-help"></pre></details>
-      <p id="command-status" role="status"></p>
-      <pre id="command-output"></pre>
-    </details>
     <div id="message" role="status" hidden></div>
   </body>
 </html>
