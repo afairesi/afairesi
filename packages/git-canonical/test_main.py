@@ -193,6 +193,37 @@ def test_host_check_convergence_after_formatting_is_idempotent(
         raise AssertionError(message)
 
 
+def test_host_check_upgrade_requires_no_consumer_files(repository: Path) -> None:
+    """Upgrade a generated check without changing its host or adding resources."""
+    _run(repository, "add", "hosts/laptop")
+    host = repository / "hosts/laptop/configuration.nix"
+    original_host = host.read_bytes()
+    original_paths = _git(repository, "ls-files").splitlines()
+    relative = "checks/laptopVmWithDisko/default.nix"
+    check = repository / relative
+    current = check.read_bytes()
+    legacy = b'{ pkgs, ... }: pkgs.runCommand "legacy-host-check" {} "mkdir $out"\n'
+    check.write_bytes(legacy)
+    _git(repository, "add", "--", relative)
+    _run(repository, "converge", "--dry-run", code=1)
+    if check.read_bytes() != legacy:
+        message = "dry-run changed the generated check"
+        raise AssertionError(message)
+    _run(repository, "converge")
+    if check.read_bytes() != current:
+        message = "convergence did not upgrade the generated check"
+        raise AssertionError(message)
+    if host.read_bytes() != original_host:
+        message = "check upgrade changed the host configuration"
+        raise AssertionError(message)
+    if _git(repository, "ls-files").splitlines() != original_paths:
+        message = "check upgrade added consumer files"
+        raise AssertionError(message)
+    if _run(repository, "converge", "--dry-run").stdout:
+        message = "check upgrade did not converge"
+        raise AssertionError(message)
+
+
 def test_structure_validation_does_not_traverse_excluded_trees(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,
