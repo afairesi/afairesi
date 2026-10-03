@@ -37,7 +37,7 @@ from canonical import (
     canonical_root,
     command_catalog,
     overview_data,
-    profile,
+    repository_type,
     resource_data,
     source_resource_data,
 )
@@ -870,7 +870,7 @@ def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
         tree.children = [TreeNode("OS: NixOS (configuration)"), *(tree.children or [])]
     elif record["kind"] == "repository":
         tree.title = record["repository"]
-        tree.children = [TreeNode(f"Profile: {record.get('profile', 'flake')}")]
+        tree.children = [TreeNode(f"Repository type: {record.get('profile', 'flake')}")]
     return tree
 
 
@@ -1138,7 +1138,7 @@ def browser_snapshot(
     try:
         current = overview_data(root)
     except CanonicalError:
-        if profile(root, "directory") != "directory":
+        if repository_type(root, "directory") != "directory":
             raise
         return directory_snapshot(root)
     validate_overview(current)

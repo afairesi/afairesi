@@ -126,6 +126,85 @@ def test_package_and_host_lifecycle(repository: Path) -> None:
     _run(root, "converge", "--dry-run")
 
 
+@pytest.mark.parametrize("collection", ["packages", "hosts"])
+def test_rename_preserves_staged_unstaged_and_untracked_files(
+    repository: Path,
+    collection: str,
+) -> None:
+    """Rename resources and checks with the same index behavior as Git."""
+    root = repository
+    original = f"{collection}/example"
+    destination = f"{collection}/renamed"
+    if collection == "packages":
+        _run(root, "add", original, "python")
+        (root / original / "test_main.py").write_text("def test_one(): pass\n")
+        _run(root, "converge")
+        marker = "main.py"
+        check_name = "example"
+        renamed_check = "renamed"
+    else:
+        _run(root, "add", original)
+        marker = "configuration.nix"
+        check_name = "exampleVmWithDisko"
+        renamed_check = "renamedVmWithDisko"
+    paths = [f"{original}/{marker}", f"checks/{check_name}/default.nix"]
+    staged = {}
+    working = {}
+    for relative in paths:
+        path = root / relative
+        source = path.read_text()
+        staged[relative] = source + "\n"
+        working[relative] = source + "\n\n"
+        path.write_text(staged[relative])
+        _git(root, "add", "--", relative)
+        path.write_text(working[relative])
+    resource = root / original / "prm/asset.txt"
+    resource.parent.mkdir()
+    resource.write_text("untracked")
+    status = _git(root, "status", "--porcelain")
+    _run(root, "mv", original, destination, "--dry-run")
+    if _git(root, "status", "--porcelain") != status:
+        message = "rename dry-run changed Git state"
+        raise AssertionError(message)
+    _run(root, "mv", original, destination)
+    for relative in paths:
+        renamed = relative.replace(original, destination).replace(
+            f"checks/{check_name}/",
+            f"checks/{renamed_check}/",
+        )
+        if (
+            _git(root, "show", f":{renamed}") != staged[relative]
+            or (root / renamed).read_text() != working[relative]
+        ):
+            message = "rename changed staged or unstaged contents"
+            raise AssertionError(message)
+    moved_resource = f"{destination}/prm/asset.txt"
+    if (root / moved_resource).read_text() != "untracked" or _git(
+        root,
+        "ls-files",
+        "--",
+        moved_resource,
+    ):
+        message = "rename staged or lost an untracked resource"
+        raise AssertionError(message)
+
+
+def test_rename_untracked_resource_preserves_untracked_state(repository: Path) -> None:
+    """Move an untracked package without implicitly staging its sources."""
+    package = repository / "packages/example"
+    package.mkdir(parents=True)
+    (package / "default.nix").write_text("{}\n")
+    _run(repository, "mv", "packages/example", "packages/renamed")
+    if not (repository / "packages/renamed/default.nix").is_file() or _git(
+        repository,
+        "ls-files",
+        "--",
+        "packages/renamed",
+    ):
+        message = "rename lost or staged an untracked package"
+        raise AssertionError(message)
+
+
 def test_convergence_preserves_source_and_scratch_and_is_idempotent(
     repository: Path,
 ) -> None:
@@ -170,15 +249,7 @@ def test_host_check_convergence_after_formatting_is_idempotent(
     _run(repository, "add", "hosts/laptop")
     relative = "checks/laptopVmWithDisko/default.nix"
     check = repository / relative
-    for command in (
-        ["uncomment"],
-        ["remove_empty_lines"],
-        ["deadnix", "--edit"],
-        ["statix", "fix"],
-        ["nix_alphabetize"],
-        ["nixfmt"],
-    ):
-        _run(repository, *command[1:], relative, executable=command[0])
+    _run(repository, "--no-cache", relative, executable="treefmt")
     formatted = check.read_text(encoding="utf-8")
     _git(repository, "add", "--", relative)
     index = _git(repository, "ls-files", "--stage")
@@ -678,6 +749,25 @@ def test_home_convergence_restores_submodule_whitelist(home_repository: Path) ->
         message = "convergence did not stage the repaired whitelist"
         raise AssertionError(message)
     _run(root, "converge", "--dry-run")
+
+
+def test_home_convergence_preserves_optional_submodule_settings(
+    home_repository: Path,
+) -> None:
+    """Allow Git settings beyond the path and URL managed by Canonical."""
+    root = home_repository
+    modules = root / ".gitmodules"
+    source = modules.read_text() + (
+        "branch = main\nignore = dirty\nshallow = true\nupdate = checkout\n"
+    )
+    modules.write_text(source)
+    _git(root, "add", ".gitmodules")
+    index = _git(root, "ls-files", "--stage")
+    _run(root, "converge", "--dry-run")
+    _run(root, "converge")
+    if modules.read_text() != source or _git(root, "ls-files", "--stage") != index:
+        message = "convergence changed optional submodule settings"
+        raise AssertionError(message)
 
 
 def test_home_convergence_rejects_duplicate_submodule_fields(
@@ -1349,6 +1439,38 @@ def test_overview_details_preserve_documentation_and_source_facts(
         raise AssertionError(msg)
 
 
+@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+def test_revision_sources_support_git_object_formats(
+    tmp_path: Path,
+    object_format: str,
+) -> None:
+    """Read Git source objects without assuming an object ID length."""
+    _git(tmp_path, "init", "--quiet", f"--object-format={object_format}")
+    expected = {"flake.nix": "{}\n", "packages/tool/default.nix": "{}\n"}
+    for relative, content in expected.items():
+        path = tmp_path / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content)
+    _git(tmp_path, "add", ".")
+    _git(
+        tmp_path,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "-qm",
+        "baseline",
+    )
+    subject = import_module("packages.canonical.main")
+    current = subject.overview_data(tmp_path)
+    actual = subject.overview_data(tmp_path, revision="HEAD")
+    if [node.get("details") for node in actual["nodes"]] != [
+        node.get("details") for node in current["nodes"]
+    ]:
+        raise AssertionError(actual)
+
+
 def test_overview_revision_sources_preserve_the_checkout_and_cover_all_resources(
     repository: Path,
 ) -> None:
@@ -1549,6 +1671,43 @@ def test_overview_counts_local_and_global_suppressions(repository: Path) -> None
     ):
         if expected not in detail:
             raise AssertionError(detail)
+
+
+@pytest.mark.parametrize(
+    ("filename", "source", "expected"),
+    [
+        (
+            "index.html",
+            '<script>const text = "<!-- htmlhint-disable -->";</script>',
+            {},
+        ),
+        (
+            "script.js",
+            "const value = `${(() => { /* eslint-disable */ return 1; })()}`;",
+            {("eslint-disable", "global"): 1},
+        ),
+        (
+            "script.js",
+            "const value = `/* eslint-disable */`; /* eslint-disable-next-line */",
+            {("eslint-disable", "local"): 1},
+        ),
+        (
+            "style.css",
+            'p { content: "/* stylelint-disable */"; } /* stylelint-disable */',
+            {("stylelint-disable", "global"): 1},
+        ),
+    ],
+)
+def test_web_suppressions_use_comment_nodes(
+    filename: str,
+    source: str,
+    expected: dict[tuple[str, str], int],
+) -> None:
+    """Distinguish real comments from literals and inspect template expressions."""
+    subject = import_module("packages.canonical.main")
+    actual = subject.source_suppressions(filename, source)
+    if actual != expected:
+        raise AssertionError(actual)
 
 
 def test_overview_lists_checked_out_home_flakes(home_repository: Path) -> None:

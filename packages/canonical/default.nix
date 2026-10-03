@@ -60,12 +60,11 @@ python.pkgs.buildPythonPackage {
   };
   passthru = {
     checkInputs = [
-      inputs.self.packages.${pkgs.stdenv.system}.nix_alphabetize
-      inputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines
-      inputs.self.packages.${pkgs.stdenv.system}.uncomment
-      pkgs.deadnix
-      pkgs.nixfmt
-      pkgs.statix
+      (import ../../formatter.nix {
+        inherit inputs pkgs;
+        enableMypy = false;
+        flake = inputs.self.outPath;
+      }).passthru.raw
       python.pkgs.coverage
     ];
     python = python;
@@ -78,6 +77,7 @@ python.pkgs.buildPythonPackage {
     inputs.self.packages.${pkgs.stdenv.system}.nix_syntax
     pkgs.git
     pkgs.nix
+    python.pkgs.tree-sitter-language-pack
   ];
   pyproject = false;
   src = ./.;

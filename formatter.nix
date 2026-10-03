@@ -1,4 +1,5 @@
 {
+  enableMypy ? true,
   flake,
   inputs,
   pkgs,
@@ -7,11 +8,15 @@
 }:
 let
   packagesPath = self.outPath + "/packages";
-  pythonPackageNames = builtins.attrNames (
-    pkgs.lib.filterAttrs (
-      name: type: type == "directory" && builtins.pathExists (packagesPath + "/${name}/main.py")
-    ) (if builtins.pathExists packagesPath then builtins.readDir packagesPath else { })
-  );
+  pythonPackageNames =
+    if enableMypy then
+      builtins.attrNames (
+        pkgs.lib.filterAttrs (
+          name: type: type == "directory" && builtins.pathExists (packagesPath + "/${name}/main.py")
+        ) (if builtins.pathExists packagesPath then builtins.readDir packagesPath else { })
+      )
+    else
+      [ ];
   rawFormatter = treefmtEval.config.build.wrapper;
   treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
     programs = {
@@ -62,7 +67,7 @@ let
             ];
           }
         );
-        enable = true;
+        enable = enableMypy;
       };
       nixfmt = {
         enable = true;

@@ -29,9 +29,11 @@ from typing import TYPE_CHECKING, Any, TypedDict, cast
 from urllib.parse import urlparse
 
 import nix_syntax
+from tree_sitter_language_pack import get_parser
 
 if TYPE_CHECKING:
     from tree_sitter import Node
+    from tree_sitter_language_pack import SupportedLanguage
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 KIND_MARKERS = {
     "html": "index.html",
@@ -48,8 +50,8 @@ ROOT_FILES = {
     "flake.nix",
     "formatter.nix",
 }
-OPAQUE_NAME = "prm"
-SCRATCH_NAME = "tmp"
+PRM_NAME = "prm"
+TMP_NAME = "tmp"
 RESOURCE_SOURCE_DEPTH = 3
 SOURCE_SUFFIXES = {
     ".nix",
@@ -126,9 +128,9 @@ def repository_root(path: Path = Path()) -> Path:
     return Path(completed.stdout.strip())
 
 
-def profile(root: Path, default: str | None = None) -> str:
+def repository_type(root: Path, default: str | None = None) -> str:
     """Detect home/submodule and flake repository layouts."""
-    flake, home = _profile_markers(root)
+    flake, home = _repository_type_markers(root)
     if home and not flake:
         return "home"
     if flake and not home:
@@ -146,7 +148,7 @@ def profile(root: Path, default: str | None = None) -> str:
     raise CommandError(msg)
 
 
-def _profile_markers(root: Path) -> tuple[bool, bool]:
+def _repository_type_markers(root: Path) -> tuple[bool, bool]:
     """Share layout recognition between inspection and lifecycle commands."""
     flake = any(
         (root / marker).exists()
@@ -161,8 +163,8 @@ def canonical_root(directory: Path) -> Path:
     """Find the nearest Canonical layout, or retain an ordinary directory."""
     directory = directory.resolve()
     for candidate in (directory, *directory.parents):
-        if any(_profile_markers(candidate)):
-            profile(candidate)
+        if any(_repository_type_markers(candidate)):
+            repository_type(candidate)
             return candidate
     return directory
 
@@ -217,7 +219,7 @@ def _tracked_paths(root: Path) -> set[Path]:
 
 
 def _clean_arguments(*, dry_run: bool, exclusions: tuple[str, ...]) -> list[str]:
-    """Build a native Git clean command with profile-selected exclusions."""
+    """Build a native Git clean command with repository-specific exclusions."""
     arguments = ["clean", "-ndx" if dry_run else "-fdx"]
     for exclusion in exclusions:
         arguments.extend(("-e", exclusion))
@@ -228,7 +230,7 @@ def _flake_clean_arguments(*, dry_run: bool) -> list[str]:
     """Build the flake cleanup command."""
     return _clean_arguments(
         dry_run=dry_run,
-        exclusions=(f"/{SCRATCH_NAME}/", f"/packages/*/{SCRATCH_NAME}/"),
+        exclusions=(f"/{TMP_NAME}/", f"/packages/*/{TMP_NAME}/"),
     )
 
 
@@ -287,7 +289,7 @@ def home_repositories(
             "--show-names",
             "--all",
             "--regexp",
-            r"^submodule\..*",
+            r"^submodule\..*\.(path|url)$",
         ],
         check=False,
     )
@@ -313,7 +315,7 @@ def home_repositories(
     repositories = []
     for name, fields in sorted(grouped.items()):
         required = {"path", "url"} if require_url else {"path"}
-        if not required.issubset(fields) or set(fields) - {"path", "url"}:
+        if not required.issubset(fields):
             suffix = "path and one URL" if require_url else "path"
             msg = f'submodule "{name}": must have exactly one {suffix}'
             raise CommandError(
@@ -648,25 +650,25 @@ def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
     return allowed
 
 
-def opaque_trees(root: Path) -> set[Path]:
-    """Return existing repository trees whose contents are unrestricted."""
+def prm_directories(root: Path) -> set[Path]:
+    """Return existing prm directories whose contents are unrestricted."""
     candidates = {Path("prm")}
     for parent in ("hosts", "packages"):
         base = root / parent
         if base.is_dir():
             for child in base.iterdir():
                 if child.is_dir():
-                    candidates.add(Path(parent) / child.name / OPAQUE_NAME)
+                    candidates.add(Path(parent) / child.name / PRM_NAME)
     return {path for path in candidates if (root / path).is_dir()}
 
 
-def scratch_trees(root: Path) -> set[Path]:
-    """Return permitted untracked scratch trees."""
-    candidates = {Path(SCRATCH_NAME)}
+def tmp_directories(root: Path) -> set[Path]:
+    """Return permitted untracked tmp trees."""
+    candidates = {Path(TMP_NAME)}
     packages = root / "packages"
     if packages.is_dir():
         candidates.update(
-            Path("packages") / child.name / SCRATCH_NAME
+            Path("packages") / child.name / TMP_NAME
             for child in packages.iterdir()
             if child.is_dir()
         )
@@ -701,7 +703,7 @@ def _refresh_gitignore(root: Path) -> None:
     packages = detect_packages(root)
     nix_syntax.write_if_changed(
         root / ".gitignore",
-        render_gitignore(allowed_paths(root, packages), opaque_trees(root)),
+        render_gitignore(allowed_paths(root, packages), prm_directories(root)),
     )
 
 
@@ -733,9 +735,9 @@ def inspect_structure(root: Path) -> tuple[list[Package], list[str]]:
         for relative in sorted(required_package_files(package)):
             if not (root / relative).is_file():
                 issues.extend([f"{relative}: missing required regular file"])
-    opaque = opaque_trees(root)
-    scratch = scratch_trees(root)
-    for path in _structure_paths(root, opaque | scratch | {Path(".git")}):
+    prm = prm_directories(root)
+    tmp = tmp_directories(root)
+    for path in _structure_paths(root, prm | tmp | {Path(".git")}):
         relative = path.relative_to(root)
         if path.is_symlink():
             issues.append(
@@ -1697,17 +1699,17 @@ def _converge_allowed_files(
     return changed
 
 
-def _converge_opaque_files(
+def _converge_prm_files(
     root: Path,
-    opaque: set[Path],
+    prm: set[Path],
     tracked: set[Path],
     *,
     dry_run: bool,
 ) -> tuple[bool, set[Path]]:
-    """Stage unmanaged files below opaque trees without changing their modes."""
+    """Stage unmanaged files below prm trees without changing their modes."""
     files = {
         path.relative_to(root)
-        for tree in opaque
+        for tree in prm
         for path in (root / tree).rglob("*")
         if path.is_file() or path.is_symlink()
     }
@@ -1724,14 +1726,14 @@ def _converge_opaque_files(
 def _remove_unsupported_tracked(
     root: Path,
     tracked: set[Path],
-    scratch: set[Path],
+    tmp: set[Path],
     protected: set[Path],
     *,
     dry_run: bool,
 ) -> bool:
-    """Untrack scratch content and delete unsupported tracked paths."""
+    """Untrack tmp content and delete unsupported tracked paths."""
     changed = False
-    for relative in sorted(path for path in tracked if beneath(path, scratch)):
+    for relative in sorted(path for path in tracked if beneath(path, tmp)):
         _change(f"untrack '{relative}'", dry_run=dry_run)
         changed = True
         if not dry_run:
@@ -1747,10 +1749,10 @@ def _remove_unsupported_tracked(
 
 
 def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool:  # noqa: FBT001
-    """Remove undeclared files while preserving permitted scratch trees."""
+    """Remove undeclared files while preserving permitted tmp trees."""
     allowed = allowed_paths(root, packages)
-    opaque = opaque_trees(root)
-    scratch = scratch_trees(root)
+    prm = prm_directories(root)
+    tmp = tmp_directories(root)
     tracked = _tracked_paths(root)
     python_entrypoints = {
         Path("packages") / package.name / "main.py"
@@ -1764,23 +1766,23 @@ def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool: 
         python_entrypoints,
         dry_run=dry_run,
     )
-    opaque_changed, opaque_files = _converge_opaque_files(
+    prm_changed, prm_files = _converge_prm_files(
         root,
-        opaque,
+        prm,
         tracked,
         dry_run=dry_run,
     )
-    changed |= opaque_changed
+    changed |= prm_changed
     changed |= _remove_unsupported_tracked(
         root,
         tracked,
-        scratch,
-        opaque | scratch | allowed,
+        tmp,
+        prm | tmp | allowed,
         dry_run=dry_run,
     )
     clean_arguments = _flake_clean_arguments(dry_run=dry_run)
     if dry_run:
-        for relative in sorted(allowed | opaque_files):
+        for relative in sorted(allowed | prm_files):
             if (root / relative).exists():
                 clean_arguments.extend(("-e", f"/{relative.as_posix()}"))
     clean = git(root, clean_arguments, check=False)
@@ -1806,7 +1808,7 @@ def check_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
         if issue := _python_test_placement_issue(package):
             raise CommandError(issue)
     changed = _converge_packages(root, packages, dry_run)
-    expected = render_gitignore(allowed_paths(root, packages), opaque_trees(root))
+    expected = render_gitignore(allowed_paths(root, packages), prm_directories(root))
     actual = _read_regular(root / ".gitignore")
     if actual != expected:
         changed |= _write_managed(
@@ -1831,7 +1833,7 @@ def validate_flake_source(root: Path) -> list[Package]:  # noqa: C901
             issues.append(f"{required}: missing required regular file")
     expected_ignore = render_gitignore(
         allowed_paths(root, packages),
-        opaque_trees(root),
+        prm_directories(root),
     )
     if _read_regular(root / ".gitignore") != expected_ignore:
         issues.append(".gitignore: does not match the canonical source whitelist")
@@ -2223,23 +2225,13 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
     if dry_run:
         return
     tracked = _tracked_paths(root)
-    tracked_sources = [
-        old for old, _new in moves if any(beneath(path, {old}) for path in tracked)
-    ]
     for old, new in moves:
-        shutil.move(root / old, root / new)
+        if any(beneath(path, {old}) for path in tracked):
+            git(root, ["mv", "--", str(old), str(new)])
+        else:
+            shutil.move(root / old, root / new)
     _refresh_gitignore(root)
-    git(
-        root,
-        [
-            "add",
-            "--all",
-            "--",
-            *(str(path) for path in tracked_sources),
-            *(str(new) for _old, new in moves),
-            ".gitignore",
-        ],
-    )
+    git(root, ["add", "--", ".gitignore"])
 
 
 def initialize_home() -> None:
@@ -2247,7 +2239,7 @@ def initialize_home() -> None:
     root = Path.home()
     if not (root / ".git").exists():
         _run(["git", "init", str(root)])
-    if profile(root, "home") != "home":
+    if repository_type(root, "home") != "home":
         msg = "cannot initialize a flake repository as a home repository"
         raise CommandError(msg)
     _converge_home_ignore(root, dry_run=False)
@@ -2257,7 +2249,7 @@ def initialize_submodule(remote: str) -> None:
     """Add a hosted repository at its canonical home-relative path."""
     relative = canonical_remote_path(remote)
     home = Path.home()
-    if repository_root(home) != home or profile(home) != "home":
+    if repository_root(home) != home or repository_type(home) != "home":
         message = "$HOME must be an initialized canonical home repository"
         raise CommandError(message)
     _allow_home_submodule(home, relative)
@@ -2295,7 +2287,7 @@ def initialize_flake(remote: str) -> None:
     """Create a canonical flake at its remote-derived home path."""
     relative = canonical_remote_path(remote)
     home = Path.home()
-    if repository_root(home) != home or profile(home) != "home":
+    if repository_root(home) != home or repository_type(home) != "home":
         msg = "$HOME must be an initialized canonical home repository"
         raise CommandError(msg)
     if not _remote_is_empty(remote):
@@ -2324,7 +2316,7 @@ def initialize_flake(remote: str) -> None:
         (directory / ".gitignore").write_text(
             render_gitignore(
                 allowed_paths(directory, detected_packages),
-                opaque_trees(directory),
+                prm_directories(directory),
             ),
             encoding="utf-8",
         )
@@ -3345,22 +3337,23 @@ def source_suppressions(filename: str, source: str) -> Counter[tuple[str, str]]:
     if filename.endswith(".py"):
         return _python_suppressions(source)
     counts: Counter[tuple[str, str]] = Counter()
-    if filename.endswith(".html"):
-        web_comments = re.findall(r"<!--(.*?)-->", source, re.DOTALL)
-    elif filename.endswith((".js", ".css")):
-        pattern = (
-            r"""("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)"""
-            r"|/\*(.*?)\*/" + (r"|(?<!:)//([^\n]*)" if filename.endswith(".js") else "")
-        )
-        web_comments = [
-            match.group(2)
-            or ((match.group(3) or "") if filename.endswith(".js") else "")
-            for match in re.finditer(pattern, source, re.DOTALL)
-            if not match.group(1)
-        ]
-    else:
+    languages: dict[str, SupportedLanguage] = {
+        ".html": "html",
+        ".js": "javascript",
+        ".css": "css",
+    }
+    language = languages.get(Path(filename).suffix)
+    if language is None:
         return counts
-    for comment in web_comments:
+    encoded = source.encode()
+    tree = get_parser(language).parse(encoded)
+    web_comments = [
+        encoded[node.start_byte : node.end_byte].decode()
+        for node in nix_syntax.walk(tree.root_node)
+        if node.type == "comment"
+    ]
+    for text in web_comments:
+        comment = text.removeprefix("<!--").removeprefix("/*").removeprefix("//")
         directive = re.match(
             r"\s*(html-validate|htmlhint|eslint|stylelint)-disable"
             r"(-next-line|-next|-current|-line)?\b",
@@ -3488,7 +3481,7 @@ def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax f
     node: Node,
     seen: frozenset[int] = frozenset(),
 ) -> list[tuple[Node, list[str | None] | None]]:
-    """Expand literal lists and simple aliases; leave computed expressions opaque."""
+    """Expand lists and aliases while retaining unresolved expressions."""
     if node.id in seen:
         return [(node, None)]
     seen = seen | {node.id}
@@ -3760,7 +3753,7 @@ def _resource_source_path(filename: str) -> bool:
     path = Path(filename)
     return (
         path.suffix in SOURCE_SUFFIXES
-        and (len(path.parts) == 1 or path.parts[0] == OPAQUE_NAME)
+        and (len(path.parts) == 1 or path.parts[0] == PRM_NAME)
         and not any(part.startswith(".") for part in path.parts)
     )
 
@@ -3771,7 +3764,7 @@ def resource_data(directory: Path, *, path: str | None = None) -> ResourceData:
     errors = {}
     if directory.is_dir() and not directory.is_symlink():
         candidates = list(directory.iterdir())
-        resources = directory / OPAQUE_NAME
+        resources = directory / PRM_NAME
         if resources.is_dir() and not resources.is_symlink():
             for parent, folders, names in os.walk(resources, followlinks=False):
                 folders[:] = [
@@ -4058,9 +4051,9 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
     ):
         focus = f".:packages/{target.name}"
         target = target.parent.parent
-    current_profile = profile(target)
+    current_type = repository_type(target)
     repositories = [(".", target)]
-    if current_profile == "home":
+    if current_type == "home":
         repositories = []
         for repository in home_repositories(target, require_url=False):
             scope = repository["path"]
@@ -4071,7 +4064,7 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
             repositories.append((scope, checkout))
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, Any]] = []
-    if current_profile == "home":
+    if current_type == "home":
         nodes[".:repository"] = {
             "id": ".:repository",
             "kind": "repository",
@@ -4098,7 +4091,7 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
         }
         if revision is not None:
             nodes[f"{scope}:repository"]["revision_available"] = historical is not None
-        if current_profile == "home":
+        if current_type == "home":
             edges.append(
                 {
                     "source": ".:repository",
@@ -4187,7 +4180,7 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
         "schema": "canonical.overview",
         "schema_version": 1,
         "analysis": "source-declarations",
-        "profile": current_profile,
+        "profile": current_type,
         "focus": focus,
         "revision": revision,
         "nodes": [nodes[key] for key in sorted(nodes)],
@@ -4368,7 +4361,7 @@ def _test_target_root(package: Path) -> Path:
 
 
 def _copy_test_sources(root: Path, workspace: Path) -> None:
-    """Copy package sources and supporting assets without scratch or metadata."""
+    """Copy package sources and supporting assets without tmp or metadata."""
     ignored = shutil.ignore_patterns(
         "tmp",
         ".git",
@@ -4630,10 +4623,10 @@ def _run_test_package(
 ) -> bool:
     """Run one isolated package and retain its logs and reports."""
     root = _test_target_root(package)
-    scratch = root / "tmp"
-    scratch.mkdir(exist_ok=True)
+    tmp = root / "tmp"
+    tmp.mkdir(exist_ok=True)
     workspace = Path(
-        tempfile.mkdtemp(prefix=f"python-{command}-{package.name}-", dir=scratch),
+        tempfile.mkdtemp(prefix=f"python-{command}-{package.name}-", dir=tmp),
     )
     label = (
         "Mutation workspace and reports"
@@ -4920,15 +4913,15 @@ def parser() -> argparse.ArgumentParser:
         description="Initialize HOME, create a flake, or add a remote under HOME.",
     )
     init.add_argument(
-        "profile",
+        "repository_type",
         metavar="home|flake|REMOTE",
-        help="home or flake profile, or a hosted Git remote to add as a submodule",
+        help="home or flake repository type, or a hosted Git remote for a submodule",
     )
     init.add_argument(
         "remote",
         nargs="?",
         metavar="REMOTE",
-        help="empty hosted Git remote required by the flake profile",
+        help="empty hosted Git remote required by the flake repository type",
     )
     add = commands.add_parser(
         "add",
@@ -5238,12 +5231,12 @@ def _dispatch_standalone_command(
         return True
     if options.command != "init":
         return False
-    if options.profile == "home":
+    if options.repository_type == "home":
         if options.remote is not None:
             msg = "init home does not accept a remote"
             raise CommandError(msg)
         initialize_home()
-    elif options.profile == "flake":
+    elif options.repository_type == "flake":
         if options.remote is None:
             msg = "init flake requires REMOTE"
             raise CommandError(msg)
@@ -5251,7 +5244,7 @@ def _dispatch_standalone_command(
     else:
         if options.remote is not None:
             cli.error("init REMOTE accepts exactly one remote")
-        initialize_submodule(options.profile)
+        initialize_submodule(options.repository_type)
     return True
 
 
@@ -5297,9 +5290,9 @@ def main() -> None:
             validate_flake_source(options.source.resolve())
             return
         root = repository_root()
-        current_profile = profile(root)
-        if options.command in {"add", "mv", "rm"} and current_profile != "flake":
-            msg = f"{current_profile} repositories do not support flake resources"
+        current_type = repository_type(root)
+        if options.command in {"add", "mv", "rm"} and current_type != "flake":
+            msg = f"{current_type} repositories do not support flake resources"
             raise CommandError(  # noqa: TRY301
                 msg,
             )
@@ -5307,7 +5300,7 @@ def main() -> None:
             check_home(
                 root,
                 options.dry_run,
-            ) if current_profile == "home" else check_flake(
+            ) if current_type == "home" else check_flake(
                 root,
                 options.dry_run,
             )
