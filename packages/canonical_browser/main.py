@@ -1439,7 +1439,6 @@ class PackageActions:
         """Keep command logs outside the package output being compared."""
         self.storage = tempfile.TemporaryDirectory(prefix="canonical-browser-actions-")
         self.packages: dict[str, tuple[Path, str, bool]] = {}
-        self.html_packages: set[str] = set()
         self.jobs: dict[str, PackageAction] = {}
 
     def observe(self, data: dict[str, Any]) -> None:
@@ -1457,10 +1456,6 @@ class PackageActions:
                 continue
             check = (repository / "checks" / record["name"] / "default.nix").is_file()
             self.packages[str(package)] = repository, record["name"], check
-            if record.get("package_type") == "html":
-                self.html_packages.add(str(package))
-            else:
-                self.html_packages.discard(str(package))
             record["actions"] = {"package": str(package), "check": check}
 
     def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
@@ -1508,7 +1503,6 @@ class PackageActions:
                 "run",
                 f"{repository}#{name}",
                 "--",
-                *(["-o", "/"] if package in self.html_packages else []),
                 *shlex.split(arguments),
             ]
         return self.launch(package, action, command)

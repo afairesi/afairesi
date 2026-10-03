@@ -291,6 +291,59 @@ def test_html_template_keeps_prm_install_hook(repository: Path) -> None:
         raise AssertionError(msg)
 
 
+@pytest.mark.parametrize(
+    ("display", "wayland_display", "arguments", "expected"),
+    [
+        ("", "", [], []),
+        (":0", "", [], ["-o", "/"]),
+        ("", "wayland-0", [], ["-o", "/"]),
+        (":0", "wayland-0", ["--no-open"], []),
+        ("", "", ["--no-open"], []),
+        (":0", "", ["-o", "/prm/example.html"], ["-o", "/prm/example.html"]),
+        ("", "", ["-o", "/"], ["-o", "/"]),
+        (":0", "", ["--no-o"], ["--no-o"]),
+        (
+            ":0",
+            "",
+            ["--no-open", "-p", "8761", "two words"],
+            ["-p", "8761", "two words"],
+        ),
+    ],
+)
+def test_html_launcher_opens_only_for_desktop_sessions(
+    tmp_path: Path,
+    display: str,
+    wayland_display: str,
+    arguments: list[str],
+    expected: list[str],
+) -> None:
+    """Desktop runs open once, headless runs serve, and explicit options survive."""
+    subject = import_module("packages.git-canonical.main")
+    generated = subject.scaffold("html", "viewer", None)[
+        Path("packages/viewer/default.nix")
+    ]
+    shell = generated.split("  text = ''\n", 1)[1].rsplit("  '';", 1)[0]
+    shell = shell.replace("${site}", "/example/site").replace("''${", "${")
+    server = tmp_path / "http-server"
+    server.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
+    server.chmod(0o700)
+    result = subprocess.run(  # noqa: S603
+        [shutil.which("bash") or "bash", "-euc", shell, "viewer", *arguments],
+        env={
+            **os.environ,
+            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+            "DISPLAY": display,
+            "WAYLAND_DISPLAY": wayland_display,
+        },
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    if result.stdout.splitlines() != ["/example/site", *expected]:
+        raise AssertionError(result.stdout)
+
+
 def test_invalid_source_is_rejected_before_cleanup(repository: Path) -> None:
     """A failed convergence preserves both source and unrelated work."""
     _run(repository, "add", "packages/example", "python")

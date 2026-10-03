@@ -734,7 +734,7 @@ class TestGui(unittest.TestCase):
                     thread.join(timeout=5)
 
     def test_package_actions_run_checks_arguments_failures_and_stop(self) -> None:
-        """Open HTML runs, execute checks and stop long-running commands on close."""
+        """Forward run arguments, execute checks and stop commands on close."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = root / "packages/example"
@@ -800,7 +800,7 @@ class TestGui(unittest.TestCase):
                 )
                 require_output(command["cwd"] == str(package))
                 require_output(
-                    command["argv"][:5] == ["run", f"{root}#example", "--", "-o", "/"],
+                    command["argv"][:3] == ["run", f"{root}#example", "--"],
                 )
                 require_output(
                     command["argv"][-3:]
