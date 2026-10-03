@@ -9,6 +9,10 @@ const searchCollapsed = new Set();
 const blocks = new Map();
 const directorySnapshots = new Map();
 const directoryViews = new Map();
+const actionStates = new Map();
+const actionViews = new Map();
+const actionTimers = new Map();
+const runArguments = new Map();
 let restoringFocus = false;
 let keyboardFocus = false;
 let pendingView = null;
@@ -339,16 +343,10 @@ function behaviorTree(tree, key, filterChanges) {
     const matches = query && tree.title.toLowerCase().includes(query);
     const row = element("div", "output-row");
     const leaf = element(
-      tree.directory ? "a" : "div",
-      `detail-leaf ${tree.directory ? "directory-leaf " : ""}${tree.change || ""}${tree.warning ? " warning" : ""}${matches ? " match" : ""}`,
+      "div",
+      `detail-leaf ${tree.change || ""}${tree.warning ? " warning" : ""}${matches ? " match" : ""}`,
       tree.title,
     );
-    if (tree.directory) {
-      leaf.href = `/output?path=${encodeURIComponent(tree.directory)}`;
-      leaf.target = "_blank";
-      leaf.rel = "noopener";
-      leaf.title = `Browse ${tree.directory}`;
-    }
     if (tree.source_file) leaf.classList.add("source-row");
     appendLines(leaf);
     if (!tree.output_diff) return leaf;
@@ -370,19 +368,94 @@ function behaviorTree(tree, key, filterChanges) {
   details.append(summary);
   const content = element("div", "behavior-content");
   if (tree.text_diff) content.append(element("pre", "output-text-diff", tree.text_diff));
-  if (tree.directory && tree.expandable) {
-    const browse = element("a", "directory-leaf", "Browse output");
-    browse.href = `/output?path=${encodeURIComponent(tree.directory)}`;
-    browse.target = "_blank";
-    browse.rel = "noopener";
-    content.append(browse);
-  }
   children.forEach((child, index) => {
     if (!filterChanges || hasChange(child))
       content.append(behaviorTree(child, `${key}/${index}`, filterChanges));
   });
   details.append(content);
   return details;
+}
+
+async function packageAction(packagePath, action = null) {
+  clearTimeout(actionTimers.get(packagePath));
+  try {
+    const response = await fetch(
+      action ? "/api/action" : `/api/action?package=${encodeURIComponent(packagePath)}`,
+      action
+        ? {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              package: packagePath,
+              action,
+              args: runArguments.get(packagePath) || "",
+            }),
+          }
+        : {},
+    );
+    const state = await response.json();
+    if (!response.ok) throw new Error(state.error || `HTTP ${response.status}`);
+    const previous = actionStates.get(packagePath);
+    actionStates.set(packagePath, state);
+    actionViews.get(packagePath)?.(state);
+    if (state.state === "running")
+      actionTimers.set(packagePath, setTimeout(() => packageAction(packagePath), 1000));
+    else if (action || previous?.state === "running") {
+      directorySnapshots.clear();
+      refresh(directory, false);
+    }
+  } catch (error) {
+    actionViews.get(packagePath)?.({ state: "failed", output: error.message });
+  }
+}
+
+function packageControls(node, meta, body, details) {
+  const packagePath = node.actions.package;
+  const controls = element("div", "package-controls");
+  const argumentsInput = element("input", "run-arguments");
+  argumentsInput.placeholder = "Run arguments (optional)";
+  argumentsInput.setAttribute("aria-label", `Run arguments for ${node.name}`);
+  argumentsInput.value = runArguments.get(packagePath) || "";
+  argumentsInput.addEventListener("input", () =>
+    runArguments.set(packagePath, argumentsInput.value),
+  );
+  const buttons = {};
+  for (const action of ["check", "run", "stop"]) {
+    const button = element("button", "package-action", action[0].toUpperCase() + action.slice(1));
+    button.type = "button";
+    button.setAttribute("aria-label", `${button.textContent} ${node.name}`);
+    button.title = action === "check" && !node.actions.check ? "No declared check" : button.textContent;
+    button.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      details.open = true;
+      update({ state: "running", action, output: "Starting…" });
+      packageAction(packagePath, action);
+    });
+    buttons[action] = button;
+    controls.append(button);
+  }
+  const result = element("details", "behavior-group action-result");
+  const status = element("summary", "");
+  const output = element("pre", "output-text-diff action-output");
+  result.append(status, output);
+  result.open = true;
+  result.setAttribute("aria-live", "polite");
+  function update(state) {
+    const running = state.state === "running";
+    buttons.check.disabled = running || !node.actions.check;
+    buttons.run.disabled = running;
+    buttons.stop.hidden = !running;
+    argumentsInput.disabled = running;
+    result.hidden = state.state === "idle";
+    status.textContent = `${state.action === "check" ? "Check" : "Run"}: ${state.state}${state.exit_code != null ? ` (exit ${state.exit_code})` : ""}`;
+    output.textContent = state.output || "No output.";
+  }
+  actionViews.set(packagePath, update);
+  update(actionStates.get(packagePath) || { state: "idle" });
+  meta.append(controls);
+  body.append(argumentsInput, result);
+  if (!actionStates.has(packagePath)) packageAction(packagePath);
 }
 
 function resourceBlock(node) {
@@ -425,6 +498,10 @@ function resourceBlock(node) {
   });
   details.append(summary);
   const body = element("div", "resource-body");
+  if (node.actions) {
+    packageControls(node, meta, body, details);
+    if (!summary.contains(meta)) summary.append(meta);
+  }
   if (node.tree) {
     if (node.tree.children.some((child) => child.title !== "tmp/" && hasChange(child)))
       body.append(element("div", "diff-baseline", "HEAD → Working tree"));

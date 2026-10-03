@@ -20,6 +20,7 @@ let
     inputs.self.packages.${pkgs.stdenv.system}.git-canonical
     pkgs.diffoscope
     pkgs.git
+    pkgs.nix
   ];
 in
 python.pkgs.buildPythonPackage {

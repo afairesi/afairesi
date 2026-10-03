@@ -12,6 +12,7 @@ import mimetypes
 import os
 import platform
 import re
+import shlex
 import shutil
 import signal
 import stat
@@ -46,6 +47,7 @@ MOUNT_FIELDS = 3
 EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
 OUTPUT_DIFF_TIMEOUT = 120
 OUTPUT_TEXT_LIMIT = 65536
+ACTION_BODY_LIMIT = 16384
 
 
 @dataclass
@@ -1418,6 +1420,134 @@ def output_index(root: Path, directory: Path, diff_url: str | None = None) -> by
     ).encode()
 
 
+@dataclass
+class PackageAction:
+    """Retain a command and its output while the browser is open."""
+
+    action: str
+    process: subprocess.Popen[bytes]
+    log: Path
+    stopped: bool = False
+    observed: bool = False
+
+
+class PackageActions:
+    """Run only packages discovered by this browser, with bounded output reads."""
+
+    def __init__(self) -> None:
+        """Keep command logs outside the package output being compared."""
+        self.storage = tempfile.TemporaryDirectory(prefix="canonical-browser-actions-")
+        self.packages: dict[str, tuple[Path, str, bool]] = {}
+        self.jobs: dict[str, PackageAction] = {}
+
+    def observe(self, data: dict[str, Any]) -> None:
+        """Advertise actions for existing packages and their declared checks."""
+        for record in data.get("nodes", []):
+            if (
+                record["kind"] != "package"
+                or record.get("change") == "removed"
+                or not record.get("directory")
+            ):
+                continue
+            repository = Path(record["directory"])
+            package = repository / record["path"]
+            if not package.is_dir():
+                continue
+            check = (repository / "checks" / record["name"] / "default.nix").is_file()
+            self.packages[str(package)] = repository, record["name"], check
+            record["actions"] = {"package": str(package), "check": check}
+
+    def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
+        """Start an argument-list command, or stop the active process group."""
+        if package not in self.packages or action not in {"check", "run", "stop"}:
+            msg = "Unknown package or action"
+            raise ValueError(msg)
+        active = self.jobs.get(package)
+        if action == "stop":
+            if active is not None and active.process.poll() is None:
+                self.stop(active)
+            return self.status(package)
+        if active is not None and active.process.poll() is None:
+            msg = "A command is already running for this package"
+            raise ValueError(msg)
+        repository, name, check = self.packages[package]
+        if action == "check":
+            if not check:
+                msg = "This package has no declared check"
+                raise ValueError(msg)
+            machine = {"arm64": "aarch64"}.get(platform.machine(), platform.machine())
+            system = f"{machine}-{platform.system().lower()}"
+            command = [
+                "nix",
+                "build",
+                "--no-link",
+                "--print-build-logs",
+                f"{repository}#checks.{system}.{json.dumps(name)}",
+            ]
+        else:
+            command = [
+                "nix",
+                "run",
+                f"{repository}#{name}",
+                "--",
+                *shlex.split(arguments),
+            ]
+        log = Path(self.storage.name) / (
+            hashlib.sha256(package.encode()).hexdigest() + ".log"
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(  # noqa: S603 - allowlisted package and argument list
+                command,
+                cwd=package,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        self.jobs[package] = PackageAction(action, process, log)
+        return self.status(package)
+
+    def status(self, package: str) -> dict[str, Any]:
+        """Return status and the tail of command output without blocking."""
+        if package not in self.packages:
+            msg = "Unknown package"
+            raise ValueError(msg)
+        job = self.jobs.get(package)
+        if job is None:
+            return {"state": "idle", "output": ""}
+        result = job.process.poll()
+        with job.log.open("rb") as stream:
+            stream.seek(max(0, job.log.stat().st_size - OUTPUT_TEXT_LIMIT))
+            output = stream.read(OUTPUT_TEXT_LIMIT).decode(errors="replace")
+        state = "running" if result is None else "passed" if result == 0 else "failed"
+        return {
+            "action": job.action,
+            "state": "stopped" if job.stopped else state,
+            "exit_code": result,
+            "output": output,
+        }
+
+    @staticmethod
+    def stop(job: PackageAction) -> None:
+        """Terminate a command and its descendants, escalating after a short wait."""
+        job.stopped = True
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(job.process.pid, signal.SIGTERM)
+        try:
+            job.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(job.process.pid, signal.SIGKILL)
+            job.process.wait()
+
+    def close(self) -> None:
+        """Stop active commands before removing session logs."""
+        for job in self.jobs.values():
+            if job.process.poll() is None:
+                self.stop(job)
+        self.storage.cleanup()
+
+
 def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     root: Path,
     port: int = 0,
@@ -1425,6 +1555,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
     """Serve the graph and output reports, retaining captures outside package output."""
     assets = Path(__file__).parent / "prm"
     outputs = OutputSnapshots()
+    actions = PackageActions()
     routes = {
         "/": ("index.html", "text/html; charset=utf-8"),
         "/script.js": ("script.js", "text/javascript; charset=utf-8"),
@@ -1444,14 +1575,90 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
             raise ValueError(msg)
         data = gui_data(directory)
         outputs.observe(data, refresh=parameters.get("refresh") == ["1"])
+        actions.observe(data)
         return data
 
     class Handler(BaseHTTPRequestHandler):
+        def action_parameters(self) -> dict[str, str]:
+            """Read a small JSON object of string action parameters."""
+            length = int(self.headers.get("Content-Length", "0"))
+            if (
+                not 0 < length <= ACTION_BODY_LIMIT
+                or self.headers.get("Content-Type") != "application/json"
+            ):
+                msg = "Expected a bounded JSON request"
+                raise ValueError(msg)
+            parameters = json.loads(self.rfile.read(length))
+            if not isinstance(parameters, dict) or not all(
+                isinstance(value, str) for value in parameters.values()
+            ):
+                msg = "Action parameters must be strings"
+                raise ValueError(msg)
+            return parameters
+
+        def action_response(self, *, start: bool) -> None:
+            """Serve local package actions through JSON requests."""
+            try:
+                if start:
+                    origin = self.headers.get("Origin")
+                    if (
+                        origin is not None
+                        and origin != f"http://127.0.0.1:{server.server_port}"
+                    ) or self.headers.get("Sec-Fetch-Site") == "cross-site":
+                        self.send_error(HTTPStatus.FORBIDDEN, "Local requests only")
+                        return
+                    parameters = self.action_parameters()
+                    package = parameters.get("package", "")
+                    state = actions.start(
+                        package,
+                        parameters.get("action", ""),
+                        parameters.get("args", ""),
+                    )
+                else:
+                    package = parse_qs(urlsplit(self.path).query).get("package", [""])[
+                        0
+                    ]
+                    state = actions.status(package)
+                job = actions.jobs.get(package)
+                if (
+                    job is not None
+                    and job.process.poll() is not None
+                    and not job.observed
+                ):
+                    job.observed = True
+                    comparison = outputs.comparisons.get(Path(package) / "tmp")
+                    if comparison is not None:
+                        comparison.future = outputs.executor.submit(
+                            outputs.capture,
+                            comparison,
+                        )
+                content = json.dumps(state).encode()
+                status = HTTPStatus.OK
+            except (OSError, ValueError) as exc:
+                content = json.dumps({"error": str(exc)}).encode()
+                status = HTTPStatus.BAD_REQUEST
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(content)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(content)
+
+        def do_POST(self) -> None:
+            """Start package commands only through the action endpoint."""
+            if urlsplit(self.path).path == "/api/action":
+                self.action_response(start=True)
+            else:
+                self.send_error(HTTPStatus.NOT_IMPLEMENTED)
+
         def do_GET(self) -> None:
             """Return an allowlisted asset or a fresh repository snapshot."""
             request = urlsplit(self.path)
             route = request.path
             status = HTTPStatus.OK
+            if route == "/api/action":
+                self.action_response(start=False)
+                return
             if route == "/output":
                 self.serve_output(parse_qs(request.query).get("path", [""])[0])
                 return
@@ -1545,6 +1752,7 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
         def server_close(self) -> None:
             """Finish output capture and release locks when this launch ends."""
             super().server_close()
+            actions.close()
             outputs.close()
 
     server = Server(("127.0.0.1", port), Handler)

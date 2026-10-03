@@ -353,6 +353,36 @@ summary::-webkit-details-marker {
   max-height: 260px;
   overflow: auto;
 }
+.package-controls {
+  display: flex;
+  gap: 5px;
+  margin-top: 5px;
+}
+.package-action {
+  font: inherit;
+  font-size: 10px;
+  padding: 2px 7px;
+  border: 1px solid var(--muted);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--green);
+  cursor: pointer;
+}
+.package-action:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.run-arguments {
+  box-sizing: border-box;
+  width: 100%;
+  margin-bottom: 8px;
+  font: inherit;
+  font-size: 10px;
+}
+.action-result[hidden],
+.package-action[hidden] {
+  display: none;
+}
 .match {
   background: #fff2c5;
   border-radius: 3px;

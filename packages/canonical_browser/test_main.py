@@ -16,6 +16,7 @@ import unittest
 import zipfile
 from http import HTTPStatus
 from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 from urllib.parse import urlencode
 
@@ -33,6 +34,7 @@ from packages.canonical_browser import main as app
 TEST_MODIFIED_CHANGE = "modified"
 TEST_PARSER_ERROR = 2
 TEST_REPOSITORY_FIELDS = 3
+TEST_ACTION_FAILURE = 7
 
 
 def commit_sources(root: Path) -> None:
@@ -588,6 +590,88 @@ class TestBoundary(unittest.TestCase):
 
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
+
+    def test_package_actions_run_checks_arguments_failures_and_stop(self) -> None:
+        """Execute fixed Nix commands and stop long-running commands on close."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            executable = root / "nix"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys, time\n"
+                "value = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
+                "print(json.dumps(value), flush=True)\n"
+                "if '--wait' in sys.argv: time.sleep(60)\n"
+                "sys.exit(7 if '--fail' in sys.argv else 0)\n",
+            )
+            executable.chmod(0o700)
+            data: dict[str, Any] = {
+                "nodes": [
+                    {
+                        "kind": "package",
+                        "directory": str(root),
+                        "path": "packages/example",
+                        "name": "example",
+                    },
+                ],
+            }
+            actions = app.PackageActions()
+            self.addCleanup(actions.close)
+            with patch.dict(
+                os.environ,
+                {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
+            ):
+                actions.observe(data)
+                require_output(not data["nodes"][0]["actions"]["check"])
+                with pytest.raises(ValueError, match="no declared check"):
+                    actions.start(str(package), "check")
+                check = root / "checks/example"
+                check.mkdir(parents=True)
+                (check / "default.nix").write_text("{}\n")
+                actions.observe(data)
+                actions.start(str(package), "check")
+                actions.jobs[str(package)].process.wait(timeout=10)
+                state = actions.status(str(package))
+                command = json.loads(state["output"])
+                require_output(state["state"] == "passed")
+                require_output(
+                    command["argv"][:3] == ["build", "--no-link", "--print-build-logs"],
+                )
+                require_output(
+                    "#checks." in command["argv"][3]
+                    and command["argv"][3].endswith('."example"'),
+                )
+                actions.start(
+                    str(package),
+                    "run",
+                    "'two words' '$(touch injected)' --fail",
+                )
+                actions.jobs[str(package)].process.wait(timeout=10)
+                state = actions.status(str(package))
+                command = json.loads(state["output"])
+                require_output(
+                    state["state"] == "failed"
+                    and state["exit_code"] == TEST_ACTION_FAILURE,
+                )
+                require_output(command["cwd"] == str(package))
+                require_output(
+                    command["argv"][-3:]
+                    == ["two words", "$(touch injected)", "--fail"],
+                )
+                require_output(not (package / "injected").exists())
+                actions.start(str(package), "run", "--wait")
+                with pytest.raises(ValueError, match="already running"):
+                    actions.start(str(package), "run")
+                actions.start(str(package), "stop")
+                require_output(actions.status(str(package))["state"] == "stopped")
+                actions.start(str(package), "run", "--wait")
+                job = actions.jobs[str(package)]
+                actions.close()
+                require_output(job.process.poll() is not None)
+            with pytest.raises(ValueError, match="Unknown package"):
+                actions.start(str(root), "run")
 
     def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
         """Count prm allocation once per inode and preserve the runtime link."""
