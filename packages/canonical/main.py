@@ -3489,10 +3489,8 @@ def _dependency_parts(
         for child in attrs.named_children:
             if child.type == "identifier":
                 parts.append(document.text(child))
-            elif child.type == "string_expression" and "${" not in document.text(child):
-                parts.append(json.loads(document.text(child)))
             else:
-                parts.append(None)
+                parts.append(nix_syntax.string_value(document, child))
         return parts
     return None
 

@@ -2991,7 +2991,8 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         (consumer / "default.nix").write_text(
             "{ inputs, pkgs, system, ... }: "
             "let local = inputs.self.packages.${system}; in {\n"
-            f"  propagatedBuildInputs = [ local.{provider} local.missing pkgs.git ];\n"
+            f"  propagatedBuildInputs = [ local.{provider} "
+            'local."\\missing" local."literal \\${name}" pkgs.git ];\n'
             f'  installPhase = "cp ${{../{provider}/main.py}} result";\n'
             "  # propagatedBuildInputs = [ local.fake ];\n"
             '  text = "inputs.self.packages.system.also_fake";\n}\n',
@@ -3084,6 +3085,7 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
                 (f".:packages/{provider}", ".:packages/consumer", "runtime"),
                 (f".:packages/{provider}", ".:packages/consumer", "source"),
                 (".:packages/missing", ".:packages/consumer", "runtime"),
+                (".:packages/literal ${name}", ".:packages/consumer", "runtime"),
             },
             edges,
         )

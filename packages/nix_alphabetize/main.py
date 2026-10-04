@@ -164,8 +164,7 @@ def _render_key(key: str) -> str:
         and all(character.isalnum() or character in "_-'" for character in key)
     ):
         return key
-    escaped = key.replace("\\", "\\\\").replace('"', '\\"').replace("${", "\\${")
-    return f'"{escaped}"'
+    return cast("str", nix_syntax.quote_string(key))
 
 
 def _render_set(bindings: list[Binding]) -> str:

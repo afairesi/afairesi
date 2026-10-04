@@ -29,6 +29,14 @@ if TYPE_CHECKING:
             "{ a = { inherit (python) version; }; }",
         ),
         ('{ "é" = "keep  spaces"; a = 0; }', '{ a = 0; "é" = "keep  spaces"; }'),
+        (
+            '{ "line\\nnext\\t\\r" = 1; a = 0; }',
+            '{ a = 0; "line\\nnext\\t\\r" = 1; }',
+        ),
+        (
+            r'{ "literal \${name}" = 1; "back\\slash\"quote" = 2; }',
+            r'{ "back\\slash\"quote" = 2; "literal \${name}" = 1; }',
+        ),
     ],
 )
 def test_cli_formats_and_converges(tmp_path: Path, source: str, expected: str) -> None:
