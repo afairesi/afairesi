@@ -792,13 +792,27 @@ def _meta_description(source: str) -> str | None:
         return None
     if any(node.type == "interpolation" for node in nix_syntax.walk(expression)):
         return None
-    decoded = json.loads(document.text(expression).replace(r"\${", "${"))
-    return cast("str", decoded)
+    literal = document.text(expression)[1:-1]
+    escapes = {"n": "\n", "r": "\r", "t": "\t"}
+    return re.sub(
+        r"\\(.)",
+        lambda match: escapes.get(match[1], match[1]),
+        literal,
+        flags=re.DOTALL,
+    )
 
 
 def _nix_string(value: str) -> str:
     """Encode a non-interpolating Nix string literal."""
-    return json.dumps(value).replace("${", r"\${")
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', r"\"")
+        .replace("\n", r"\n")
+        .replace("\r", r"\r")
+        .replace("\t", r"\t")
+        .replace("${", r"\${")
+    )
+    return '"' + escaped + '"'
 
 
 def _attrset_expression(
@@ -4404,7 +4418,7 @@ def _build_test_environment(root: Path, name: str, workspace: Path) -> tuple[str
         '    "propagatedBuildInputs" "propagatedNativeBuildInputs"\n'
         "  ];\n"
         "  python = package.python.withPackages (ps:\n"
-        "    (package.propagatedBuildInputs or []) ++ [ps.hypothesis ps.pytest]);\n"
+        "    dependencies ++ [ps.hypothesis ps.pytest]);\n"
         'in pkgs.writeText "test-environment.json" (builtins.toJSON {\n'
         '  python = "${python}/bin/python";\n'
         "  path = pkgs.lib.makeBinPath dependencies;\n"

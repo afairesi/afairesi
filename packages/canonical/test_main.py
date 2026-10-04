@@ -1,5 +1,5 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Exercise resource management and convergence through the installed CLI."""
+"""Check Canonical's public contracts with explicit regressions and generated cases."""
 
 from __future__ import annotations
 
@@ -7,17 +7,23 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
+from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
-from typing import TYPE_CHECKING
+from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING, cast
 
 import coverage
 import pytest
+from hypothesis import example, given, settings
+from hypothesis import strategies as st
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
+    from typing import Any
 
 
 def _run(
@@ -25,10 +31,12 @@ def _run(
     *arguments: str,
     code: int = 0,
     executable: str | None = None,
+    environment: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(  # noqa: S603
         [executable or os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
         cwd=root,
+        env=environment,
         capture_output=True,
         text=True,
         check=False,
@@ -50,251 +58,293 @@ def _git(root: Path, *arguments: str) -> str:
     ).stdout
 
 
-@pytest.fixture
-def repository(tmp_path: Path) -> Path:
-    """Create an isolated indexed flake without contacting a forge."""
-    _git(tmp_path, "init", "--quiet")
-    for name in (".gitignore", "flake.nix", "flake.lock", "README"):
-        (tmp_path / name).write_text("", encoding="utf-8")
-    _git(tmp_path, "add", ".")
-    return tmp_path
-
-
-def test_package_and_host_lifecycle(repository: Path) -> None:
-    """Create, rename, and remove resources with their generated checks and assets."""
-    root = repository
-    _run(root, "add", "packages/report", "python", 'A "quoted" report.')
-    package = root / "packages/report"
-    tests = package / "test_main.py"
-    if tests.exists() or (root / "checks/report").exists():
-        message = "untested packages should not receive tests or test checks"
-        raise AssertionError(message)
-    resource = package / "prm/nested/asset.txt"
-    resource.parent.mkdir(parents=True)
-    resource.write_text("keep this resource", encoding="utf-8")
-    tests.write_text("def test_result():\n    pass\n", encoding="utf-8")
-    _run(root, "add", "hosts/demoHost")
-    _run(root, "converge")
-    tracked = _git(root, "ls-files").splitlines()
-    for name in (
-        "packages/report/test_main.py",
-        "packages/report/prm/nested/asset.txt",
-        "checks/report/default.nix",
-        "checks/demoHostVmWithDisko/default.nix",
-    ):
-        if name not in tracked:
-            raise AssertionError(name)
-    _run(root, "mv", "packages/report", "packages/renamed", "--dry-run")
-    if not package.is_dir() or (root / "packages/renamed").exists():
-        message = "dry-run moved a package"
-        raise AssertionError(message)
-    _run(root, "mv", "packages/report", "packages/renamed")
-    _run(root, "mv", "hosts/demoHost", "hosts/newHost")
-    if (
-        root / "packages/renamed/prm/nested/asset.txt"
-    ).read_text() != "keep this resource":
-        message = "rename lost package resources"
-        raise AssertionError(message)
-    for name in (
-        "checks/renamed/default.nix",
-        "checks/newHostVmWithDisko/default.nix",
-    ):
-        if not (root / name).is_file():
-            raise AssertionError(name)
-    _run(root, "rm", "packages/renamed", "--dry-run")
-    if not (root / "packages/renamed/main.py").is_file():
-        message = "dry-run removed the package"
-        raise AssertionError(message)
-    _run(root, "rm", "packages/renamed")
-    _run(root, "rm", "hosts/newHost")
-    if any(
-        (root / name).exists()
-        for name in (
-            "packages/report",
-            "packages/renamed",
-            "hosts/demoHost",
-            "hosts/newHost",
-            "checks/report",
-            "checks/renamed",
-            "checks/demoHostVmWithDisko",
-            "checks/newHostVmWithDisko",
-        )
-    ):
-        message = "removed resources left package or check directories behind"
-        raise AssertionError(message)
-    _run(root, "converge")
-    _run(root, "converge", "--dry-run")
-
-
-@pytest.mark.parametrize("collection", ["packages", "hosts"])
-def test_rename_preserves_staged_unstaged_and_untracked_files(
-    repository: Path,
-    collection: str,
-) -> None:
-    """Rename resources and checks with the same index behavior as Git."""
-    root = repository
-    original = f"{collection}/example"
-    destination = f"{collection}/renamed"
-    if collection == "packages":
-        _run(root, "add", original, "python")
-        (root / original / "test_main.py").write_text("def test_one(): pass\n")
-        _run(root, "converge")
-        marker = "main.py"
-        check_name = "example"
-        renamed_check = "renamed"
-    else:
-        _run(root, "add", original)
-        marker = "configuration.nix"
-        check_name = "exampleVmWithDisko"
-        renamed_check = "renamedVmWithDisko"
-    paths = [f"{original}/{marker}", f"checks/{check_name}/default.nix"]
-    staged = {}
-    working = {}
-    for relative in paths:
-        path = root / relative
-        source = path.read_text()
-        staged[relative] = source + "\n"
-        working[relative] = source + "\n\n"
-        path.write_text(staged[relative])
-        _git(root, "add", "--", relative)
-        path.write_text(working[relative])
-    resource = root / original / "prm/asset.txt"
-    resource.parent.mkdir()
-    resource.write_text("untracked")
-    status = _git(root, "status", "--porcelain")
-    _run(root, "mv", original, destination, "--dry-run")
-    if _git(root, "status", "--porcelain") != status:
-        message = "rename dry-run changed Git state"
-        raise AssertionError(message)
-    _run(root, "mv", original, destination)
-    for relative in paths:
-        renamed = relative.replace(original, destination).replace(
-            f"checks/{check_name}/",
-            f"checks/{renamed_check}/",
-        )
-        if (
-            _git(root, "show", f":{renamed}") != staged[relative]
-            or (root / renamed).read_text() != working[relative]
-        ):
-            message = "rename changed staged or unstaged contents"
-            raise AssertionError(message)
-    moved_resource = f"{destination}/prm/asset.txt"
-    if (root / moved_resource).read_text() != "untracked" or _git(
-        root,
-        "ls-files",
-        "--",
-        moved_resource,
-    ):
-        message = "rename staged or lost an untracked resource"
-        raise AssertionError(message)
-
-
-def test_rename_untracked_resource_preserves_untracked_state(repository: Path) -> None:
-    """Move an untracked package without implicitly staging its sources."""
-    package = repository / "packages/example"
+def _make_test_names_package(root: Path, name: str, source: str) -> Path:
+    """Create a canonical package fixture without executing its source."""
+    package = root / "packages" / name
     package.mkdir(parents=True)
-    (package / "default.nix").write_text("{}\n")
-    _run(repository, "mv", "packages/example", "packages/renamed")
-    if not (repository / "packages/renamed/default.nix").is_file() or _git(
-        repository,
-        "ls-files",
-        "--",
-        "packages/renamed",
-    ):
-        message = "rename lost or staged an untracked package"
+    (root / "flake.nix").touch()
+    (package / "default.nix").touch()
+    (package / "main.py").touch()
+    (package / "test_main.py").write_text(source)
+    return package
+
+
+def _run_test_names(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
+    """Invoke the installed command from a chosen working directory."""
+    return subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "names", *arguments],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+
+
+def _test_names_git(root: Path, *arguments: str) -> str:
+    """Run fixture Git commands with a local identity and no signing."""
+    return subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "git",
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+            *arguments,
+        ],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout
+
+
+def _make_runner_target(
+    root: Path,
+    source: str,
+    tests: str,
+    *,
+    name: str = "example",
+) -> Path:
+    """Create a minimal canonical package for an isolated test."""
+    package = root / "packages" / name
+    package.mkdir(parents=True)
+    (root / "flake.nix").write_text("{}", encoding="utf-8")
+    (package / "default.nix").write_text("{}", encoding="utf-8")
+    (package / "main.py").write_text(source, encoding="utf-8")
+    (package / "test_main.py").write_text(tests, encoding="utf-8")
+    return package
+
+
+def _prepare_runner_flake(
+    root: Path,
+    tests: str,
+    source: str = "def main():\n    print('ready')\n",
+    *,
+    name: str = "example",
+) -> dict[str, str]:
+    """Provide an offline flake backed by this check's real Python environment."""
+    package = _make_runner_target(root, source, tests, name=name)
+    (package / "main.py").write_text(source, encoding="utf-8")
+    dependency = root / "prm/nixpkgs"
+    dependency.mkdir(parents=True)
+    (dependency / "flake.nix").write_text("{ outputs = _: {}; }", encoding="utf-8")
+    (dependency / "default.nix").write_text(
+        "_: { lib = { concatMap = f: xs: builtins.concatLists (map f xs); "
+        'makeBinPath = _: ""; }; writeText = builtins.toFile; }',
+        encoding="utf-8",
+    )
+    (root / "flake.nix").write_text(
+        '{ inputs.nixpkgs.url = "path:./prm/nixpkgs"; '
+        "outputs = _: { packages.${builtins.currentSystem} = { "
+        f"{json.dumps(name)}.python"
+        ".withPackages = "
+        f"_ : {json.dumps(sys.prefix)}; }}; }}; }}",
+        encoding="utf-8",
+    )
+    for args in (["init", "--quiet"], ["add", "."]):
+        subprocess.run(  # noqa: S603
+            ["git", "-C", str(root), *args],  # noqa: S607
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    environment = dict(os.environ)
+    store = root.parent / "nix"
+    environment["NIX_REMOTE"] = (
+        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
+    )
+    environment["NIX_CONFIG"] = (
+        "experimental-features = nix-command flakes\nbuild-users-group =\n"
+    )
+    return environment
+
+
+def _run_runner_cli(
+    root: Path,
+    environment: dict[str, str],
+    command: str,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    """Exercise test runners through the public standalone command."""
+    environment = dict(environment)
+    executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
+    environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
+    return subprocess.run(  # noqa: S603
+        ["canonical", "test", command, str(root), *arguments],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+
+
+def _prepare_coverage_flake(
+    root: Path,
+    *,
+    failure: str | None = None,
+) -> dict[str, str]:
+    """Build generated checks and coverage variants with offline Nix inputs."""
+    root.mkdir(parents=True)
+    _git(root, "init", "--quiet")
+    for filename in (".gitignore", "flake.nix", "flake.lock", "README"):
+        (root / filename).write_text(
+            "{}" if filename.endswith((".nix", ".lock")) else "",
+        )
+    (root / "flake.lock").write_text(
+        json.dumps({"nodes": {"root": {}}, "root": "root", "version": 7}),
+    )
+    _git(root, "add", ".")
+    environment = dict(os.environ)
+    store = root.parent / "nix"
+    environment["NIX_REMOTE"] = (
+        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
+    )
+    environment["NIX_CONFIG"] = (
+        "experimental-features = nix-command flakes\n"
+        "build-users-group =\n"
+        "sandbox = false\n"
+        "sandbox-build-dir = /coverage-build\n"
+        "eval-cache = false\n"
+    )
+    system = subprocess.run(
+        ["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    site_packages = (
+        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    coverage_root = Path(coverage.__file__).resolve().parents[4]
+    bash = shutil.which("bash")
+    if bash is None:
+        message = "coverage fixtures require bash"
         raise AssertionError(message)
-
-
-def test_convergence_preserves_source_and_scratch_and_is_idempotent(
-    repository: Path,
-) -> None:
-    """Convergence stages source, preserves scratch, and reaches a stable checkout."""
-    root = repository
-    _run(root, "add", "packages/example", "python")
-    for name in (
-        "tmp/root-state",
-        "packages/example/tmp/package-state",
-        "packages/example/prm/ms.tex",
-    ):
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(name, encoding="utf-8")
-    (root / "discarded").write_text("generated artifact", encoding="utf-8")
+    packages = []
+    checks = []
+    for name in ("example", "z-last"):
+        _run(root, "add", f"packages/{name}", "python")
+        package = root / "packages" / name
+        source = "def main():\n    print('ready')\n"
+        tests = (
+            "import os, subprocess\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "@given(st.just(1))\n"
+            "@example(0)\n"
+            "def test_explicit(value):\n"
+            "    assert value == 0\n"
+            "def test_cli():\n"
+            "    result = "
+            "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
+            "        capture_output=True, text=True)\n"
+            "    assert result.stdout == 'ready\\n'\n"
+        )
+        if name == "example" and failure == "build":
+            tests = "def test_failure(): assert False\n"
+        (package / "main.py").write_text(source)
+        (package / "test_main.py").write_text(tests)
+        installed = root / "prm/installed" / name
+        module_name = name.replace("-", "_")
+        module = installed / site_packages / module_name
+        module.mkdir(parents=True)
+        (module / "__init__.py").write_text(source)
+        executable = installed / "bin" / name
+        executable.parent.mkdir()
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "
+            f"{site_packages!r}))\n"
+            f"from {module_name} import main\nmain()\n",
+        )
+        executable.chmod(0o755)
+        packages.append(
+            f"{json.dumps(name)} = {{ "
+            f"src = builtins.path {{ path = ./packages/{name}; "
+            f'name = "{name}-src"; }}; '
+            f"outPath = builtins.path {{ path = ./prm/installed/{name}; "
+            f'name = "{name}-installed"; }}; '
+            f"pname = {json.dumps(module_name)}; cliName = {json.dumps(name)}; "
+            f"meta.mainProgram = {json.dumps(name)}; "
+            "propagatedBuildInputs = []; python = { "
+            f"sitePackages = {json.dumps(site_packages)}; "
+            f"pkgs.coverage = {json.dumps(str(coverage_root))}; "
+            f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};",
+        )
+        expression = (
+            f"import ./checks/{name}/default.nix {{ inherit pkgs; "
+            "inputs.self.packages.${system} = packages; }"
+        )
+        if name == "example" and failure == "report":
+            expression = (
+                f"({expression}).overrideAttrs "
+                '(_: { buildCommand = "mkdir -p $out\\n"; })'
+            )
+        checks.append(f"{json.dumps(name)} = {expression};")
     _run(root, "converge")
-    if (root / "discarded").exists():
-        message = "convergence retained an unsupported artifact"
-        raise AssertionError(message)
-    tracked = _git(root, "ls-files").splitlines()
-    if "packages/example/prm/ms.tex" not in tracked or any(
-        "tmp/" in p for p in tracked
-    ):
-        raise AssertionError(tracked)
-    before = {name: (root / name).read_bytes() for name in tracked}
-    index = _git(root, "ls-files", "--stage")
-    _run(root, "converge")
-    if before != {
-        name: (root / name).read_bytes() for name in tracked
-    } or index != _git(root, "ls-files", "--stage"):
-        message = "a second convergence changed the checkout"
-        raise AssertionError(message)
-    for name in ("tmp/root-state", "packages/example/tmp/package-state"):
-        if (root / name).read_text() != name:
-            raise AssertionError(name)
+    (root / "flake.nix").write_text(
+        "{ outputs = _: let "
+        f"system = {json.dumps(system)}; "
+        "mkCheck = name: attrs: script: let build = current: (builtins.derivation { "
+        "inherit system; inherit (current) name src PACKAGE_E2E_EXECUTABLE; "
+        f"builder = {json.dumps(bash)}; "
+        f"PATH = {json.dumps(sys.prefix + '/bin:' + environment['PATH'])}; "
+        f"PYTHONPATH = {json.dumps(os.pathsep.join(sys.path))}; "
+        'args = [ "-e" (builtins.toFile "check-builder" '
+        '("export -n src PACKAGE_E2E_EXECUTABLE\\n" + current.buildCommand)) ]; '
+        "}) // { overrideAttrs = f: build (current // f current); }; "
+        "in build (attrs // { inherit name; buildCommand = script; }); "
+        "pkgs = { stdenv.system = system; runCommand = mkCheck; lib = { "
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
+        "concatMap = f: xs: builtins.concatLists (map f xs); "
+        'getExe = p: "${p}/bin/${p.cliName}"; }; }; '
+        "packages = { "
+        + " ".join(packages)
+        + " }; in { packages.${system} = packages; "
+        "checks.${system} = { " + " ".join(checks) + " }; }; }\n",
+    )
+    _git(root, "add", ".")
+    return environment
 
 
-def test_host_check_convergence_after_formatting_is_idempotent(
-    repository: Path,
-) -> None:
-    """The full formatting pipeline must not trigger check regeneration."""
-    _run(repository, "add", "hosts/laptop")
-    relative = "checks/laptopVmWithDisko/default.nix"
-    check = repository / relative
-    _run(repository, "--no-cache", relative, executable="treefmt")
-    formatted = check.read_text(encoding="utf-8")
-    _git(repository, "add", "--", relative)
-    index = _git(repository, "ls-files", "--stage")
-    result = _run(repository, "converge")
-    if (
-        check.read_text(encoding="utf-8") != formatted
-        or _git(repository, "ls-files", "--stage") != index
-        or f"write '{relative}'" in result.stdout
-    ):
-        message = "convergence regenerated a formatted host check"
-        raise AssertionError(message)
+def _home_repository(root: Path) -> Path:
+    """Create a home repository with a locally initialized submodule."""
+    relative = "forge.example/owner/demo"
+    checkout = root / relative
+    checkout.mkdir(parents=True)
+    _git(root, "init", "--quiet")
+    _git(checkout, "init", "--quiet")
+    _git(checkout, "config", "user.name", "Test")
+    _git(checkout, "config", "user.email", "test@example.org")
+    _git(checkout, "config", "commit.gpgSign", "false")
+    _git(checkout, "remote", "add", "origin", "git@forge.example:owner/demo")
+    source = checkout / "README"
+    source.write_text("first", encoding="utf-8")
+    _git(checkout, "add", "README")
+    _git(checkout, "commit", "--quiet", "-m", "first")
+    first = _git(checkout, "rev-parse", "HEAD").strip()
+    _git(checkout, "update-ref", "refs/remotes/origin/main", first)
+    (root / ".gitmodules").write_text(
+        f'[submodule "{relative}"]\npath = {relative}\n'
+        "url = git@forge.example:owner/demo\n",
+        encoding="utf-8",
+    )
+    (root / ".gitignore").write_text(
+        "*\n!/.gitignore\n!/.gitmodules\n"
+        "!/forge.example/\n!/forge.example/owner/\n!/forge.example/owner/demo\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "--force", ".gitignore", ".gitmodules", relative)
+    return root
 
 
-def test_host_check_upgrade_requires_no_consumer_files(repository: Path) -> None:
-    """Upgrade a generated check without changing its host or adding resources."""
-    _run(repository, "add", "hosts/laptop")
-    host = repository / "hosts/laptop/configuration.nix"
-    original_host = host.read_bytes()
-    original_paths = _git(repository, "ls-files").splitlines()
-    relative = "checks/laptopVmWithDisko/default.nix"
-    check = repository / relative
-    current = check.read_bytes()
-    legacy = b'{ pkgs, ... }: pkgs.runCommand "legacy-host-check" {} "mkdir $out"\n'
-    check.write_bytes(legacy)
-    _git(repository, "add", "--", relative)
-    _run(repository, "converge", "--dry-run", code=1)
-    if check.read_bytes() != legacy:
-        message = "dry-run changed the generated check"
-        raise AssertionError(message)
-    _run(repository, "converge")
-    if check.read_bytes() != current:
-        message = "convergence did not upgrade the generated check"
-        raise AssertionError(message)
-    if host.read_bytes() != original_host:
-        message = "check upgrade changed the host configuration"
-        raise AssertionError(message)
-    if _git(repository, "ls-files").splitlines() != original_paths:
-        message = "check upgrade added consumer files"
-        raise AssertionError(message)
-    if _run(repository, "converge", "--dry-run").stdout:
-        message = "check upgrade did not converge"
-        raise AssertionError(message)
-
-
-def test_structure_validation_does_not_traverse_excluded_trees(
+def _check_excluded_trees(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -336,253 +386,59 @@ def test_structure_validation_does_not_traverse_excluded_trees(
         raise AssertionError(issues)
 
 
-def test_html_template_keeps_prm_install_hook(repository: Path) -> None:
-    """Keep bundled assets and package-specific resources across convergence."""
-    subject = import_module("packages.canonical.main")
-    package_root = repository / "packages/viewer"
-    package_root.mkdir(parents=True)
-    (package_root / "index.html").write_text("<!doctype html>", encoding="utf-8")
-    package = subject.Package("viewer", "html", package_root)
-    generated = subject.scaffold("html", "viewer", None)[
-        Path("packages/viewer/default.nix")
-    ]
-    if "if [ -d ${./.}/prm ]; then" not in generated:
-        msg = "HTML template does not copy prm assets"
-        raise AssertionError(msg)
-    custom = generated.replace(
-        'prmInstall = "";',
-        "prmInstall = ''\n    cp /example/sample.dcm \"$out/prm/sample.dcm\"\n  '';",
-    )
-    (package_root / "default.nix").write_text(custom, encoding="utf-8")
-    canonical = subject.canonical_typed_default(package)
-    if canonical != custom:
-        msg = "HTML convergence discarded the prm install hook"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize(
-    ("kind", "binding", "expression"),
-    [
-        (
-            "html",
-            "runtimeDeps",
-            "(let runtimeDeps = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]",
-        ),
-        (
-            "html",
-            "prmInstall",
-            "let prmInstall = \"inner\"; in ''cp /asset \"$out/prm/asset\"''",
-        ),
-        (
-            "latex",
-            "nativeDeps",
-            "(let nativeDeps = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]",
-        ),
-    ],
-)
-def test_template_bindings_use_outer_nix_scope(
+def _check_formatted_host(
     repository: Path,
-    kind: str,
-    binding: str,
-    expression: str,
 ) -> None:
-    """Preserve actual expressions while ignoring comments and nested bindings."""
-    subject = import_module("packages.canonical.main")
-    root = repository / "packages/example"
-    root.mkdir(parents=True)
-    generated = subject.scaffold(kind, "example", None)[
-        Path("packages/example/default.nix")
-    ]
-    placeholder = '""' if binding == "prmInstall" else "[ ]"
-    expected = f"{binding} = {expression};"
-    custom = generated.replace(f"{binding} = {placeholder};", expected).replace(
-        "let\n",
-        f"let\n  # {binding} = [ pkgs.fromComment ];\n"
-        f"  ignored = let {binding} = [ pkgs.fromNested ]; in null;\n",
-        1,
-    )
-    definition = root / "default.nix"
-    definition.write_text(custom)
-    package = subject.Package("example", kind, root)
-    canonical = subject.canonical_typed_default(package)
-    if canonical is None or expected not in canonical:
-        msg = "Convergence must preserve the outer binding's complete expression"
-        raise AssertionError(msg)
-    if "fromComment" in canonical or "fromNested" in canonical:
-        msg = "Comment and nested bindings must not replace template fields"
-        raise AssertionError(msg)
-    definition.write_text(canonical)
-    if subject.canonical_typed_default(package) != canonical:
-        msg = "Preserving scoped expressions must remain idempotent"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize(
-    ("display", "wayland_display", "arguments", "expected"),
-    [
-        ("", "", [], []),
-        (":0", "", [], ["-o", "/"]),
-        ("", "wayland-0", [], ["-o", "/"]),
-        (":0", "wayland-0", ["--no-open"], []),
-        ("", "", ["--no-open"], []),
-        (":0", "", ["-o", "/prm/example.html"], ["-o", "/prm/example.html"]),
-        ("", "", ["-o", "/"], ["-o", "/"]),
-        (":0", "", ["--no-o"], ["--no-o"]),
-        (
-            ":0",
-            "",
-            ["--no-open", "-p", "8761", "two words"],
-            ["-p", "8761", "two words"],
-        ),
-    ],
-)
-def test_html_launcher_opens_only_for_desktop_sessions(
-    tmp_path: Path,
-    display: str,
-    wayland_display: str,
-    arguments: list[str],
-    expected: list[str],
-) -> None:
-    """Desktop runs open once, headless runs serve, and explicit options survive."""
-    subject = import_module("packages.canonical.main")
-    generated = subject.scaffold("html", "viewer", None)[
-        Path("packages/viewer/default.nix")
-    ]
-    shell = generated.split("  text = ''\n", 1)[1].rsplit("  '';", 1)[0]
-    shell = shell.replace("${site}", "/example/site").replace("''${", "${")
-    server = tmp_path / "http-server"
-    server.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\n', encoding="utf-8")
-    server.chmod(0o700)
-    result = subprocess.run(  # noqa: S603
-        [shutil.which("bash") or "bash", "-euc", shell, "viewer", *arguments],
-        env={
-            **os.environ,
-            "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
-            "DISPLAY": display,
-            "WAYLAND_DISPLAY": wayland_display,
-        },
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    if result.stdout.splitlines() != ["/example/site", *expected]:
-        raise AssertionError(result.stdout)
-
-
-def test_invalid_source_is_rejected_before_cleanup(repository: Path) -> None:
-    """A failed convergence preserves both source and unrelated work."""
-    _run(repository, "add", "packages/example", "python")
-    source = repository / "packages/example/main.py"
-    source.write_text("def test_misplaced(): pass\n", encoding="utf-8")
-    artifact = repository / "work-in-progress"
-    artifact.write_text("keep", encoding="utf-8")
-    result = _run(repository, "converge", code=1)
-    if "test_main.py" not in result.stderr or artifact.read_text() != "keep":
-        raise AssertionError(result.stderr)
-    if source.read_text() != "def test_misplaced(): pass\n":
-        message = "failed convergence rewrote invalid source"
-        raise AssertionError(message)
-
-
-def test_unittest_methods_drive_checks_and_source_validation(repository: Path) -> None:
-    """Discover aliased unittest cases consistently in tests and package source."""
-    _run(repository, "add", "packages/example", "python")
-    package = repository / "packages/example"
-    tests = package / "test_main.py"
-    tests.write_text(
-        "from unittest import TestCase as Case\n"
-        "class Behavior(Case):\n    def test_result(self): pass\n",
-        encoding="utf-8",
-    )
-    _run(repository, "converge")
-    check = repository / "checks/example/default.nix"
+    """Preserve formatted generated checks through the full formatting pipeline."""
+    _run(repository, "add", "hosts/laptop")
+    relative = "checks/laptopVmWithDisko/default.nix"
+    check = repository / relative
+    _run(repository, "--no-cache", relative, executable="treefmt")
+    formatted = check.read_text(encoding="utf-8")
+    _git(repository, "add", "--", relative)
+    index = _git(repository, "ls-files", "--stage")
+    result = _run(repository, "converge")
     if (
-        not check.is_file()
-        or "checks/example/default.nix"
-        not in _git(
-            repository,
-            "ls-files",
-        ).splitlines()
+        check.read_text(encoding="utf-8") != formatted
+        or _git(repository, "ls-files", "--stage") != index
+        or f"write '{relative}'" in result.stdout
     ):
-        message = "unittest methods did not generate a staged check"
-        raise AssertionError(message)
-    source = package / "main.py"
-    source.write_text(
-        source.read_text(encoding="utf-8") + tests.read_text(encoding="utf-8"),
-        encoding="utf-8",
-    )
-    artifact = repository / "work-in-progress"
-    artifact.write_text("keep", encoding="utf-8")
-    result = _run(repository, "converge", code=1)
-    if "move test definitions to test_main.py" not in result.stderr:
-        raise AssertionError(result.stderr)
-    if artifact.read_text(encoding="utf-8") != "keep":
-        message = "failed validation cleaned unrelated work"
+        message = "convergence regenerated a formatted host check"
         raise AssertionError(message)
 
 
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ("mv", "packages/example", "hosts/example"),
-        ("add", "packages/bad--name", "python"),
-        ("add", "hosts/bad-name"),
-        ("rm", "../outside"),
-    ],
-)
-def test_invalid_resource_requests_do_not_change_the_checkout(
-    repository: Path,
-    arguments: tuple[str, ...],
-) -> None:
-    """Reject malformed resource operations without staging changes."""
-    before = _git(repository, "status", "--porcelain")
-    _run(repository, *arguments, code=1)
-    if _git(repository, "status", "--porcelain") != before:
-        message = "invalid operation changed the checkout"
+def _check_host_upgrade(repository: Path) -> None:
+    """Upgrade a generated check without changing its host or adding resources."""
+    _run(repository, "add", "hosts/laptop")
+    host = repository / "hosts/laptop/configuration.nix"
+    original_host = host.read_bytes()
+    original_paths = _git(repository, "ls-files").splitlines()
+    relative = "checks/laptopVmWithDisko/default.nix"
+    check = repository / relative
+    current = check.read_bytes()
+    legacy = b'{ pkgs, ... }: pkgs.runCommand "legacy-host-check" {} "mkdir $out"\n'
+    check.write_bytes(legacy)
+    _git(repository, "add", "--", relative)
+    _run(repository, "converge", "--dry-run", code=1)
+    if check.read_bytes() != legacy:
+        message = "dry-run changed the generated check"
+        raise AssertionError(message)
+    _run(repository, "converge")
+    if check.read_bytes() != current:
+        message = "convergence did not upgrade the generated check"
+        raise AssertionError(message)
+    if host.read_bytes() != original_host:
+        message = "check upgrade changed the host configuration"
+        raise AssertionError(message)
+    if _git(repository, "ls-files").splitlines() != original_paths:
+        message = "check upgrade added consumer files"
+        raise AssertionError(message)
+    if _run(repository, "converge", "--dry-run").stdout:
+        message = "check upgrade did not converge"
         raise AssertionError(message)
 
 
-def test_cli_help_and_retired_commands(tmp_path: Path) -> None:
-    """Help works outside a repository and retired commands fail clearly."""
-    for command in (
-        (),
-        ("add",),
-        ("mv",),
-        ("rm",),
-        ("init",),
-        ("converge",),
-        ("overview",),
-        ("test",),
-        ("test", "names"),
-        ("test", "coverage"),
-        ("test", "hypothesis"),
-        ("test", "mutation"),
-    ):
-        option = _run(tmp_path, *command, "--help").stdout
-        alias = _run(tmp_path, "help", *command).stdout
-        if option != alias or "usage:" not in option:
-            raise AssertionError(option)
-    _run(tmp_path, "status", code=2)
-    _run(tmp_path, "check", code=2)
-    for retired_command in ("test-names", "coverage", "hypothesis", "mutation"):
-        _run(tmp_path, retired_command, code=2)
-    help_output = _run(tmp_path, "test", "--help").stdout
-    if _run(tmp_path, "test").stdout != help_output:
-        message = "bare test should show help without running tests"
-        raise AssertionError(message)
-    _run(tmp_path, "test", "unknown", code=2)
-
-
-@pytest.mark.parametrize(
-    "remote",
-    [
-        "https://example.test/team/project.git",
-        "ssh://git@example.test/team/project.git",
-        "git@example.test:team/project.git",
-    ],
-)
-def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(  # noqa: C901
+def _check_remote_initialization(  # noqa: C901
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote: str,
@@ -678,7 +534,7 @@ def test_init_remote_adds_a_home_submodule_and_preserves_git_failures(  # noqa: 
         raise AssertionError(duplicate.stderr)
 
 
-def test_init_flake_stages_home_whitelist_without_force(
+def _check_flake_initialization(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -720,40 +576,7 @@ def test_init_flake_stages_home_whitelist_without_force(
         raise AssertionError(message)
 
 
-@pytest.fixture
-def home_repository(tmp_path: Path) -> Path:
-    """Create a home repository with a locally initialized submodule."""
-    root = tmp_path
-    relative = "forge.example/owner/demo"
-    checkout = root / relative
-    checkout.mkdir(parents=True)
-    _git(root, "init", "--quiet")
-    _git(checkout, "init", "--quiet")
-    _git(checkout, "config", "user.name", "Test")
-    _git(checkout, "config", "user.email", "test@example.org")
-    _git(checkout, "config", "commit.gpgSign", "false")
-    _git(checkout, "remote", "add", "origin", "git@forge.example:owner/demo")
-    source = checkout / "README"
-    source.write_text("first", encoding="utf-8")
-    _git(checkout, "add", "README")
-    _git(checkout, "commit", "--quiet", "-m", "first")
-    first = _git(checkout, "rev-parse", "HEAD").strip()
-    _git(checkout, "update-ref", "refs/remotes/origin/main", first)
-    (root / ".gitmodules").write_text(
-        f'[submodule "{relative}"]\npath = {relative}\n'
-        "url = git@forge.example:owner/demo\n",
-        encoding="utf-8",
-    )
-    (root / ".gitignore").write_text(
-        "*\n!/.gitignore\n!/.gitmodules\n"
-        "!/forge.example/\n!/forge.example/owner/\n!/forge.example/owner/demo\n",
-        encoding="utf-8",
-    )
-    _git(root, "add", "--force", ".gitignore", ".gitmodules", relative)
-    return root
-
-
-def test_home_convergence_preserves_dirty_and_unpublished_submodule_state(
+def _check_home_commits(
     home_repository: Path,
 ) -> None:
     """Leave dirty files and gitlink advancement to native Git."""
@@ -783,7 +606,7 @@ def test_home_convergence_preserves_dirty_and_unpublished_submodule_state(
         raise AssertionError(message)
 
 
-def test_home_convergence_restores_submodule_whitelist(home_repository: Path) -> None:
+def _check_home_whitelist(home_repository: Path) -> None:
     """Repair missing whitelist entries for a registered home submodule."""
     root = home_repository
     ignore = root / ".gitignore"
@@ -808,7 +631,7 @@ def test_home_convergence_restores_submodule_whitelist(home_repository: Path) ->
     _run(root, "converge", "--dry-run")
 
 
-def test_home_convergence_preserves_optional_submodule_settings(
+def _check_home_settings(
     home_repository: Path,
 ) -> None:
     """Allow Git settings beyond the path and URL managed by Canonical."""
@@ -827,29 +650,7 @@ def test_home_convergence_preserves_optional_submodule_settings(
         raise AssertionError(message)
 
 
-def test_home_convergence_rejects_duplicate_submodule_fields(
-    home_repository: Path,
-) -> None:
-    """Reject ambiguous Git configuration instead of silently choosing a URL."""
-    root = home_repository
-    modules = root / ".gitmodules"
-    source = modules.read_text(encoding="utf-8")
-    modules.write_text(
-        source + "url = git@forge.example:owner/other\n",
-        encoding="utf-8",
-    )
-    result = _run(root, "converge", code=1)
-    if "duplicate url field" not in result.stderr:
-        raise AssertionError(result.stderr)
-    if (
-        modules.read_text(encoding="utf-8")
-        != source + "url = git@forge.example:owner/other\n"
-    ):
-        message = "invalid metadata was changed"
-        raise AssertionError(message)
-
-
-def test_home_rename_preserves_dirty_checkout_and_recorded_commit(
+def _check_home_move(
     home_repository: Path,
 ) -> None:
     """Move dirty submodules safely and reject collisions before mutation."""
@@ -858,7 +659,7 @@ def test_home_rename_preserves_dirty_checkout_and_recorded_commit(
     checkout = root / relative
     source = checkout / "README"
     first = _git(checkout, "rev-parse", "HEAD").strip()
-    source.write_text("second", encoding="utf-8")
+    source.write_text("move snapshot", encoding="utf-8")
     _git(checkout, "add", "README")
     _git(checkout, "commit", "--quiet", "-m", "second")
     _git(root, "submodule", "absorbgitdirs", relative)
@@ -918,591 +719,17 @@ def test_home_rename_preserves_dirty_checkout_and_recorded_commit(
     _run(root, "converge", "--dry-run")
 
 
-@pytest.mark.parametrize("kind", ["python", "html", "latex", "nix"])
-def test_dash_case_packages_normalize_nix_names(repository: Path, kind: str) -> None:
-    """Keep dashed resource paths and normalize generated package names."""
-    _run(repository, "add", "packages/dash-case", kind)
-    package = repository / "packages/dash-case"
-    expected = 'builtins.replaceStrings [ "-" ] [ "_" ] (baseNameOf ./.)'
-    if expected not in (package / "default.nix").read_text():
-        msg = "generated Nix package name was not normalized"
-        raise AssertionError(msg)
-    _run(repository, "converge")
-    _run(repository, "converge", "--dry-run")
-    _run(repository, "mv", "packages/dash-case", "packages/another-name")
-    _run(repository, "converge")
-    _run(repository, "rm", "packages/another-name")
-
-
-def test_canonical_is_available_on_path(repository: Path) -> None:
-    """Expose the installed CLI as a standalone command."""
-    environment = dict(os.environ)
-    executable_directory = os.path.dirname(environment["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
-    environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
-    result = subprocess.run(
-        ["canonical", "help"],  # noqa: S607
-        cwd=repository,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
-    if "usage: canonical" not in result.stdout:
-        msg = "PATH did not expose the canonical CLI"
-        raise AssertionError(msg)
-
-
-def _make_test_names_package(root: Path, name: str, source: str) -> Path:
-    """Create a canonical package fixture without executing its source."""
-    package = root / "packages" / name
-    package.mkdir(parents=True)
-    (root / "flake.nix").touch()
-    (package / "default.nix").touch()
-    (package / "main.py").touch()
-    (package / "test_main.py").write_text(source)
-    return package
-
-
-def _run_test_names(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    """Invoke the installed command from a chosen working directory."""
-    return subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "names", *arguments],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-
-
-def test_args_prefers_conventional_public_parser(tmp_path: Path) -> None:
-    """Keep internal helper parsers out of a package's public interface."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text(
-        "import argparse\n"
-        "def helper():\n"
-        "    internal = argparse.ArgumentParser()\n"
-        "    internal.add_argument('--internal')\n"
-        "def parser():\n"
-        "    public = argparse.ArgumentParser()\n"
-        "    public.add_argument('--public')\n"
-        "    return public\n",
-        encoding="utf-8",
-    )
-    if _run(package, "args").stdout != "--public  optional\n":
-        msg = "internal parser leaked into CLI summary"
-        raise AssertionError(msg)
-
-
-def test_args_accepts_an_empty_parser_returned_directly(tmp_path: Path) -> None:
-    """Fixed workflows can return an empty parser without a temporary binding."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text(
-        "import argparse\ndef parser():\n"
-        "    return argparse.ArgumentParser(description='Fixed workflow')\n"
-        "def main(argv=None):\n    parser().parse_args(argv)\n",
-    )
-    if _run(package, "args").stdout:
-        msg = "An empty parser must produce an empty argument contract"
-        raise AssertionError(msg)
-    if "Arguments:\n  (none)" not in _run(package, "overview").stdout:
-        msg = "An empty parser must remain available in the overview"
-        raise AssertionError(msg)
-
-
-def test_python_scaffold_declares_an_empty_cli(repository: Path) -> None:
-    """New executables expose help and reject arguments without running work."""
-    _run(repository, "add", "packages/example", "python")
-    package = repository / "packages/example"
-    if _run(package, "args").stdout:
-        msg = "A fixed workflow must have no custom arguments"
-        raise AssertionError(msg)
-    result = subprocess.run(  # noqa: S603
-        [sys.executable, str(package / "main.py"), "--help"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode or "--help" not in result.stdout:
-        msg = "The generated executable must provide standard help"
-        raise AssertionError(msg)
-    result = subprocess.run(  # noqa: S603
-        [sys.executable, str(package / "main.py"), "unexpected"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 2 or "unrecognized arguments" not in result.stderr:  # noqa: PLR2004
-        msg = "The generated executable must reject unexpected arguments"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("dotted_metadata", [False, True])
-def test_python_library_convergence_removes_only_executable_packaging(
-    repository: Path,
-    *,
-    dotted_metadata: bool,
-) -> None:
-    """Libraries retain resources and metadata across repeated convergence."""
-    _run(repository, "add", "packages/example", "python")
-    package = repository / "packages/example"
-    (package / "main.py").write_text('"""An importable library."""\nVALUE = 1\n')
-    resource = package / "prm" / "asset.txt"
-    resource.parent.mkdir()
-    resource.write_text("preserve this asset")
-    default = package / "default.nix"
-    source = default.read_text()
-    if dotted_metadata:
-        source = source.replace("    mainProgram = pname;", "")
-        source = source.replace(
-            "  passthru.python",
-            "  meta.mainProgram = pname;\n  passthru.python",
-        )
-    default.write_text(source)
-    _run(repository, "converge")
-    source = default.read_text()
-    if "mainProgram" in source or "$out/bin" in source:
-        msg = "Libraries must not install executable wrappers"
-        raise AssertionError(msg)
-    if "description" not in source or "cp -R prm/" not in source:
-        msg = "Library convergence lost metadata or resources"
-        raise AssertionError(msg)
-    if _run(package, "args").stdout != "(not applicable)\n":
-        msg = "Library arguments must be marked not applicable"
-        raise AssertionError(msg)
-    if "Arguments:\n  (not applicable)" not in _run(package, "overview").stdout:
-        msg = "Library overview disagrees with argument discovery"
-        raise AssertionError(msg)
-    _run(repository, "converge", "--dry-run")
-    (package / "main.py").write_text(
-        "import argparse\ndef main():\n    argparse.ArgumentParser().parse_args()\n",
-    )
-    _run(repository, "converge")
-    if (
-        "mainProgram" not in default.read_text()
-        or "$out/bin" not in default.read_text()
-    ):
-        msg = "Adding a main entry point must restore executable packaging"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("executable", [False, True])
-def test_python_check_only_exposes_declared_executables(
-    tmp_path: Path,
-    *,
-    executable: bool,
-) -> None:
-    """Library checks omit a launcher and executable checks honor its name."""
-    subject = import_module("packages.canonical.main")
-    check = tmp_path / "example" / "default.nix"
-    check.parent.mkdir()
-    check.write_text(subject._current_python_test_source())  # noqa: SLF001
-    metadata = '{ mainProgram = "different-name"; }' if executable else "{}"
-    expression = (
-        'let pkgs = { stdenv.system = "test"; '
-        "runCommand = _: attrs: _: attrs; lib = { "
-        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
-        'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
-        'else abort "Library checks must not request an executable"; }; }; '
-        'package = { src = "/source"; propagatedBuildInputs = []; '
-        f'meta = {metadata}; python = {{ withPackages = _: "/python"; }}; }}; '
-        f"in import {json.dumps(str(check))} {{ inherit pkgs; "
-        "inputs.self.packages.test.example = package; }"
-    )
-    result = subprocess.run(  # noqa: S603
-        [  # noqa: S607
-            "nix",
-            "eval",
-            "--store",
-            "dummy://",
-            "--extra-experimental-features",
-            "nix-command",
-            "--impure",
-            "--json",
-            "--expr",
-            expression,
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if result.returncode:
-        raise AssertionError(result.stderr)
-    attributes = json.loads(result.stdout)
-    if executable:
-        if attributes.get("PACKAGE_E2E_EXECUTABLE") != "/package/bin/different-name":
-            msg = "The check must use the declared executable name"
-            raise AssertionError(msg)
-    elif "PACKAGE_E2E_EXECUTABLE" in attributes:
-        msg = "Library checks must not expose a nonexistent executable"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "def main():\n    pass\n",
-        "async def main():\n    pass\n",
-        "from example import main\n",
-        "from example import cli as main\n",
-        "main = lambda: None\n",
-        "main: object = lambda: None\n",
-    ],
-)
-def test_args_keeps_unparsed_executables_unavailable(
-    tmp_path: Path,
-    source: str,
-) -> None:
-    """A main entry point without a declared parser is not an empty CLI."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text(source)
-    result = _run(package, "args", code=1)
-    if "declare parser()" not in result.stderr:
-        msg = "Executables need an actionable parser diagnostic"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize(
-    ("imports", "constructor"),
-    [
-        ("import argparse", "argparse.ArgumentParser"),
-        ("import argparse as cli", "cli.ArgumentParser"),
-        ("from argparse import ArgumentParser as Parser", "Parser"),
-    ],
-)
-def test_args_lists_static_interfaces_without_execution(
-    tmp_path: Path,
-    imports: str,
-    constructor: str,
-) -> None:
-    """Expose aliases, subcommands and declared constraints without imports."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text(
-        f"{imports}\nraise RuntimeError('must not execute')\n"
-        f"parser = {constructor}()\n"
-        "parser.add_argument('-o', '--output', default='out')\n"
-        "commands = parser.add_subparsers()\n"
-        "run = commands.add_parser('run')\n"
-        "run.add_argument('mode', choices=['fast', 'slow'])\n",
-    )
-    result = _run(package, "args")
-    if result.stdout != (
-        "-o, --output  optional; default='out'\n"
-        "run: command\n"
-        "run: mode  required; choices=['fast', 'slow']\n"
-    ):
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-
-
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        (
-            (
-                "import click\n"
-                "@click.command()\n"
-                "@click.option('--count', default=1, help='Number')\n"
-                "def cli(count): pass\n"
-            ),
-            "cli: command\ncli: --count  help=Number\n",
-        ),
-        (
-            (
-                "import typer\n"
-                "app = typer.Typer()\n"
-                "@app.command()\n"
-                "def greet(name: str, formal: bool = False): pass\n"
-            ),
-            (
-                "greet: command\n"
-                "greet: name  required; type=str\n"
-                "greet: --formal  default=False; type=bool\n"
-            ),
-        ),
-        (
-            "import fire\ndef greet(name='world'): pass\nfire.Fire(greet)\n",
-            "greet: command\ngreet: name  default='world'\n",
-        ),
-        (
-            (
-                "import typer\nraise RuntimeError('must not execute')\n"
-                "app = typer.Typer()\n@app.command()\n"
-                "def greet(name: str, suffix: str = '!', *, language: str, "
-                "formal: bool = False, note: str | None = None): pass\n"
-            ),
-            (
-                "greet: command\n"
-                "greet: name  required; type=str\n"
-                "greet: --suffix  default='!'; type=str\n"
-                "greet: language  required; type=str\n"
-                "greet: --formal  default=False; type=bool\n"
-                "greet: --note  default=None; type=str | None\n"
-            ),
-        ),
-        (
-            (
-                "import fire\nraise RuntimeError('must not execute')\n"
-                "def greet(name, /, suffix='!', *, language, count=2, "
-                "note=None): pass\n"
-                "fire.Fire(greet)\n"
-            ),
-            (
-                "greet: command\n"
-                "greet: name  default=required\n"
-                "greet: suffix  default='!'\n"
-                "greet: language  default=required\n"
-                "greet: count  default=2\n"
-                "greet: note  default=None\n"
-            ),
-        ),
-        (
-            (
-                "import fire\nraise RuntimeError('must not execute')\n"
-                "class Tools:\n"
-                " def greet(self, name, /, suffix='!', *, language, count=2, "
-                "note=None): pass\n"
-                " def _hidden(self): pass\n"
-                "fire.Fire(Tools)\n"
-            ),
-            (
-                "greet: command\n"
-                "greet: name  default=required\n"
-                "greet: suffix  default='!'\n"
-                "greet: language  default=required\n"
-                "greet: count  default=2\n"
-                "greet: note  default=None\n"
-            ),
-        ),
-    ],
-)
-def test_args_support_click_fire_and_typer_static_interfaces(
-    tmp_path: Path,
-    source: str,
-    expected: str,
-) -> None:
-    """Describe common Click, Fire, and Typer declarations without execution."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text(source)
-    actual = _run(package, "args")
-    if actual.stdout != expected:
-        message = (
-            f"Unexpected argument review result: {actual.stdout!r} {actual.stderr!r}"
-        )
-        raise AssertionError(message)
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import sys\nprint(sys.argv)\n",
-        "import argparse\np = argparse.ArgumentParser()\np.add_argument(dynamic)\n",
-        (
-            "import argparse\np = argparse.ArgumentParser()\n"
-            "for name in names:\n p.add_argument(name)\n"
-        ),
-    ],
-)
-def test_args_rejects_unsupported_interfaces(tmp_path: Path, source: str) -> None:
-    """Report unsupported interfaces instead of claiming an empty contract."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text(source)
-    result = _run(package, "args", code=1)
-    if "unsupported CLI interface" not in result.stderr:
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-    if result.stdout != "":
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-
-
-@pytest.mark.parametrize(
-    ("source", "path", "parameter"),
-    [
-        (
-            (
-                "import argparse\n"
-                "p = argparse.ArgumentParser()\n"
-                "p.add_argument('--verbose')\n"
-                "commands = p.add_subparsers()\n"
-                "test = commands.add_parser('test')\n"
-                "children = test.add_subparsers()\n"
-                "coverage = children.add_parser('coverage')\n"
-                "coverage.add_argument('--jobs', default=2, type=int)\n"
-            ),
-            ("test", "coverage"),
-            "--jobs  optional; default=2; type=int",
-        ),
-        (
-            (
-                "import click\n"
-                "@click.group()\n"
-                "def cli(): pass\n"
-                "@cli.group(name='test')\n"
-                "def tests(): pass\n"
-                "@tests.command('coverage')\n"
-                "@click.option('--jobs')\n"
-                "def coverage(jobs): pass\n"
-            ),
-            ("cli", "test", "coverage"),
-            "--jobs",
-        ),
-        (
-            (
-                "import typer\n"
-                "app = typer.Typer()\n"
-                "tests = typer.Typer()\n"
-                "app.add_typer(tests, name='test')\n"
-                "@tests.callback()\n"
-                "def settings(verbose: bool = False): pass\n"
-                "@tests.command(name='coverage')\n"
-                "def coverage(jobs: int = 2): pass\n"
-            ),
-            ("test", "coverage"),
-            "--jobs  default=2; type=int",
-        ),
-        (
-            (
-                "import fire\n"
-                "class Tools:\n"
-                " def coverage(self, jobs=2): pass\n"
-                "fire.Fire(Tools)\n"
-            ),
-            ("coverage",),
-            "jobs  default=2",
-        ),
-    ],
-)
-def test_cli_records_retain_command_paths_without_executing_source(
-    source: str,
-    path: tuple[str, ...],
-    parameter: str,
-) -> None:
-    """Keep library-specific ownership in the shared static CLI contract."""
-    subject = import_module("packages.canonical.main")
-    entries = subject.source_package_cli(source.encode(), "main.py")
-    if subject.CliEntry(path, "command", command=True) not in entries:
-        msg = "Missing nested command path"
-        raise AssertionError(msg)
-    if subject.CliEntry(path, parameter) not in entries:
-        msg = "Parameter must belong to its declared command"
-        raise AssertionError(msg)
-    if source.startswith("import typer"):
-        if (
-            subject.CliEntry(("test",), "--verbose  default=False; type=bool")
-            not in entries
-        ):
-            msg = "Callback options must belong to their application"
-            raise AssertionError(msg)
-        if any(entry.path[-1:] == ("settings",) for entry in entries):
-            msg = "Callbacks must not become subcommands"
-            raise AssertionError(msg)
-
-
-def test_args_repository_continues_after_unsupported_package(tmp_path: Path) -> None:
-    """Keep repository listings useful when some interfaces are unsupported."""
-    _make_test_names_package(tmp_path, "alpha", "")
-    package = _make_test_names_package(tmp_path, "zebra", "")
-    (package / "main.py").write_text(
-        "import argparse\np = argparse.ArgumentParser()\n"
-        "p.add_argument('--verbose', action='store_true')\n",
-    )
-    result = _run(tmp_path, "args", code=1)
-    if (
-        result.stdout
-        != (
-            "packages/alpha:\npackages/zebra:\n"
-            "--verbose  optional; action='store_true'\n"
-        )
-        or "alpha: unsupported CLI interface" not in result.stderr
-    ):
-        message = "Repository review did not continue after an unsupported package"
-        raise AssertionError(message)
-
-
-def test_args_git_views_compare_interfaces(repository: Path) -> None:
-    """Compare staged and historical declarations while ignoring body edits."""
-    package = _make_test_names_package(repository, "example", "")
-    source = package / "main.py"
-    before = "import argparse\np = argparse.ArgumentParser()\np.add_argument('--old')\n"
-    source.write_text(before)
-    _git(repository, "add", ".")
-    _git(
-        repository,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.com",
-        "commit",
-        "-qm",
-        "initial",
-    )
-    source.write_text(before + "print('implementation only')\n")
-    if _run(repository, "args", "diff").stdout != "":
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-    source.write_text(before.replace("--old", "--new"))
-    diff = _run(repository, "args", "diff").stdout
-    if "---old  optional" not in diff:
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-    if "+--new  optional" not in diff:
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-    if not ("add_argument" not in diff):
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-    _git(repository, "add", ".")
-    if "+--new  optional" not in _run(repository, "args", "diff", "--staged").stdout:
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-    _git(
-        repository,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.com",
-        "commit",
-        "-qm",
-        "change",
-    )
-    if "+--new  optional" not in _run(repository, "args", "show", "HEAD").stdout:
-        message = "Unexpected argument review result"
-        raise AssertionError(message)
-
-
-def test_command_catalog_tracks_nested_parser_commands(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep client command menus synchronized when CLI commands are added."""
-    subject = import_module("packages.canonical.main")
-    cli = argparse.ArgumentParser(prog="canonical")
-    commands = cli.add_subparsers()
-    added = commands.add_parser("future")
-    added.add_argument("--visible", help="Public option")
-    added.add_argument("--internal", help=argparse.SUPPRESS)
-    children = added.add_subparsers()
-    children.add_parser("nested").add_argument("target")
-    monkeypatch.setattr(subject, "parser", lambda: cli)
-    catalog = subject.command_catalog()
-    if [entry["command"] for entry in catalog] != ["future", "future nested"]:
-        msg = "Catalog must include new commands and their nested commands"
-        raise AssertionError(msg)
-    if "--visible" not in catalog[0]["help"] or "--internal" in catalog[0]["help"]:
-        msg = "Catalog must publish public parser help without hidden options"
-        raise AssertionError(msg)
-
-
-def test_overview_details_preserve_documentation_and_source_facts(
+def _check_overview_details(
     repository: Path,
 ) -> None:
     """Expose structured declarations independently of terminal labels and layout."""
-    subject = import_module("packages.canonical.main")
     package = repository / "packages/example"
     package.mkdir(parents=True)
     help_text = (
-        "First paragraph.\n\nArguments:\n  Documentation text.\n"
+        "First paragraph.\n"
+        "\n"
+        "Arguments:\n"
+        "  Documentation text.\n"
         "Description: Still documentation."
     )
     (package / "default.nix").write_text('{ meta.description = "Example"; }\n')
@@ -1523,7 +750,7 @@ def test_overview_details_preserve_documentation_and_source_facts(
     (asset.parent / "linked.py").symlink_to(package / "main.py")
     (package / "tmp").mkdir()
     (package / "tmp/generated.py").write_text("runtime\n")
-    data = subject.overview_data(repository)
+    data = _overview(repository)
     record = next(node for node in data["nodes"] if node["kind"] == "package")
     details = record["details"]
     if details["help"] != help_text or details["tests"] != ["test result"]:
@@ -1552,47 +779,20 @@ def test_overview_details_preserve_documentation_and_source_facts(
     ]:
         msg = "Asset line counts and suppressions must be structured source facts"
         raise AssertionError(msg)
-    if (
-        record["overview"] != subject.render_resource_overview(details)
-        or subject.overview_data(repository) != data
-    ):
-        msg = "Terminal summaries and deterministic snapshots must use the same facts"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("object_format", ["sha1", "sha256"])
-def test_revision_sources_support_git_object_formats(
-    tmp_path: Path,
-    object_format: str,
-) -> None:
-    """Read Git source objects without assuming an object ID length."""
-    _git(tmp_path, "init", "--quiet", f"--object-format={object_format}")
-    expected = {"flake.nix": "{}\n", "packages/tool/default.nix": "{}\n"}
-    for relative, content in expected.items():
-        path = tmp_path / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    _git(tmp_path, "add", ".")
-    _git(
-        tmp_path,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.com",
-        "commit",
-        "-qm",
-        "baseline",
+    expected = (
+        f"Name: example\nDescription: Example\nHelp: {help_text}\n"
+        "Arguments:\n  build: command\n  build: --jobs  optional; default=2\n"
+        "Dependencies:\n  (none)\nTests:\n  test result\n"
+        "Suppressions:\n  prm/nested/script.js: eslint-disable (global): 1"
     )
-    subject = import_module("packages.canonical.main")
-    current = subject.overview_data(tmp_path)
-    actual = subject.overview_data(tmp_path, revision="HEAD")
-    if [node.get("details") for node in actual["nodes"]] != [
-        node.get("details") for node in current["nodes"]
-    ]:
-        raise AssertionError(actual)
+    _expect(record["overview"] == expected, record)
+    _expect(
+        _run(repository, "overview", "packages/example").stdout == expected + "\n",
+        expected,
+    )
 
 
-def test_overview_revision_sources_preserve_the_checkout_and_cover_all_resources(
+def _check_overview_history(
     repository: Path,
 ) -> None:
     """Read historical regular blobs with the same inventory as current sources."""
@@ -1666,7 +866,7 @@ def test_overview_revision_sources_preserve_the_checkout_and_cover_all_resources
         raise AssertionError(msg)
 
 
-def test_overview_empty_home_roots_and_missing_history_are_explicit(
+def _check_missing_history(
     tmp_path: Path,
 ) -> None:
     """Recognize initialized home policy and distinguish absent HEAD from errors."""
@@ -1699,257 +899,7 @@ def test_overview_empty_home_roots_and_missing_history_are_explicit(
         raise AssertionError(msg)
 
 
-def test_overview_moves_from_catalog_to_package_behavior(repository: Path) -> None:
-    """Expose the reading path without executing the package or its tests."""
-    _run(repository, "add", "packages/alpha", "python", "Alpha package")
-    _run(repository, "add", "packages/zeta", "nix", "Zeta package")
-    package = repository / "packages/alpha"
-    (package / "main.py").write_text(
-        '"""Explain alpha in more detail."""\n'
-        "import argparse\n"
-        "raise RuntimeError('must not execute')\n"
-        "parser = argparse.ArgumentParser()\n"
-        "parser.add_argument('--output', help='Output path')\n",
-        encoding="utf-8",
-    )
-    (package / "test_main.py").write_text(
-        "def test_saves_output(): pass\ndef test_rejects_bad_paths(): pass\n",
-        encoding="utf-8",
-    )
-    catalog = _run(repository, "overview").stdout
-    if catalog != ("packages/alpha: Alpha package\npackages/zeta: Zeta package\n"):
-        raise AssertionError(catalog)
-    detail = _run(repository, "overview", "packages/alpha").stdout
-    for expected in (
-        "Name: alpha\n",
-        "Description: Alpha package\n",
-        "Help: Explain alpha in more detail.\n",
-        "  --output  optional; help='Output path'\n",
-        "  test saves output\n",
-        "  test rejects bad paths\n",
-    ):
-        if expected not in detail:
-            raise AssertionError(detail)
-    full = _run(repository, "overview", "--full").stdout
-    if "packages/alpha:\n" not in full or "packages/zeta:\n" not in full:
-        raise AssertionError(full)
-    if "  (not applicable)\n" not in full:
-        raise AssertionError(full)
-    if "  (not declared)\n" not in full:
-        raise AssertionError(full)
-
-
-def test_overview_counts_local_and_global_suppressions(repository: Path) -> None:
-    """Count directives in comments across Python and HTML package sources."""
-    _run(repository, "add", "packages/python_sample", "python")
-    python_package = repository / "packages/python_sample"
-    (python_package / "main.py").write_text(
-        '"""# noqa is text."""\n'
-        "# ruff: noqa: D\n"
-        "value = 1  # noqa: E501, F401\n"
-        "other = 2  # type: ignore[assignment]\n",
-        encoding="utf-8",
-    )
-    (python_package / "test_main.py").write_text(
-        "def test_one(): pass  # noqa: D103\n",
-        encoding="utf-8",
-    )
-    detail = _run(repository, "overview", "packages/python_sample").stdout
-    for expected in (
-        "main.py: noqa (global): 1",
-        "main.py: noqa (local): 1",
-        "main.py: type: ignore (local): 1",
-        "test_main.py: noqa (local): 1",
-    ):
-        if expected not in detail:
-            raise AssertionError(detail)
-    _run(repository, "add", "packages/html_sample", "html")
-    html_package = repository / "packages/html_sample"
-    (html_package / "index.html").write_text(
-        "<!-- html-validate-disable -->\n"
-        "<!-- html-validate-disable-next heading-level -->\n"
-        "<p>eslint-disable is text</p>\n",
-        encoding="utf-8",
-    )
-    (html_package / "script.js").write_text(
-        'const text = "// eslint-disable";\n'
-        "/* eslint-disable no-alert */\n"
-        "alert(text); // eslint-disable-line no-alert\n",
-        encoding="utf-8",
-    )
-    (html_package / "style.css").write_text(
-        'p::before { content: "/* stylelint-disable */"; }\n'
-        "/* stylelint-disable color-no-invalid-hex */\n",
-        encoding="utf-8",
-    )
-    detail = _run(repository, "overview", "packages/html_sample").stdout
-    for expected in (
-        "index.html: html-validate-disable (global): 1",
-        "index.html: html-validate-disable (local): 1",
-        "script.js: eslint-disable (global): 1",
-        "script.js: eslint-disable (local): 1",
-        "style.css: stylelint-disable (global): 1",
-    ):
-        if expected not in detail:
-            raise AssertionError(detail)
-
-
-@pytest.mark.parametrize(
-    ("filename", "source", "expected"),
-    [
-        (
-            "index.html",
-            '<script>const text = "<!-- htmlhint-disable -->";</script>',
-            {},
-        ),
-        (
-            "script.js",
-            "const value = `${(() => { /* eslint-disable */ return 1; })()}`;",
-            {("eslint-disable", "global"): 1},
-        ),
-        (
-            "script.js",
-            "const value = `/* eslint-disable */`; /* eslint-disable-next-line */",
-            {("eslint-disable", "local"): 1},
-        ),
-        (
-            "style.css",
-            'p { content: "/* stylelint-disable */"; } /* stylelint-disable */',
-            {("stylelint-disable", "global"): 1},
-        ),
-    ],
-)
-def test_web_suppressions_use_comment_nodes(
-    filename: str,
-    source: str,
-    expected: dict[tuple[str, str], int],
-) -> None:
-    """Distinguish real comments from literals and inspect template expressions."""
-    subject = import_module("packages.canonical.main")
-    actual = subject.source_suppressions(filename, source)
-    if actual != expected:
-        raise AssertionError(actual)
-
-
-def test_overview_lists_checked_out_home_flakes(home_repository: Path) -> None:
-    """Include the repository path above packages in a canonical home."""
-    checkout = home_repository / "forge.example/owner/demo"
-    (checkout / "flake.nix").write_text("", encoding="utf-8")
-    (checkout / ".gitignore").write_text("", encoding="utf-8")
-    _run(checkout, "add", "packages/example", "nix", "Example package")
-    output = _run(home_repository, "overview").stdout
-    if output != ("forge.example/owner/demo:\npackages/example: Example package\n"):
-        raise AssertionError(output)
-
-
-def test_overview_dependencies_resolve_aliases_sources_and_skip_comments(
-    repository: Path,
-) -> None:
-    """Parse Canonical references without evaluating Nix or importing package code."""
-    _run(repository, "add", "packages/consumer", "python", "Consumer")
-    _run(repository, "add", "packages/core", "nix", "Core")
-    source = """{ inputs, pkgs, ... }:
-let
-  python = pkgs.python3;
-  local = inputs.self.packages.${pkgs.stdenv.system};
-  pythonDeps = with python.pkgs; [ numpy local.core ];
-  nativeDeps = [ pkgs.makeWrapper ];
-in python.pkgs.buildPythonPackage {
-  propagatedBuildInputs = pythonDeps ++ [ pkgs.git ];
-  nativeBuildInputs = nativeDeps;
-  # propagatedBuildInputs = [ inputs.self.packages.${system}.fake ];
-  description = "inputs.self.packages.system.also_fake";
-  installPhase = "cp ${../core/main.py} result";
-}
-"""
-    package = repository / "packages/consumer"
-    (package / "default.nix").write_text(source, encoding="utf-8")
-    (package / "main.py").write_text(
-        "raise RuntimeError('must not run')\n",
-        encoding="utf-8",
-    )
-    detail = _run(repository, "overview", "packages/consumer").stdout
-    for expected in (
-        "Dependencies:",
-        "runtime: packages/core",
-        "source: packages/core",
-    ):
-        if expected not in detail:
-            raise AssertionError(detail)
-    if any(
-        excluded in detail
-        for excluded in (
-            "packages/fake",
-            "packages/also_fake",
-            "pkgs.python3.pkgs.numpy",
-            "pkgs.makeWrapper",
-            "runtime: pkgs.git",
-        )
-    ):
-        raise AssertionError(detail)
-    first = _run(repository, "overview", "--json").stdout
-    if _run(repository, "overview", "--json").stdout != first:
-        msg = "Identical source must produce byte-identical JSON"
-        raise AssertionError(msg)
-    data = json.loads(first)
-    if (
-        data["schema"] != "canonical.overview"
-        or data["analysis"] != "source-declarations"
-        or any(node["kind"] == "dependency" for node in data["nodes"])
-    ):
-        raise AssertionError(data)
-    if not any(
-        edge["source"] == ".:packages/core"
-        and edge["target"] == ".:packages/consumer"
-        and edge["kind"] == "runtime"
-        for edge in data["edges"]
-    ):
-        raise AssertionError(data)
-    if any(
-        not dependency["target"].startswith("packages/")
-        for node in data["nodes"]
-        for dependency in node.get("dependencies", [])
-    ):
-        raise AssertionError(data)
-    focus = json.loads(
-        _run(repository, "overview", "packages/consumer", "--json").stdout,
-    )
-    if focus["focus"] != ".:packages/consumer":
-        raise AssertionError(focus)
-    (package / "default.nix").write_text(
-        source.replace("local.core", "local.missing"),
-        encoding="utf-8",
-    )
-    changed = json.loads(_run(repository, "overview", "--json").stdout)
-    if not any(
-        node["id"] == ".:packages/missing" and node["kind"] == "package-reference"
-        for node in changed["nodes"]
-    ):
-        raise AssertionError(changed)
-
-
-def test_overview_dependency_cycles_and_computed_expressions_are_opaque(
-    repository: Path,
-) -> None:
-    """Avoid inventing active dependencies for recursive aliases and conditions."""
-    _run(repository, "add", "packages/computed", "nix", "Computed dependencies")
-    (repository / "packages/computed/default.nix").write_text(
-        """{ pkgs, ... }: let
-      one = two; two = one;
-    in { buildInputs = one;
-      nativeBuildInputs = if pkgs.stdenv.isLinux then [ pkgs.git ] else []; }
-    """,
-        encoding="utf-8",
-    )
-    detail = _run(repository, "overview", "packages/computed").stdout
-    if "Dependencies:\n  (none)" not in detail:
-        raise AssertionError(detail)
-    data = json.loads(_run(repository, "overview", "--json").stdout)
-    if any(node.get("dependencies") for node in data["nodes"]):
-        raise AssertionError(data)
-
-
-def test_overview_json_namespaces_home_packages_and_links_checks(
+def _check_home_graph(
     home_repository: Path,
 ) -> None:
     """Keep same-named packages distinct and expose Canonical check relationships."""
@@ -1982,7 +932,7 @@ def test_overview_json_namespaces_home_packages_and_links_checks(
         raise AssertionError(data)
 
 
-def test_overview_host_packages_keep_scope_and_source_declarations(
+def _check_host_graph(
     home_repository: Path,
 ) -> None:
     """Link host package usage without confusing repositories or external inputs."""
@@ -2030,472 +980,7 @@ def test_overview_host_packages_keep_scope_and_source_declarations(
         raise AssertionError(edges)
 
 
-@pytest.mark.parametrize("explicit", [False, True])
-@pytest.mark.parametrize("package_name", ["example", "my-package"])
-def test_names_package_names_become_sentences_without_executing_source(
-    tmp_path: Path,
-    package_name: str,
-    *,
-    explicit: bool,
-) -> None:
-    """Preserve the test prefix and parse decorators, async tests and test classes."""
-    source = (
-        "raise RuntimeError('must not execute')\n"
-        "@unknown_decorator()\n"
-        "def test_saves_valid_input(): pass\n"
-        "async def test_async_behavior(): pass\n"
-        "def helper():\n    def test_nested(): pass\n"
-        "class Helper:\n    def test_hidden(self): pass\n"
-        "class TestBehavior:\n    def test_method(self): pass\n"
-        "def test_double__underscore(): pass\n"
-    )
-    package = _make_test_names_package(tmp_path, package_name, source)
-    result = _run_test_names(
-        tmp_path if explicit else package,
-        *([str(package)] if explicit else []),
-    )
-    if not (result.returncode == 0):
-        raise AssertionError(result.stderr)
-    if result.stdout != (
-        "test async behavior\ntest double  underscore\ntest method\n"
-        "test saves valid input\n"
-    ):
-        msg = f"Unexpected CLI result: {result}"
-        raise AssertionError(msg)
-    if result.stderr != "":
-        msg = "Expectation failed: result.stderr == ''"
-        raise AssertionError(msg)
-    if (package / "test_main.py").read_text() != source:
-        msg = "Expectation failed: (package / 'test_main.py').read_text() == source"
-        raise AssertionError(msg)
-    if (tmp_path / "tmp").exists():
-        msg = "Expectation failed: not (tmp_path / 'tmp').exists()"
-        raise AssertionError(msg)
-
-
-def test_names_unittest_aliases_and_local_subclasses_are_recognized(
-    tmp_path: Path,
-) -> None:
-    """List methods of statically recognized unittest classes."""
-    package = _make_test_names_package(
-        tmp_path,
-        "example",
-        "import unittest as unit\n"
-        "from unittest import TestCase as Case, IsolatedAsyncioTestCase\n"
-        "class Reports(unit.TestCase):\n    def test_report(self): pass\n"
-        "class Base(Case): pass\n"
-        "class Derived(Base):\n    def test_derived(self): pass\n"
-        "class AsyncChecks(IsolatedAsyncioTestCase):\n"
-        "    async def test_async(self): pass\n",
-    )
-    result = _run_test_names(package)
-    if not (result.returncode == 0):
-        raise AssertionError(result.stderr)
-    if result.stdout != "test async\ntest derived\ntest report\n":
-        msg = f"Unexpected CLI result: {result}"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("explicit", [False, True])
-def names_repository_groups_sorted_packages_and_skips_untested_packages(
-    tmp_path: Path,
-    *,
-    explicit: bool,
-) -> None:
-    """Match runner target discovery while reporting sentences by package."""
-    _make_test_names_package(tmp_path, "zebra", "def test_last(): pass\n")
-    _make_test_names_package(tmp_path, "alpha", "def test_first(): pass\n")
-    missing = _make_test_names_package(tmp_path, "untested", "")
-    (missing / "test_main.py").unlink()
-    (tmp_path / "packages/linked").symlink_to(missing, target_is_directory=True)
-    result = _run_test_names(tmp_path, *([str(tmp_path)] if explicit else []))
-    if not (result.returncode == 0):
-        raise AssertionError(result.stderr)
-    if result.stdout != "packages/alpha:\ntest first\npackages/zebra:\ntest last\n":
-        msg = f"Unexpected CLI result: {result}"
-        raise AssertionError(msg)
-    if result.stderr != "Skipping untested: no test_main.py\n":
-        msg = f"Unexpected CLI result: {result}"
-        raise AssertionError(msg)
-
-
-def names_repository_continues_after_a_malformed_test_file(tmp_path: Path) -> None:
-    """Report a parse error while still printing later packages."""
-    _make_test_names_package(tmp_path, "broken", "def invalid(")
-    _make_test_names_package(tmp_path, "valid", "def test_still_listed(): pass\n")
-    result = _run_test_names(tmp_path)
-    if result.returncode != 1:
-        msg = "Expectation failed: result.returncode == 1"
-        raise AssertionError(msg)
-    if "test still listed\n" not in result.stdout:
-        msg = "Expectation failed: 'test still listed\\n' in result.stdout"
-        raise AssertionError(msg)
-    if "canonical test names: broken:" not in result.stderr:
-        msg = "Expectation failed: 'canonical test names: broken:' in result.stderr"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("layout", ["missing", "syntax", "encoding", "linked"])
-def test_names_invalid_test_files_return_failure(tmp_path: Path, layout: str) -> None:
-    """Reject missing, malformed, undecodable and linked source files."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    source = package / "test_main.py"
-    if layout == "missing":
-        source.unlink()
-    elif layout == "syntax":
-        source.write_text("def invalid(")
-    elif layout == "encoding":
-        source.write_bytes(b"\xff")
-    else:
-        source.unlink()
-        source.symlink_to(package / "main.py")
-    result = _run_test_names(package)
-    if result.returncode != 1:
-        msg = "Expectation failed: result.returncode == 1"
-        raise AssertionError(msg)
-    if "canonical test names:" not in result.stderr:
-        msg = "Expectation failed: 'canonical test names:' in result.stderr"
-        raise AssertionError(msg)
-    if result.stdout != "":
-        msg = "Expectation failed: result.stdout == ''"
-        raise AssertionError(msg)
-
-
-def test_names_empty_test_file_succeeds_without_sentences(tmp_path: Path) -> None:
-    """An empty test file has no specifications to print."""
-    package = _make_test_names_package(tmp_path, "example", "")
-    result = _run_test_names(package)
-    if result.returncode != 0:
-        msg = "Expectation failed: result.returncode == 0"
-        raise AssertionError(msg)
-    if not (result.stdout == result.stderr == ""):
-        msg = "Expectation failed: result.stdout == result.stderr == ''"
-        raise AssertionError(msg)
-
-
-def test_names_cli_help_invalid_targets_and_unsupported_options(tmp_path: Path) -> None:
-    """Share target and help conventions without accepting execution budgets."""
-    usage_error = 2
-    result = _run_test_names(tmp_path, "--help")
-    if result.returncode != 0:
-        msg = "Expectation failed: result.returncode == 0"
-        raise AssertionError(msg)
-    if "[target]" not in result.stdout:
-        msg = "Expectation failed: '[target]' in result.stdout"
-        raise AssertionError(msg)
-    if "current directory" not in result.stdout:
-        msg = "Expectation failed: 'current directory' in result.stdout"
-        raise AssertionError(msg)
-    if _run_test_names(tmp_path).returncode != 1:
-        msg = "Expectation failed: run_cli(tmp_path).returncode == 1"
-        raise AssertionError(msg)
-    if _run_test_names(tmp_path, "--timeout", "60").returncode != usage_error:
-        msg = f"Unexpected CLI result: {result}"
-        raise AssertionError(msg)
-    if _run_test_names(tmp_path, "--max-examples", "100").returncode != usage_error:
-        msg = f"Unexpected CLI result: {result}"
-        raise AssertionError(msg)
-    (tmp_path / "flake.nix").touch()
-    result = _run_test_names(tmp_path)
-    if result.returncode != 1:
-        msg = "Expectation failed: result.returncode == 1"
-        raise AssertionError(msg)
-    if "no Python packages found" not in result.stderr:
-        msg = "Expectation failed: 'no Python packages found' in result.stderr"
-        raise AssertionError(msg)
-
-
-def _test_names_git(root: Path, *arguments: str) -> str:
-    """Run fixture Git commands with a local identity and no signing."""
-    return subprocess.run(  # noqa: S603
-        [  # noqa: S607
-            "git",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            *arguments,
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    ).stdout
-
-
-@pytest.fixture
-def names_repository(tmp_path: Path) -> Path:
-    """Create distinct previous, HEAD, staged and working-tree sentences."""
-    _test_names_git(tmp_path, "init", "-q")
-    package = _make_test_names_package(
-        tmp_path,
-        "example",
-        "def test_previous(): pass\n",
-    )
-    _test_names_git(tmp_path, "add", ".")
-    _test_names_git(tmp_path, "commit", "-qm", "Initial tests")
-    source = package / "test_main.py"
-    source.write_text("def test_committed(): pass\n")
-    _test_names_git(tmp_path, "add", ".")
-    _test_names_git(tmp_path, "commit", "-qm", "Rename the test")
-    source.write_text("def test_staged(): pass\n")
-    _test_names_git(tmp_path, "add", ".")
-    source.write_text("def test_working(): pass\n")
-    (package / "main.py").write_text("PRIVATE_IMPLEMENTATION = 1\n")
-    return tmp_path
-
-
-@pytest.mark.parametrize(
-    ("arguments", "removed", "added"),
-    [
-        (("diff",), "staged", "working"),
-        (("diff", "--staged"), "committed", "staged"),
-        (("diff", "--cached"), "committed", "staged"),
-        (("diff", "HEAD"), "committed", "working"),
-        (("diff", "HEAD~1", "HEAD"), "previous", "committed"),
-        (("show",), "previous", "committed"),
-        (("show", "HEAD"), "previous", "committed"),
-        (("diff", "-R"), "working", "staged"),
-    ],
-)
-def test_names_git_compares_sentences_using_native_revision_and_index_semantics(
-    names_repository: Path,
-    arguments: tuple[str, ...],
-    removed: str,
-    added: str,
-) -> None:
-    """Let Git select versions while exposing only test-name sentences."""
-    result = _run_test_names(names_repository, *arguments)
-    if result.returncode != 0 or result.stderr:
-        raise AssertionError(result)
-    if (
-        f"-test {removed}\n" not in result.stdout
-        or f"+test {added}\n" not in result.stdout
-    ):
-        raise AssertionError(result.stdout)
-    if "def test_" in result.stdout or "PRIVATE_IMPLEMENTATION" in result.stdout:
-        raise AssertionError(result.stdout)
-    if arguments[0] == "show" and "Rename the test" not in result.stdout:
-        raise AssertionError(result.stdout)
-
-
-def test_names_git_path_filters_intersect_test_scope_and_work_from_subdirectories(
-    names_repository: Path,
-) -> None:
-    """Explicit source paths never widen the test-only view."""
-    _make_test_names_package(names_repository, "other", "def test_other(): pass\n")
-    _test_names_git(names_repository, "add", "packages/other")
-    result = _run_test_names(
-        names_repository,
-        "diff",
-        "HEAD",
-        "--",
-        "packages/example",
-    )
-    if "+test working" not in result.stdout or "test other" in result.stdout:
-        raise AssertionError(result)
-    excluded = _run_test_names(
-        names_repository,
-        "diff",
-        "HEAD",
-        "--",
-        "packages/example/main.py",
-    )
-    if excluded.returncode != 0 or excluded.stdout:
-        raise AssertionError(excluded)
-    local = _run_test_names(
-        names_repository / "packages/example",
-        "diff",
-        "HEAD",
-        "--",
-        ".",
-    )
-    if local.returncode != 0 or local.stdout != result.stdout:
-        raise AssertionError(local)
-    all_packages = _run_test_names(
-        names_repository / "packages/example",
-        "diff",
-        "HEAD",
-    )
-    if all_packages.returncode != 0 or "+test other" not in all_packages.stdout:
-        raise AssertionError(all_packages)
-
-
-def test_names_body_edits_and_untracked_files_have_no_sentence_patch(
-    names_repository: Path,
-) -> None:
-    """Keep Git tracking rules and hide edits outside extracted names."""
-    (names_repository / "packages/example/test_main.py").write_text(
-        "raise RuntimeError('never execute')\ndef test_staged(): assert False\n",
-    )
-    _make_test_names_package(
-        names_repository,
-        "untracked",
-        "def test_untracked(): pass\n",
-    )
-    result = _run_test_names(names_repository, "diff")
-    if result.returncode != 0 or result.stdout or result.stderr:
-        raise AssertionError(result)
-
-
-def test_names_deleted_packages_and_initial_commits_use_historical_sources(
-    names_repository: Path,
-) -> None:
-    """Do not require historical packages to exist in the working tree."""
-    _test_names_git(names_repository, "rm", "-rf", "packages/example")
-    _test_names_git(names_repository, "commit", "-qm", "Delete package")
-    deleted = _run_test_names(names_repository, "show")
-    initial = _run_test_names(names_repository, "show", "HEAD~2")
-    historical = _run_test_names(names_repository, "diff", "HEAD~2", "HEAD~1")
-    for result, sentence in (
-        (deleted, "-test committed"),
-        (initial, "+test previous"),
-        (historical, "+test committed"),
-    ):
-        if result.returncode != 0 or sentence not in result.stdout:
-            raise AssertionError(result)
-
-
-def test_names_git_preserves_exit_codes_and_reports_parse_and_revision_errors(
-    names_repository: Path,
-) -> None:
-    """Surface Git failures and converter failures without raw source output."""
-    changed = _run_test_names(names_repository, "diff", "--exit-code")
-    if changed.returncode != 1 or "+test working" not in changed.stdout:
-        raise AssertionError(changed)
-    missing = _run_test_names(
-        names_repository,
-        "diff",
-        "nonexistent-revision",
-        "--",
-    )
-    if missing.returncode == 0 or not missing.stderr:
-        raise AssertionError(missing)
-    (names_repository / "packages/example/test_main.py").write_text("def invalid(")
-    malformed = _run_test_names(names_repository, "diff")
-    if malformed.returncode == 0 or "canonical test names:" not in malformed.stderr:
-        raise AssertionError(malformed)
-
-
-def test_names_git_rejects_conflicting_attributes_without_changing_repository(
-    names_repository: Path,
-) -> None:
-    """Temporary Git configuration cannot silently lose to repository attributes."""
-    attributes = names_repository / ".gitattributes"
-    attributes.write_text("packages/*/test_main.py diff=custom\n")
-    preserved = [
-        names_repository / ".git/config",
-        names_repository / ".git/index",
-        attributes,
-        names_repository / "packages/example/test_main.py",
-    ]
-    before = [path.read_bytes() for path in preserved]
-    result = _run_test_names(names_repository, "diff")
-    if result.returncode == 0 or "conflicting diff attribute" not in result.stderr:
-        raise AssertionError(result)
-    if result.stdout or before != [path.read_bytes() for path in preserved]:
-        raise AssertionError(result)
-
-
-def test_names_git_views_leave_configuration_index_sources_and_refs_unchanged(
-    names_repository: Path,
-) -> None:
-    """Do not install attributes, stage files, or cache converted blobs."""
-    paths = [
-        names_repository / ".git/config",
-        names_repository / ".git/index",
-        names_repository / "packages/example/test_main.py",
-    ]
-    before = [path.read_bytes() for path in paths]
-    refs = _test_names_git(names_repository, "show-ref")
-    for arguments in (("diff",), ("diff", "--staged"), ("show",)):
-        result = _run_test_names(names_repository, *arguments)
-        if result.returncode != 0:
-            raise AssertionError(result)
-    if before != [path.read_bytes() for path in paths] or refs != _test_names_git(
-        names_repository,
-        "show-ref",
-    ):
-        message = "Git view changed repository state"
-        raise AssertionError(message)
-    if (names_repository / ".gitattributes").exists() or (
-        names_repository / ".git/info/attributes"
-    ).exists():
-        message = "Git view installed repository attributes"
-        raise AssertionError(message)
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ("diff", "--no-index"),
-        ("diff", "--no-textconv"),
-        ("diff", "--check"),
-        ("show", "HEAD:packages/example/test_main.py"),
-        ("show", "HEAD^{tree}"),
-    ],
-)
-def test_names_git_rejects_views_that_cannot_produce_test_name_diffs(
-    names_repository: Path,
-    arguments: tuple[str, ...],
-) -> None:
-    """Blob/tree display and raw-source modes are not sentence diffs."""
-    result = _run_test_names(names_repository, *arguments)
-    if result.returncode == 0 or result.stdout or not result.stderr:
-        raise AssertionError(result)
-
-
-@pytest.mark.parametrize("committed", [False, True])
-def test_names_git_rejects_symlink_diffs_in_working_and_historical_files(
-    names_repository: Path,
-    *,
-    committed: bool,
-) -> None:
-    """Git must not display symlink targets as test sentences."""
-    source = names_repository / "packages/example/test_main.py"
-    source.unlink()
-    source.symlink_to("PRIVATE_TARGET")
-    if committed:
-        _test_names_git(names_repository, "add", "packages/example/test_main.py")
-        _test_names_git(names_repository, "commit", "-qm", "Link test file")
-        source.unlink()
-        source.write_text("def test_working(): pass\n")
-    result = _run_test_names(names_repository, "show" if committed else "diff")
-    if result.returncode == 0 or result.stdout or "regular files" not in result.stderr:
-        raise AssertionError(result)
-
-
-def test_names_git_rename_detection_and_formatting_remain_native(
-    names_repository: Path,
-) -> None:
-    """Git handles file renames and user-selected patch presentation."""
-    _test_names_git(names_repository, "reset", "--hard", "HEAD")
-    _test_names_git(names_repository, "mv", "packages/example", "packages/renamed")
-    renamed = _run_test_names(names_repository, "diff", "--staged", "-M")
-    if (
-        renamed.returncode != 0
-        or "rename to packages/renamed/test_main.py" not in renamed.stdout
-    ):
-        raise AssertionError(renamed)
-    if "main.py" in renamed.stdout.replace("test_main.py", ""):
-        raise AssertionError(renamed.stdout)
-    formatted = _run_test_names(
-        names_repository,
-        "show",
-        "--format=%s",
-        "--color=never",
-        "-U0",
-    )
-    if formatted.returncode != 0 or not formatted.stdout.startswith(
-        "Rename the test\n",
-    ):
-        raise AssertionError(formatted)
-
-
-def test_names_merge_show_uses_gits_combined_sentence_diff(
+def _check_merge_diff(
     names_repository: Path,
 ) -> None:
     """Preserve combined merge presentation instead of inventing a first parent."""
@@ -2537,20 +1022,10 @@ def test_names_merge_show_uses_gits_combined_sentence_diff(
         raise AssertionError(result)
 
 
-def test_names_staged_diff_works_before_the_first_commit(tmp_path: Path) -> None:
-    """Let Git compare an unborn HEAD to newly staged tests."""
-    _test_names_git(tmp_path, "init", "-q")
-    _make_test_names_package(tmp_path, "example", "def test_first(): pass\n")
-    _test_names_git(tmp_path, "add", ".")
-    result = _run_test_names(tmp_path, "diff", "--staged")
-    if result.returncode != 0 or "+test first" not in result.stdout:
-        raise AssertionError(result)
-
-
-def test_names_git_views_preserve_definition_order_while_listings_remain_sorted(
+def _check_definition_order(
     tmp_path: Path,
 ) -> None:
-    """Appended tests remain appended in patches, including methods and async tests."""
+    """Append methods and async tests in declaration order in patches."""
     _test_names_git(tmp_path, "init", "-q")
     package = _make_test_names_package(tmp_path, "example", "def test_zebra(): pass\n")
     _test_names_git(tmp_path, "add", ".")
@@ -2578,725 +1053,2031 @@ def test_names_git_views_preserve_definition_order_while_listings_remain_sorted(
         raise AssertionError(listing)
 
 
-@pytest.mark.parametrize("arguments", [(), ("diff",), ("diff", "--staged"), ("show",)])
-def test_names_are_available_through_canonical(
-    names_repository: Path,
-    arguments: tuple[str, ...],
+def _check_command_catalog(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The public command preserves listing, patch output and exit status."""
-    environment = dict(os.environ)
-    executable_directory = os.path.dirname(environment["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
-    environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
-    expected = _run_test_names(names_repository, *arguments)
-    result = subprocess.run(  # noqa: S603
-        ["canonical", "test", "names", *arguments],  # noqa: S607
-        cwd=names_repository,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
+    """Keep client command menus synchronized when CLI commands are added."""
+    subject = import_module("packages.canonical.main")
+    cli = argparse.ArgumentParser(prog="canonical")
+    commands = cli.add_subparsers()
+    added = commands.add_parser("future")
+    added.add_argument("--visible", help="Public option")
+    added.add_argument("--internal", help=argparse.SUPPRESS)
+    children = added.add_subparsers()
+    children.add_parser("nested").add_argument("target")
+    monkeypatch.setattr(subject, "parser", lambda: cli)
+    catalog = subject.command_catalog()
+    if [entry["command"] for entry in catalog] != ["future", "future nested"]:
+        msg = "Catalog must include new commands and their nested commands"
+        raise AssertionError(msg)
+    if "--visible" not in catalog[0]["help"] or "--internal" in catalog[0]["help"]:
+        msg = "Catalog must publish public parser help without hidden options"
+        raise AssertionError(msg)
+
+
+def _names_repository(tmp_path: Path) -> Path:
+    """Create distinct previous, HEAD, staged and working-tree sentences."""
+    _test_names_git(tmp_path, "init", "-q")
+    package = _make_test_names_package(
+        tmp_path,
+        "example",
+        "def test_previous(): pass\n",
     )
-    if (result.returncode, result.stdout, result.stderr) != (
-        expected.returncode,
-        expected.stdout,
-        expected.stderr,
-    ):
-        raise AssertionError(result)
+    _test_names_git(tmp_path, "add", ".")
+    _test_names_git(tmp_path, "commit", "-qm", "Initial tests")
+    source = package / "test_main.py"
+    source.write_text("def test_committed(): pass\n")
+    _test_names_git(tmp_path, "add", ".")
+    _test_names_git(tmp_path, "commit", "-qm", "Rename the test")
+    source.write_text("def test_staged(): pass\n")
+    _test_names_git(tmp_path, "add", ".")
+    source.write_text("def test_working(): pass\n")
+    (package / "main.py").write_text("PRIVATE_IMPLEMENTATION = 1\n")
+    return tmp_path
 
 
-def _make_runner_target(
-    root: Path,
-    source: str,
-    tests: str,
-    *,
-    name: str = "example",
-) -> Path:
-    """Create a minimal canonical package for an isolated test."""
-    package = root / "packages" / name
-    package.mkdir(parents=True)
-    (root / "flake.nix").write_text("{}", encoding="utf-8")
-    (package / "default.nix").write_text("{}", encoding="utf-8")
-    (package / "main.py").write_text(source, encoding="utf-8")
-    (package / "test_main.py").write_text(tests, encoding="utf-8")
-    return package
+CLI_CONTRACTS = (
+    (
+        (
+            "import click\n"
+            "@click.command()\n"
+            "@click.option('--count', default=1, help='Number')\n"
+            "def cli(count): pass\n"
+        ),
+        "cli: command\ncli: --count  help=Number\n",
+    ),
+    (
+        (
+            "import typer\n"
+            "app = typer.Typer()\n"
+            "@app.command()\n"
+            "def greet(name: str, formal: bool = False): pass\n"
+        ),
+        (
+            "greet: command\n"
+            "greet: name  required; type=str\n"
+            "greet: --formal  default=False; type=bool\n"
+        ),
+    ),
+    (
+        "import fire\ndef greet(name='world'): pass\nfire.Fire(greet)\n",
+        "greet: command\ngreet: name  default='world'\n",
+    ),
+    (
+        (
+            "import typer\n"
+            "raise RuntimeError('must not execute')\n"
+            "app = typer.Typer()\n"
+            "@app.command()\n"
+            "def greet(name: str, suffix: str = '!', *, language: str, "
+            "formal: bool = False, note: str | None = None): pass\n"
+        ),
+        (
+            "greet: command\n"
+            "greet: name  required; type=str\n"
+            "greet: --suffix  default='!'; type=str\n"
+            "greet: language  required; type=str\n"
+            "greet: --formal  default=False; type=bool\n"
+            "greet: --note  default=None; type=str | None\n"
+        ),
+    ),
+    (
+        (
+            "import fire\n"
+            "raise RuntimeError('must not execute')\n"
+            "def greet(name, /, suffix='!', *, language, count=2, "
+            "note=None): pass\n"
+            "fire.Fire(greet)\n"
+        ),
+        (
+            "greet: command\n"
+            "greet: name  default=required\n"
+            "greet: suffix  default='!'\n"
+            "greet: language  default=required\n"
+            "greet: count  default=2\n"
+            "greet: note  default=None\n"
+        ),
+    ),
+    (
+        (
+            "import fire\n"
+            "raise RuntimeError('must not execute')\n"
+            "class Tools:\n"
+            " def greet(self, name, /, suffix='!', *, language, count=2, "
+            "note=None): pass\n"
+            " def _hidden(self): pass\n"
+            "fire.Fire(Tools)\n"
+        ),
+        (
+            "greet: command\n"
+            "greet: name  default=required\n"
+            "greet: suffix  default='!'\n"
+            "greet: language  default=required\n"
+            "greet: count  default=2\n"
+            "greet: note  default=None\n"
+        ),
+    ),
+    ("import argparse\ndef parser():\n    return argparse.ArgumentParser()\n", ""),
+    ("VALUE = 1\n", "(not applicable)\n"),
+    (
+        (
+            "import argparse\n"
+            "def helper():\n"
+            " p = argparse.ArgumentParser()\n"
+            ' p.add_argument("--internal")\n'
+            "def parser():\n"
+            " p = argparse.ArgumentParser()\n"
+            ' p.add_argument("--public")\n'
+            " return p\n"
+        ),
+        "--public  optional\n",
+    ),
+    (
+        (
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            'p.add_argument("-o", "--output", default="out")\n'
+            "commands = p.add_subparsers()\n"
+            'run = commands.add_parser("run")\n'
+            'run.add_argument("mode", choices=["fast", "slow"])\n'
+        ),
+        (
+            "-o, --output  optional; default='out'\n"
+            "run: command\n"
+            "run: mode  required; choices=['fast', 'slow']\n"
+        ),
+    ),
+    (
+        (
+            "import argparse as cli\n"
+            "p = cli.ArgumentParser()\n"
+            'p.add_argument("-o", "--output", default="out")\n'
+            "commands = p.add_subparsers()\n"
+            'run = commands.add_parser("run")\n'
+            'run.add_argument("mode", choices=["fast", "slow"])\n'
+        ),
+        (
+            "-o, --output  optional; default='out'\n"
+            "run: command\n"
+            "run: mode  required; choices=['fast', 'slow']\n"
+        ),
+    ),
+    (
+        (
+            "from argparse import ArgumentParser as Parser\n"
+            "p = Parser()\n"
+            'p.add_argument("-o", "--output", default="out")\n'
+            "commands = p.add_subparsers()\n"
+            'run = commands.add_parser("run")\n'
+            'run.add_argument("mode", choices=["fast", "slow"])\n'
+        ),
+        (
+            "-o, --output  optional; default='out'\n"
+            "run: command\n"
+            "run: mode  required; choices=['fast', 'slow']\n"
+        ),
+    ),
+)
+NESTED_CONTRACTS = (
+    (
+        (
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--verbose')\n"
+            "commands = p.add_subparsers()\n"
+            "test = commands.add_parser('test')\n"
+            "children = test.add_subparsers()\n"
+            "coverage = children.add_parser('coverage')\n"
+            "coverage.add_argument('--jobs', default=2, type=int)\n"
+        ),
+        ("test", "coverage"),
+        "--jobs  optional; default=2; type=int",
+    ),
+    (
+        (
+            "import click\n"
+            "@click.group()\n"
+            "def cli(): pass\n"
+            "@cli.group(name='test')\n"
+            "def tests(): pass\n"
+            "@tests.command('coverage')\n"
+            "@click.option('--jobs')\n"
+            "def coverage(jobs): pass\n"
+        ),
+        ("cli", "test", "coverage"),
+        "--jobs",
+    ),
+    (
+        (
+            "import typer\n"
+            "app = typer.Typer()\n"
+            "tests = typer.Typer()\n"
+            "app.add_typer(tests, name='test')\n"
+            "@tests.callback()\n"
+            "def settings(verbose: bool = False): pass\n"
+            "@tests.command(name='coverage')\n"
+            "def coverage(jobs: int = 2): pass\n"
+        ),
+        ("test", "coverage"),
+        "--jobs  default=2; type=int",
+    ),
+    (
+        (
+            "import fire\n"
+            "class Tools:\n"
+            " def coverage(self, jobs=2): pass\n"
+            "fire.Fire(Tools)\n"
+        ),
+        ("coverage",),
+        "jobs  default=2",
+    ),
+)
+UNSUPPORTED_INTERFACES = (
+    "def main():\n    pass\n",
+    "async def main():\n    pass\n",
+    "from example import main\n",
+    "from example import cli as main\n",
+    "main = lambda: None\n",
+    "main: object = lambda: None\n",
+    "import sys\nprint(sys.argv)\n",
+    "import argparse\np = argparse.ArgumentParser()\np.add_argument(dynamic)\n",
+    (
+        "import argparse\n"
+        "p = argparse.ArgumentParser()\n"
+        "for name in names:\n"
+        " p.add_argument(name)\n"
+    ),
+)
 
 
-def _prepare_runner_flake(
-    root: Path,
-    tests: str,
-    source: str = "def main():\n    print('ready')\n",
-    *,
-    name: str = "example",
-) -> dict[str, str]:
-    """Provide an offline flake backed by this check's real Python environment."""
-    package = _make_runner_target(root, source, tests, name=name)
-    (package / "main.py").write_text(source, encoding="utf-8")
-    dependency = root / "prm/nixpkgs"
-    dependency.mkdir(parents=True)
-    (dependency / "flake.nix").write_text("{ outputs = _: {}; }", encoding="utf-8")
-    (dependency / "default.nix").write_text(
-        "_: { lib = { concatMap = f: xs: builtins.concatLists (map f xs); "
-        'makeBinPath = _: ""; }; writeText = builtins.toFile; }',
-        encoding="utf-8",
-    )
-    (root / "flake.nix").write_text(
-        '{ inputs.nixpkgs.url = "path:./prm/nixpkgs"; '
-        "outputs = _: { packages.${builtins.currentSystem}."
-        f"{json.dumps(name)}.python"
-        ".withPackages = "
-        f"_ : {json.dumps(sys.prefix)}; }}; }}",
-        encoding="utf-8",
-    )
-    for args in (["init", "--quiet"], ["add", "."]):
-        subprocess.run(  # noqa: S603
-            ["git", "-C", str(root), *args],  # noqa: S607
-            check=True,
-            capture_output=True,
-            timeout=10,
+def _expect(condition: bool, detail: object) -> None:  # noqa: FBT001
+    """Report an invariant failure with its observed state."""
+    if not condition:
+        raise AssertionError(detail)
+
+
+def _repository(root: Path, *, object_format: str = "sha1") -> Path:
+    """Index a minimal flake in an existing temporary directory."""
+    _git(root, "init", "--quiet", f"--object-format={object_format}")
+    for name in (".gitignore", "flake.nix", "flake.lock", "README"):
+        (root / name).write_text("", encoding="utf-8")
+    _git(root, "add", ".")
+    return root
+
+
+@contextmanager
+def _fresh_repository(*, object_format: str = "sha1") -> Iterator[Path]:
+    """Give every generated example its own repository and cleanup."""
+    with TemporaryDirectory(prefix="canonical-contract-") as directory:
+        yield _repository(Path(directory), object_format=object_format)
+
+
+def _snapshot(root: Path, *, exclude: tuple[str, ...] = ()) -> tuple[object, ...]:
+    """Observe paths, contents, modes, staged blobs, refs, and local Git settings."""
+    files = {}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if relative.parts[0] in (".git", *exclude):
+            continue
+        mode = path.lstat().st_mode
+        value = (
+            str(path.readlink()).encode()
+            if stat.S_ISLNK(mode)
+            else path.read_bytes()
+            if stat.S_ISREG(mode)
+            else b""
         )
+        files[relative.as_posix()] = (stat.S_IFMT(mode), stat.S_IMODE(mode), value)
+    return (
+        files,
+        _git(root, "ls-files", "--stage", "-z"),
+        _git(root, "for-each-ref", "--format=%(refname) %(objectname)"),
+        _git(root, "config", "--local", "--list"),
+    )
+
+
+def _preview(root: Path, *arguments: str, code: int = 0) -> None:
+    """Preserve the whole repository during successful and rejected previews."""
+    before = _snapshot(root)
+    _run(root, *arguments, "--dry-run", code=code)
+    _expect(_snapshot(root) == before, arguments)
+
+
+def _overview(root: Path) -> dict[str, Any]:
+    """Read the public structured source contract."""
+    return cast("dict[str, Any]", json.loads(_run(root, "overview", "--json").stdout))
+
+
+PACKAGE_NAMES = st.from_regex(
+    r"[a-z][a-z0-9]{0,5}(?:[-_][a-z0-9]{1,5})?",
+    fullmatch=True,
+)
+DESCRIPTIONS = st.text(
+    alphabet=st.characters(exclude_categories=["Cs"], exclude_characters="\x00"),
+    min_size=1,
+    max_size=30,
+)
+TEST_LABELS = st.lists(
+    st.from_regex(r"[a-z][a-z0-9_]{0,8}", fullmatch=True),
+    max_size=5,
+    unique=True,
+)
+
+
+@settings(deadline=None)
+@given(
+    kind=st.sampled_from(("python", "html", "latex", "nix", "host", "untracked")),
+    name=PACKAGE_NAMES,
+    payload=st.binary(max_size=40),
+)
+@example(kind="python", name="dash-case", payload=b"\x00\xff")
+@example(kind="html", name="snake_case", payload=b"HTML")
+@example(kind="latex", name="document", payload=b"LaTeX")
+@example(kind="nix", name="value", payload=b"Nix")
+@example(kind="host", name="laptop", payload=b"host")
+@example(kind="untracked", name="untracked", payload=b"untracked")
+def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR0915
+    kind: str,
+    name: str,
+    payload: bytes,
+) -> None:
+    """Add, preview, rename, converge, and remove resources without losing Git state."""
+    with _fresh_repository() as root:
+        if kind == "host":
+            name = name.replace("-", "").replace("_", "")
+        collection = "hosts" if kind == "host" else "packages"
+        original, destination = f"{collection}/a{name}", f"{collection}/b{name}"
+        package = root / original
+        if kind == "untracked":
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text("{}\n")
+        else:
+            _run(root, "add", original, *(() if kind == "host" else (kind,)))
+        check = f"checks/a{name}" + ("VmWithDisko" if kind == "host" else "")
+        if kind == "python":
+            _expect(
+                not (package / "test_main.py").exists() and not (root / check).exists(),
+                "new packages must be untested",
+            )
+            (package / "test_main.py").write_text(
+                (
+                    "from unittest import TestCase as Case\n"
+                    "class Reports(Case):\n"
+                    "    def test_result(self): pass\n"
+                ),
+            )
+        resource = package / "prm/nested/asset.bin"
+        resource.parent.mkdir(parents=True)
+        resource.write_bytes(payload)
+        if kind != "untracked":
+            _run(root, "converge")
+            _expect(
+                f"{original}/prm/nested/asset.bin"
+                in _git(root, "ls-files").splitlines(),
+                "resources must be indexed",
+            )
+        expected_check = kind in {"host", "python"}
+        _expect((root / check / "default.nix").is_file() == expected_check, check)
+        tracked = _git(root, "ls-files", "--", original, check).splitlines()
+        staged, working = {}, {}
+        for relative in tracked:
+            path = root / relative
+            staged[relative] = path.read_bytes() + b"\n"
+            working[relative] = staged[relative] + b"\n"
+            path.write_bytes(staged[relative])
+            _git(root, "add", "--", relative)
+            path.write_bytes(working[relative])
+        untracked = package / "prm/untracked.bin"
+        untracked.write_bytes(payload)
+        _preview(root, "mv", original, destination)
+        _run(root, "mv", original, destination)
+        new_check = check.replace(f"a{name}", f"b{name}")
+        for relative in tracked:
+            renamed = relative.replace(original, destination).replace(check, new_check)
+            _expect(
+                subprocess.run(  # noqa: S603
+                    ["git", "show", f":{renamed}"],  # noqa: S607
+                    cwd=root,
+                    capture_output=True,
+                    check=True,
+                    timeout=10,
+                ).stdout
+                == staged[relative]
+                and (root / renamed).read_bytes() == working[relative],
+                renamed,
+            )
+        _expect(
+            (root / destination / "prm/untracked.bin").read_bytes() == payload,
+            "untracked contents",
+        )
+        _expect(
+            not _git(root, "ls-files", "--", f"{destination}/prm/untracked.bin"),
+            "rename must not stage untracked assets",
+        )
+        _expect(
+            not package.exists() and not (root / check).exists(),
+            "rename left old paths",
+        )
+        _expect(
+            (root / new_check / "default.nix").is_file() == expected_check,
+            new_check,
+        )
+        if kind == "untracked":
+            _expect(
+                not _git(root, "ls-files", "--", destination),
+                "rename staged an untracked package",
+            )
+            return
+        _run(root, "converge")
+        _preview(root, "rm", destination)
+        _run(root, "rm", destination)
+        _expect(
+            not (root / destination).exists() and not (root / new_check).exists(),
+            "remove left resource or check",
+        )
+        _expect(
+            not _git(root, "ls-files", "--", original, destination, check, new_check),
+            "remove left indexed paths",
+        )
+        _run(root, "converge")
+        _preview(root, "converge")
+
+
+@settings(deadline=None)
+@given(payload=st.binary(max_size=50), tracked_scratch=st.booleans())
+@example(payload=b"\x00\xff", tracked_scratch=True)
+@example(payload=b"scratch", tracked_scratch=False)
+def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
+    payload: bytes,
+    *,
+    tracked_scratch: bool,
+) -> None:
+    """Repair generated state, retain resources and scratch, and respect formatting."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        source = root / "packages/example/main.py"
+        original = source.read_bytes()
+        for relative in (
+            "tmp/root-state",
+            "packages/example/tmp/package-state",
+            "packages/example/prm/nested/asset.bin",
+        ):
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(payload)
+            if tracked_scratch:
+                _git(root, "add", "--force", "--", relative)
+        (root / "discarded").write_bytes(payload)
+        _preview(root, "converge", code=1)
+        _run(root, "converge")
+        _expect(
+            not (root / "discarded").exists() and source.read_bytes() == original,
+            "cleanup or source preservation",
+        )
+        indexed = _git(root, "ls-files").splitlines()
+        _expect(
+            "packages/example/prm/nested/asset.bin" in indexed
+            and not any("tmp/" in path for path in indexed),
+            indexed,
+        )
+        for relative in (
+            "tmp/root-state",
+            "packages/example/tmp/package-state",
+            "packages/example/prm/nested/asset.bin",
+        ):
+            _expect((root / relative).read_bytes() == payload, relative)
+        stable = _snapshot(root)
+        _run(root, "converge")
+        _expect(_snapshot(root) == stable, "convergence is not idempotent")
+        _preview(root, "converge")
+        _check_formatted_host(root)
+        with _fresh_repository() as upgrade:
+            _check_host_upgrade(upgrade)
+        with (
+            _fresh_repository() as validation,
+            pytest.MonkeyPatch.context() as patch,
+        ):
+            _check_excluded_trees(validation, patch)
+
+
+@settings(deadline=None)
+@given(
+    arguments=st.sampled_from(
+        (
+            ("mv", "packages/example", "hosts/example"),
+            ("add", "packages/bad--name", "python"),
+            ("add", "hosts/bad-name"),
+            ("rm", "../outside"),
+            ("rm", "/outside"),
+            ("mv", "packages/example", "packages/taken"),
+            ("add", "packages/example", "python"),
+        ),
+    ),
+    misplaced=st.sampled_from(
+        (
+            "def test_misplaced(): pass\n",
+            (
+                "from unittest import TestCase as Case\n"
+                "class Reports(Case):\n"
+                "    def test_result(self): pass\n"
+            ),
+        ),
+    ),
+)
+@example(
+    arguments=("mv", "packages/example", "hosts/example"),
+    misplaced="def test_misplaced(): pass\n",
+)
+@example(
+    arguments=("rm", "../outside"),
+    misplaced=(
+        "from unittest import TestCase as Case\n"
+        "class Reports(Case):\n"
+        "    def test_result(self): pass\n"
+    ),
+)
+@example(arguments=("rm", "/outside"), misplaced="def test_misplaced(): pass\n")
+@example(
+    arguments=("add", "packages/bad--name", "python"),
+    misplaced="def test_misplaced(): pass\n",
+)
+@example(arguments=("add", "hosts/bad-name"), misplaced="def test_misplaced(): pass\n")
+@example(
+    arguments=("mv", "packages/example", "packages/taken"),
+    misplaced="def test_misplaced(): pass\n",
+)
+@example(
+    arguments=("add", "packages/example", "python"),
+    misplaced="def test_misplaced(): pass\n",
+)
+def test_rejected_operations_preserve_contents_modes_index_and_refs(
+    arguments: tuple[str, ...],
+    misplaced: str,
+) -> None:
+    """Reject invalid paths, collisions, and embedded tests before modifying work."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        _run(root, "add", "packages/taken", "nix")
+        (root / "work-in-progress").write_text("preserve unrelated work")
+        before = _snapshot(root)
+        rejected = _run(root, *arguments, code=1)
+        _expect(bool(rejected.stderr) and _snapshot(root) == before, rejected)
+        source = root / "packages/example/main.py"
+        source.write_text(misplaced)
+        before = _snapshot(root)
+        rejected = _run(root, "converge", code=1)
+        _expect(
+            "move test definitions to test_main.py" in rejected.stderr
+            and _snapshot(root) == before,
+            rejected,
+        )
+
+
+def _nix_environment(root: Path) -> dict[str, str]:
+    """Keep offline Nix evaluation and builds inside this example's scratch tree."""
     environment = dict(os.environ)
-    store = root.parent / "nix"
+    store = root / "tmp/nix"
     environment["NIX_REMOTE"] = (
         f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
     )
     environment["NIX_CONFIG"] = (
-        "experimental-features = nix-command flakes\nbuild-users-group =\n"
+        "experimental-features = nix-command flakes\n"
+        "build-users-group =\n"
+        "sandbox = false\n"
+        "eval-cache = false\n"
     )
     return environment
 
 
-def _run_runner_cli(
+def _template_expression(root: Path, name: str) -> str:
+    """Build generated install scripts with real Nix and offline tool stand-ins."""
+    bash = shutil.which("bash")
+    _expect(bash is not None, "template fixtures require bash")
+    site_packages = (
+        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    builder_command = json.dumps('source "$scriptPath"')
+    return (
+        "let mk = name: script: builtins.derivation { inherit name; "
+        "system = builtins.currentSystem; "
+        f"builder = {json.dumps(bash)}; PATH = {json.dumps(os.environ['PATH'])}; "
+        'inherit script; passAsFile = [ "script" ]; '
+        f'args = [ "-e" "-c" {builder_command} ]; }}; '
+        "python = { "
+        f"interpreter = {json.dumps(sys.executable)}; "
+        f"sitePackages = {json.dumps(site_packages)}; "
+        f"withPackages = _: {json.dumps(sys.prefix)}; "
+        "pkgs.buildPythonPackage = attrs: (mk attrs.pname "
+        '("pname=${attrs.pname}\\ncp -R ${attrs.src}/. .\\n" '
+        "+ attrs.installPhase)) // attrs; }; "
+        'pkgs = { python3 = python; git = "git"; curl = "curl"; inner = "wrong-inner"; '
+        'http-server = "server"; texliveFull = "tex"; '
+        "stdenv.hostPlatform.isLinux = false; "
+        "stdenv.mkDerivation = attrs: attrs; writeTextFile = attrs: attrs; "
+        "lib.optionals = condition: values: if condition then values else []; "
+        "runCommand = name: _: script: mk name script; "
+        "writeShellApplication = attrs: (mk attrs.name "
+        "("
+        + json.dumps(
+            'mkdir -p "$out/bin"\ncat > "$out/bin/${attrs.name}" '
+            f"<<'CANONICAL_SCRIPT'\n#!{bash}\n",
+        )
+        + " + attrs.text + "
+        + json.dumps('\nCANONICAL_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
+        + ")) // attrs; }; "
+        + f"package = import {root / 'packages' / name / 'default.nix'} "
+        + "{ inherit pkgs; }; in "
+    )
+
+
+def _evaluated_template(
+    root: Path,
+    name: str,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Use Nix's evaluated values as the independent metadata and dependency oracle."""
+    expression = _template_expression(root, name) + (
+        "{ meta = package.meta; name = package.pname or "
+        "package.name; dependencies = package.runtimeInputs or "
+        "package.nativeBuildInputs or []; }"
+    )
+    result = _run(
+        root,
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        expression,
+        executable="nix",
+        environment=environment,
+    )
+    return cast("dict[str, Any]", json.loads(result.stdout))
+
+
+def _check_launcher_environment(
+    root: Path,
+    name: str,
+    environment: dict[str, str],
+    *,
+    library: bool,
+) -> None:
+    """Evaluate generated checks with an absent or independently named executable."""
+    metadata = (
+        "package.meta" if library else 'package.meta // { mainProgram = "other-name"; }'
+    )
+    expression = _template_expression(root, name) + (
+        "let checkPkgs = pkgs // { stdenv.system = builtins.currentSystem; "
+        "runCommand = _: attrs: _: attrs; lib = pkgs.lib // { "
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
+        'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
+        'else abort "library check requested an executable"; }; }; '
+        f"packageDrv = package // {{ inherit python; meta = {metadata}; }}; "
+        f"in import {root / 'checks' / name / 'default.nix'} {{ pkgs = checkPkgs; "
+        "inputs.self.packages.${builtins.currentSystem}."
+        f"{json.dumps(name)} = packageDrv; }}"
+    )
+    result = _run(
+        root,
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        expression,
+        executable="nix",
+        environment=environment,
+    )
+    attributes = json.loads(result.stdout)
+    expected = None if library else "/package/bin/other-name"
+    _expect(attributes.get("PACKAGE_E2E_EXECUTABLE") == expected, attributes)
+
+
+@settings(deadline=None)
+@given(
+    kind=st.sampled_from(("python", "html", "latex", "nix")),
+    name=PACKAGE_NAMES,
+    description=DESCRIPTIONS,
+    library=st.booleans(),
+)
+@example(
+    kind="python",
+    name="dash-case",
+    description='A "quoted" report.\n${literal}\\path',
+    library=False,
+)
+@example(kind="python", name="snake_case", description="é\b\f\x01", library=True)
+@example(
+    kind="python",
+    name="dash-library",
+    description="Nested library metadata",
+    library=True,
+)
+@example(kind="html", name="web-site", description="Δ report", library=False)
+@example(kind="latex", name="document", description="LaTeX\tresources", library=False)
+@example(kind="nix", name="my-package", description="é", library=False)
+def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(  # noqa: C901, PLR0915
+    kind: str,
+    name: str,
+    description: str,
+    *,
+    library: bool,
+) -> None:
+    """Evaluate generated Nix and run installed Python and HTML launchers."""
+    with _fresh_repository() as root:
+        _run(root, "add", f"packages/{name}", kind, description)
+        package = root / "packages" / name
+        asset = package / "prm/asset.bin"
+        asset.parent.mkdir()
+        asset.write_bytes(b"\x00\xff asset")
+        definition = package / "default.nix"
+        source = definition.read_text()
+        if kind == "python":
+            (package / "test_main.py").write_text("def test_result(): pass\n")
+            if library:
+                (package / "main.py").write_text("VALUE = 1\n")
+            if library and "_" in name:
+                source = (
+                    source.replace("    mainProgram = pname;", "")
+                    .replace("    mainProgram = baseNameOf ./.;", "")
+                    .replace(
+                        "  passthru.python",
+                        "  meta.mainProgram = pname;\n  passthru.python",
+                    )
+                )
+        elif kind in {"html", "latex"}:
+            binding = "runtimeDeps" if kind == "html" else "nativeDeps"
+            expression = (
+                f"(let {binding} = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]"
+            )
+            source = source.replace(
+                f"{binding} = [ ];",
+                f"{binding} = {expression};",
+            ).replace(
+                "let\n",
+                f"let\n  # {binding} = [ pkgs.fromComment ];\n"
+                f"  ignored = let {binding} = [ pkgs.fromNested ]; in null;\n",
+                1,
+            )
+            if kind == "html":
+                resource = root / "prm/source.bin"
+                resource.parent.mkdir()
+                resource.write_bytes(b"copied resource")
+                source = source.replace(
+                    'prmInstall = "";',
+                    (
+                        "prmInstall = let prmInstall = \"inner\"; in ''cp "
+                        "${../../prm/source.bin} \"$out/prm/copied.bin\"'';"
+                    ),
+                )
+        definition.write_text(source)
+        _run(root, "converge")
+        _preview(root, "converge")
+        environment = _nix_environment(root)
+        actual = _evaluated_template(root, name, environment)
+        _expect(actual["name"] == name.replace("-", "_"), actual)
+        _expect(actual["meta"]["description"] == description, actual)
+        graph = _overview(root)
+        details = next(
+            node["details"] for node in graph["nodes"] if node["kind"] == "package"
+        )
+        _expect(details["description"] == description, details)
+        if kind == "latex":
+            _expect(actual["dependencies"] == ["git", "curl", "tex"], actual)
+        if kind not in {"python", "html"}:
+            return
+        expression = _template_expression(root, name) + "package"
+        built = _run(
+            root,
+            "build",
+            "--impure",
+            "--no-link",
+            "--print-out-paths",
+            "--expr",
+            expression,
+            executable="nix",
+            environment=environment,
+        )
+        output = Path(built.stdout.strip())
+        if kind == "python":
+            _check_launcher_environment(root, name, environment, library=library)
+            module = name.replace("-", "_")
+            version = f"{sys.version_info.major}.{sys.version_info.minor}"
+            installed = output / f"lib/python{version}/site-packages"
+            _expect(
+                (installed / module / "prm/asset.bin").read_bytes()
+                == asset.read_bytes(),
+                "Python installation lost assets",
+            )
+            environment["PYTHONPATH"] = (
+                str(installed) + os.pathsep + environment.get("PYTHONPATH", "")
+            )
+            if library:
+                _expect(
+                    "mainProgram" not in actual["meta"]
+                    and not (output / "bin").exists(),
+                    actual,
+                )
+                imported = _run(
+                    root,
+                    "-c",
+                    f"import {module}; print({module}.VALUE)",
+                    executable=sys.executable,
+                    environment=environment,
+                )
+                _expect(imported.stdout == "1\n", imported)
+                _expect(
+                    _run(package, "args").stdout == "(not applicable)\n",
+                    "library contract",
+                )
+                (package / "main.py").write_text(
+                    (
+                        "import argparse\n"
+                        "def main():\n"
+                        "    argparse.ArgumentParser().parse_args()\n"
+                    ),
+                )
+                _run(root, "converge")
+                restored = _evaluated_template(root, name, environment)
+                _expect(restored["meta"]["mainProgram"] == name, restored)
+            else:
+                _expect(
+                    actual["meta"]["mainProgram"] == name
+                    and (output / "bin" / name).is_file(),
+                    actual,
+                )
+                _expect(
+                    "--help"
+                    in _run(
+                        root,
+                        "--help",
+                        executable=str(output / "bin" / name),
+                        environment=environment,
+                    ).stdout,
+                    "installed help",
+                )
+                _run(
+                    root,
+                    "unexpected",
+                    executable=str(output / "bin" / name),
+                    environment=environment,
+                    code=2,
+                )
+                _expect(
+                    not _run(package, "args").stdout,
+                    "scaffold must declare an empty CLI",
+                )
+        else:
+            _expect(actual["dependencies"] == ["git", "curl", "server"], actual)
+            tools = root / "tmp/tools"
+            tools.mkdir(parents=True)
+            server = tools / "http-server"
+            server.write_text(
+                f"#!{sys.executable}\n"
+                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+            )
+            server.chmod(0o755)
+            environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
+            cases = (
+                ("", "", (), ()),
+                (":0", "", (), ("-o", "/")),
+                ("", "wayland-0", (), ("-o", "/")),
+                (":0", "wayland-0", ("--no-open",), ()),
+                ("", "", ("--no-open",), ()),
+                (":0", "", ("-o", "/prm/example.html"), ("-o", "/prm/example.html")),
+                ("", "", ("-o", "/"), ("-o", "/")),
+                (":0", "", ("--no-o",), ("--no-o",)),
+                (
+                    ":0",
+                    "",
+                    ("--no-open", "-p", "8761", "two words"),
+                    ("-p", "8761", "two words"),
+                ),
+                (":0", "", ("--o=/prm/example.html",), ("--o=/prm/example.html",)),
+            )
+            for display, wayland, arguments, expected in cases:
+                environment.update(DISPLAY=display, WAYLAND_DISPLAY=wayland)
+                result = _run(
+                    root,
+                    *arguments,
+                    executable=str(output / "bin" / name.replace("-", "_")),
+                    environment=environment,
+                )
+                site, *options = json.loads(result.stdout)
+                _expect(options == list(expected), result)
+                _expect(
+                    (Path(site) / "prm/asset.bin").read_bytes() == asset.read_bytes(),
+                    site,
+                )
+                _expect(
+                    (Path(site) / "prm/copied.bin").read_bytes() == b"copied resource",
+                    site,
+                )
+                _expect(
+                    (Path(site) / "script.js").is_file()
+                    and (Path(site) / "style.css").is_file(),
+                    site,
+                )
+
+
+def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
+    """Initialize remotes and preserve checkout/index state through home convergence."""
+    for remote in (
+        "https://example.test/team/project.git",
+        "ssh://git@example.test/team/project.git",
+        "git@example.test:team/project.git",
+    ):
+        with (
+            TemporaryDirectory(prefix="canonical-home-") as directory,
+            pytest.MonkeyPatch.context() as patch,
+        ):
+            _check_remote_initialization(Path(directory), patch, remote)
+    with (
+        TemporaryDirectory(prefix="canonical-bootstrap-") as directory,
+        pytest.MonkeyPatch.context() as patch,
+    ):
+        _check_flake_initialization(Path(directory), patch)
+    with TemporaryDirectory(prefix="canonical-home-") as directory:
+        root = _home_repository(Path(directory))
+        _check_home_commits(root)
+        _check_home_whitelist(root)
+        _check_home_settings(root)
+        _check_home_move(root)
+        modules = root / ".gitmodules"
+        modules.write_text(
+            modules.read_text() + "url = git@forge.example:owner/other\n",
+        )
+        before = _snapshot(root)
+        result = _run(root, "converge", code=1)
+        _expect(
+            "duplicate url field" in result.stderr and _snapshot(root) == before,
+            result,
+        )
+
+
+def _check_discovery_boundaries() -> None:
+    """Validate nested declarations and malformed inputs once per suite."""
+    with _fresh_repository() as root:
+        sentinel = (
+            "from pathlib import Path\nPath('SENTINEL').touch()\n"
+            "raise RuntimeError('must not execute')\n"
+        )
+        package = _make_test_names_package(
+            root,
+            "example",
+            sentinel + "def test_result(): pass\n",
+        )
+        for nested, path, parameter in NESTED_CONTRACTS:
+            (package / "main.py").write_text(sentinel + nested)
+            before = _snapshot(root)
+            data = next(
+                node["details"]
+                for node in _overview(root)["nodes"]
+                if node["kind"] == "package"
+            )
+            _expect(
+                _snapshot(root) == before,
+                "nested discovery executed code or changed state",
+            )
+            _expect(
+                {"path": list(path), "text": "command", "command": True} in data["cli"],
+                data,
+            )
+            _expect(
+                {"path": list(path), "text": parameter, "command": False}
+                in data["cli"],
+                data,
+            )
+            if nested.startswith("import typer"):
+                _expect(
+                    {
+                        "path": ["test"],
+                        "text": "--verbose  default=False; type=bool",
+                        "command": False,
+                    }
+                    in data["cli"],
+                    data,
+                )
+                _expect(
+                    not any(
+                        entry["path"][-1:] == ["settings"] for entry in data["cli"]
+                    ),
+                    data,
+                )
+        for unsupported in UNSUPPORTED_INTERFACES:
+            (package / "main.py").write_text(unsupported)
+            before = _snapshot(root)
+            rejected = _run(package, "args", code=1)
+            _expect(
+                "unsupported CLI interface" in rejected.stderr and not rejected.stdout,
+                rejected,
+            )
+            _expect(_snapshot(root) == before, "unsupported interface changed state")
+        for layout in ("missing", "syntax", "encoding", "linked"):
+            test_file = package / "test_main.py"
+            test_file.unlink(missing_ok=True)
+            if layout == "syntax":
+                test_file.write_text("def invalid(")
+            elif layout == "encoding":
+                test_file.write_bytes(b"\xff")
+            elif layout == "linked":
+                test_file.symlink_to(package / "main.py")
+            before = _snapshot(root)
+            rejected = _run(package, "test", "names", code=1)
+            _expect(
+                "canonical test names:" in rejected.stderr and not rejected.stdout,
+                rejected,
+            )
+            _expect(_snapshot(root) == before, "malformed test source changed state")
+
+
+@settings(deadline=None)
+@given(
+    contract=st.sampled_from(CLI_CONTRACTS),
+    labels=TEST_LABELS,
+    form=st.sampled_from(("functions", "classes", "unittest")),
+    explicit=st.booleans(),
+)
+@example(
+    contract=CLI_CONTRACTS[0],
+    labels=["double__underscore", "async_behavior"],
+    form="functions",
+    explicit=True,
+)
+@example(contract=CLI_CONTRACTS[1], labels=["result"], form="classes", explicit=False)
+@example(
+    contract=CLI_CONTRACTS[2],
+    labels=["derived", "async"],
+    form="unittest",
+    explicit=True,
+)
+@example(contract=CLI_CONTRACTS[3], labels=["complex"], form="functions", explicit=True)
+@example(contract=CLI_CONTRACTS[4], labels=["complex"], form="unittest", explicit=False)
+@example(contract=CLI_CONTRACTS[5], labels=["complex"], form="classes", explicit=True)
+@example(contract=CLI_CONTRACTS[7], labels=[], form="functions", explicit=True)
+@example(contract=CLI_CONTRACTS[6], labels=[], form="functions", explicit=False)
+@example(contract=CLI_CONTRACTS[8], labels=["public"], form="functions", explicit=False)
+@example(contract=CLI_CONTRACTS[9], labels=["aliased"], form="classes", explicit=True)
+@example(
+    contract=CLI_CONTRACTS[10],
+    labels=["aliased"],
+    form="functions",
+    explicit=False,
+)
+@example(contract=CLI_CONTRACTS[11], labels=["aliased"], form="unittest", explicit=True)
+def test_static_interfaces_and_test_sentences_match_declarations_without_execution(
+    contract: tuple[str, str],
+    labels: list[str],
+    form: str,
+    *,
+    explicit: bool,
+) -> None:
+    """Compare static declarations to expectations and continue after errors."""
+    with _fresh_repository() as root:
+        sentinel = (
+            "from pathlib import Path\n"
+            "Path('SENTINEL').touch()\n"
+            "raise RuntimeError('must not execute')\n"
+        )
+        tests = sentinel + (
+            "def helper():\n"
+            "    def test_hidden(): pass\n"
+            "class Helper:\n"
+            "    def test_hidden(self): pass\n"
+        )
+        if form == "functions":
+            tests += "".join(
+                f"@unknown_decorator()\nasync def test_{label}():\n    assert False\n"
+                for label in labels
+            )
+        else:
+            header = (
+                "class TestBehavior:\n"
+                if form == "classes"
+                else (
+                    "import unittest as unit\n"
+                    "from unittest import TestCase as Case, "
+                    "IsolatedAsyncioTestCase\n"
+                    "class Base(Case): pass\n"
+                    "class Reports(Base):\n"
+                )
+            )
+            tests += header + (
+                "    pass\n"
+                if not labels
+                else "".join(
+                    f"    async def test_{label}(self):\n        assert False\n"
+                    for label in labels
+                )
+            )
+        package = _make_test_names_package(root, "my-package", tests)
+        source, expected_args = contract
+        (package / "main.py").write_text(
+            '"""First paragraph.\n\nArguments:\n  Documentation text."""\n'
+            + sentinel
+            + source,
+        )
+        expected_names = "".join(
+            "test " + label.replace("_", " ") + "\n" for label in sorted(labels)
+        )
+        cwd = root if explicit else package
+        target = (str(package),) if explicit else ()
+        before = _snapshot(root)
+        _expect(_run(cwd, "args", *target).stdout == expected_args, contract)
+        _expect(_run(cwd, "test", "names", *target).stdout == expected_names, tests)
+        details = next(
+            node["details"]
+            for node in _overview(root)["nodes"]
+            if node["kind"] == "package"
+        )
+        _expect(
+            details["tests"] == ["test " + label.replace("_", " ") for label in labels],
+            details,
+        )
+        _expect(
+            details["help"] == "First paragraph.\n\nArguments:\n  Documentation text.",
+            details,
+        )
+        _expect(
+            _snapshot(root) == before
+            and not (root / "SENTINEL").exists()
+            and not (package / "SENTINEL").exists(),
+            "inspection changed source or executed code",
+        )
+        (package / "test_main.py").write_text(
+            tests.replace("assert False", "raise RuntimeError('changed body')"),
+        )
+        _expect(
+            _run(package, "test", "names").stdout == expected_names,
+            "body edits changed sentences",
+        )
+        (package / "test_main.py").unlink(missing_ok=True)
+        (package / "test_main.py").write_text(tests)
+        broken = _make_test_names_package(root, "alpha", "def invalid(")
+        (broken / "main.py").write_text("import sys\nprint(sys.argv)\n")
+        (package / "main.py").write_text(source)
+        missing = _make_test_names_package(root, "untested", "")
+        (missing / "test_main.py").unlink()
+        (root / "packages/linked").symlink_to(package, target_is_directory=True)
+        listed = _run(root, "test", "names", code=1)
+        _expect(
+            listed.stdout == "packages/alpha:\npackages/my-package:\n" + expected_names,
+            listed,
+        )
+        _expect(
+            "canonical test names: alpha:" in listed.stderr
+            and "Skipping untested: no test_main.py" in listed.stderr,
+            listed,
+        )
+        args = _run(root, "args", code=1)
+        _expect(
+            "packages/my-package:\n" + expected_args in args.stdout
+            and "alpha: unsupported CLI interface" in args.stderr,
+            args,
+        )
+
+
+@settings(deadline=None)
+@given(name=PACKAGE_NAMES, object_format=st.sampled_from(("sha1", "sha256")))
+@example(name="core", object_format="sha1")
+@example(name="dash-case", object_format="sha256")
+def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  # noqa: PLR0915
+    name: str,
+    object_format: str,
+) -> None:
+    """Model declarations and compare current and historical source views."""
+    with _fresh_repository(object_format=object_format) as root:
+        provider = "p" + name
+        _run(root, "add", f"packages/{provider}", "nix", "Provider")
+        _run(root, "add", "packages/consumer", "python", "Consumer")
+        _run(root, "add", "packages/computed", "nix", "Computed")
+        consumer = root / "packages/consumer"
+        (consumer / "default.nix").write_text(
+            "{ inputs, pkgs, system, ... }: "
+            "let local = inputs.self.packages.${system}; in {\n"
+            f"  propagatedBuildInputs = [ local.{provider} local.missing pkgs.git ];\n"
+            f'  installPhase = "cp ${{../{provider}/main.py}} result";\n'
+            "  # propagatedBuildInputs = [ local.fake ];\n"
+            '  text = "inputs.self.packages.system.also_fake";\n}\n',
+        )
+        (consumer / "main.py").write_text(
+            (
+                '"""Consumer help."""\n'
+                "import argparse\n"
+                'raise RuntimeError("must not run")\n'
+                "p = argparse.ArgumentParser()\n"
+                'p.add_argument("--output", help="Output path")\n'
+                "literal = '# noqa: D103 and # type: ignore are text'\n"
+                "# ruff: noqa: D\n"
+                "value = 1  # noqa: E501\n"
+                "other = 2  # type: ignore[assignment]\n"
+            ),
+        )
+        (consumer / "test_main.py").write_text(
+            "def test_result(): pass  # noqa: D103\n",
+        )
+        assets = consumer / "prm/assets"
+        assets.mkdir(parents=True)
+        snippets: tuple[tuple[str, str, list[dict[str, str | int]]], ...] = (
+            (
+                "directives.html",
+                (
+                    "<!-- html-validate-disable -->\n"
+                    "<!-- html-validate-disable-next heading-level -->\n"
+                    "<p>eslint-disable is text</p>\n"
+                ),
+                [
+                    {"kind": "html-validate-disable", "scope": "global", "count": 1},
+                    {"kind": "html-validate-disable", "scope": "local", "count": 1},
+                ],
+            ),
+            (
+                "index.html",
+                '<script>const text = "<!-- htmlhint-disable -->";</script>',
+                [],
+            ),
+            (
+                "script.js",
+                "const value = `${(() => { /* eslint-disable */ return 1; })()}`;",
+                [{"kind": "eslint-disable", "scope": "global", "count": 1}],
+            ),
+            (
+                "string.js",
+                "const value = `/* eslint-disable */`; /* eslint-disable-next-line */",
+                [{"kind": "eslint-disable", "scope": "local", "count": 1}],
+            ),
+            (
+                "style.css",
+                'p { content: "/* stylelint-disable */"; } /* stylelint-disable */',
+                [{"kind": "stylelint-disable", "scope": "global", "count": 1}],
+            ),
+        )
+        for filename, source, _ in snippets:
+            (assets / filename).write_text(source)
+        (assets / "picture.png").write_bytes(b"binary")
+        (assets / "linked.py").symlink_to(consumer / "main.py")
+        (consumer / "tmp").mkdir()
+        (consumer / "tmp/generated.py").write_text("runtime")
+        (root / "packages/computed/default.nix").write_text(
+            (
+                "{ pkgs, ... }: let one = two; two = one; in { buildInputs = "
+                "one; nativeBuildInputs = if pkgs.stdenv.isLinux then [ "
+                "pkgs.git ] else []; }"
+            ),
+        )
+        graph = _overview(root)
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        _expect(
+            graph["schema"] == "canonical.overview"
+            and graph["analysis"] == "source-declarations",
+            graph,
+        )
+        _expect(
+            len(nodes) == len(graph["nodes"])
+            and nodes[".:packages/missing"]["kind"] == "package-reference",
+            graph,
+        )
+        edges = {
+            (edge["source"], edge["target"], edge["kind"])
+            for edge in graph["edges"]
+            if edge["target"] == ".:packages/consumer" and edge["kind"] != "contains"
+        }
+        _expect(
+            edges
+            == {
+                (f".:packages/{provider}", ".:packages/consumer", "runtime"),
+                (f".:packages/{provider}", ".:packages/consumer", "source"),
+                (".:packages/missing", ".:packages/consumer", "runtime"),
+            },
+            edges,
+        )
+        _expect(not nodes[".:packages/computed"]["dependencies"], nodes)
+        details = nodes[".:packages/consumer"]["details"]
+        sources = {source["path"]: source for source in details["sources"]}
+        _expect(
+            set(sources)
+            == {
+                "default.nix",
+                "main.py",
+                "test_main.py",
+                *("prm/assets/" + filename for filename, _, _ in snippets),
+            },
+            sources,
+        )
+        for filename, _, expected in snippets:
+            _expect(
+                sources["prm/assets/" + filename]["suppressions"] == expected,
+                sources,
+            )
+        _expect(
+            details["source_metrics"]["suppressions"]
+            == {"noqa (global)": 1, "noqa (local)": 2, "type: ignore (local)": 1},
+            details,
+        )
+        _expect(
+            details["tests"] == ["test result"] and details["help"] == "Consumer help.",
+            details,
+        )
+        focus = json.loads(_run(root, "overview", "packages/consumer", "--json").stdout)
+        _expect(focus["focus"] == ".:packages/consumer", focus)
+        terminal = _run(root, "overview", "--full").stdout
+        _expect(
+            "packages/consumer:\n" in terminal
+            and "runtime: packages/" + provider in terminal
+            and "  test result\n" in terminal,
+            terminal,
+        )
+        _git(root, "add", "--force", ".")
+        _test_names_git(root, "commit", "-qm", "Source snapshot")
+        before = _snapshot(root)
+        historical = json.loads(
+            _run(root, "overview", "--json", "--revision", "HEAD").stdout,
+        )
+        _expect(
+            [node.get("details") for node in historical["nodes"]]
+            == [node.get("details") for node in graph["nodes"]],
+            historical,
+        )
+        _expect(
+            _snapshot(root) == before and _overview(root) == graph,
+            "overview changed its repository",
+        )
+    with _fresh_repository() as root:
+        _check_overview_details(root)
+    with _fresh_repository() as root:
+        _check_overview_history(root)
+    with TemporaryDirectory(prefix="canonical-history-") as directory:
+        _check_missing_history(Path(directory))
+    with TemporaryDirectory(prefix="canonical-graph-") as directory:
+        _check_home_graph(_home_repository(Path(directory)))
+    with TemporaryDirectory(prefix="canonical-host-graph-") as directory:
+        _check_host_graph(_home_repository(Path(directory)))
+
+
+def _review_source(label: str, *, arguments: bool) -> str:
+    """Describe one known interface or sentence independently of the converter."""
+    if arguments:
+        return (
+            "import argparse\np = argparse.ArgumentParser()\n"
+            f"p.add_argument('--{label}')\n"
+        )
+    return f"def test_{label}(): pass\n"
+
+
+def _review_view(
+    root: Path,
+    arguments: bool,  # noqa: FBT001
+    *options: str,
+    code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Preserve repository state through successful and rejected Git views."""
+    before = _snapshot(root)
+    result = _run(
+        root,
+        *(("args",) if arguments else ("test", "names")),
+        *options,
+        code=code,
+    )
+    _expect(_snapshot(root) == before, options)
+    _expect(
+        "def test_" not in result.stdout
+        and "add_argument" not in result.stdout
+        and "PRIVATE_IMPLEMENTATION" not in result.stdout,
+        result,
+    )
+    return result
+
+
+@settings(deadline=None)
+@given(suffix=st.text(alphabet="abcxyz", max_size=4))
+@example(suffix="")
+def test_git_views_preserve_native_history_filters_errors_and_source_state(  # noqa: C901, PLR0912, PLR0915
+    suffix: str,
+) -> None:
+    """Compare known source versions through both public Git views."""
+    with _fresh_repository() as root:
+        package = _make_test_names_package(root, "example", "")
+        files = {False: package / "test_main.py", True: package / "main.py"}
+        previous, committed, staged, working = (
+            prefix + suffix for prefix in ("previous", "committed", "staged", "working")
+        )
+
+        def write_version(label: str) -> None:
+            for arguments, path in files.items():
+                path.write_text(_review_source(label, arguments=arguments))
+
+        def row(label: str, arguments: bool) -> str:  # noqa: FBT001
+            return f"--{label}  optional" if arguments else "test " + label
+
+        write_version(previous)
+        _test_names_git(root, "add", ".")
+        for arguments in files:
+            result = _review_view(root, arguments, "diff", "--staged")
+            _expect("+" + row(previous, arguments) + "\n" in result.stdout, result)
+        _test_names_git(root, "commit", "-qm", "Initial declarations")
+        initial = _git(root, "rev-parse", "HEAD").strip()
+        write_version(committed)
+        _test_names_git(root, "commit", "-qam", "Change declarations")
+        write_version(staged)
+        _test_names_git(root, "add", ".")
+        write_version(working)
+        cases = (
+            (("diff",), staged, working),
+            (("diff", "--staged"), committed, staged),
+            (("diff", "--cached"), committed, staged),
+            (("diff", "HEAD"), committed, working),
+            (("diff", "HEAD~1", "HEAD"), previous, committed),
+            (("show",), previous, committed),
+            (("diff", "-R"), working, staged),
+        )
+        for arguments, path in files.items():
+            for options, removed, added in cases:
+                result = _review_view(root, arguments, *options)
+                _expect(
+                    "-" + row(removed, arguments) + "\n" in result.stdout
+                    and "+" + row(added, arguments) + "\n" in result.stdout,
+                    result,
+                )
+            changed = _review_view(root, arguments, "diff", "--exit-code", code=1)
+            _expect("+" + row(working, arguments) in changed.stdout, changed)
+            filename = "main.py" if arguments else "test_main.py"
+            excluded = "test_main.py" if arguments else "main.py"
+            scoped = _review_view(
+                root,
+                arguments,
+                "diff",
+                "HEAD",
+                "--",
+                "packages/example",
+            )
+            local = _review_view(package, arguments, "diff", "HEAD", "--", ".")
+            _expect(local.stdout == scoped.stdout, local)
+            _expect(
+                not _review_view(
+                    root,
+                    arguments,
+                    "diff",
+                    "HEAD",
+                    "--",
+                    "packages/example/" + excluded,
+                ).stdout,
+                excluded,
+            )
+            unsupported = (
+                ("diff", "--no-index"),
+                ("diff", "--no-textconv"),
+                ("diff", "--check"),
+                ("diff", "--ext-diff"),
+                ("diff", "--output=patch"),
+            )
+            for options in unsupported:
+                rejected = _review_view(root, arguments, *options, code=1)
+                _expect(not rejected.stdout and bool(rejected.stderr), rejected)
+            for revision in (f"HEAD:packages/example/{filename}", "HEAD^{tree}"):
+                rejected = _review_view(root, arguments, "show", revision, code=128)
+                _expect(
+                    not rejected.stdout and "commit type" in rejected.stderr,
+                    rejected,
+                )
+            rejected = _review_view(
+                root,
+                arguments,
+                "diff",
+                "missing-revision",
+                code=128,
+            )
+            _expect(not rejected.stdout and bool(rejected.stderr), rejected)
+            for layout in ("attributes", "syntax", "linked", "historical-link"):
+                source = path
+                saved = source.read_bytes()
+                attributes = root / ".gitattributes"
+                if layout == "attributes":
+                    attributes.write_text(f"packages/*/{filename} diff=custom\n")
+                elif layout == "syntax":
+                    source.write_text("def invalid(")
+                else:
+                    source.unlink()
+                    source.symlink_to("PRIVATE_TARGET")
+                    if layout == "historical-link":
+                        _test_names_git(root, "add", str(source.relative_to(root)))
+                        _test_names_git(root, "commit", "-qm", "Link source")
+                        source.unlink()
+                        source.write_bytes(saved)
+                rejected = _review_view(
+                    root,
+                    arguments,
+                    "show" if layout == "historical-link" else "diff",
+                    code=128 if layout == "syntax" else 1,
+                )
+                _expect(not rejected.stdout and bool(rejected.stderr), rejected)
+                attributes.unlink(missing_ok=True)
+                source.unlink(missing_ok=True)
+                source.write_bytes(saved)
+                if layout == "historical-link":
+                    _test_names_git(root, "reset", "--hard", "HEAD~1")
+                    write_version(staged)
+                    _test_names_git(root, "add", ".")
+                    write_version(working)
+        write_version(staged)
+        for path in files.values():
+            path.write_text(
+                path.read_text() + "raise RuntimeError('body edit must not run')\n",
+            )
+        _make_test_names_package(root, "untracked", "def test_untracked(): pass\n")
+        for arguments in files:
+            _expect(
+                not _review_view(root, arguments, "diff").stdout,
+                "body or untracked edits leaked",
+            )
+        other = _make_test_names_package(root, "other", "def test_other(): pass\n")
+        (other / "main.py").write_text(_review_source("other", arguments=True))
+        _test_names_git(root, "add", "packages/other")
+        for arguments in files:
+            all_packages = _review_view(package, arguments, "diff", "HEAD")
+            scoped = _review_view(
+                root,
+                arguments,
+                "diff",
+                "HEAD",
+                "--",
+                "packages/example",
+            )
+            _expect(
+                "+" + row("other", arguments) in all_packages.stdout
+                and row("other", arguments) not in scoped.stdout,
+                all_packages,
+            )
+        _test_names_git(root, "reset", "--hard", "HEAD")
+        _test_names_git(root, "mv", "packages/example", "packages/renamed")
+        for arguments in files:
+            renamed = _review_view(root, arguments, "diff", "--staged", "-M")
+            filename = "main.py" if arguments else "test_main.py"
+            _expect("rename to packages/renamed/" + filename in renamed.stdout, renamed)
+            formatted = _review_view(
+                root,
+                arguments,
+                "show",
+                "--format=%s",
+                "--color=never",
+                "-U0",
+            )
+            _expect(formatted.stdout.startswith("Change declarations\n"), formatted)
+        _test_names_git(root, "commit", "-qm", "Rename package")
+        _test_names_git(root, "rm", "-rf", "packages/renamed")
+        _test_names_git(root, "commit", "-qm", "Delete package")
+        for arguments in files:
+            _expect(
+                "-" + row(committed, arguments)
+                in _review_view(root, arguments, "show").stdout,
+                "deleted source missing",
+            )
+            _expect(
+                "+" + row(previous, arguments)
+                in _review_view(root, arguments, "show", initial).stdout,
+                "initial source missing",
+            )
+    with TemporaryDirectory(prefix="canonical-merge-") as directory:
+        _check_merge_diff(_names_repository(Path(directory)))
+    with TemporaryDirectory(prefix="canonical-order-") as directory:
+        _check_definition_order(Path(directory))
+
+
+def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None:
+    """Add another offline runnable package without replacing the fixture flake."""
+    flake = (root / "flake.nix").read_text()
+    _make_runner_target(root, source, tests, name=name)
+    prefix, ending = flake.rsplit("}; }; }", 1)
+    (root / "flake.nix").write_text(
+        prefix
+        + f" {json.dumps(name)}.python.withPackages = "
+        + f"_: {json.dumps(sys.prefix)}; "
+        + "}; }; }"
+        + ending,
+    )
+    _git(root, "add", "flake.nix", f"packages/{name}")
+
+
+def _campaign(
     root: Path,
     environment: dict[str, str],
     command: str,
     *arguments: str,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Exercise test runners through the public standalone command."""
-    environment = dict(environment)
-    executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
-    environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
-    return subprocess.run(  # noqa: S603
-        ["canonical", "test", command, str(root), *arguments],  # noqa: S607
+    """Run an omitted target and preserve original sources, settings, and refs."""
+    before = _snapshot(root, exclude=("tmp",))
+    result = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
+        cwd=cwd or root,
         env=environment,
         capture_output=True,
         text=True,
         check=False,
         timeout=120,
     )
-
-
-def test_hypothesis_generates_examples_and_executes_cli_without_changing_source(
-    tmp_path: Path,
-) -> None:
-    """Discover a package, generate examples, and retain diagnostics through the CLI."""
-    root = tmp_path / "source with spaces"
-    tests = (
-        "import os, subprocess\n"
-        "from hypothesis import given, example, strategies as st\n"
-        "from pathlib import Path\n"
-        "@given(st.integers())\n@example(0)\n"
-        "def test_property(value):\n"
-        "    with Path('examples').open('a') as output:\n"
-        "        output.write(str(value) + '\\n')\n"
-        "def test_cli():\n"
-        "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
-        "        capture_output=True, text=True)\n"
-        "    assert result.returncode == 0\n"
-        "    assert result.stdout == 'ready\\n'\n"
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
+        "campaign changed original sources or Git state",
     )
-    environment = _prepare_runner_flake(root, tests)
-    original = (root / "packages/example/main.py").read_bytes()
-    result = _run_runner_cli(root, environment, "hypothesis", "--max-examples", "5")
-    if result.returncode or "1 passed, 0 failed, 0 skipped" not in result.stdout:
-        raise AssertionError(result.stdout + result.stderr)
-    (workspace,) = (root / "tmp").glob("python-hypothesis-example-*")
-    expected_examples = 6
-    if len((workspace / "examples").read_text().splitlines()) != expected_examples:
-        msg = "one explicit and five generated examples must run"
-        raise AssertionError(msg)
-    if "5 passing examples" not in (workspace / "tests.log").read_text():
-        msg = "retained diagnostics must include Hypothesis statistics"
-        raise AssertionError(msg)
-    if (root / "packages/example/main.py").read_bytes() != original or (
-        root / "packages/example/examples"
-    ).exists():
-        msg = "running tests must leave the source untouched"
-        raise AssertionError(msg)
+    return result
 
 
-@pytest.mark.parametrize(
-    ("tests", "timeout", "diagnostic"),
-    [
-        (
-            (
-                "from hypothesis import given, strategies as st\n"
-                "@given(st.integers())\n"
-                "def test_failure(value):\n    assert value != 0\n"
-            ),
-            "20",
-            "Falsifying example",
-        ),
-        ("import time\ndef test_stalled():\n    time.sleep(30)\n", "0.5", "timed out"),
-    ],
+@settings(deadline=None)
+@given(
+    max_examples=st.integers(min_value=1, max_value=5),
+    failure=st.sampled_from(("counterexample", "timeout")),
 )
-def test_hypothesis_failed_or_stalled_suites_return_failure_and_retain_diagnostics(
-    tmp_path: Path,
-    tests: str,
-    timeout: str,
-    diagnostic: str,
+@example(max_examples=5, failure="counterexample")
+@example(max_examples=1, failure="timeout")
+def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
+    max_examples: int,
+    failure: str,
 ) -> None:
-    """Fail with retained diagnostics for counterexamples and stalled suites."""
-    root = tmp_path / "source"
-    environment = _prepare_runner_flake(root, tests)
-    result = _run_runner_cli(root, environment, "hypothesis", "--timeout", timeout)
-    (workspace,) = (root / "tmp").glob("python-hypothesis-example-*")
-    if result.returncode != 1 or "0 passed, 1 failed, 0 skipped" not in result.stdout:
-        raise AssertionError(result.stdout + result.stderr)
-    if (
-        diagnostic
-        not in result.stdout + result.stderr + (workspace / "tests.log").read_text()
-    ):
-        msg = "failure diagnostics were not retained"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("target_directory", [".", "packages/example"])
-def test_hypothesis_omitted_target_runs_current_directory(
-    tmp_path: Path,
-    target_directory: str,
-) -> None:
-    """Run the current package or repository without an explicit target."""
-    root = tmp_path / "source with spaces"
-    environment = _prepare_runner_flake(
-        root,
-        "from packages.example import main\ndef test_import():\n"
-        "    assert main is not None\n",
-        "",
-    )
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "hypothesis"],
-        cwd=root / target_directory,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    if result.returncode:
-        raise AssertionError(result.stdout + result.stderr)
-    if not (root / "tmp").is_dir():
-        msg = "current-directory run did not retain diagnostics"
-        raise AssertionError(msg)
-    if target_directory == "." and "1 passed, 0 failed, 0 skipped" not in result.stdout:
-        raise AssertionError(result.stdout)
-
-
-def test_hypothesis_cli_validation(tmp_path: Path) -> None:
-    """The installed command validates its target and resource budgets."""
-    for arguments, code in [
-        (["--help"], 0),
-        ([str(tmp_path)], 1),
-        ([str(tmp_path), "--timeout", "nan"], 2),
-        ([str(tmp_path), "--timeout", "0"], 2),
-        ([str(tmp_path), "--max-examples", "0"], 2),
-    ]:
-        result = subprocess.run(  # noqa: S603
-            [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "hypothesis", *arguments],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != code:
-            raise AssertionError(result.stderr)
-
-
-@pytest.mark.parametrize(
-    "layout",
-    ["empty", "nonpython", "untested", "single_untested"],
-)
-def test_hypothesis_cli_repository_without_runnable_packages(
-    tmp_path: Path,
-    layout: str,
-) -> None:
-    """Report empty repositories, skipped packages, and invalid explicit targets."""
-    (tmp_path / "flake.nix").write_text("{}", encoding="utf-8")
-    target = tmp_path
-    if layout == "nonpython":
-        package = tmp_path / "packages" / "web"
-        package.mkdir(parents=True)
-        (package / "default.nix").write_text("{}", encoding="utf-8")
-        (package / "index.html").write_text("hello", encoding="utf-8")
-    elif layout in {"untested", "single_untested"}:
-        package = _make_runner_target(tmp_path, "", "")
-        (package / "test_main.py").unlink()
-        if layout == "single_untested":
-            target = package
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "hypothesis", str(target)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    expected_code = 0 if layout == "untested" else 1
-    if result.returncode != expected_code:
-        raise AssertionError(result.stdout + result.stderr)
-    if layout == "untested":
-        if (
-            "Skipping example: no test_main.py" not in result.stdout
-            or "0 passed, 0 failed, 1 skipped" not in result.stdout
-        ):
-            msg = "repository did not report its skipped package"
-            raise AssertionError(msg)
-    elif (
-        layout != "single_untested" and "no Python packages found" not in result.stderr
-    ):
-        msg = "empty repository diagnostic missing"
-        raise AssertionError(msg)
-    if (tmp_path / "tmp").exists():
-        msg = "a non-runnable target started a workspace"
-        raise AssertionError(msg)
-
-
-def test_mutation_reports_killed_and_surviving_mutations_without_changing_source(
-    tmp_path: Path,
-) -> None:
-    """Discover a package and report mutations exercised by CLI-only tests."""
-    root = tmp_path / "source with spaces"
-    source = (
-        "def value():\n    return 1\n\n"
-        "def unused():\n    return 2\n\ndef main():\n    print(value())\n"
-    )
-    tests = (
-        "import os, subprocess\n"
-        "def test_cli():\n"
-        "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
-        "        capture_output=True, text=True)\n"
-        "    assert result.returncode == 0\n"
-        "    assert result.stdout == '1\\n'\n"
-    )
-    environment = _prepare_runner_flake(root, tests, source)
-    result = _run_runner_cli(root, environment, "mutation", "--timeout", "10")
-    if result.returncode or "1 passed, 0 failed, 0 skipped" not in result.stdout:
-        raise AssertionError(result.stdout + result.stderr)
-    (workspace,) = (root / "tmp").glob("python-mutation-example-*")
-    summary = json.loads((workspace / "summary.json").read_text())
-    if summary.get("killed", 0) <= 0 or summary.get("survived", 0) <= 0:
-        raise AssertionError(summary)
-    if not (workspace / "report.html").stat().st_size:
-        msg = "the campaign must retain a readable report"
-        raise AssertionError(msg)
-    if (root / "packages/example/main.py").read_text() != source:
-        msg = "mutations must never alter the original source"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize(
-    "tests",
-    [
-        "def test_failure():\n    assert False\n",
-        "",
-        "raise ImportError('missing dependency')\n",
-    ],
-)
-def test_mutation_invalid_baselines_fail_without_publishing_scores(
-    tmp_path: Path,
-    tests: str,
-) -> None:
-    """An invalid baseline cannot produce a misleading mutation report."""
-    root = tmp_path / "source"
-    environment = _prepare_runner_flake(root, tests)
-    result = _run_runner_cli(root, environment, "mutation")
-    (workspace,) = (root / "tmp").glob("python-mutation-example-*")
-    if result.returncode != 1 or "baseline.log" not in result.stderr:
-        raise AssertionError(result.stdout + result.stderr)
-    if (
-        not (workspace / "baseline.log").is_file()
-        or (workspace / "summary.json").exists()
-    ):
-        msg = "retain baseline diagnostics without publishing mutation scores"
-        raise AssertionError(msg)
-
-
-def test_mutation_a_package_without_mutable_code_completes_with_an_empty_report(
-    tmp_path: Path,
-) -> None:
-    """A passing import-only suite needs no artificial mutations to succeed."""
-    root = tmp_path / "source"
-    environment = _prepare_runner_flake(
-        root,
-        "from packages.example import main\n"
-        "from hypothesis import given, example, strategies as st\n"
-        "@given(st.just(1))\n@example(0)\n"
-        "def test_explicit_only(value):\n"
-        "    assert value == 0\n"
-        "    assert main is not None\n",
-        "",
-    )
-    result = _run_runner_cli(root, environment, "mutation")
-    (workspace,) = (root / "tmp").glob("python-mutation-example-*")
-    if result.returncode or json.loads((workspace / "summary.json").read_text()) != {}:
-        raise AssertionError(result.stdout + result.stderr)
-
-
-@pytest.mark.parametrize("target_directory", [".", "packages/example"])
-def test_mutation_omitted_target_runs_current_directory(
-    tmp_path: Path,
-    target_directory: str,
-) -> None:
-    """Run the current package or repository without an explicit target."""
-    root = tmp_path / "source with spaces"
-    environment = _prepare_runner_flake(
-        root,
-        "from packages.example import main\ndef test_import():\n"
-        "    assert main is not None\n",
-        "",
-    )
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "mutation"],
-        cwd=root / target_directory,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    if result.returncode:
-        raise AssertionError(result.stdout + result.stderr)
-    if not (root / "tmp").is_dir():
-        msg = "current-directory run did not retain diagnostics"
-        raise AssertionError(msg)
-    if target_directory == "." and "1 passed, 0 failed, 0 skipped" not in result.stdout:
-        raise AssertionError(result.stdout)
-
-
-def test_mutation_cli_errors_and_help(tmp_path: Path) -> None:
-    """The installed CLI rejects invalid targets and nonfinite timeouts."""
-    executable = os.environ["PACKAGE_E2E_EXECUTABLE"]
-    for arguments, code in [
-        (["--help"], 0),
-        ([str(tmp_path)], 1),
-        ([str(tmp_path), "--timeout", "nan"], 2),
-    ]:
-        result = subprocess.run(  # noqa: S603
-            [executable, "test", "mutation", *arguments],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if result.returncode != code:
-            message = "mutation runner expectation failed"
-            raise AssertionError(message)
-
-
-@pytest.mark.parametrize(
-    "layout",
-    ["empty", "nonpython", "untested", "single_untested"],
-)
-def test_mutation_cli_repository_without_runnable_packages(
-    tmp_path: Path,
-    layout: str,
-) -> None:
-    """Report empty repositories, skipped packages, and invalid explicit targets."""
-    (tmp_path / "flake.nix").write_text("{}", encoding="utf-8")
-    target = tmp_path
-    if layout == "nonpython":
-        package = tmp_path / "packages" / "web"
-        package.mkdir(parents=True)
-        (package / "default.nix").write_text("{}", encoding="utf-8")
-        (package / "index.html").write_text("hello", encoding="utf-8")
-    elif layout in {"untested", "single_untested"}:
-        package = _make_runner_target(tmp_path, "", "")
-        (package / "test_main.py").unlink()
-        if layout == "single_untested":
-            target = package
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "mutation", str(target)],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    expected_code = 0 if layout == "untested" else 1
-    if result.returncode != expected_code:
-        raise AssertionError(result.stdout + result.stderr)
-    if layout == "untested":
-        if (
-            "Skipping example: no test_main.py" not in result.stdout
-            or "0 passed, 0 failed, 1 skipped" not in result.stdout
-        ):
-            msg = "repository did not report its skipped package"
-            raise AssertionError(msg)
-    elif (
-        layout != "single_untested" and "no Python packages found" not in result.stderr
-    ):
-        msg = "empty repository diagnostic missing"
-        raise AssertionError(msg)
-    if (tmp_path / "tmp").exists():
-        msg = "a non-runnable target started a workspace"
-        raise AssertionError(msg)
-
-
-@pytest.mark.parametrize("command", ["hypothesis", "mutation"])
-def test_runners_support_dash_case_and_execute_copied_git_subcommands(
-    tmp_path: Path,
-    command: str,
-) -> None:
-    """A copied Git subcommand must run from the isolated package."""
-    root = tmp_path / "source with spaces"
-    source = "def main():\n    print('isolated')\n"
-    tests = (
-        "import subprocess\n"
-        "def test_copied_command():\n"
-        "    result = subprocess.run(['git', 'example'],\n"
-        "        capture_output=True, text=True)\n"
-        "    assert result.returncode == 0\n"
-        "    assert result.stdout == 'isolated\\n'\n"
-    )
-    environment = _prepare_runner_flake(root, tests, source, name="git-example")
-    result = _run_runner_cli(root, environment, command)
-    if result.returncode or "1 passed, 0 failed, 0 skipped" not in result.stdout:
-        raise AssertionError(result.stdout + result.stderr)
-    if (root / "packages/git-example/main.py").read_text() != source:
-        message = "runner changed the original dash-case package"
-        raise AssertionError(message)
-
-
-def _prepare_coverage_flake(
-    root: Path,
-    *,
-    failure: str | None = None,
-) -> dict[str, str]:
-    """Build generated checks and coverage variants with offline Nix inputs."""
-    root.mkdir(parents=True)
-    _git(root, "init", "--quiet")
-    for filename in (".gitignore", "flake.nix", "flake.lock", "README"):
-        (root / filename).write_text(
-            "{}" if filename.endswith((".nix", ".lock")) else "",
-        )
-    (root / "flake.lock").write_text(
-        json.dumps({"nodes": {"root": {}}, "root": "root", "version": 7}),
-    )
-    _git(root, "add", ".")
-    environment = dict(os.environ)
-    store = root.parent / "nix"
-    environment["NIX_REMOTE"] = (
-        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
-    )
-    environment["NIX_CONFIG"] = (
-        "experimental-features = nix-command flakes\nbuild-users-group =\n"
-        "sandbox = false\nsandbox-build-dir = /coverage-build\neval-cache = false\n"
-    )
-    system = subprocess.run(
-        ["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],  # noqa: S607
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    ).stdout
-    site_packages = (
-        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
-    )
-    coverage_root = Path(coverage.__file__).resolve().parents[4]
-    bash = shutil.which("bash")
-    if bash is None:
-        message = "coverage fixtures require bash"
-        raise AssertionError(message)
-    packages = []
-    checks = []
-    for name in ("example", "z-last"):
-        _run(root, "add", f"packages/{name}", "python")
-        package = root / "packages" / name
+    """Run copied Git commands, count cases, and retain failure diagnostics."""
+    with TemporaryDirectory(prefix="canonical-campaign-") as directory:
+        root = Path(directory) / "source with spaces"
         source = "def main():\n    print('ready')\n"
         tests = (
             "import os, subprocess\n"
+            "from pathlib import Path\n"
             "from hypothesis import given, example, strategies as st\n"
-            "@given(st.just(1))\n@example(0)\n"
-            "def test_explicit(value):\n    assert value == 0\n"
+            "@given(st.integers())\n"
+            "@example(0)\n"
+            "def test_property(value):\n"
+            "    with Path('examples').open('a') as output:\n"
+            "        output.write(str(value) + '\\n')\n"
             "def test_cli():\n"
-            "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
-            "        capture_output=True, text=True)\n"
-            "    assert result.stdout == 'ready\\n'\n"
+            "    result = subprocess.run(['git', 'example'], "
+            "capture_output=True, text=True)\n"
+            "    assert result.returncode == 0 and result.stdout == "
+            "'ready\\n'\n"
         )
-        if name == "example" and failure == "build":
-            tests = "def test_failure(): assert False\n"
-        (package / "main.py").write_text(source)
-        (package / "test_main.py").write_text(tests)
-        installed = root / "prm/installed" / name
-        module_name = name.replace("-", "_")
-        module = installed / site_packages / module_name
-        module.mkdir(parents=True)
-        (module / "__init__.py").write_text(source)
-        executable = installed / "bin" / name
-        executable.parent.mkdir()
-        executable.write_text(
-            f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
-            "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "
-            f"{site_packages!r}))\n"
-            f"from {module_name} import main\nmain()\n",
+        environment = _prepare_runner_flake(root, tests, source, name="git-example")
+        before = _snapshot(root, exclude=("tmp",))
+        result = _run_runner_cli(
+            root,
+            environment,
+            "hypothesis",
+            "--max-examples",
+            str(max_examples),
         )
-        executable.chmod(0o755)
-        packages.append(
-            f"{json.dumps(name)} = {{ "
-            f"src = builtins.path {{ path = ./packages/{name}; "
-            f'name = "{name}-src"; }}; '
-            f"outPath = builtins.path {{ path = ./prm/installed/{name}; "
-            f'name = "{name}-installed"; }}; '
-            f"pname = {json.dumps(module_name)}; cliName = {json.dumps(name)}; "
-            f"meta.mainProgram = {json.dumps(name)}; "
-            "propagatedBuildInputs = []; python = { "
-            f"sitePackages = {json.dumps(site_packages)}; "
-            f"pkgs.coverage = {json.dumps(str(coverage_root))}; "
-            f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};",
+        _expect(
+            not result.returncode and "1 passed, 0 failed, 0 skipped" in result.stdout,
+            result,
         )
-        expression = (
-            f"import ./checks/{name}/default.nix {{ inherit pkgs; "
-            "inputs.self.packages.${system} = packages; }"
+        _expect(
+            _snapshot(root, exclude=("tmp",)) == before,
+            "explicit campaign modified source",
         )
-        if name == "example" and failure == "report":
-            expression = (
-                f"({expression}).overrideAttrs "
-                '(_: { buildCommand = "mkdir -p $out\\n"; })'
+        current = _campaign(
+            root,
+            environment,
+            "hypothesis",
+            "--max-examples",
+            str(max_examples),
+            cwd=root / "packages/git-example",
+        )
+        _expect(not current.returncode, current)
+        workspaces = list((root / "tmp").glob("python-hypothesis-git-example-*"))
+        expected_workspaces = 2
+        _expect(len(workspaces) == expected_workspaces, workspaces)
+        for workspace in workspaces:
+            _expect(
+                len((workspace / "examples").read_text().splitlines())
+                == max_examples + 1,
+                workspace,
             )
-        checks.append(f"{json.dumps(name)} = {expression};")
-    _run(root, "converge")
-    (root / "flake.nix").write_text(
-        "{ outputs = _: let "
-        f"system = {json.dumps(system)}; "
-        "mkCheck = name: attrs: script: let build = current: (builtins.derivation { "
-        "inherit system; inherit (current) name src PACKAGE_E2E_EXECUTABLE; "
-        f"builder = {json.dumps(bash)}; "
-        f"PATH = {json.dumps(sys.prefix + '/bin:' + environment['PATH'])}; "
-        f"PYTHONPATH = {json.dumps(os.pathsep.join(sys.path))}; "
-        'args = [ "-e" (builtins.toFile "check-builder" '
-        '("export -n src PACKAGE_E2E_EXECUTABLE\\n" + current.buildCommand)) ]; '
-        "}) // { overrideAttrs = f: build (current // f current); }; "
-        "in build (attrs // { inherit name; buildCommand = script; }); "
-        "pkgs = { stdenv.system = system; runCommand = mkCheck; lib = { "
-        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
-        "concatMap = f: xs: builtins.concatLists (map f xs); "
-        'getExe = p: "${p}/bin/${p.cliName}"; }; }; '
-        "packages = { "
-        + " ".join(packages)
-        + " }; in { packages.${system} = packages; "
-        "checks.${system} = { " + " ".join(checks) + " }; }; }\n",
-    )
-    _git(root, "add", ".")
-    return environment
+            _expect(
+                f"{max_examples} passing examples"
+                in (workspace / "tests.log").read_text(),
+                workspace,
+            )
+        bad_tests = (
+            (
+                "from hypothesis import given, strategies as st\n"
+                "@given(st.integers())\n"
+                "def test_failure(value):\n"
+                "    assert value != 0\n"
+            )
+            if failure == "counterexample"
+            else (
+                "import subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "def test_stalled():\n"
+                "    child = subprocess.Popen([sys.executable, '-c', 'import "
+                "time; time.sleep(30)'])\n"
+                "    Path('child.pid').write_text(str(child.pid))\n"
+                "    time.sleep(30)\n"
+            )
+        )
+        _runner_package(root, "alpha", bad_tests)
+        _runner_package(root, "untested", "")
+        (root / "packages/untested/test_main.py").unlink()
+        result = _campaign(
+            root,
+            environment,
+            "hypothesis",
+            "--max-examples",
+            str(max_examples),
+            "--timeout",
+            "20" if failure == "counterexample" else "2",
+        )
+        _expect(
+            result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
+            result,
+        )
+        (failed,) = (root / "tmp").glob("python-hypothesis-alpha-*")
+        diagnostic = (
+            "Falsifying example" if failure == "counterexample" else "timed out"
+        )
+        _expect(
+            diagnostic
+            in result.stdout + result.stderr + (failed / "tests.log").read_text(),
+            result,
+        )
+        if failure == "timeout":
+            pid = int((failed / "child.pid").read_text())
+            status = Path(f"/proc/{pid}/status")
+            _expect(
+                not status.exists() or "State:\tZ" in status.read_text(),
+                "timed-out suite left a running descendant",
+            )
 
 
-@pytest.fixture(scope="module")
-def coverage_repository(
-    tmp_path_factory: pytest.TempPathFactory,
-) -> tuple[Path, dict[str, str]]:
-    """Reuse an unchanged flake and its cached builds across successful CLI cases."""
-    root = tmp_path_factory.mktemp("coverage") / "source with spaces"
-    return root, _prepare_coverage_flake(root)
-
-
-def test_ordinary_checks_run_explicit_examples_without_coverage(
-    coverage_repository: tuple[Path, dict[str, str]],
+@settings(deadline=None)
+@given(value=st.integers(min_value=1, max_value=9))
+@example(value=1)
+def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
+    value: int,
 ) -> None:
-    """The shared test invocation succeeds without producing report artifacts."""
-    root, environment = coverage_repository
-    plain = subprocess.run(  # noqa: S603
-        [  # noqa: S607
-            "nix",
+    """Report killed/surviving mutations and keep invalid baselines out of scores."""
+    with TemporaryDirectory(prefix="canonical-mutations-") as directory:
+        root = Path(directory) / "source with spaces"
+        source = (
+            "def value():\n"
+            f"    return {value}\n"
+            "\n"
+            "def unused():\n"
+            "    return 2\n"
+            "\n"
+            "def main():\n"
+            "    print(value())\n"
+        )
+        tests = (
+            "import subprocess\n"
+            "def test_cli():\n"
+            "    result = subprocess.run(['git', 'example'], "
+            "capture_output=True, text=True)\n"
+            "    assert result.returncode == 0 "
+            f"and result.stdout == {str(value) + chr(10)!r}\n"
+        )
+        environment = _prepare_runner_flake(root, tests, source, name="git-example")
+        result = _campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            cwd=root / "packages/git-example",
+        )
+        _expect(not result.returncode, result)
+        (workspace,) = (root / "tmp").glob("python-mutation-git-example-*")
+        summary = json.loads((workspace / "summary.json").read_text())
+        _expect(
+            summary.get("killed", 0) > 0
+            and summary.get("survived", 0) > 0
+            and (workspace / "report.html").stat().st_size > 0,
+            summary,
+        )
+        baselines = {
+            "alpha": "def test_failure():\n    assert False\n",
+            "beta": "",
+            "gamma": "raise ImportError('missing dependency')\n",
+        }
+        for name, baseline in baselines.items():
+            _runner_package(root, name, baseline)
+        _runner_package(root, "untested", "")
+        (root / "packages/untested/test_main.py").unlink()
+        result = _campaign(root, environment, "mutation", "--timeout", "10")
+        _expect(
+            result.returncode == 1
+            and "1 passed, 3 failed, 1 skipped" in result.stdout
+            and "baseline.log" in result.stderr,
+            result,
+        )
+        for name in baselines:
+            (failed,) = (root / "tmp").glob(f"python-mutation-{name}-*")
+            _expect(
+                (failed / "baseline.log").is_file()
+                and not (failed / "summary.json").exists(),
+                failed,
+            )
+    with TemporaryDirectory(prefix="canonical-empty-mutations-") as directory:
+        root = Path(directory) / "source"
+        tests = (
+            "from packages.example import main\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "@given(st.just(1))\n"
+            "@example(0)\n"
+            "def test_explicit(value):\n"
+            "    assert value == 0 and main is not None\n"
+        )
+        environment = _prepare_runner_flake(root, tests, "")
+        result = _campaign(root, environment, "mutation")
+        (workspace,) = (root / "tmp").glob("python-mutation-example-*")
+        _expect(
+            not result.returncode
+            and json.loads((workspace / "summary.json").read_text()) == {},
+            result,
+        )
+
+
+def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> None:
+    """Build real checks, measure CLI lines, and keep reports outside the checkout."""
+    with TemporaryDirectory(prefix="canonical-coverage-") as directory:
+        root = Path(directory) / "source with spaces"
+        environment = _prepare_coverage_flake(root)
+        before = _snapshot(root)
+        expression = (
+            f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
+            "in f.checks.${builtins.currentSystem}.example"
+        )
+        plain = _run(
+            root,
             "build",
             "--no-link",
             "--print-out-paths",
             "--impure",
             "--expr",
-            (
-                f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
-                "in f.checks.${builtins.currentSystem}.example"
+            expression,
+            executable="nix",
+            environment=environment,
+        )
+        _expect(
+            not any(
+                path.name.startswith(".coverage")
+                or path.name in {"html", "coverage.json"}
+                for path in Path(plain.stdout.strip()).iterdir()
             ),
-        ],
-        cwd=root,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    if plain.returncode:
-        raise AssertionError(plain.stdout + plain.stderr)
-    if any(
-        path.name.startswith(".coverage") or path.name in {"html", "coverage.json"}
-        for path in Path(plain.stdout.strip()).iterdir()
-    ):
-        message = "ordinary checks produced coverage artifacts"
-        raise AssertionError(message)
+            "ordinary checks produced coverage artifacts",
+        )
+        for target in (root, root / "packages/z-last"):
+            explicit = _run_runner_cli(target, environment, "coverage")
+            current = _campaign(root, environment, "coverage", cwd=target)
+            _expect(
+                not explicit.returncode
+                and explicit.stdout == current.stdout
+                and not current.returncode,
+                (explicit, current),
+            )
+            reports = [
+                line
+                for line in explicit.stdout.splitlines()
+                if line.endswith("/html/index.html")
+            ]
+            _expect(len(reports) == (2 if target == root else 1), explicit)
+            for line in reports:
+                report = Path(line.split(": ", 1)[1]).parents[1]
+                files = json.loads((report / "coverage.json").read_text())["files"]
+                _expect(
+                    len(files) == 1 and next(iter(files)).endswith("/main.py"),
+                    files,
+                )
+                _expect(
+                    set(next(iter(files.values()))["executed_lines"]) == {1, 2},
+                    files,
+                )
+        _expect(
+            _snapshot(root) == before and not (root / "tmp").exists(),
+            "coverage changed repository state",
+        )
+    for failure in ("build", "report", "check", "syntax"):
+        with TemporaryDirectory(prefix="canonical-coverage-failure-") as directory:
+            root = Path(directory) / "source"
+            environment = _prepare_coverage_flake(root, failure=failure)
+            if failure == "check":
+                (root / "checks/example/default.nix").unlink()
+            if failure == "syntax":
+                (root / "packages/example/test_main.py").write_text("def invalid(")
+            untested = _make_runner_target(root, "", "", name="untested")
+            (untested / "test_main.py").unlink()
+            (root / "flake.nix").write_text(_git(root, "show", ":flake.nix"))
+            before = _snapshot(root)
+            result = _run_runner_cli(root, environment, "coverage")
+            _expect(
+                result.returncode == 1
+                and "1 passed, 1 failed, 1 skipped" in result.stdout,
+                result,
+            )
+            _expect(
+                "z-last:" in result.stdout
+                and "/html/index.html" in result.stdout
+                and "canonical test coverage: example:" in result.stderr,
+                result,
+            )
+            _expect(
+                _snapshot(root) == before,
+                f"{failure} failure changed repository state",
+            )
 
 
-@pytest.mark.parametrize("target", [".", "packages/example", "packages/z-last"])
-def test_coverage_builds_instrumented_checks_and_preserves_the_checkout(
-    coverage_repository: tuple[Path, dict[str, str]],
-    target: str,
-) -> None:
-    """Build cached HTML reports for explicit and current-directory targets."""
-    root, environment = coverage_repository
-    before = _git(root, "status", "--porcelain")
-    explicit = _run_runner_cli(root / target, environment, "coverage")
-    current = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "coverage"],
-        cwd=root / target,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    for result in (explicit, current):
-        if result.returncode or "/html/index.html" not in result.stdout:
-            raise AssertionError(result.stdout + result.stderr)
-    for line in explicit.stdout.splitlines():
-        if line.endswith("/html/index.html"):
-            report = Path(line.split(": ", 1)[1]).parents[1] / "coverage.json"
-            files = json.loads(report.read_text())["files"]
-            if len(files) != 1 or not next(iter(files)).endswith("/main.py"):
-                raise AssertionError(files)
-            if not next(iter(files.values()))["executed_lines"]:
-                message = "coverage missed the CLI subprocess"
-                raise AssertionError(message)
-    if explicit.stdout != current.stdout:
-        raise AssertionError(current.stdout)
-    if _git(root, "status", "--porcelain") != before or (root / "result").exists():
-        message = "coverage changed the checkout"
-        raise AssertionError(message)
-    if (root / "tmp").exists():
-        message = "coverage created local campaign state"
-        raise AssertionError(message)
-
-
-@pytest.mark.parametrize("failure", ["build", "report", "check", "syntax"])
-def test_coverage_continues_after_failures_and_skips_packages_without_tests(
-    tmp_path: Path,
-    failure: str,
-) -> None:
-    """A failed or missing report cannot hide a later package's successful check."""
-    root = tmp_path / "source"
-    environment = _prepare_coverage_flake(root, failure=failure)
-    if failure == "check":
-        (root / "checks/example/default.nix").unlink()
-    if failure == "syntax":
-        (root / "packages/example/test_main.py").write_text("def invalid(")
-    untested = _make_runner_target(root, "", "", name="untested")
-    (untested / "test_main.py").unlink()
-    (root / "flake.nix").write_text(_git(root, "show", ":flake.nix"))
-    result = _run_runner_cli(root, environment, "coverage")
-    if result.returncode != 1 or "1 passed, 1 failed, 1 skipped" not in result.stdout:
-        raise AssertionError(result.stdout + result.stderr)
-    if "z-last:" not in result.stdout or "/html/index.html" not in result.stdout:
-        raise AssertionError(result.stdout)
-    if "canonical test coverage: example:" not in result.stderr:
-        raise AssertionError(result.stderr)
-
-
-def test_coverage_rejects_invalid_targets_without_starting_a_build(
-    tmp_path: Path,
-) -> None:
-    """Coverage requires an existing canonical package or nonempty Python repository."""
-    _run(tmp_path, "test", "coverage", code=1)
-    (tmp_path / "flake.nix").write_text("{}")
-    _run(tmp_path, "test", "coverage", code=1)
+def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
+    """Expose consistent commands and reject invalid requests before creating state."""
+    with TemporaryDirectory(prefix="canonical-cli-") as directory:
+        root = Path(directory)
+        commands = (
+            (),
+            ("add",),
+            ("mv",),
+            ("rm",),
+            ("init",),
+            ("converge",),
+            ("overview",),
+            ("args",),
+            ("test",),
+            ("test", "names"),
+            ("test", "coverage"),
+            ("test", "hypothesis"),
+            ("test", "mutation"),
+        )
+        for path in commands:
+            option = _run(root, *path, "--help").stdout
+            _expect(
+                option == _run(root, "help", *path).stdout and "usage:" in option,
+                path,
+            )
+        environment = dict(os.environ)
+        environment["PATH"] = (
+            str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
+            + os.pathsep
+            + environment["PATH"]
+        )
+        _expect(
+            _run(root, "help", executable="canonical", environment=environment).stdout
+            == _run(root, "--help").stdout,
+            "standalone command unavailable through PATH",
+        )
+        for retired in (
+            "status",
+            "check",
+            "test-names",
+            "coverage",
+            "hypothesis",
+            "mutation",
+        ):
+            _run(root, retired, code=2)
+        _expect(
+            _run(root, "test").stdout == _run(root, "test", "--help").stdout,
+            "bare test must show help",
+        )
+        _run(root, "test", "unknown", code=2)
+        names_help = _run(root, "test", "names", "--help").stdout
+        _expect(
+            "[target]" in names_help and "current directory" in names_help,
+            names_help,
+        )
+        for option in ("--timeout", "--max-examples"):
+            _run(root, "test", "names", option, "10", code=2)
+        for command in ("names", "coverage", "hypothesis", "mutation"):
+            _run(root, "test", command, code=1)
+        for command in ("hypothesis", "mutation"):
+            for timeout in ("nan", "inf", "-inf", "0", "-1"):
+                _run(root, "test", command, str(root), f"--timeout={timeout}", code=2)
+        _run(root, "test", "hypothesis", str(root), "--max-examples", "0", code=2)
+        _expect(not any(root.iterdir()), "invalid CLI request created state")
+    for layout in ("empty", "nonpython", "untested", "single_untested"):
+        with _fresh_repository() as root:
+            target = root
+            if layout == "nonpython":
+                _run(root, "add", "packages/web", "html")
+            elif layout in {"untested", "single_untested"}:
+                target = _make_runner_target(root, "", "")
+                (target / "test_main.py").unlink()
+                if layout == "untested":
+                    target = root
+            before = _snapshot(root)
+            for command in ("hypothesis", "mutation"):
+                result = _run(
+                    root,
+                    "test",
+                    command,
+                    str(target),
+                    code=0 if layout == "untested" else 1,
+                )
+                if layout == "untested":
+                    _expect(
+                        "Skipping example: no test_main.py" in result.stdout
+                        and "0 passed, 0 failed, 1 skipped" in result.stdout,
+                        result,
+                    )
+                elif layout != "single_untested":
+                    _expect("no Python packages found" in result.stderr, result)
+            if layout == "empty":
+                for command in ("names", "coverage"):
+                    _expect(
+                        "no Python packages found"
+                        in _run(root, "test", command, code=1).stderr,
+                        command,
+                    )
+            _expect(_snapshot(root) == before, "nonrunnable target created state")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _check_command_catalog(monkeypatch)
+    _check_discovery_boundaries()
