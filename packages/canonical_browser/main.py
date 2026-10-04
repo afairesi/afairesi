@@ -22,9 +22,10 @@ import webbrowser
 from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from difflib import unified_diff
+from functools import cache
 from html import escape
 from http import HTTPStatus
 from pathlib import Path
@@ -58,10 +59,9 @@ ACTION_BODY_LIMIT = 16384
 @dataclass
 class TreeNode:  # noqa: D101
     title: str
-    children: list["TreeNode"] | None = None
+    children: list["TreeNode"] = field(default_factory=list)
     change: str | None = None
     warning: bool = False
-    resource_id: str | None = None
     directory: Path | None = None
     source_file: bool = False
     output_diff: str | None = None
@@ -224,12 +224,9 @@ class OutputSnapshots:
                 )
             else:
                 message = "Previous capture → Current capture"
-            tree.children = [
-                TreeNode(message, warning=bool(comparison.error)),
-                *(tree.children or []),
-            ]
+            tree.children.insert(0, TreeNode(message, warning=bool(comparison.error)))
             children = record["tree"]["children"]
-            children[:] = [child for child in children if child["title"] != "tmp/"]
+            children[:] = [child for child in children if child["field"] != "tmp"]
             children.append(serialize_node(tree))
 
     def entry_report(
@@ -404,19 +401,17 @@ class RepositoryBrowser:
         """Start browsing at the given directory."""
         self.cwd = Path(cwd or Path.cwd()).resolve()
         self.snapshot: dict[str, Any] = {}
-        self.source_snapshots: dict[Path, dict[str, Any]] = {}
+        self.source_snapshot = cache(browser_snapshot)
 
     def refresh(self) -> None:
         """Discard cached declarations and rebuild the current snapshot."""
-        self.source_snapshots.clear()
+        self.source_snapshot.cache_clear()
         self.load()
 
     def load(self) -> None:
         """Scope cached declarations without changing the source snapshot."""
         root = canonical_root(self.cwd)
-        if root not in self.source_snapshots:
-            self.source_snapshots[root] = browser_snapshot(root)
-        self.snapshot = scope_snapshot(deepcopy(self.source_snapshots[root]), self.cwd)
+        self.snapshot = scope_snapshot(deepcopy(self.source_snapshot(root)), self.cwd)
 
 
 def cli_tree(current: list[CliEntry], previous: list[CliEntry]) -> list[TreeNode]:
@@ -436,7 +431,7 @@ def cli_tree(current: list[CliEntry], previous: list[CliEntry]) -> list[TreeNode
                 commands[path] = TreeNode(name, [])
                 children.append(commands[path])
             node = commands[path]
-            children = node.children if node.children is not None else []
+            children = node.children
         prefix = "- " if change == "removed" else "+ " if change == "added" else ""
         if entry.command:
             node.title = prefix + entry.path[-1]
@@ -485,7 +480,7 @@ def resource_entry(record: dict[str, Any]) -> TreeNode:  # noqa: C901
     metadata = fields("name", "Name") + fields("description", "Description")
     documentation = fields("help")
     if documentation:
-        source("main.py").children = documentation + (source("main.py").children or [])
+        source("main.py").children[:0] = documentation
 
     def suppressions(data: ResourceData) -> dict[tuple[str, str, str], int]:
         return {
@@ -515,10 +510,7 @@ def resource_entry(record: dict[str, Any]) -> TreeNode:  # noqa: C901
             str(after) if change is None else f"{before} → {after}"
         )
         parent = source(filename)
-        parent.children = [
-            *(parent.children or []),
-            TreeNode(title, change=change, field="suppressions"),
-        ]
+        parent.children.append(TreeNode(title, change=change, field="suppressions"))
 
     def cli(data: ResourceData) -> list[CliEntry]:
         return [
@@ -560,29 +552,24 @@ def resource_entry(record: dict[str, Any]) -> TreeNode:  # noqa: C901
             )
         if children:
             parent = source(filename)
-            parent.children = [
-                *(parent.children or []),
-                TreeNode(title, children, field=key),
-            ]
+            parent.children.append(TreeNode(title, children, field=key))
     tree = TreeNode(
         record["path"],
         [*metadata, *(files[name] for name in sorted(files))],
         change=record.get("change"),
-        resource_id=record["id"],
     )
     if record["kind"] == "host":
-        tree.children = [TreeNode("OS: NixOS (configuration)"), *(tree.children or [])]
+        tree.children.insert(0, TreeNode("OS: NixOS (configuration)"))
     return tree
 
 
 def serialize_node(node: TreeNode) -> dict[str, Any]:
     """Serialize source details and semantic changes for the web browser."""
-    children = [serialize_node(child) for child in node.children or []]
+    children = [serialize_node(child) for child in node.children]
     return {
         "title": node.title,
         "change": node.change,
         "warning": node.warning or any(child["warning"] for child in children),
-        "resource_id": node.resource_id,
         "source_file": node.source_file,
         "output_diff": node.output_diff,
         "text_diff": node.text_diff,
@@ -853,7 +840,7 @@ def output_tree(output: Path, previous: Path | None, current: Path) -> TreeNode:
         if previous is not None:
             node.change = output_change(old, new)
             if node.change or any(
-                child.change or child.output_diff for child in node.children or []
+                child.change or child.output_diff for child in node.children
             ):
                 node.output_diff = "/output-diff?" + urlencode(
                     {
@@ -901,7 +888,7 @@ def browser_snapshot(root: Path) -> dict[str, Any]:
             record["icon"] = "nixos"
         tree = resource_entry(record)
         directory = root / record["repository"] / record["path"]
-        tree.children = [*(tree.children or []), *package_storage(directory)]
+        tree.children.extend(package_storage(directory))
         links = [
             TreeNode(
                 f"{edge['kind']}: {edge['source']} → {edge['target']}",
@@ -912,10 +899,7 @@ def browser_snapshot(root: Path) -> dict[str, Any]:
             and edge["kind"] not in {"contains", "submodule"}
         ]
         if links:
-            tree.children = [
-                *(tree.children or []),
-                TreeNode("Connections", links, field="connections"),
-            ]
+            tree.children.append(TreeNode("Connections", links, field="connections"))
         record["source_metrics"] = record["details"]["source_metrics"]
         record["tree"] = serialize_node(tree)
     data["root"] = str(root)
@@ -1456,15 +1440,12 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
         "/style.css": ("style.css", "text/css"),
     }
 
-    @application.api_route("/", methods=["GET", "HEAD"])
-    @application.api_route("/script.js", methods=["GET", "HEAD"])
-    @application.api_route("/g6.js", methods=["GET", "HEAD"])
-    @application.api_route("/icons.js", methods=["GET", "HEAD"])
-    @application.api_route("/style.css", methods=["GET", "HEAD"])
     def asset(request: Request) -> Response:
         filename, media_type = routes[request.url.path]
         return FileResponse(assets / filename, media_type=media_type)
 
+    for route in routes:
+        application.add_api_route(route, asset, methods=["GET", "HEAD"])
     return application
 
 

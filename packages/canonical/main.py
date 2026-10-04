@@ -2363,16 +2363,7 @@ def initialize_flake(remote: str) -> None:
     )
 
 
-def _test_names_qualified_name(node: ast.expr) -> str:
-    """Read a dotted Python name without evaluating it."""
-    if isinstance(node, ast.Name):
-        return node.id
-    if isinstance(node, ast.Attribute):
-        return _test_names_qualified_name(node.value) + "." + node.attr
-    return ""
-
-
-def _test_names_unittest_classes(module: ast.Module) -> set[str]:
+def _unittest_classes(module: ast.Module) -> set[str]:
     """Recognize unittest subclasses regardless of their class names."""
     bases: set[str] = set()
     case_types = {"TestCase", "IsolatedAsyncioTestCase"}
@@ -2396,9 +2387,7 @@ def _test_names_unittest_classes(module: ast.Module) -> set[str]:
         node.name
         for node in classes
         if node.name not in found
-        and any(
-            _test_names_qualified_name(base) in bases | found for base in node.bases
-        )
+        and any(ast.unparse(base) in bases | found for base in node.bases)
     }:
         found.update(additions)
     return found
@@ -2416,7 +2405,7 @@ def read_test_names(path: Path, *, source_order: bool = False) -> list[str]:
 def source_test_names(source: bytes, filename: str) -> list[str]:
     """Convert Python source into sentences in definition order without executing it."""
     module = ast.parse(source, filename=filename)
-    case_classes = _test_names_unittest_classes(module)
+    case_classes = _unittest_classes(module)
     definitions = []
     for node in module.body:
         if isinstance(node, ast.ClassDef) and (
@@ -2506,7 +2495,7 @@ def _textconv_git_arguments(arguments: list[str]) -> tuple[list[str], list[str]]
         } or option.startswith(
             ("--output", "--textconv=", "-L"),
         ):
-            message = f"unsupported test-name diff option: {option}"
+            message = f"unsupported Git textconv option: {option}"
             raise ValueError(message)
     return options, paths
 
@@ -2542,7 +2531,7 @@ def _textconv_diff_paths(raw: bytes) -> bytes:
             modes = header.lstrip(b":").split()[: parents + 1]
             if any(mode not in {b"000000", b"100644", b"100755"} for mode in modes):
                 message = (
-                    "test-name diffs require regular files, not symlinks or submodules"
+                    "Git textconv requires regular files, not symlinks or submodules"
                 )
                 raise ValueError(message)
         else:
@@ -2556,7 +2545,7 @@ def _print_git_textconv(
     *,
     package_args: bool = False,
 ) -> int:
-    """Let Git compare test sentences using an invocation-local textconv driver."""
+    """Show source summaries using an invocation-local Git textconv driver."""
     options, paths = _textconv_git_arguments(arguments)
     if command == "show":
         revisions = _git_output(
@@ -2571,7 +2560,7 @@ def _print_git_textconv(
     driver = "python-package-args" if package_args else "python-test-names"
     filename = "main.py" if package_args else "test_main.py"
     converter = shlex.join([str(Path(sys.argv[0]).resolve()), *view, "_textconv"])
-    with TemporaryDirectory(prefix="python-test-names-") as directory:
+    with TemporaryDirectory(prefix="canonical-textconv-") as directory:
         attributes = Path(directory) / "attributes"
         attributes.write_text(
             f"/packages/*/{filename} diff={driver} {driver}\n",
@@ -2765,7 +2754,7 @@ def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # no
                     or (
                         keyword.arg == "default"
                         and isinstance(keyword.value, ast.Call)
-                        and _test_names_qualified_name(keyword.value.func) == "Path"
+                        and ast.unparse(keyword.value.func) == "Path"
                         and not keyword.value.args
                         and not keyword.value.keywords
                     )
@@ -2818,7 +2807,7 @@ def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # no
                     unsupported(statement)
                 continue
             method = call.func.attr if isinstance(call.func, ast.Attribute) else ""
-            name = _test_names_qualified_name(call.func)
+            name = ast.unparse(call.func)
             parent = (
                 ast.unparse(call.func.value)
                 if isinstance(call.func, ast.Attribute)
@@ -2866,8 +2855,7 @@ def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # no
             if isinstance(node, ast.FunctionDef)
             and node.name == "parser"
             and any(
-                isinstance(child, ast.Call)
-                and _test_names_qualified_name(child.func) in constructors
+                isinstance(child, ast.Call) and ast.unparse(child.func) in constructors
                 for child in ast.walk(node)
             )
         ),
@@ -2961,7 +2949,7 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
                     ),
                     name,
                 )
-                owner = _test_names_qualified_name(decorator.func.value)
+                owner = ast.unparse(decorator.func.value)
                 parent = (
                     click_path(owner, visiting | {name})
                     if owner in command_functions
@@ -3031,7 +3019,7 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
                 ):
                     raise unsupported(call, "Typer")
                 applications[call.args[0].id] = (
-                    _test_names_qualified_name(call.func.value),
+                    ast.unparse(call.func.value),
                     label.value,
                 )
 
@@ -3146,7 +3134,8 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
             call.args[0].id
             for call in ast.walk(module)
             if isinstance(call, ast.Call)
-            and _test_names_qualified_name(call.func).endswith("run")
+            and isinstance(call.func, (ast.Name, ast.Attribute))
+            and ast.unparse(call.func).endswith("run")
             and call.args
             and isinstance(call.args[0], ast.Name)
         }
@@ -3180,7 +3169,7 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
                         command_name = str(keyword.value.value)
             decorator = decorators[0]
             typer_method = cast("ast.Attribute", decorator.func)
-            owner = _test_names_qualified_name(typer_method.value)
+            owner = ast.unparse(typer_method.value)
             path = typer_path(owner)
             if typer_method.attr == "command":
                 path = (*path, command_name)
@@ -3193,7 +3182,8 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
             node
             for node in ast.walk(module)
             if isinstance(node, ast.Call)
-            and _test_names_qualified_name(node.func).endswith("Fire")
+            and isinstance(node.func, (ast.Name, ast.Attribute))
+            and ast.unparse(node.func).endswith("Fire")
         ]
         if fire_calls:
             found = True
