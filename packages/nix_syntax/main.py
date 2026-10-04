@@ -71,11 +71,6 @@ def _first_error(node: Node) -> Node:
     return node
 
 
-def field(node: Node, name: str) -> Node | None:
-    """Return a named grammar field."""
-    return node.child_by_field_name(name)
-
-
 def walk(node: Node) -> Iterable[Node]:
     """Walk a syntax tree depth first."""
     yield node

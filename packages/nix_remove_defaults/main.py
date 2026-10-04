@@ -84,8 +84,8 @@ def literal(document: nix_syntax.Document, node: Node) -> Literal:  # noqa: C901
         )
         values: dict[str, Literal] = {}
         for binding in [] if binding_set is None else binding_set.named_children:
-            attrpath = nix_syntax.field(binding, "attrpath")
-            expression = nix_syntax.field(binding, "expression")
+            attrpath = binding.child_by_field_name("attrpath")
+            expression = binding.child_by_field_name("expression")
             path = (
                 None
                 if attrpath is None
@@ -107,7 +107,7 @@ def literal(document: nix_syntax.Document, node: Node) -> Literal:  # noqa: C901
 
 def _returned_expression(node: Node) -> Node:
     if node.type in {"function_expression", "let_expression"}:
-        return _returned_expression(nix_syntax.field(node, "body") or node)
+        return _returned_expression(node.child_by_field_name("body") or node)
     return node
 
 
@@ -127,8 +127,8 @@ def collect_candidates(
             None,
         )
         for binding in [] if binding_set is None else binding_set.named_children:
-            attrpath = nix_syntax.field(binding, "attrpath")
-            value = nix_syntax.field(binding, "expression")
+            attrpath = binding.child_by_field_name("attrpath")
+            value = binding.child_by_field_name("expression")
             path = (
                 None
                 if attrpath is None
@@ -154,8 +154,8 @@ def treefmt_arguments(document: nix_syntax.Document) -> list[Node]:
     for node in nix_syntax.walk(document.root):
         if node.type != "apply_expression":
             continue
-        argument = nix_syntax.field(node, "argument")
-        function = nix_syntax.field(node, "function")
+        argument = node.child_by_field_name("argument")
+        function = node.child_by_field_name("function")
         if (
             argument is not None
             and function is not None
@@ -282,8 +282,8 @@ def rewrite(
             return document.text(node), False
         rendered: list[str] = []
         for binding in binding_set.named_children:
-            attrpath = nix_syntax.field(binding, "attrpath")
-            value = nix_syntax.field(binding, "expression")
+            attrpath = binding.child_by_field_name("attrpath")
+            value = binding.child_by_field_name("expression")
             path = (
                 None
                 if attrpath is None

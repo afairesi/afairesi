@@ -46,8 +46,8 @@ def _binding(document: nix_syntax.Document, node: Node) -> Binding:
     rendered = _replace_children(document, node)
     if node.type != "binding":
         return Binding(None, None, rendered)
-    attrpath = nix_syntax.field(node, "attrpath")
-    expression = nix_syntax.field(node, "expression")
+    attrpath = node.child_by_field_name("attrpath")
+    expression = node.child_by_field_name("expression")
     if attrpath is None or expression is None:
         return Binding(None, None, rendered)
     path = nix_syntax.static_attrpath(document, attrpath)
@@ -72,7 +72,7 @@ def _nested_bindings(
         return ()
     expanded: list[Binding] = []
     for child in binding_set.named_children:
-        attrs = nix_syntax.field(child, "attrs")
+        attrs = child.child_by_field_name("attrs")
         if (
             child.type == "inherit"
             and attrs is not None

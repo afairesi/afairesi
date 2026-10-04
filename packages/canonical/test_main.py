@@ -1441,7 +1441,8 @@ def _template_expression(root: Path, name: str) -> str:
         "stdenv.hostPlatform.isLinux = false; "
         "stdenv.mkDerivation = attrs: attrs; writeTextFile = attrs: attrs; "
         "lib.optionals = condition: values: if condition then values else []; "
-        "runCommand = name: _: script: mk name script; "
+        "runCommand = name: attrs: script: mk name "
+        '("runHook() {\\n" + (attrs.postInstall or ":") + "\\n}\\n" + script); '
         "writeShellApplication = attrs: (mk attrs.name "
         "("
         + json.dumps(
@@ -1976,7 +1977,7 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
 @example(kind="html", name="web-site", description="Δ report", library=False)
 @example(kind="latex", name="document", description="LaTeX\tresources", library=False)
 @example(kind="nix", name="my-package", description="é", library=False)
-def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(  # noqa: C901, PLR0915
+def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(  # noqa: C901, PLR0912, PLR0915
     kind: str,
     name: str,
     description: str,
@@ -2006,35 +2007,58 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     )
                 )
         elif kind in {"html", "latex"}:
-            binding = "runtimeDeps" if kind == "html" else "nativeDeps"
+            binding = "runtimeInputs" if kind == "html" else "nativeBuildInputs"
             expression = (
                 f"(let {binding} = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]"
             )
-            source = source.replace(
-                f"{binding} = [ ];",
-                f"{binding} = {expression};",
-            ).replace(
-                "let\n",
-                f"let\n  # {binding} = [ pkgs.fromComment ];\n"
-                f"  ignored = let {binding} = [ pkgs.fromNested ]; in null;\n",
-                1,
+            dependency = "pkgs.http-server" if kind == "html" else "pkgs.texliveFull"
+            source = (
+                source.replace(
+                    f"{binding} = [ {dependency} ]",
+                    f"{binding} = {expression} ++ [ {dependency} ]",
+                )
+                .replace(
+                    "let\n",
+                    f"let\n  # {binding} = [ pkgs.fromComment ];\n"
+                    f"  ignored = let {binding} = [ pkgs.fromNested ]; in null;\n",
+                    1,
+                )
+                .replace(
+                    "  meta.description =",
+                    '  passthru.custom = "preserved";\n  meta.description =',
+                )
             )
             if kind == "html":
                 resource = root / "prm/source.bin"
                 resource.parent.mkdir()
                 resource.write_bytes(b"copied resource")
                 source = source.replace(
-                    'prmInstall = "";',
+                    'pkgs.runCommand "${pname}-site" { }',
                     (
-                        "prmInstall = let prmInstall = \"inner\"; in ''cp "
-                        "${../../prm/source.bin} \"$out/prm/copied.bin\"'';"
+                        'pkgs.runCommand "${pname}-site" { postInstall = '
+                        "let postInstall = \"inner\"; in ''cp "
+                        "${../../prm/source.bin} \"$out/prm/copied.bin\"''; }"
                     ),
+                )
+            else:
+                source = source.replace(
+                    f"{binding} = {expression} ++ [ {dependency} ];",
+                    f"inherit {binding};",
+                ).replace(
+                    "let\n",
+                    f"let\n  {binding} = {expression} ++ [ {dependency} ];\n",
+                    1,
                 )
         definition.write_text(source)
         _run(root, "converge")
         _preview(root, "converge")
         environment = _nix_environment(root)
         actual = _evaluated_template(root, name, environment)
+        _expect(
+            kind not in {"html", "latex"}
+            or 'passthru.custom = "preserved";' in definition.read_text(),
+            "convergence lost custom package attributes",
+        )
         _expect(actual["name"] == name.replace("-", "_"), actual)
         _expect(actual["meta"]["description"] == description, actual)
         graph = _overview(root)

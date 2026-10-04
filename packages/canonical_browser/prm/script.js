@@ -322,13 +322,13 @@ async function packageAction(packagePath, action = null) {
   clearTimeout(actionTimers.get(packagePath));
   try {
     const response = await fetch(
-      action ? "/api/action" : `/api/action?package=${encodeURIComponent(packagePath)}`,
+      action ? "/api/action" : `/api/action?directory=${encodeURIComponent(packagePath)}`,
       action
         ? {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              package: packagePath,
+              directory: packagePath,
               action,
               args: runArguments.get(packagePath) || "",
             }),
@@ -355,7 +355,7 @@ async function packageAction(packagePath, action = null) {
 }
 
 function packageControls(node, meta, body, details) {
-  const packagePath = node.actions.package;
+  const packagePath = node.actions.directory;
   const controls = element("div", "package-controls");
   const argumentsInput = element("input", "run-arguments");
   argumentsInput.placeholder = "Run arguments (optional)";

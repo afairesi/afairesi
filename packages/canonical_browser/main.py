@@ -1057,7 +1057,7 @@ def output_index(root: Path, directory: Path, diff_url: str | None = None) -> by
 
 
 @dataclass
-class PackageAction:
+class CommandJob:
     """Retain a command and its output while the browser is open."""
 
     action: str
@@ -1067,14 +1067,91 @@ class PackageAction:
     observed: bool = False
 
 
-class PackageActions:
-    """Run only packages discovered by this browser, with bounded output reads."""
+class CommandActions:
+    """Keep process groups and bounded command logs for registered directories."""
 
     def __init__(self) -> None:
         """Keep command logs outside the package output being compared."""
         self.storage = tempfile.TemporaryDirectory(prefix="canonical-browser-actions-")
+        self.directories: set[str] = set()
+        self.jobs: dict[str, CommandJob] = {}
+
+    def launch(self, directory: str, action: str, command: list[str]) -> dict[str, Any]:
+        """Launch a command without a shell and retain its output and process group."""
+        if directory not in self.directories:
+            msg = "Unknown directory"
+            raise ValueError(msg)
+        active = self.jobs.get(directory)
+        if action == "stop":
+            if active is not None and active.process.poll() is None:
+                self.stop(active)
+            return self.status(directory)
+        if active is not None and active.process.poll() is None:
+            msg = "A command is already running for this directory"
+            raise ValueError(msg)
+        log = Path(self.storage.name) / (
+            hashlib.sha256(directory.encode()).hexdigest() + ".log"
+        )
+        with log.open("wb") as output:
+            process = subprocess.Popen(  # noqa: S603 - allowlisted package and argument list
+                command,
+                cwd=directory,
+                stdin=subprocess.DEVNULL,
+                stdout=output,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        self.jobs[directory] = CommandJob(action, process, log)
+        return self.status(directory)
+
+    def status(self, directory: str) -> dict[str, Any]:
+        """Return status and the tail of command output without blocking."""
+        if directory not in self.directories:
+            msg = "Unknown directory"
+            raise ValueError(msg)
+        job = self.jobs.get(directory)
+        if job is None:
+            return {"state": "idle", "output": ""}
+        result = job.process.poll()
+        with job.log.open("rb") as stream:
+            stream.seek(max(0, job.log.stat().st_size - OUTPUT_TEXT_LIMIT))
+            output = stream.read(OUTPUT_TEXT_LIMIT).decode(errors="replace")
+        state = "running" if result is None else "passed" if result == 0 else "failed"
+        return {
+            "action": job.action,
+            "state": "stopped" if job.stopped else state,
+            "exit_code": result,
+            "output": output,
+        }
+
+    @staticmethod
+    def stop(job: CommandJob) -> None:
+        """Terminate a command and its descendants, escalating after a short wait."""
+        job.stopped = True
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(job.process.pid, signal.SIGTERM)
+        try:
+            job.process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(job.process.pid, signal.SIGKILL)
+            job.process.wait()
+
+    def close(self) -> None:
+        """Stop active commands before removing session logs."""
+        for job in self.jobs.values():
+            if job.process.poll() is None:
+                self.stop(job)
+        self.storage.cleanup()
+
+
+class PackageActions(CommandActions):
+    """Construct run and check commands for packages discovered by the browser."""
+
+    def __init__(self) -> None:
+        """Register packages separately from their command process state."""
+        super().__init__()
         self.packages: dict[str, tuple[Path, str, bool]] = {}
-        self.jobs: dict[str, PackageAction] = {}
 
     def observe(self, data: dict[str, Any]) -> None:
         """Advertise actions for existing packages and their declared checks."""
@@ -1091,7 +1168,8 @@ class PackageActions:
                 continue
             check = (repository / "checks" / record["name"] / "default.nix").is_file()
             self.packages[str(package)] = repository, record["name"], check
-            record["actions"] = {"package": str(package), "check": check}
+            self.directories.add(str(package))
+            record["actions"] = {"directory": str(package), "check": check}
 
     def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
         """Start an argument-list command, or stop the active process group."""
@@ -1108,16 +1186,10 @@ class PackageActions:
         }:
             msg = "Unknown package or action"
             raise ValueError(msg)
-        active = self.jobs.get(package)
-        if action == "stop":
-            if active is not None and active.process.poll() is None:
-                self.stop(active)
-            return self.status(package)
-        if active is not None and active.process.poll() is None:
-            msg = "A command is already running for this package"
-            raise ValueError(msg)
         repository, name, check = self.packages[package]
-        if action in tests:
+        if action == "stop":
+            command = []
+        elif action in tests:
             command = ["canonical", *action.split(), *shlex.split(arguments)]
         elif action == "check":
             if not check:
@@ -1142,94 +1214,32 @@ class PackageActions:
             ]
         return self.launch(package, action, command)
 
-    def launch(self, package: str, action: str, command: list[str]) -> dict[str, Any]:
-        """Launch a command without a shell and retain its output and process group."""
-        log = Path(self.storage.name) / (
-            hashlib.sha256(package.encode()).hexdigest() + ".log"
-        )
-        with log.open("wb") as output:
-            process = subprocess.Popen(  # noqa: S603 - allowlisted package and argument list
-                command,
-                cwd=package,
-                stdin=subprocess.DEVNULL,
-                stdout=output,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
-        self.jobs[package] = PackageAction(action, process, log)
-        return self.status(package)
 
-    def status(self, package: str) -> dict[str, Any]:
-        """Return status and the tail of command output without blocking."""
-        if package not in self.packages:
-            msg = "Unknown package"
-            raise ValueError(msg)
-        job = self.jobs.get(package)
-        if job is None:
-            return {"state": "idle", "output": ""}
-        result = job.process.poll()
-        with job.log.open("rb") as stream:
-            stream.seek(max(0, job.log.stat().st_size - OUTPUT_TEXT_LIMIT))
-            output = stream.read(OUTPUT_TEXT_LIMIT).decode(errors="replace")
-        state = "running" if result is None else "passed" if result == 0 else "failed"
-        return {
-            "action": job.action,
-            "state": "stopped" if job.stopped else state,
-            "exit_code": result,
-            "output": output,
-        }
-
-    @staticmethod
-    def stop(job: PackageAction) -> None:
-        """Terminate a command and its descendants, escalating after a short wait."""
-        job.stopped = True
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(job.process.pid, signal.SIGTERM)
-        try:
-            job.process.wait(timeout=2)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(job.process.pid, signal.SIGKILL)
-            job.process.wait()
-
-    def close(self) -> None:
-        """Stop active commands before removing session logs."""
-        for job in self.jobs.values():
-            if job.process.poll() is None:
-                self.stop(job)
-        self.storage.cleanup()
-
-
-class CanonicalActions(PackageActions):
+class CanonicalActions(CommandActions):
     """Expose the Canonical CLI in directories visited during this session."""
 
     def observe(self, data: dict[str, Any]) -> None:
         """Register the selected directory and publish the shared command catalog."""
         directory = Path(data["root"])
-        self.packages[str(directory)] = directory, "", False
+        self.directories.add(str(directory))
         data["commands"] = command_catalog()
 
-    def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
+    def start(self, directory: str, action: str, arguments: str = "") -> dict[str, Any]:
         """Execute a catalog command with CLI arguments in the selected directory."""
-        if package not in self.packages:
+        if directory not in self.directories:
             msg = "Unknown directory"
             raise ValueError(msg)
-        if action == "stop":
-            job = self.jobs.get(package)
-            if job is not None and job.process.poll() is None:
-                self.stop(job)
-            return self.status(package)
-        if action not in {entry["command"] for entry in command_catalog()}:
+        if action != "stop" and action not in {
+            entry["command"] for entry in command_catalog()
+        }:
             msg = "Unknown Canonical command"
             raise ValueError(msg)
-        active = self.jobs.get(package)
-        if active is not None and active.process.poll() is None:
-            msg = "A command is already running for this directory"
-            raise ValueError(msg)
         return self.launch(
-            package,
+            directory,
             action,
-            ["canonical", *action.split(), *shlex.split(arguments)],
+            []
+            if action == "stop"
+            else ["canonical", *action.split(), *shlex.split(arguments)],
         )
 
 
@@ -1237,7 +1247,7 @@ class ActionRequest(BaseModel):
     """Validate the browser's command parameters without coercing their types."""
 
     model_config = ConfigDict(extra="forbid")
-    package: StrictStr = ""
+    directory: StrictStr = ""
     action: StrictStr = ""
     args: StrictStr = ""
 
@@ -1348,21 +1358,21 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
             )
 
     def action_response(
-        runner: PackageActions,
-        package: str,
+        runner: PackageActions | CanonicalActions,
+        directory: str,
         parameters: ActionRequest | None = None,
     ) -> Response:
         with lock:
             try:
                 state = (
-                    runner.start(package, parameters.action, parameters.args)
+                    runner.start(directory, parameters.action, parameters.args)
                     if parameters is not None
-                    else runner.status(package)
+                    else runner.status(directory)
                 )
-                job = runner.jobs.get(package)
+                job = runner.jobs.get(directory)
                 if job is not None and state["state"] != "running" and not job.observed:
                     job.observed = True
-                    comparison = outputs.comparisons.get(Path(package) / "tmp")
+                    comparison = outputs.comparisons.get(Path(directory) / "tmp")
                     if comparison is not None:
                         comparison.future = outputs.executor.submit(
                             outputs.capture,
@@ -1376,20 +1386,20 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
                 )
 
     @application.get("/api/action")
-    def package_status(package: str = "") -> Response:
-        return action_response(actions, package)
+    def package_status(directory: str = "") -> Response:
+        return action_response(actions, directory)
 
     @application.post("/api/action")
     def package_action(parameters: ActionRequest) -> Response:
-        return action_response(actions, parameters.package, parameters)
+        return action_response(actions, parameters.directory, parameters)
 
     @application.get("/api/command")
-    def command_status(package: str = "") -> Response:
-        return action_response(commands, package)
+    def command_status(directory: str = "") -> Response:
+        return action_response(commands, directory)
 
     @application.post("/api/command")
     def command_action(parameters: ActionRequest) -> Response:
-        return action_response(commands, parameters.package, parameters)
+        return action_response(commands, parameters.directory, parameters)
 
     @application.get("/output-diff")
     def output_report(path: str = "", entry: str = "") -> Response:

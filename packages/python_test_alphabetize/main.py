@@ -6,162 +6,79 @@ from __future__ import annotations
 
 import argparse
 import ast
-import io
-import itertools
 import sys
-import tokenize
 from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+import libcst as cst
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 
-def _statement_start(
-    node: ast.stmt,
-    lower: int,
-    comments: dict[int, int],
-    decorators: list[tuple[int, int]],
-) -> int:
-    start = node.lineno - 1
-    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (
-        node.decorator_list
-    ):
-        start = min(
-            row
-            for row, column in decorators
-            if lower <= row < start and column == node.col_offset
-        )
-    while start > lower and comments.get(start - 1) == node.col_offset:
-        start -= 1
-    return start
-
-
-def _statement_end(
-    node: ast.stmt,
-    limit: int,
-    lines: list[bytes],
-    comments: dict[int, int],
-) -> int:
-    end = node.end_lineno or node.lineno
-    for row in range(end, limit):
-        if not lines[row].strip():
-            continue
-        if comments.get(row, -1) <= node.col_offset:
-            break
-        end = row + 1
-    return end
-
-
-def _line_ending(source: bytes) -> bytes:
-    for ending in (b"\r\n", b"\n", b"\r"):
-        if source.endswith(ending):
-            return ending
-    return b""
-
-
-def _test_edits(
-    tests: list[ast.FunctionDef | ast.AsyncFunctionDef],
-    starts: dict[ast.stmt, int],
-    ends: dict[ast.stmt, int],
-    limits: dict[ast.stmt, int],
-    lines: list[bytes],
-) -> list[tuple[int, int, bytes]]:
-    ordered = sorted(tests, key=lambda node: node.name)
-    if tests == ordered and all(
-        limits[left] == starts[right] for left, right in itertools.pairwise(tests)
-    ):
-        return []
-    edits = []
-    blocks = []
-    for original, replacement_node in zip(
-        tests,
-        ordered,
-        strict=True,
-    ):
-        current = b"".join(lines[starts[original] : ends[original]])
-        replacement = b"".join(
-            lines[starts[replacement_node] : ends[replacement_node]],
-        )
-        replacement = replacement.removesuffix(
-            _line_ending(replacement),
-        ) + _line_ending(
-            current,
-        )
-        if original is tests[-1]:
-            blocks.append(replacement)
-            continue
-        gap = b"".join(lines[ends[original] : limits[original]])
-        end = ends[original]
-        if not gap.strip():
-            replacement += gap
-            end = limits[original]
-        blocks.append(replacement)
-        edits.append((starts[original], end, b""))
-    if tests:
-        last = tests[-1]
-        edits.append((starts[last], ends[last], b"".join(blocks)))
-    return edits
-
-
-def _scope_edits(  # noqa: PLR0913
-    body: list[ast.stmt],
-    lines: list[bytes],
-    comments: dict[int, int],
-    decorators: list[tuple[int, int]],
-    limit: int,
-    *,
-    lower: int = 0,
-) -> list[tuple[int, int, bytes]]:
-    starts = {}
+def _sort_tests(body: Sequence[cst.BaseStatement]) -> tuple[cst.BaseStatement, ...]:
+    """Move complete CST definitions, keeping blank lines at their original slots."""
+    if not body:
+        return ()
+    statements = []
+    prefixes = []
     for node in body:
-        starts[node] = _statement_start(node, lower, comments, decorators)
-        lower = node.end_lineno or node.lineno
-    limits = {
-        node: starts[body[index + 1]] if index + 1 < len(body) else limit
-        for index, node in enumerate(body)
-    }
-    ends = {node: _statement_end(node, limits[node], lines, comments) for node in body}
-    edits = []
-    tests: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
-    for node in body:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and (
-            node.name.startswith("test_")
+        statement = cast("cst.SimpleStatementLine | cst.BaseCompoundStatement", node)
+        if isinstance(statement, cst.ClassDef) and isinstance(
+            statement.body,
+            cst.IndentedBlock,
         ):
-            tests.append(node)
-        elif isinstance(node, ast.ClassDef):
-            edits.extend(
-                _scope_edits(node.body, lines, comments, decorators, limits[node]),
+            statement = statement.with_changes(
+                body=statement.body.with_changes(body=_sort_tests(statement.body.body)),
             )
-    edits.extend(_test_edits(tests, starts, ends, limits, lines))
-    return edits
+        leading = statement.leading_lines
+        split = len(leading)
+        while split and leading[split - 1].comment is not None:
+            split -= 1
+        prefixes.append(leading[:split])
+        statements.append(statement.with_changes(leading_lines=leading[split:]))
+    tests = [
+        index
+        for index, statement in enumerate(statements)
+        if isinstance(statement, cst.FunctionDef)
+        and statement.name.value.startswith("test_")
+    ]
+    ordered = sorted(
+        (cast("cst.FunctionDef", statements[index]) for index in tests),
+        key=lambda statement: statement.name.value,
+    )
+    gaps = [*prefixes[1:], ()]
+    rows: list[
+        tuple[
+            cst.SimpleStatementLine | cst.BaseCompoundStatement,
+            Sequence[cst.EmptyLine],
+        ]
+    ] = []
+    for index, statement in enumerate(statements):
+        if tests and index == tests[-1]:
+            rows.extend(zip(ordered, (gaps[index] for index in tests), strict=True))
+        elif index not in tests:
+            rows.append((statement, gaps[index]))
+    result = []
+    leading = prefixes[0]
+    for statement, gap in rows:
+        result.append(
+            statement.with_changes(
+                leading_lines=(*leading, *statement.leading_lines),
+            ),
+        )
+        leading = gap
+    return tuple(result)
 
 
 def format_source(source: bytes, filename: str = "<source>") -> bytes:
     """Group sorted tests after intervening support code, preserving its order."""
-    module = ast.parse(source, filename=filename)
-    lines = source.splitlines(keepends=True)
-    comments = {}
-    decorators = []
-    normalized = source.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
-    for token in tokenize.tokenize(io.BytesIO(normalized).readline):
-        row, column = token.start
-        if token.type == tokenize.COMMENT and not token.line[:column].strip():
-            comments[row - 1] = column
-        elif token.type == tokenize.OP and token.string == "@":
-            decorators.append((row - 1, column))
-    header_end = 0
-    while header_end < len(lines) and (
-        not lines[header_end].strip() or header_end in comments
-    ):
-        header_end += 1
-    edits = _scope_edits(
-        module.body,
-        lines,
-        comments,
-        decorators,
-        len(lines),
-        lower=header_end,
-    )
-    for start, end, replacement in sorted(edits, reverse=True):
-        lines[start:end] = [replacement]
-    formatted = b"".join(lines)
+    ast.parse(source, filename=filename)
+    module = cst.parse_module(source)
+    formatted = module.with_changes(
+        body=_sort_tests(module.body),
+        has_trailing_newline=source.endswith((b"\n", b"\r")),
+    ).bytes
     ast.parse(formatted, filename=filename)
     return formatted
 
@@ -176,7 +93,7 @@ def format_file(path: Path) -> bool:
         formatted = format_source(source, str(path))
         if formatted != source:
             path.write_bytes(formatted)
-    except (OSError, SyntaxError, tokenize.TokenError) as error:
+    except (OSError, SyntaxError, cst.ParserSyntaxError) as error:
         print(f"error: {path}: {error}", file=sys.stderr)  # noqa: T201
         return False
     return True

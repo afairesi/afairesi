@@ -675,7 +675,7 @@ class TestGui(unittest.TestCase):
                 response = client.request("GET", "/api/overview")
                 data = json.loads(response.content)
                 require_output(data["commands"] == command_catalog())
-                body = json.dumps({"package": str(root), "action": "overview"})
+                body = json.dumps({"directory": str(root), "action": "overview"})
                 response = client.request(
                     "POST",
                     "/api/command",
@@ -690,8 +690,8 @@ class TestGui(unittest.TestCase):
                     "{",
                     "null",
                     "[]",
-                    json.dumps({"package": str(root), "args": 42}),
-                    json.dumps({"package": str(root), "unexpected": "value"}),
+                    json.dumps({"directory": str(root), "args": 42}),
+                    json.dumps({"directory": str(root), "unexpected": "value"}),
                     " " * (app.ACTION_BODY_LIMIT + 1),
                 ):
                     response = client.post(
@@ -704,7 +704,7 @@ class TestGui(unittest.TestCase):
                     "POST",
                     "/api/command",
                     content=json.dumps(
-                        {"package": str(root / "unknown"), "action": "overview"},
+                        {"directory": str(root / "unknown"), "action": "overview"},
                     ),
                     headers={"Content-Type": "application/json"},
                 )
@@ -714,7 +714,7 @@ class TestGui(unittest.TestCase):
                 )
                 response = client.request(
                     "GET",
-                    "/api/command?" + urlencode({"package": str(root)}),
+                    "/api/command?" + urlencode({"directory": str(root)}),
                 )
                 require_output(json.loads(response.content)["state"] == "idle")
 
