@@ -781,7 +781,7 @@ def package_description(package: Package) -> str | None:
 
 def source_package_description(source: str) -> str | None:
     """Extract a literal Nix package description without evaluation."""
-    with contextlib.suppress(json.JSONDecodeError, nix_syntax.NixSyntaxError):
+    with contextlib.suppress(nix_syntax.NixSyntaxError):
         return _meta_description(source)
     return None
 
@@ -789,31 +789,14 @@ def source_package_description(source: str) -> str | None:
 def _meta_description(source: str) -> str | None:
     """Return a literal meta.description through the Nix syntax tree."""
     document, expression = _metadata_expression(source, "meta", ("description",))
-    if expression is None or expression.type != "string_expression":
-        return None
-    if any(node.type == "interpolation" for node in nix_syntax.walk(expression)):
-        return None
-    literal = document.text(expression)[1:-1]
-    escapes = {"n": "\n", "r": "\r", "t": "\t"}
-    return re.sub(
-        r"\\(.)",
-        lambda match: escapes.get(match[1], match[1]),
-        literal,
-        flags=re.DOTALL,
+    return (
+        None
+        if expression is None
+        else cast(
+            "str | None",
+            nix_syntax.string_value(document, expression),
+        )
     )
-
-
-def _nix_string(value: str) -> str:
-    """Encode a non-interpolating Nix string literal."""
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace('"', r"\"")
-        .replace("\n", r"\n")
-        .replace("\r", r"\r")
-        .replace("\t", r"\t")
-        .replace("${", r"\${")
-    )
-    return '"' + escaped + '"'
 
 
 def _attrset_expression(
@@ -2008,7 +1991,7 @@ def scaffold(
             "nix": "A Nix package.",
         }[kind]
     )
-    description_literal = _nix_string(description)
+    description_literal = nix_syntax.quote_string(description)
     root = Path("packages") / name
     defaults = {
         "python": """{ pkgs, ... }:
@@ -4487,10 +4470,12 @@ def _build_test_environment(root: Path, name: str, workspace: Path) -> TestEnvir
     expression = workspace / "environment.nix"
     expression.write_text(
         "let\n"
-        f"  flake = builtins.getFlake {_nix_string('git+' + root.as_uri())};\n"
+        "  flake = builtins.getFlake "
+        f"{nix_syntax.quote_string('git+' + root.as_uri())};\n"
         "  system = builtins.currentSystem;\n"
         "  pkgs = import flake.inputs.nixpkgs { inherit system; };\n"
-        f"  package = flake.packages.${{system}}.${{{_nix_string(name)}}};\n"
+        "  package = flake.packages.${system}."
+        f"${{{nix_syntax.quote_string(name)}}};\n"
         "  dependencies = pkgs.lib.concatMap (name: package.${name} or []) [\n"
         '    "buildInputs" "checkInputs" "nativeBuildInputs" "nativeCheckInputs"\n'
         '    "propagatedBuildInputs" "propagatedNativeBuildInputs"\n'
@@ -5241,10 +5226,10 @@ check.overrideAttrs (previous: {
 })
 """  # noqa: E501
     substitutions = {
-        "FLAKE": _nix_string("git+" + root.as_uri()),
-        "SYSTEM": _nix_string(system),
-        "PACKAGE": _nix_string(name),
-        "REPORT_PLUGIN": _nix_string(_test_report_source()),
+        "FLAKE": nix_syntax.quote_string("git+" + root.as_uri()),
+        "SYSTEM": nix_syntax.quote_string(system),
+        "PACKAGE": nix_syntax.quote_string(name),
+        "REPORT_PLUGIN": nix_syntax.quote_string(_test_report_source()),
     }
     return re.sub(
         r"\b(?:FLAKE|SYSTEM|PACKAGE|REPORT_PLUGIN)\b",

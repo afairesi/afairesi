@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import os
+import re
 import sys
 import tempfile
 from dataclasses import dataclass
@@ -78,29 +79,46 @@ def walk(node: Node) -> Iterable[Node]:
         yield from walk(child)
 
 
+def quote_string(value: str) -> str:
+    """Encode a quoted Nix string without enabling interpolation."""
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', r"\"")
+        .replace("\n", r"\n")
+        .replace("\r", r"\r")
+        .replace("\t", r"\t")
+        .replace("${", r"\${")
+    )
+    return '"' + escaped + '"'
+
+
+def string_value(document: Document, node: Node) -> str | None:
+    """Decode a quoted Nix literal, returning None for other expressions."""
+    if node.type != "string_expression" or any(
+        child.type == "interpolation" for child in walk(node)
+    ):
+        return None
+    escapes = {"n": "\n", "r": "\r", "t": "\t"}
+    return re.sub(
+        r"\\(.)",
+        lambda match: escapes.get(match[1], match[1]),
+        document.text(node)[1:-1],
+        flags=re.DOTALL,
+    )
+
+
 def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | None:
     """Extract an attribute path when every component is statically named."""
-    parts: list[str] = []
+    parts = []
     for child in attrpath.named_children:
-        text = document.text(child)
-        if child.type == "identifier":
-            parts.append(text)
-        elif child.type == "string_expression" and not any(
-            node.type == "interpolation" for node in walk(child)
-        ):
-            characters = iter(text[1:-1])
-            decoded = []
-            for character in characters:
-                if character == "\\":
-                    escaped = next(characters)
-                    decoded.append(
-                        {"n": "\n", "r": "\r", "t": "\t"}.get(escaped, escaped),
-                    )
-                else:
-                    decoded.append(character)
-            parts.append("".join(decoded))
-        else:
+        value = (
+            document.text(child)
+            if child.type == "identifier"
+            else string_value(document, child)
+        )
+        if value is None:
             return None
+        parts.append(value)
     return tuple(parts) if parts else None
 
 

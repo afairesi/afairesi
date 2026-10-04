@@ -13,7 +13,7 @@ if TYPE_CHECKING:
 
 def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
     """Resolve option defaults with Nix, rewrite their source, and converge."""
-    root = tmp_path / "repository"
+    root = tmp_path / "repository-${unbound}"
     root.mkdir()
     dependency = root / "prm/nixpkgs"
     dependency.mkdir(parents=True)
@@ -39,6 +39,18 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
             default = false;
             definitionsWithLocations = [{ file = "${self}/configuration.nix"; }];
           };
+          services.demo.text = {
+            default = "literal \\${name} \\q";
+            definitionsWithLocations = [{ file = "${self}/configuration.nix"; }];
+          };
+          services.demo.multiline = {
+            default = "one\\ntwo\\n";
+            definitionsWithLocations = [{ file = "${self}/configuration.nix"; }];
+          };
+          services.demo.compound = {
+            default = { values = [ null true 7 2.5 ]; };
+            definitionsWithLocations = [{ file = "${self}/configuration.nix"; }];
+          };
           services.other.enable = {
             default = false;
             definitionsWithLocations = [{ file = "${self}/configuration.nix"; }];
@@ -51,6 +63,9 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
     configuration = root / "configuration.nix"
     configuration.write_text(
         "{ services.demo.enable = false; services.other.enable = true; "
+        'services.demo.text = "literal \\${name} \\q"; '
+        "services.demo.multiline = ''\n  one\n  two\n''; "
+        "services.demo.compound = { values = [ null true 7 2.5 ]; }; "
         'description = "keep  spacing"; empty = {}; }',
         encoding="utf-8",
     )

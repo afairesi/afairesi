@@ -67,14 +67,14 @@ def literal(document: nix_syntax.Document, node: Node) -> Literal:  # noqa: C901
             msg = "non-finite float"
             raise ValueError(msg)
         return value
-    if node.type == "string_expression" and "${" not in text:
-        decoded = json.loads(text)
-        if isinstance(decoded, str):
-            return decoded
-        msg = "not a literal string"
-        raise ValueError(msg)
-    if node.type == "indented_string_expression" and "${" not in text:
-        return str(text[2:-2])
+    if node.type == "string_expression":
+        decoded = nix_syntax.string_value(document, node)
+        if decoded is not None:
+            return cast("str", decoded)
+    if node.type == "indented_string_expression" and not any(
+        child.type == "interpolation" for child in nix_syntax.walk(node)
+    ):
+        return cast("str", _run_nix(text))
     if node.type == "list_expression":
         return [literal(document, child) for child in node.named_children]
     if node.type == "attrset_expression" and not text.lstrip().startswith("rec"):
@@ -167,35 +167,8 @@ def treefmt_arguments(document: nix_syntax.Document) -> list[Node]:
     return result
 
 
-def _nix_string(value: str) -> str:
-    return json.dumps(value, ensure_ascii=False)
-
-
-def _render_literal(value: Literal) -> str:  # noqa: PLR0911
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, str):
-        return _nix_string(value)
-    if isinstance(value, list):
-        return "[ " + " ".join(_render_literal(item) for item in value) + " ]"
-    if isinstance(value, dict):
-        return (
-            "{ "
-            + " ".join(
-                f"{_nix_string(key)} = {_render_literal(item)};"
-                for key, item in sorted(value.items())
-            )
-            + " }"
-        )
-    return repr(value)
-
-
 def _path_list(path: tuple[str, ...]) -> str:
-    return "[ " + " ".join(_nix_string(part) for part in path) + " ]"
+    return "[ " + " ".join(nix_syntax.quote_string(part) for part in path) + " ]"
 
 
 def _run_nix(expression: str) -> Any:  # noqa: ANN401
@@ -221,7 +194,8 @@ def treefmt_defaults(
     if not paths:
         return {}
     expression = (
-        f"let flake = builtins.getFlake (toString (/. + {_nix_string(str(root))})); "
+        "let flake = builtins.getFlake (toString (/. + "
+        f"{nix_syntax.quote_string(str(root))})); "
         "pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; }; "
         "evaluated = flake.inputs.treefmt-nix.lib.evalModule pkgs {}; "
         f"paths = [ {' '.join(_path_list(path) for path in sorted(paths))} ]; "
@@ -239,19 +213,20 @@ def nixos_removals(
     if not candidates:
         return {}
     unique_candidates = {
-        (path, json.dumps(value, sort_keys=True, ensure_ascii=False)): value
+        (path, json.dumps(value, sort_keys=True, ensure_ascii=False))
         for path, value in candidates
     }
     rendered = (
         "[ "
         + " ".join(
-            f"{{ path = {_path_list(path)}; value = {_render_literal(value)}; }}"
-            for (path, _serialized), value in sorted(unique_candidates.items())
+            f"{{ path = {_path_list(path)}; "
+            f"value = builtins.fromJSON {nix_syntax.quote_string(value)}; }}"
+            for path, value in sorted(unique_candidates)
         )
         + " ]"
     )
     expression = (
-        f"let f = builtins.getFlake (toString (/. + {_nix_string(str(root))})); lib = f.inputs.nixpkgs.lib; cs = f.nixosConfigurations or {{}}; names = builtins.attrNames cs; candidates = {rendered}; "  # noqa: E501
+        f"let f = builtins.getFlake (toString (/. + {nix_syntax.quote_string(str(root))})); lib = f.inputs.nixpkgs.lib; cs = f.nixosConfigurations or {{}}; names = builtins.attrNames cs; candidates = {rendered}; "  # noqa: E501
         "eq = a: b: builtins.toJSON a == builtins.toJSON b; files = name: candidate: let option = lib.attrByPath candidate.path {} (builtins.getAttr name cs).options; raw = if builtins.isAttrs option && option ? default && eq candidate.value option.default then builtins.concatMap (d: if builtins.isAttrs d && d ? file then [d.file] else []) (option.definitionsWithLocations or []) else []; tried = builtins.tryEval (builtins.deepSeq raw raw); in if tried.success then tried.value else []; "  # noqa: E501
         "one = candidate: { inherit (candidate) path; files = builtins.concatMap (name: files name candidate) names; }; in builtins.map one candidates"  # noqa: E501
     )
