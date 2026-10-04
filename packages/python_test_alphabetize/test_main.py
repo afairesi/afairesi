@@ -6,6 +6,7 @@ from __future__ import annotations
 import os
 import stat
 import subprocess
+import sys
 from typing import TYPE_CHECKING
 
 import pytest
@@ -56,10 +57,21 @@ SORTED_BOUNDARY = (
     b"    def test_z_local(): pass\n"
     b"    def test_a_local(): pass\n"
     b"class TestBoundary:\n"
-    b"    def test_a_after_helper(self): pass\n"
     b"    def helper(self): pass\n"
+    b"    def test_a_after_helper(self): pass\n"
     b"    def test_z_before_helper(self): pass\n"
 )
+MARKER = (
+    b"def mark(value):\n"
+    b"    def decorate(function): return function\n"
+    b"    return decorate\n"
+)
+DEFINITION_HELPERS = (
+    MARKER + b"def records(): return record()\n" + b"def record(): return [7]\n"
+)
+DECORATED_ALPHA = b"@mark(records())\ndef test_alpha(value=record()[0]): return value\n"
+PLAIN_ZEBRA = b"def test_zebra(): return 9\n"
+POSTAMBLE = b"if __name__ == '__main__':\n    print(test_alpha() + test_zebra())\n"
 
 
 def _run(*paths: Path) -> subprocess.CompletedProcess[bytes]:
@@ -103,6 +115,50 @@ def test_cli_continues_after_errors_and_preserves_invalid_or_linked_files(
 
 
 @pytest.mark.parametrize(
+    "source",
+    [
+        PLAIN_ZEBRA + DEFINITION_HELPERS + DECORATED_ALPHA + POSTAMBLE,
+        DECORATED_ALPHA + DEFINITION_HELPERS + PLAIN_ZEBRA + POSTAMBLE,
+        MARKER
+        + b"class TestDefinitions:\n"
+        + b"    def test_zebra(self): return 9\n"
+        + b"    VALUE = 7\n"
+        + b"    @staticmethod\n"
+        + b"    def records(): return [7]\n"
+        + b"    @mark(records())\n"
+        + b"    def test_alpha(self, value=VALUE): return value\n"
+        + b"if __name__ == '__main__':\n"
+        + b"    tests = TestDefinitions()\n"
+        + b"    print(tests.test_alpha() + tests.test_zebra())\n",
+    ],
+)
+def test_cli_preserves_definition_time_dependencies_and_postamble_execution(
+    tmp_path: Path,
+    source: bytes,
+) -> None:
+    """Decorators and defaults resolve their helpers and following code sees tests."""
+    path = tmp_path / "test_declarations.py"
+    path.write_bytes(source)
+    for _ in range(2):
+        formatted = _run(path)
+        executed = subprocess.run(  # noqa: S603
+            [sys.executable, str(path)],
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        if (
+            formatted.returncode
+            or formatted.stdout
+            or formatted.stderr
+            or executed.returncode
+            or executed.stderr
+            or executed.stdout != b"16\n"
+        ):
+            raise AssertionError((formatted, executed, path.read_bytes()))
+
+
+@pytest.mark.parametrize(
     ("source", "expected"),
     [
         (
@@ -126,8 +182,8 @@ def test_cli_continues_after_errors_and_preserves_invalid_or_linked_files(
             b"def test_z(): pass\ndef test_a(): pass\n"
             + BOUNDARY
             + b"def test_z_after(): pass\ndef test_a_after(): pass\n",
-            b"def test_a(): pass\ndef test_a_after(): pass\n"
-            + SORTED_BOUNDARY
+            SORTED_BOUNDARY
+            + b"def test_a(): pass\ndef test_a_after(): pass\n"
             + b"def test_z(): pass\ndef test_z_after(): pass\n",
         ),
         (
@@ -266,7 +322,7 @@ def test_sorting_preserves_generated_test_bodies_and_is_idempotent(
 ) -> None:
     """Sort every scope across helpers without losing a body or changing constants."""
 
-    def render(order: list[str]) -> bytes:
+    def render(order: list[str], *, grouped: bool = False) -> bytes:
         lines = [b'"""Generated tests."""']
         indent = b""
         if scope == "class":
@@ -274,20 +330,30 @@ def test_sorting_preserves_generated_test_bodies_and_is_idempotent(
             indent = b"    "
             if not order:
                 lines.append(indent + b"pass")
-        for index, name in enumerate(order):
-            lines.append(indent + f"def test_{name}(): return {name!r}".encode())
-            if separated:
-                lines.extend(
-                    [
-                        indent + f"VALUE_{index} = {index}".encode(),
-                        indent + f"def helper_{index}(): return {index}".encode(),
-                    ],
-                )
+        tests = [
+            indent + f"def test_{name}(): return {name!r}".encode() for name in order
+        ]
+        helpers = [
+            [
+                indent + f"VALUE_{index} = {index}".encode(),
+                indent + f"def helper_{index}(): return {index}".encode(),
+            ]
+            for index in range(len(order))
+        ]
+        if separated and grouped and order:
+            lines.extend(line for helper in helpers[:-1] for line in helper)
+            lines.extend(tests)
+            lines.extend(helpers[-1])
+        else:
+            for test, helper in zip(tests, helpers, strict=True):
+                lines.append(test)
+                if separated:
+                    lines.extend(helper)
         contents = newline.join(lines)
         return contents + newline if final_newline else contents
 
     source = render(names)
-    expected = render(sorted(names))
+    expected = render(sorted(names), grouped=True)
     formatted = format_source(source)
     if formatted != expected or format_source(formatted) != formatted:
         raise AssertionError((source, formatted, expected))

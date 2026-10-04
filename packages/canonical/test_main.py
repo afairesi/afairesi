@@ -1399,6 +1399,274 @@ TEST_LABELS = st.lists(
 )
 
 
+def _nix_environment(root: Path) -> dict[str, str]:
+    """Keep offline Nix evaluation and builds inside this example's scratch tree."""
+    environment = dict(os.environ)
+    store = root / "tmp/nix"
+    environment["NIX_REMOTE"] = (
+        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
+    )
+    environment["NIX_CONFIG"] = (
+        "experimental-features = nix-command flakes\n"
+        "build-users-group =\n"
+        "sandbox = false\n"
+        "eval-cache = false\n"
+    )
+    return environment
+
+
+def _template_expression(root: Path, name: str) -> str:
+    """Build generated install scripts with real Nix and offline tool stand-ins."""
+    bash = shutil.which("bash")
+    _expect(bash is not None, "template fixtures require bash")
+    site_packages = (
+        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    builder_command = json.dumps('source "$scriptPath"')
+    return (
+        "let mk = name: script: builtins.derivation { inherit name; "
+        "system = builtins.currentSystem; "
+        f"builder = {json.dumps(bash)}; PATH = {json.dumps(os.environ['PATH'])}; "
+        'inherit script; passAsFile = [ "script" ]; '
+        f'args = [ "-e" "-c" {builder_command} ]; }}; '
+        "python = { "
+        f"interpreter = {json.dumps(sys.executable)}; "
+        f"sitePackages = {json.dumps(site_packages)}; "
+        f"withPackages = _: {json.dumps(sys.prefix)}; "
+        "pkgs.buildPythonPackage = attrs: (mk attrs.pname "
+        '("pname=${attrs.pname}\\ncp -R ${attrs.src}/. .\\n" '
+        "+ attrs.installPhase)) // attrs; }; "
+        'pkgs = { python3 = python; git = "git"; curl = "curl"; inner = "wrong-inner"; '
+        'http-server = "server"; texliveFull = "tex"; '
+        "stdenv.hostPlatform.isLinux = false; "
+        "stdenv.mkDerivation = attrs: attrs; writeTextFile = attrs: attrs; "
+        "lib.optionals = condition: values: if condition then values else []; "
+        "runCommand = name: _: script: mk name script; "
+        "writeShellApplication = attrs: (mk attrs.name "
+        "("
+        + json.dumps(
+            'mkdir -p "$out/bin"\ncat > "$out/bin/${attrs.name}" '
+            f"<<'CANONICAL_SCRIPT'\n#!{bash}\n",
+        )
+        + " + attrs.text + "
+        + json.dumps('\nCANONICAL_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
+        + ")) // attrs; }; "
+        + f"package = import {root / 'packages' / name / 'default.nix'} "
+        + "{ inherit pkgs; }; in "
+    )
+
+
+def _evaluated_template(
+    root: Path,
+    name: str,
+    environment: dict[str, str],
+) -> dict[str, Any]:
+    """Use Nix's evaluated values as the independent metadata and dependency oracle."""
+    expression = _template_expression(root, name) + (
+        "{ meta = package.meta; name = package.pname or "
+        "package.name; dependencies = package.runtimeInputs or "
+        "package.nativeBuildInputs or []; }"
+    )
+    result = _run(
+        root,
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        expression,
+        executable="nix",
+        environment=environment,
+    )
+    return cast("dict[str, Any]", json.loads(result.stdout))
+
+
+def _check_launcher_environment(
+    root: Path,
+    name: str,
+    environment: dict[str, str],
+    *,
+    library: bool,
+) -> None:
+    """Evaluate generated checks with an absent or independently named executable."""
+    metadata = (
+        "package.meta" if library else 'package.meta // { mainProgram = "other-name"; }'
+    )
+    expression = _template_expression(root, name) + (
+        "let checkPkgs = pkgs // { stdenv.system = builtins.currentSystem; "
+        "runCommand = _: attrs: _: attrs; lib = pkgs.lib // { "
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
+        'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
+        'else abort "library check requested an executable"; }; }; '
+        f"packageDrv = package // {{ inherit python; meta = {metadata}; }}; "
+        f"in import {root / 'checks' / name / 'default.nix'} {{ pkgs = checkPkgs; "
+        "inputs.self.packages.${builtins.currentSystem}."
+        f"{json.dumps(name)} = packageDrv; }}"
+    )
+    result = _run(
+        root,
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        expression,
+        executable="nix",
+        environment=environment,
+    )
+    attributes = json.loads(result.stdout)
+    expected = None if library else "/package/bin/other-name"
+    _expect(attributes.get("PACKAGE_E2E_EXECUTABLE") == expected, attributes)
+
+
+def _check_discovery_boundaries() -> None:
+    """Validate nested declarations and malformed inputs once per suite."""
+    with _fresh_repository() as root:
+        sentinel = (
+            "from pathlib import Path\nPath('SENTINEL').touch()\n"
+            "raise RuntimeError('must not execute')\n"
+        )
+        package = _make_test_names_package(
+            root,
+            "example",
+            sentinel + "def test_result(): pass\n",
+        )
+        for nested, path, parameter in NESTED_CONTRACTS:
+            (package / "main.py").write_text(sentinel + nested)
+            before = _snapshot(root)
+            data = next(
+                node["details"]
+                for node in _overview(root)["nodes"]
+                if node["kind"] == "package"
+            )
+            _expect(
+                _snapshot(root) == before,
+                "nested discovery executed code or changed state",
+            )
+            _expect(
+                {"path": list(path), "text": "command", "command": True} in data["cli"],
+                data,
+            )
+            _expect(
+                {"path": list(path), "text": parameter, "command": False}
+                in data["cli"],
+                data,
+            )
+            if nested.startswith("import typer"):
+                _expect(
+                    {
+                        "path": ["test"],
+                        "text": "--verbose  default=False; type=bool",
+                        "command": False,
+                    }
+                    in data["cli"],
+                    data,
+                )
+                _expect(
+                    not any(
+                        entry["path"][-1:] == ["settings"] for entry in data["cli"]
+                    ),
+                    data,
+                )
+        for unsupported in UNSUPPORTED_INTERFACES:
+            (package / "main.py").write_text(unsupported)
+            before = _snapshot(root)
+            rejected = _run(package, "args", code=1)
+            _expect(
+                "unsupported CLI interface" in rejected.stderr and not rejected.stdout,
+                rejected,
+            )
+            _expect(_snapshot(root) == before, "unsupported interface changed state")
+        for layout in ("missing", "syntax", "encoding", "linked"):
+            test_file = package / "test_main.py"
+            test_file.unlink(missing_ok=True)
+            if layout == "syntax":
+                test_file.write_text("def invalid(")
+            elif layout == "encoding":
+                test_file.write_bytes(b"\xff")
+            elif layout == "linked":
+                test_file.symlink_to(package / "main.py")
+            before = _snapshot(root)
+            rejected = _run(package, "test", "names", code=1)
+            _expect(
+                "canonical test names:" in rejected.stderr and not rejected.stdout,
+                rejected,
+            )
+            _expect(_snapshot(root) == before, "malformed test source changed state")
+
+
+def _review_source(label: str, *, arguments: bool) -> str:
+    """Describe one known interface or sentence independently of the converter."""
+    if arguments:
+        return (
+            "import argparse\np = argparse.ArgumentParser()\n"
+            f"p.add_argument('--{label}')\n"
+        )
+    return f"def test_{label}(): pass\n"
+
+
+def _review_view(
+    root: Path,
+    arguments: bool,  # noqa: FBT001
+    *options: str,
+    code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Preserve repository state through successful and rejected Git views."""
+    before = _snapshot(root)
+    result = _run(
+        root,
+        *(("args",) if arguments else ("test", "names")),
+        *options,
+        code=code,
+    )
+    _expect(_snapshot(root) == before, options)
+    _expect(
+        "def test_" not in result.stdout
+        and "add_argument" not in result.stdout
+        and "PRIVATE_IMPLEMENTATION" not in result.stdout,
+        result,
+    )
+    return result
+
+
+def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None:
+    """Add another offline runnable package without replacing the fixture flake."""
+    flake = (root / "flake.nix").read_text()
+    _make_runner_target(root, source, tests, name=name)
+    prefix, ending = flake.rsplit("}; }; }", 1)
+    (root / "flake.nix").write_text(
+        prefix
+        + f" {json.dumps(name)}.python.withPackages = "
+        + f"_: {json.dumps(sys.prefix)}; "
+        + "}; }; }"
+        + ending,
+    )
+    _git(root, "add", "flake.nix", f"packages/{name}")
+
+
+def _campaign(
+    root: Path,
+    environment: dict[str, str],
+    command: str,
+    *arguments: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an omitted target and preserve original sources, settings, and refs."""
+    before = _snapshot(root, exclude=("tmp",))
+    result = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
+        cwd=cwd or root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
+        "campaign changed original sources or Git state",
+    )
+    return result
+
+
 def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="canonical-cli-") as directory:
@@ -1683,124 +1951,6 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
                 _snapshot(root) == before,
                 f"{failure} failure changed repository state",
             )
-
-
-def _nix_environment(root: Path) -> dict[str, str]:
-    """Keep offline Nix evaluation and builds inside this example's scratch tree."""
-    environment = dict(os.environ)
-    store = root / "tmp/nix"
-    environment["NIX_REMOTE"] = (
-        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
-    )
-    environment["NIX_CONFIG"] = (
-        "experimental-features = nix-command flakes\n"
-        "build-users-group =\n"
-        "sandbox = false\n"
-        "eval-cache = false\n"
-    )
-    return environment
-
-
-def _template_expression(root: Path, name: str) -> str:
-    """Build generated install scripts with real Nix and offline tool stand-ins."""
-    bash = shutil.which("bash")
-    _expect(bash is not None, "template fixtures require bash")
-    site_packages = (
-        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
-    )
-    builder_command = json.dumps('source "$scriptPath"')
-    return (
-        "let mk = name: script: builtins.derivation { inherit name; "
-        "system = builtins.currentSystem; "
-        f"builder = {json.dumps(bash)}; PATH = {json.dumps(os.environ['PATH'])}; "
-        'inherit script; passAsFile = [ "script" ]; '
-        f'args = [ "-e" "-c" {builder_command} ]; }}; '
-        "python = { "
-        f"interpreter = {json.dumps(sys.executable)}; "
-        f"sitePackages = {json.dumps(site_packages)}; "
-        f"withPackages = _: {json.dumps(sys.prefix)}; "
-        "pkgs.buildPythonPackage = attrs: (mk attrs.pname "
-        '("pname=${attrs.pname}\\ncp -R ${attrs.src}/. .\\n" '
-        "+ attrs.installPhase)) // attrs; }; "
-        'pkgs = { python3 = python; git = "git"; curl = "curl"; inner = "wrong-inner"; '
-        'http-server = "server"; texliveFull = "tex"; '
-        "stdenv.hostPlatform.isLinux = false; "
-        "stdenv.mkDerivation = attrs: attrs; writeTextFile = attrs: attrs; "
-        "lib.optionals = condition: values: if condition then values else []; "
-        "runCommand = name: _: script: mk name script; "
-        "writeShellApplication = attrs: (mk attrs.name "
-        "("
-        + json.dumps(
-            'mkdir -p "$out/bin"\ncat > "$out/bin/${attrs.name}" '
-            f"<<'CANONICAL_SCRIPT'\n#!{bash}\n",
-        )
-        + " + attrs.text + "
-        + json.dumps('\nCANONICAL_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
-        + ")) // attrs; }; "
-        + f"package = import {root / 'packages' / name / 'default.nix'} "
-        + "{ inherit pkgs; }; in "
-    )
-
-
-def _evaluated_template(
-    root: Path,
-    name: str,
-    environment: dict[str, str],
-) -> dict[str, Any]:
-    """Use Nix's evaluated values as the independent metadata and dependency oracle."""
-    expression = _template_expression(root, name) + (
-        "{ meta = package.meta; name = package.pname or "
-        "package.name; dependencies = package.runtimeInputs or "
-        "package.nativeBuildInputs or []; }"
-    )
-    result = _run(
-        root,
-        "eval",
-        "--impure",
-        "--json",
-        "--expr",
-        expression,
-        executable="nix",
-        environment=environment,
-    )
-    return cast("dict[str, Any]", json.loads(result.stdout))
-
-
-def _check_launcher_environment(
-    root: Path,
-    name: str,
-    environment: dict[str, str],
-    *,
-    library: bool,
-) -> None:
-    """Evaluate generated checks with an absent or independently named executable."""
-    metadata = (
-        "package.meta" if library else 'package.meta // { mainProgram = "other-name"; }'
-    )
-    expression = _template_expression(root, name) + (
-        "let checkPkgs = pkgs // { stdenv.system = builtins.currentSystem; "
-        "runCommand = _: attrs: _: attrs; lib = pkgs.lib // { "
-        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
-        'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
-        'else abort "library check requested an executable"; }; }; '
-        f"packageDrv = package // {{ inherit python; meta = {metadata}; }}; "
-        f"in import {root / 'checks' / name / 'default.nix'} {{ pkgs = checkPkgs; "
-        "inputs.self.packages.${builtins.currentSystem}."
-        f"{json.dumps(name)} = packageDrv; }}"
-    )
-    result = _run(
-        root,
-        "eval",
-        "--impure",
-        "--json",
-        "--expr",
-        expression,
-        executable="nix",
-        environment=environment,
-    )
-    attributes = json.loads(result.stdout)
-    expected = None if library else "/package/bin/other-name"
-    _expect(attributes.get("PACKAGE_E2E_EXECUTABLE") == expected, attributes)
 
 
 @settings(deadline=None)
@@ -2224,82 +2374,6 @@ def test_git_views_preserve_native_history_filters_errors_and_source_state(  # n
         _check_definition_order(Path(directory))
 
 
-def _check_discovery_boundaries() -> None:
-    """Validate nested declarations and malformed inputs once per suite."""
-    with _fresh_repository() as root:
-        sentinel = (
-            "from pathlib import Path\nPath('SENTINEL').touch()\n"
-            "raise RuntimeError('must not execute')\n"
-        )
-        package = _make_test_names_package(
-            root,
-            "example",
-            sentinel + "def test_result(): pass\n",
-        )
-        for nested, path, parameter in NESTED_CONTRACTS:
-            (package / "main.py").write_text(sentinel + nested)
-            before = _snapshot(root)
-            data = next(
-                node["details"]
-                for node in _overview(root)["nodes"]
-                if node["kind"] == "package"
-            )
-            _expect(
-                _snapshot(root) == before,
-                "nested discovery executed code or changed state",
-            )
-            _expect(
-                {"path": list(path), "text": "command", "command": True} in data["cli"],
-                data,
-            )
-            _expect(
-                {"path": list(path), "text": parameter, "command": False}
-                in data["cli"],
-                data,
-            )
-            if nested.startswith("import typer"):
-                _expect(
-                    {
-                        "path": ["test"],
-                        "text": "--verbose  default=False; type=bool",
-                        "command": False,
-                    }
-                    in data["cli"],
-                    data,
-                )
-                _expect(
-                    not any(
-                        entry["path"][-1:] == ["settings"] for entry in data["cli"]
-                    ),
-                    data,
-                )
-        for unsupported in UNSUPPORTED_INTERFACES:
-            (package / "main.py").write_text(unsupported)
-            before = _snapshot(root)
-            rejected = _run(package, "args", code=1)
-            _expect(
-                "unsupported CLI interface" in rejected.stderr and not rejected.stdout,
-                rejected,
-            )
-            _expect(_snapshot(root) == before, "unsupported interface changed state")
-        for layout in ("missing", "syntax", "encoding", "linked"):
-            test_file = package / "test_main.py"
-            test_file.unlink(missing_ok=True)
-            if layout == "syntax":
-                test_file.write_text("def invalid(")
-            elif layout == "encoding":
-                test_file.write_bytes(b"\xff")
-            elif layout == "linked":
-                test_file.symlink_to(package / "main.py")
-            before = _snapshot(root)
-            rejected = _run(package, "test", "names", code=1)
-            _expect(
-                "canonical test names:" in rejected.stderr and not rejected.stdout,
-                rejected,
-            )
-            _expect(_snapshot(root) == before, "malformed test source changed state")
-
-
 def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
     """Initialize remotes and preserve checkout/index state through home convergence."""
     for remote in (
@@ -2502,40 +2576,6 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
             )
 
 
-def _review_source(label: str, *, arguments: bool) -> str:
-    """Describe one known interface or sentence independently of the converter."""
-    if arguments:
-        return (
-            "import argparse\np = argparse.ArgumentParser()\n"
-            f"p.add_argument('--{label}')\n"
-        )
-    return f"def test_{label}(): pass\n"
-
-
-def _review_view(
-    root: Path,
-    arguments: bool,  # noqa: FBT001
-    *options: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Preserve repository state through successful and rejected Git views."""
-    before = _snapshot(root)
-    result = _run(
-        root,
-        *(("args",) if arguments else ("test", "names")),
-        *options,
-        code=code,
-    )
-    _expect(_snapshot(root) == before, options)
-    _expect(
-        "def test_" not in result.stdout
-        and "add_argument" not in result.stdout
-        and "PRIVATE_IMPLEMENTATION" not in result.stdout,
-        result,
-    )
-    return result
-
-
 @settings(deadline=None)
 @given(value=st.integers(min_value=1, max_value=9))
 @example(value=1)
@@ -2715,46 +2755,6 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
             and json.loads((workspace / "summary.json").read_text()) == {},
             result,
         )
-
-
-def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None:
-    """Add another offline runnable package without replacing the fixture flake."""
-    flake = (root / "flake.nix").read_text()
-    _make_runner_target(root, source, tests, name=name)
-    prefix, ending = flake.rsplit("}; }; }", 1)
-    (root / "flake.nix").write_text(
-        prefix
-        + f" {json.dumps(name)}.python.withPackages = "
-        + f"_: {json.dumps(sys.prefix)}; "
-        + "}; }; }"
-        + ending,
-    )
-    _git(root, "add", "flake.nix", f"packages/{name}")
-
-
-def _campaign(
-    root: Path,
-    environment: dict[str, str],
-    command: str,
-    *arguments: str,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run an omitted target and preserve original sources, settings, and refs."""
-    before = _snapshot(root, exclude=("tmp",))
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
-        cwd=cwd or root,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    _expect(
-        _snapshot(root, exclude=("tmp",)) == before,
-        "campaign changed original sources or Git state",
-    )
-    return result
 
 
 @settings(deadline=None)
