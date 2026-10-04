@@ -1139,10 +1139,24 @@ def test_python_check_only_exposes_declared_executables(
         raise AssertionError(msg)
 
 
-def test_args_keeps_unparsed_executables_unavailable(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def main():\n    pass\n",
+        "async def main():\n    pass\n",
+        "from example import main\n",
+        "from example import cli as main\n",
+        "main = lambda: None\n",
+        "main: object = lambda: None\n",
+    ],
+)
+def test_args_keeps_unparsed_executables_unavailable(
+    tmp_path: Path,
+    source: str,
+) -> None:
     """A main entry point without a declared parser is not an empty CLI."""
     package = _make_test_names_package(tmp_path, "example", "")
-    (package / "main.py").write_text("def main():\n    pass\n")
+    (package / "main.py").write_text(source)
     result = _run(package, "args", code=1)
     if "declare parser()" not in result.stderr:
         msg = "Executables need an actionable parser diagnostic"
@@ -1210,6 +1224,56 @@ def test_args_lists_static_interfaces_without_execution(
         (
             "import fire\ndef greet(name='world'): pass\nfire.Fire(greet)\n",
             "greet: command\ngreet: name  default='world'\n",
+        ),
+        (
+            (
+                "import typer\nraise RuntimeError('must not execute')\n"
+                "app = typer.Typer()\n@app.command()\n"
+                "def greet(name: str, suffix: str = '!', *, language: str, "
+                "formal: bool = False, note: str | None = None): pass\n"
+            ),
+            (
+                "greet: command\n"
+                "greet: name  required; type=str\n"
+                "greet: --suffix  default='!'; type=str\n"
+                "greet: language  required; type=str\n"
+                "greet: --formal  default=False; type=bool\n"
+                "greet: --note  default=None; type=str | None\n"
+            ),
+        ),
+        (
+            (
+                "import fire\nraise RuntimeError('must not execute')\n"
+                "def greet(name, /, suffix='!', *, language, count=2, "
+                "note=None): pass\n"
+                "fire.Fire(greet)\n"
+            ),
+            (
+                "greet: command\n"
+                "greet: name  default=required\n"
+                "greet: suffix  default='!'\n"
+                "greet: language  default=required\n"
+                "greet: count  default=2\n"
+                "greet: note  default=None\n"
+            ),
+        ),
+        (
+            (
+                "import fire\nraise RuntimeError('must not execute')\n"
+                "class Tools:\n"
+                " def greet(self, name, /, suffix='!', *, language, count=2, "
+                "note=None): pass\n"
+                " def _hidden(self): pass\n"
+                "fire.Fire(Tools)\n"
+            ),
+            (
+                "greet: command\n"
+                "greet: name  default=required\n"
+                "greet: suffix  default='!'\n"
+                "greet: language  default=required\n"
+                "greet: count  default=2\n"
+                "greet: note  default=None\n"
+            ),
         ),
     ],
 )

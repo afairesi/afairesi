@@ -1421,7 +1421,11 @@ def source_python_has_main(source: str | None) -> bool:
     """Recognize the module-level main binding used by canonical wrappers."""
     if not source:
         return True
-    module = ast.parse(source, filename="main.py")
+    return _module_has_main(ast.parse(source, filename="main.py"))
+
+
+def _module_has_main(module: ast.Module) -> bool:
+    """Recognize function, import, and assignment bindings for a module's main."""
     return any(
         (
             isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
@@ -2681,9 +2685,8 @@ def source_package_args(source: bytes, filename: str) -> list[str]:
     return [entry.render() for entry in source_package_cli(source, filename)]
 
 
-def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # noqa: C901, PLR0915
+def _argparse_cli(module: ast.Module, filename: str) -> list[CliEntry]:  # noqa: C901, PLR0915
     """Describe the supported static argparse declarations."""
-    module = ast.parse(source, filename=filename)
     lines: list[CliEntry] = []
     found = False
     constructors: set[str] = set()
@@ -2870,12 +2873,22 @@ def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # no
     return lines
 
 
-def source_package_cli(  # noqa: C901, PLR0912, PLR0915
-    source: bytes,
-    filename: str,
-) -> list[CliEntry]:
+def source_package_cli(source: bytes, filename: str) -> list[CliEntry]:
     """Describe conventional CLI declarations without importing package code."""
-    module = ast.parse(source, filename=filename)
+    return _module_cli(
+        ast.parse(source, filename=filename),
+        filename,
+        empty_source=not source,
+    )
+
+
+def _module_cli(  # noqa: C901, PLR0912, PLR0915
+    module: ast.Module,
+    filename: str,
+    *,
+    empty_source: bool = False,
+) -> list[CliEntry]:
+    """Read CLI declarations from the same AST used for module documentation."""
     imports: set[str] = set()
     for node in ast.walk(module):
         if isinstance(node, ast.Import):
@@ -2883,7 +2896,7 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
         elif isinstance(node, ast.ImportFrom) and node.module:
             imports.add(node.module.split(".", 1)[0])
     if "argparse" in imports:
-        return _source_argparse_args(source, filename)
+        return _argparse_cli(module, filename)
 
     def unsupported(node: ast.AST, library: str) -> ValueError:
         return ValueError(
@@ -2907,6 +2920,17 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
             if isinstance(rendered, str) and rendered.startswith(("-", "<")):
                 result.append(rendered)
         return result
+
+    def parameters(arguments: ast.arguments) -> list[tuple[ast.arg, ast.expr | None]]:
+        positional = [*arguments.posonlyargs, *arguments.args]
+        defaults: list[ast.expr | None] = [None] * (
+            len(positional) - len(arguments.defaults)
+        )
+        defaults.extend(arguments.defaults)
+        return [
+            *zip(positional, defaults, strict=True),
+            *zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True),
+        ]
 
     lines: list[CliEntry] = []
     found = False
@@ -3048,17 +3072,7 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
             node: ast.FunctionDef | ast.AsyncFunctionDef,
             path: tuple[str, ...],
         ) -> None:
-            arguments = [*node.args.posonlyargs, *node.args.args, *node.args.kwonlyargs]
-            defaults: list[ast.expr | None] = [None] * (
-                len(arguments) - len(node.args.defaults)
-            )
-            defaults.extend(node.args.defaults)
-            defaults.extend(node.args.kw_defaults)
-            for argument, parameter_default in zip(
-                arguments,
-                defaults,
-                strict=True,
-            ):
+            for argument, parameter_default in parameters(node.args):
                 if argument.arg in {"self", "cls"}:
                     continue
                 annotation = argument.annotation
@@ -3200,62 +3214,32 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
             for name, node in targets.items():
                 if target_name is not None and name != target_name:
                     continue
-                if isinstance(node, ast.ClassDef):
-                    for method in node.body:
-                        if isinstance(
-                            method,
-                            (ast.FunctionDef, ast.AsyncFunctionDef),
-                        ) and not method.name.startswith("_"):
-                            callable_node = method
-                            method_name = method.name
-                            lines.append(
-                                CliEntry((method_name,), "command", command=True),
-                            )
-                            parameters = [
-                                *callable_node.args.posonlyargs,
-                                *callable_node.args.args,
-                            ]
-                            method_defaults: list[ast.expr | None] = [None] * (
-                                len(parameters) - len(callable_node.args.defaults)
-                            )
-                            method_defaults.extend(callable_node.args.defaults)
-                            for parameter, default in zip(
-                                parameters,
-                                method_defaults,
-                                strict=True,
-                            ):
-                                if parameter.arg in {"self", "cls"}:
-                                    continue
-                                value = (
-                                    "required"
-                                    if default is None
-                                    else repr(ast.literal_eval(default))
-                                )
-                                lines.append(
-                                    CliEntry(
-                                        (method_name,),
-                                        f"{parameter.arg}  default={value}",
-                                    ),
-                                )
-                else:
-                    lines.append(CliEntry((name,), "command", command=True))
-                    parameters = [*node.args.posonlyargs, *node.args.args]
-                    function_defaults: list[ast.expr | None] = [None] * (
-                        len(parameters) - len(node.args.defaults)
-                    )
-                    function_defaults.extend(node.args.defaults)
-                    for parameter, default in zip(
-                        parameters,
-                        function_defaults,
-                        strict=True,
-                    ):
+                callables = (
+                    [
+                        method
+                        for method in node.body
+                        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and not method.name.startswith("_")
+                    ]
+                    if isinstance(node, ast.ClassDef)
+                    else [node]
+                )
+                for callable_node in callables:
+                    path = (callable_node.name,)
+                    lines.append(CliEntry(path, "command", command=True))
+                    for parameter, default in parameters(callable_node.args):
+                        if isinstance(node, ast.ClassDef) and parameter.arg in {
+                            "self",
+                            "cls",
+                        }:
+                            continue
                         value = (
                             "required"
                             if default is None
                             else repr(ast.literal_eval(default))
                         )
                         lines.append(
-                            CliEntry((name,), f"{parameter.arg}  default={value}"),
+                            CliEntry(path, f"{parameter.arg}  default={value}"),
                         )
             return lines
     library = next(
@@ -3264,11 +3248,15 @@ def source_package_cli(  # noqa: C901, PLR0912, PLR0915
     )
     if library:
         raise unsupported(module, library)
-    if not source_python_has_main(source.decode()) and not any(
-        (isinstance(node, ast.Attribute) and node.attr == "argv")
-        or (isinstance(node, ast.Name) and node.id == "argv")
-        or (isinstance(node, ast.Constant) and node.value == "__main__")
-        for node in ast.walk(module)
+    if (
+        not empty_source
+        and not _module_has_main(module)
+        and not any(
+            (isinstance(node, ast.Attribute) and node.attr == "argv")
+            or (isinstance(node, ast.Name) and node.id == "argv")
+            or (isinstance(node, ast.Constant) and node.value == "__main__")
+            for node in ast.walk(module)
+        )
     ):
         return [CliEntry((), "(not applicable)")]
     msg = (
@@ -3706,10 +3694,11 @@ def source_resource_data(
     cli: list[CliRecord] = []
     if main_source := files.get("main.py"):
         try:
-            help_text = ast.get_docstring(ast.parse(main_source, filename="main.py"))
+            module = ast.parse(main_source, filename="main.py")
+            help_text = ast.get_docstring(module)
             cli = [
                 {"path": list(entry.path), "text": entry.text, "command": entry.command}
-                for entry in source_package_cli(main_source.encode(), "main.py")
+                for entry in _module_cli(module, "main.py")
             ]
         except (SyntaxError, ValueError) as error:
             diagnostics["cli"] = str(error)
