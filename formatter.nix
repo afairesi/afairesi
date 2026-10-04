@@ -173,6 +173,11 @@ let
           ];
           priority = 3;
         };
+        python-test-alphabetize = {
+          command = inputs.self.packages.${pkgs.stdenv.system}.python_test_alphabetize;
+          includes = [ "packages/*/test_main.py" ];
+          priority = 4;
+        };
         remove-empty-lines = {
           command = inputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines;
           excludes = [ "README" ];

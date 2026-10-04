@@ -98,6 +98,81 @@ class TestOutputSnapshots(unittest.TestCase):
         comparison.future.result(timeout=20)
         return comparison
 
+    def test_capture_preserves_symlinks_without_reading_external_targets(self) -> None:
+        """Compare symlink destinations without exposing external file contents."""
+        secret = self.root / "private.txt"
+        secret.write_text("PRIVATE-CONTENT-MUST-NOT-APPEAR\n")
+        link = self.output / "link"
+        link.symlink_to(secret)
+        with app.OutputSnapshots() as snapshots:
+            first = self.capture(snapshots)
+            require_output(first.error == "", first.error)
+            if first.current is None:
+                msg = "Expected a complete initial capture"
+                raise AssertionError(msg)
+            require_output((first.current / "output/link").is_symlink())
+        link.unlink()
+        link.symlink_to(self.root / "missing.txt")
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            require_output(comparison.error == "", comparison.error)
+            report = re.sub(rb"<[^>]+>", b"", app.output_diff_page(comparison))
+            require_output(b"private.txt" in report)
+            require_output(b"missing.txt" in report)
+            require_output(b"PRIVATE-CONTENT-MUST-NOT-APPEAR" not in report)
+
+    def test_comparison_failures_and_timeouts_are_visible_and_refresh_can_retry(
+        self,
+    ) -> None:
+        """Show tool failures and timeouts while retaining captures for retry."""
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        tools = self.root / "tools"
+        tools.mkdir()
+        executable = tools / "diffoscope"
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\n"
+            "sys.stderr.write('<failed>')\nsys.exit(2)\n",
+        )
+        executable.chmod(0o700)
+        with app.OutputSnapshots() as snapshots:
+            with patch.dict(os.environ, {"PATH": f"{tools}:{os.environ['PATH']}"}):
+                comparison = self.capture(snapshots)
+                require_output("exit 2" in comparison.error)
+                require_output(b"&lt;failed&gt;" in app.output_diff_page(comparison))
+                previous = comparison.previous
+                executable.write_text(
+                    f"#!{sys.executable}\nimport time\ntime.sleep(10)\n",
+                )
+                with patch.object(app, "OUTPUT_DIFF_TIMEOUT", 0.05):
+                    self.capture(snapshots, refresh=True)
+                require_output("exceeded" in comparison.error)
+                require_output(comparison.previous == previous)
+            self.capture(snapshots, refresh=True)
+            require_output(comparison.error == "", comparison.error)
+            require_output(b"No output changes" in app.output_diff_page(comparison))
+
+    def test_failed_copy_preserves_history_and_other_browsers_cannot_rotate_it(
+        self,
+    ) -> None:
+        """Failed captures and concurrent browsers preserve the last complete output."""
+        (self.output / "value.txt").write_text("before\n")
+        with app.OutputSnapshots() as first, app.OutputSnapshots() as second:
+            comparison = self.capture(first)
+            latest = (comparison.store / "latest").read_text()
+            concurrent = self.capture(second)
+            require_output("another browser" in concurrent.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            with patch.object(shutil, "copytree", side_effect=OSError("copy failed")):
+                self.capture(first, refresh=True)
+            require_output("copy failed" in comparison.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
+            first.close()
+            self.capture(second, refresh=True)
+            require_output(concurrent.error == "", concurrent.error)
+            require_output(not concurrent.changed)
+
     def test_launches_compare_output_and_refresh_keeps_previous_capture(self) -> None:
         """HTML reports compare two launches, retaining the same baseline on refresh."""
         value = self.output / "value.json"
@@ -157,6 +232,25 @@ class TestOutputSnapshots(unittest.TestCase):
             require_output(not third.changed)
             require_output(b"No output changes" in app.output_diff_page(third))
 
+    def test_metadata_is_ignored_and_missing_output_reports_removals(self) -> None:
+        """Ignore metadata changes and report the removal of a whole output tree."""
+        value = self.output / "value.txt"
+        value.write_text("retained contents\n")
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        value.chmod(0o700)
+        os.utime(value, (1, 1))
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            require_output(comparison.error == "", comparison.error)
+            require_output(not comparison.changed)
+            value.unlink()
+            self.output.rmdir()
+            self.capture(snapshots, refresh=True)
+            require_output(comparison.error == "", comparison.error)
+            require_output(comparison.changed)
+            require_output(b"retained" in app.output_diff_page(comparison))
+
     def test_output_tree_embeds_changes_and_reports_individual_entries(self) -> None:
         """Keep nested output changes inline and scope reports to their entry."""
         nested = self.output / "nested"
@@ -206,100 +300,6 @@ class TestOutputSnapshots(unittest.TestCase):
                 snapshots.entry_report(comparison, "../timestamp")
             with pytest.raises(ValueError, match="escapes capture"):
                 snapshots.entry_report(comparison, "external/flake.nix")
-
-    def test_metadata_is_ignored_and_missing_output_reports_removals(self) -> None:
-        """Ignore metadata changes and report the removal of a whole output tree."""
-        value = self.output / "value.txt"
-        value.write_text("retained contents\n")
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        value.chmod(0o700)
-        os.utime(value, (1, 1))
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            require_output(comparison.error == "", comparison.error)
-            require_output(not comparison.changed)
-            value.unlink()
-            self.output.rmdir()
-            self.capture(snapshots, refresh=True)
-            require_output(comparison.error == "", comparison.error)
-            require_output(comparison.changed)
-            require_output(b"retained" in app.output_diff_page(comparison))
-
-    def test_failed_copy_preserves_history_and_other_browsers_cannot_rotate_it(
-        self,
-    ) -> None:
-        """Failed captures and concurrent browsers preserve the last complete output."""
-        (self.output / "value.txt").write_text("before\n")
-        with app.OutputSnapshots() as first, app.OutputSnapshots() as second:
-            comparison = self.capture(first)
-            latest = (comparison.store / "latest").read_text()
-            concurrent = self.capture(second)
-            require_output("another browser" in concurrent.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            with patch.object(shutil, "copytree", side_effect=OSError("copy failed")):
-                self.capture(first, refresh=True)
-            require_output("copy failed" in comparison.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
-            first.close()
-            self.capture(second, refresh=True)
-            require_output(concurrent.error == "", concurrent.error)
-            require_output(not concurrent.changed)
-
-    def test_capture_preserves_symlinks_without_reading_external_targets(self) -> None:
-        """Compare symlink destinations without exposing external file contents."""
-        secret = self.root / "private.txt"
-        secret.write_text("PRIVATE-CONTENT-MUST-NOT-APPEAR\n")
-        link = self.output / "link"
-        link.symlink_to(secret)
-        with app.OutputSnapshots() as snapshots:
-            first = self.capture(snapshots)
-            require_output(first.error == "", first.error)
-            if first.current is None:
-                msg = "Expected a complete initial capture"
-                raise AssertionError(msg)
-            require_output((first.current / "output/link").is_symlink())
-        link.unlink()
-        link.symlink_to(self.root / "missing.txt")
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            require_output(comparison.error == "", comparison.error)
-            report = re.sub(rb"<[^>]+>", b"", app.output_diff_page(comparison))
-            require_output(b"private.txt" in report)
-            require_output(b"missing.txt" in report)
-            require_output(b"PRIVATE-CONTENT-MUST-NOT-APPEAR" not in report)
-
-    def test_comparison_failures_and_timeouts_are_visible_and_refresh_can_retry(
-        self,
-    ) -> None:
-        """Show tool failures and timeouts while retaining captures for retry."""
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        tools = self.root / "tools"
-        tools.mkdir()
-        executable = tools / "diffoscope"
-        executable.write_text(
-            f"#!{sys.executable}\nimport sys\n"
-            "sys.stderr.write('<failed>')\nsys.exit(2)\n",
-        )
-        executable.chmod(0o700)
-        with app.OutputSnapshots() as snapshots:
-            with patch.dict(os.environ, {"PATH": f"{tools}:{os.environ['PATH']}"}):
-                comparison = self.capture(snapshots)
-                require_output("exit 2" in comparison.error)
-                require_output(b"&lt;failed&gt;" in app.output_diff_page(comparison))
-                previous = comparison.previous
-                executable.write_text(
-                    f"#!{sys.executable}\nimport time\ntime.sleep(10)\n",
-                )
-                with patch.object(app, "OUTPUT_DIFF_TIMEOUT", 0.05):
-                    self.capture(snapshots, refresh=True)
-                require_output("exceeded" in comparison.error)
-                require_output(comparison.previous == previous)
-            self.capture(snapshots, refresh=True)
-            require_output(comparison.error == "", comparison.error)
-            require_output(b"No output changes" in app.output_diff_page(comparison))
 
     def test_report_requests_reuse_captures_while_the_server_stays_responsive(
         self,
@@ -362,6 +362,93 @@ class TestOutputSnapshots(unittest.TestCase):
 
 class TestBoundary(unittest.TestCase):
     """Verify the source contract through complete browser snapshots."""
+
+    def test_browser_cli_is_statically_discoverable(self) -> None:
+        """The browser's own interface must remain visible to Canonical inspection."""
+        entries = source_package_cli(Path(app.__file__).read_bytes(), "main.py")
+        if not all(
+            any(entry.text.startswith(name) for entry in entries)
+            for name in ("directory", "--no-open", "--port")
+        ):
+            msg = "Canonical inspection must discover every browser CLI parameter"
+            raise AssertionError(msg)
+
+    def test_empty_home_and_host_only_flake_have_no_fabricated_packages(self) -> None:
+        """Only backend resource identities may appear in the browser graph."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
+            child = root / "forge.example"
+            child.mkdir()
+            if canonical_root(child) != root:
+                msg = "Empty home layouts must share the backend's root recognition"
+                raise AssertionError(msg)
+            home = app.gui_data(root)
+            (root / ".gitignore").unlink()
+            (root / "flake.nix").write_text("{}\n")
+            source = root / "hosts/laptop/configuration.nix"
+            source.parent.mkdir(parents=True)
+            source.write_text("{}\n")
+            flake = app.gui_data(root)
+        if [node["id"] for node in home["nodes"]] != [".:repository"]:
+            msg = "An empty home must not fabricate a removed packages directory"
+            raise AssertionError(msg)
+        if any(node["kind"] == "package" for node in flake["nodes"]):
+            msg = "Host-only flakes must not fabricate package resources"
+            raise AssertionError(msg)
+
+    def test_host_dependency_removals_and_deleted_hosts_and_checks_are_visible(
+        self,
+    ) -> None:
+        """Historical source comparisons must cover every Canonical resource kind."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            host = root / "hosts/laptop/configuration.nix"
+            host.parent.mkdir(parents=True)
+            host.write_text(
+                "{ inputs, system, ... }: { environment.systemPackages = [ "
+                "inputs.self.packages.${system}.tool ]; }\n",
+            )
+            check = root / "checks/laptopVmWithDisko/default.nix"
+            check.parent.mkdir(parents=True)
+            check.write_text("{}\n")
+            commit_sources(root)
+            host.write_text("{}\n")
+            changed = app.gui_data(root)
+            host.unlink()
+            check.unlink()
+            removed = app.gui_data(root)
+        edge = next(edge for edge in changed["edges"] if edge["kind"] == "runtime")
+        if (
+            edge["change"] != "removed"
+            or edge["declaration"]["path"] != "hosts/laptop/configuration.nix"
+        ):
+            msg = "Host dependency removals must retain their declaration metadata"
+            raise AssertionError(msg)
+        host_record = next(node for node in changed["nodes"] if node["kind"] == "host")
+        if "- runtime: packages/tool" not in json.dumps(host_record["tree"]):
+            msg = "Host dependency removals must appear in the source details"
+            raise AssertionError(msg)
+        records = {node["id"]: node for node in removed["nodes"]}
+        for identifier in (".:hosts/laptop", ".:checks/laptopVmWithDisko"):
+            if (
+                not records[identifier]["removed"]
+                or records[identifier]["tree"]["change"] != "removed"
+            ):
+                msg = (
+                    "Deleted hosts and checks must remain visible as removed resources"
+                )
+                raise AssertionError(msg)
+        host_tree = records[".:hosts/laptop"]["tree"]
+        source = next(
+            child
+            for child in host_tree["children"]
+            if child["title"] == "configuration.nix"
+        )
+        if not any(child["title"] == "Dependencies" for child in source["children"]):
+            msg = "Removed host dependencies must retain their original source filename"
+            raise AssertionError(msg)
 
     def test_multiline_help_changes_remain_under_the_source_file(self) -> None:
         """Documentation containing summary labels must retain every paragraph."""
@@ -444,83 +531,6 @@ class TestBoundary(unittest.TestCase):
             msg = "A removed source must not claim current line counts"
             raise AssertionError(msg)
 
-    def test_empty_home_and_host_only_flake_have_no_fabricated_packages(self) -> None:
-        """Only backend resource identities may appear in the browser graph."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
-            child = root / "forge.example"
-            child.mkdir()
-            if canonical_root(child) != root:
-                msg = "Empty home layouts must share the backend's root recognition"
-                raise AssertionError(msg)
-            home = app.gui_data(root)
-            (root / ".gitignore").unlink()
-            (root / "flake.nix").write_text("{}\n")
-            source = root / "hosts/laptop/configuration.nix"
-            source.parent.mkdir(parents=True)
-            source.write_text("{}\n")
-            flake = app.gui_data(root)
-        if [node["id"] for node in home["nodes"]] != [".:repository"]:
-            msg = "An empty home must not fabricate a removed packages directory"
-            raise AssertionError(msg)
-        if any(node["kind"] == "package" for node in flake["nodes"]):
-            msg = "Host-only flakes must not fabricate package resources"
-            raise AssertionError(msg)
-
-    def test_host_dependency_removals_and_deleted_hosts_and_checks_are_visible(
-        self,
-    ) -> None:
-        """Historical source comparisons must cover every Canonical resource kind."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            host = root / "hosts/laptop/configuration.nix"
-            host.parent.mkdir(parents=True)
-            host.write_text(
-                "{ inputs, system, ... }: { environment.systemPackages = [ "
-                "inputs.self.packages.${system}.tool ]; }\n",
-            )
-            check = root / "checks/laptopVmWithDisko/default.nix"
-            check.parent.mkdir(parents=True)
-            check.write_text("{}\n")
-            commit_sources(root)
-            host.write_text("{}\n")
-            changed = app.gui_data(root)
-            host.unlink()
-            check.unlink()
-            removed = app.gui_data(root)
-        edge = next(edge for edge in changed["edges"] if edge["kind"] == "runtime")
-        if (
-            edge["change"] != "removed"
-            or edge["declaration"]["path"] != "hosts/laptop/configuration.nix"
-        ):
-            msg = "Host dependency removals must retain their declaration metadata"
-            raise AssertionError(msg)
-        host_record = next(node for node in changed["nodes"] if node["kind"] == "host")
-        if "- runtime: packages/tool" not in json.dumps(host_record["tree"]):
-            msg = "Host dependency removals must appear in the source details"
-            raise AssertionError(msg)
-        records = {node["id"]: node for node in removed["nodes"]}
-        for identifier in (".:hosts/laptop", ".:checks/laptopVmWithDisko"):
-            if (
-                not records[identifier]["removed"]
-                or records[identifier]["tree"]["change"] != "removed"
-            ):
-                msg = (
-                    "Deleted hosts and checks must remain visible as removed resources"
-                )
-                raise AssertionError(msg)
-        host_tree = records[".:hosts/laptop"]["tree"]
-        source = next(
-            child
-            for child in host_tree["children"]
-            if child["title"] == "configuration.nix"
-        )
-        if not any(child["title"] == "Dependencies" for child in source["children"]):
-            msg = "Removed host dependencies must retain their original source filename"
-            raise AssertionError(msg)
-
     def test_schema_versions_are_checked_and_added_fields_are_allowed(self) -> None:
         """Reject incompatible documents before rendering, without mutating inputs."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -564,16 +574,6 @@ class TestBoundary(unittest.TestCase):
             ):
                 msg = "Optional fields must survive without modifying backend snapshots"
                 raise AssertionError(msg)
-
-    def test_browser_cli_is_statically_discoverable(self) -> None:
-        """The browser's own interface must remain visible to Canonical inspection."""
-        entries = source_package_cli(Path(app.__file__).read_bytes(), "main.py")
-        if not all(
-            any(entry.text.startswith(name) for entry in entries)
-            for name in ("directory", "--no-open", "--port")
-        ):
-            msg = "Canonical inspection must discover every browser CLI parameter"
-            raise AssertionError(msg)
 
 
 class TestGui(unittest.TestCase):
@@ -718,6 +718,257 @@ class TestGui(unittest.TestCase):
                 )
                 require_output(json.loads(response.content)["state"] == "idle")
 
+    def test_directory_scope_excludes_sibling_resources(self) -> None:
+        """Intermediate directories and package directories show only their contents."""
+        with tempfile.TemporaryDirectory() as temporary:
+            home = Path(temporary)
+            (home / ".gitmodules").write_text(
+                '[submodule "github.com/example/one"]\n'
+                "path = github.com/example/one\n"
+                '[submodule "other.example/two"]\n'
+                "path = other.example/two\n",
+            )
+            for relative in ("github.com/example/one", "other.example/two"):
+                repository = home / relative
+                repository.mkdir(parents=True)
+                (repository / "flake.nix").write_text("{}\n")
+                for name in ("first", "second"):
+                    package = repository / "packages" / name
+                    package.mkdir(parents=True)
+                    (package / "default.nix").write_text("{}\n")
+                    (package / "main.py").write_text('"""Example."""\n')
+            scoped = home / "github.com"
+            viewer = app.RepositoryBrowser(scoped)
+            viewer.refresh()
+            snapshot = viewer.snapshot
+            if snapshot["root"] != str(scoped) or snapshot["parent"] != str(home):
+                msg = "The current directory and its parent must define navigation"
+                raise AssertionError(msg)
+            repositories = {node["repository"] for node in snapshot["nodes"]}
+            if repositories != {"example/one"}:
+                msg = "A directory scope must exclude sibling repositories"
+                raise AssertionError(msg)
+            package = scoped / "example/one/packages/first"
+            snapshot = app.gui_data(package)
+            names = [
+                node["name"] for node in snapshot["nodes"] if node["kind"] == "package"
+            ]
+            if names != ["first"]:
+                msg = "Starting inside a package must exclude other packages"
+                raise AssertionError(msg)
+
+    def test_directory_scopes_reuse_data_until_refresh(self) -> None:
+        """Changing scopes must preserve cached declarations until explicit refresh."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            source = package / "main.py"
+            source.write_text('"""Before."""\n')
+            browser = app.RepositoryBrowser(root)
+            browser.load()
+            before = browser.snapshot
+            source.write_text('"""After."""\n')
+            browser.cwd = package
+            browser.load()
+            if "Before." not in json.dumps(browser.snapshot):
+                msg = "Child navigation must reuse the cached snapshot"
+                raise AssertionError(msg)
+            browser.cwd = root
+            browser.load()
+            if browser.snapshot != before:
+                msg = "Parent navigation must reuse the cached snapshot"
+                raise AssertionError(msg)
+            browser.refresh()
+            if "After." not in json.dumps(browser.snapshot):
+                msg = "Refresh must load new declarations"
+                raise AssertionError(msg)
+
+    def test_gui_package_includes_offline_layout_engine(self) -> None:
+        """The installed app must include the same engine served by source tests."""
+        executable = os.environ.get("PACKAGE_E2E_EXECUTABLE")
+        if not executable:
+            self.skipTest("Nix package executable not supplied")
+        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
+        for name in ("g6",):
+            engine = (
+                Path(executable).parent.parent
+                / "lib"
+                / version
+                / f"site-packages/canonical_browser/prm/{name}.js"
+            )
+            if (
+                engine.read_bytes()
+                != Path(
+                    os.environ[f"CANONICAL_BROWSER_{name.upper()}"],
+                ).read_bytes()
+            ):
+                msg = "The packaged graph engine must match the pinned Nix dependency"
+                raise AssertionError(msg)
+
+    def test_gui_preserves_shared_resource_details_and_changes(self) -> None:
+        """Both representations use the same resources and structured changes."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            for relative, source in (
+                ("packages/sample/default.nix", "{}\n"),
+                ("packages/sample/test_main.py", "def test_old(): pass\n"),
+                ("hosts/laptop/configuration.nix", "{}\n"),
+                ("checks/sample/default.nix", "{}\n"),
+            ):
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(source)
+            commit_sources(root)
+            (root / "packages/sample/test_main.py").write_text("def test_new(): pass\n")
+            snapshot = app.gui_data(root)
+            details = resource_data(root / "packages/sample")
+        records = {record["id"]: record for record in snapshot["nodes"]}
+        package = records[".:packages/sample"]
+        require_output(package["details"] == details)
+        require_output("tree" not in snapshot)
+        source = next(
+            node
+            for node in package["tree"]["children"]
+            if node["title"] == "test_main.py"
+        )
+        tests = next(node for node in source["children"] if node["field"] == "tests")
+        require_output(
+            [(node["title"], node["change"]) for node in tests["children"]]
+            == [("- test old", "removed"), ("+ test new", "added")],
+        )
+
+    def test_gui_serves_assets_and_live_data_without_exposing_checkout(self) -> None:
+        """Assets ship with the package; traversal and writes cannot reach files."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with TestClient(
+                app.gui_app(root),
+                base_url="http://127.0.0.1:8765",
+            ) as client:
+                for route in (
+                    "/",
+                    "/script.js",
+                    "/style.css",
+                    "/g6.js",
+                    "/icons.js",
+                ):
+                    response = client.request("GET", route)
+                    if response.status_code != HTTPStatus.OK or not response.content:
+                        msg = f"Missing packaged GUI asset: {route}"
+                        raise AssertionError(msg)
+                response = client.get("/api/overview")
+                require_output(response.status_code == HTTPStatus.OK)
+                require_output(response.json()["root"] == str(root))
+                for route in ("/../main.py", "/.git/config", "/main.py"):
+                    response = client.request("GET", route)
+                    if response.status_code != HTTPStatus.NOT_FOUND:
+                        msg = "The GUI must not serve checkout files"
+                        raise AssertionError(msg)
+                response = client.request("POST", "/api/overview", content=b"change")
+                if response.status_code != HTTPStatus.METHOD_NOT_ALLOWED:
+                    msg = "GUI requests must not write repository data"
+                    raise AssertionError(msg)
+                with patch.object(
+                    app,
+                    "gui_data",
+                    side_effect=ValueError("Invalid repository"),
+                ):
+                    response = client.request("GET", "/api/overview")
+                    if (
+                        response.status_code != HTTPStatus.INTERNAL_SERVER_ERROR
+                        or json.loads(response.content)
+                        != {"error": "Invalid repository"}
+                    ):
+                        msg = "Repository errors must return readable JSON"
+                        raise AssertionError(msg)
+
+    def test_home_is_the_upper_navigation_boundary(self) -> None:
+        """Home scopes have no parent, including a home with a flake."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch.object(Path, "home", return_value=root):
+                if app.directory_snapshot(root)["parent"] is not None:
+                    msg = "Directory home must have no parent"
+                    raise AssertionError(msg)
+                (root / "flake.nix").write_text("{}\n")
+                if app.gui_data(root)["parent"] is not None:
+                    msg = "Flake home must have no parent"
+                    raise AssertionError(msg)
+
+    def test_output_browser_serves_files_inside_tmp_only(self) -> None:
+        """List output, escape filenames, and reject traversal and symlink escapes."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output = root / "packages/example/tmp"
+            nested = output / "nested"
+            nested.mkdir(parents=True)
+            name = "report & <one>.txt"
+            (output / name).write_text("Generated output")
+            source = output.parent / "main.py"
+            source.write_text("Source must stay private")
+            (output / "escaped.py").symlink_to(source)
+            with TestClient(
+                app.gui_app(root),
+                base_url="http://127.0.0.1:8765",
+            ) as client:
+                response = client.request(
+                    "GET",
+                    "/output?" + urlencode({"path": str(output)}),
+                )
+                listing = response.content.decode()
+                if (
+                    response.status_code != HTTPStatus.OK
+                    or "report &amp; &lt;one&gt;.txt" not in listing
+                    or "escaped.py" in listing
+                ):
+                    msg = "Output listings must escape names and omit escaped links"
+                    raise AssertionError(msg)
+                response = client.request(
+                    "GET",
+                    "/output?" + urlencode({"path": str(output / name)}),
+                )
+                if (
+                    response.status_code != HTTPStatus.OK
+                    or response.content != b"Generated output"
+                ):
+                    msg = "Output files must open directly in the web browser"
+                    raise AssertionError(msg)
+                route = "/output?" + urlencode({"path": str(output / name)})
+                response = client.head(route)
+                require_output(response.status_code == HTTPStatus.OK)
+                require_output(response.content == b"")
+                require_output(
+                    int(response.headers["Content-Length"]) == len(b"Generated output"),
+                )
+                response = client.get(route, headers={"Range": "bytes=0-8"})
+                require_output(response.status_code == HTTPStatus.PARTIAL_CONTENT)
+                require_output(response.content == b"Generated")
+                response = client.request(
+                    "GET",
+                    "/output?" + urlencode({"path": str(nested)}),
+                )
+                if (
+                    response.status_code != HTTPStatus.OK
+                    or "../" not in response.content.decode()
+                ):
+                    msg = "Nested output listings must link to their parent"
+                    raise AssertionError(msg)
+                for path in (
+                    source,
+                    output / ".." / "main.py",
+                    output / "escaped.py",
+                ):
+                    response = client.request(
+                        "GET",
+                        "/output?" + urlencode({"path": str(path)}),
+                    )
+                    if response.status_code != HTTPStatus.NOT_FOUND:
+                        msg = "Output browsing must not expose source files"
+                        raise AssertionError(msg)
+
     def test_package_actions_run_checks_arguments_failures_and_stop(self) -> None:
         """Forward run arguments, execute checks and stop commands on close."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -806,110 +1057,6 @@ class TestGui(unittest.TestCase):
             with pytest.raises(ValueError, match="Unknown package"):
                 actions.start(str(root), "run")
 
-    def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
-        """Count prm allocation once per inode and preserve the runtime link."""
-        with tempfile.TemporaryDirectory() as temporary:
-            package = Path(temporary) / "packages/example"
-            resources = package / "prm"
-            resources.mkdir(parents=True)
-            original = resources / "asset.bin"
-            original.write_bytes(b"asset" * 1024)
-            (resources / "hardlink.bin").hardlink_to(original)
-            external = Path(temporary) / "external.bin"
-            external.write_bytes(b"outside" * 8192)
-            link = resources / "link.bin"
-            link.symlink_to(external)
-            expected = sum(
-                path.lstat().st_blocks * 512 for path in (resources, original, link)
-            )
-            if app.directory_disk_size(resources) != expected:
-                msg = "Disk usage must deduplicate hardlinks and ignore symlink targets"
-                raise AssertionError(msg)
-            output = package / "tmp"
-            output.mkdir()
-            storage = app.package_storage(package)
-            if [node.title for node in storage] != [
-                f"prm/: {app.format_bytes(expected)}",
-                "tmp/",
-            ] or storage[-1].directory != output.resolve():
-                msg = "Packages must show allocated prm size and existing tmp link"
-                raise AssertionError(msg)
-            output.rmdir()
-            if any(node.directory for node in app.package_storage(package)):
-                msg = "An absent output directory must not have a link"
-                raise AssertionError(msg)
-
-    def test_output_browser_serves_files_inside_tmp_only(self) -> None:
-        """List output, escape filenames, and reject traversal and symlink escapes."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            output = root / "packages/example/tmp"
-            nested = output / "nested"
-            nested.mkdir(parents=True)
-            name = "report & <one>.txt"
-            (output / name).write_text("Generated output")
-            source = output.parent / "main.py"
-            source.write_text("Source must stay private")
-            (output / "escaped.py").symlink_to(source)
-            with TestClient(
-                app.gui_app(root),
-                base_url="http://127.0.0.1:8765",
-            ) as client:
-                response = client.request(
-                    "GET",
-                    "/output?" + urlencode({"path": str(output)}),
-                )
-                listing = response.content.decode()
-                if (
-                    response.status_code != HTTPStatus.OK
-                    or "report &amp; &lt;one&gt;.txt" not in listing
-                    or "escaped.py" in listing
-                ):
-                    msg = "Output listings must escape names and omit escaped links"
-                    raise AssertionError(msg)
-                response = client.request(
-                    "GET",
-                    "/output?" + urlencode({"path": str(output / name)}),
-                )
-                if (
-                    response.status_code != HTTPStatus.OK
-                    or response.content != b"Generated output"
-                ):
-                    msg = "Output files must open directly in the web browser"
-                    raise AssertionError(msg)
-                route = "/output?" + urlencode({"path": str(output / name)})
-                response = client.head(route)
-                require_output(response.status_code == HTTPStatus.OK)
-                require_output(response.content == b"")
-                require_output(
-                    int(response.headers["Content-Length"]) == len(b"Generated output"),
-                )
-                response = client.get(route, headers={"Range": "bytes=0-8"})
-                require_output(response.status_code == HTTPStatus.PARTIAL_CONTENT)
-                require_output(response.content == b"Generated")
-                response = client.request(
-                    "GET",
-                    "/output?" + urlencode({"path": str(nested)}),
-                )
-                if (
-                    response.status_code != HTTPStatus.OK
-                    or "../" not in response.content.decode()
-                ):
-                    msg = "Nested output listings must link to their parent"
-                    raise AssertionError(msg)
-                for path in (
-                    source,
-                    output / ".." / "main.py",
-                    output / "escaped.py",
-                ):
-                    response = client.request(
-                        "GET",
-                        "/output?" + urlencode({"path": str(path)}),
-                    )
-                    if response.status_code != HTTPStatus.NOT_FOUND:
-                        msg = "Output browsing must not expose source files"
-                        raise AssertionError(msg)
-
     def test_package_sources_count_lines_and_exclude_runtime_output(self) -> None:
         """Count blank lines and unterminated last lines, including prm sources."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -969,107 +1116,36 @@ class TestGui(unittest.TestCase):
                 msg = "Host source files must contribute current metrics"
                 raise AssertionError(msg)
 
-    def test_directory_scope_excludes_sibling_resources(self) -> None:
-        """Intermediate directories and package directories show only their contents."""
-        with tempfile.TemporaryDirectory() as temporary:
-            home = Path(temporary)
-            (home / ".gitmodules").write_text(
-                '[submodule "github.com/example/one"]\n'
-                "path = github.com/example/one\n"
-                '[submodule "other.example/two"]\n'
-                "path = other.example/two\n",
-            )
-            for relative in ("github.com/example/one", "other.example/two"):
-                repository = home / relative
-                repository.mkdir(parents=True)
-                (repository / "flake.nix").write_text("{}\n")
-                for name in ("first", "second"):
-                    package = repository / "packages" / name
-                    package.mkdir(parents=True)
-                    (package / "default.nix").write_text("{}\n")
-                    (package / "main.py").write_text('"""Example."""\n')
-            scoped = home / "github.com"
-            viewer = app.RepositoryBrowser(scoped)
-            viewer.refresh()
-            snapshot = viewer.snapshot
-            if snapshot["root"] != str(scoped) or snapshot["parent"] != str(home):
-                msg = "The current directory and its parent must define navigation"
-                raise AssertionError(msg)
-            repositories = {node["repository"] for node in snapshot["nodes"]}
-            if repositories != {"example/one"}:
-                msg = "A directory scope must exclude sibling repositories"
-                raise AssertionError(msg)
-            package = scoped / "example/one/packages/first"
-            snapshot = app.gui_data(package)
-            names = [
-                node["name"] for node in snapshot["nodes"] if node["kind"] == "package"
-            ]
-            if names != ["first"]:
-                msg = "Starting inside a package must exclude other packages"
-                raise AssertionError(msg)
-
-    def test_directory_scopes_reuse_data_until_refresh(self) -> None:
-        """Changing scopes must preserve cached declarations until explicit refresh."""
+    def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
+        """Retain removed providers and declaration metadata in both views."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/example"
+            package = root / "packages/consumer"
             package.mkdir(parents=True)
-            source = package / "main.py"
-            source.write_text('"""Before."""\n')
-            browser = app.RepositoryBrowser(root)
-            browser.load()
-            before = browser.snapshot
-            source.write_text('"""After."""\n')
-            browser.cwd = package
-            browser.load()
-            if "Before." not in json.dumps(browser.snapshot):
-                msg = "Child navigation must reuse the cached snapshot"
-                raise AssertionError(msg)
-            browser.cwd = root
-            browser.load()
-            if browser.snapshot != before:
-                msg = "Parent navigation must reuse the cached snapshot"
-                raise AssertionError(msg)
-            browser.refresh()
-            if "After." not in json.dumps(browser.snapshot):
-                msg = "Refresh must load new declarations"
-                raise AssertionError(msg)
-
-    def test_home_is_the_upper_navigation_boundary(self) -> None:
-        """Home scopes have no parent, including a home with a flake."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with patch.object(Path, "home", return_value=root):
-                if app.directory_snapshot(root)["parent"] is not None:
-                    msg = "Directory home must have no parent"
-                    raise AssertionError(msg)
-                (root / "flake.nix").write_text("{}\n")
-                if app.gui_data(root)["parent"] is not None:
-                    msg = "Flake home must have no parent"
-                    raise AssertionError(msg)
-
-    def test_gui_package_includes_offline_layout_engine(self) -> None:
-        """The installed app must include the same engine served by source tests."""
-        executable = os.environ.get("PACKAGE_E2E_EXECUTABLE")
-        if not executable:
-            self.skipTest("Nix package executable not supplied")
-        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        for name in ("g6",):
-            engine = (
-                Path(executable).parent.parent
-                / "lib"
-                / version
-                / f"site-packages/canonical_browser/prm/{name}.js"
+            source = package / "default.nix"
+            source.write_text(
+                "{ inputs, system, ... }: { buildInputs = [ "
+                "inputs.self.packages.${system}.old ]; }\n",
             )
-            if (
-                engine.read_bytes()
-                != Path(
-                    os.environ[f"CANONICAL_BROWSER_{name.upper()}"],
-                ).read_bytes()
-            ):
-                msg = "The packaged graph engine must match the pinned Nix dependency"
-                raise AssertionError(msg)
+            commit_sources(root)
+            source.write_text("{}\n")
+            snapshot = app.gui_data(root)
+        records = {record["id"]: record for record in snapshot["nodes"]}
+        if not records[".:packages/old"]["removed"]:
+            msg = "Removed dependency providers must remain in the shared snapshot"
+            raise AssertionError(msg)
+        connections = records[".:packages/consumer"]["tree"]["children"][-1]
+        if connections["children"][0]["change"] != "removed":
+            msg = "Connections must retain the same change colors as GUI arrows"
+            raise AssertionError(msg)
+        edge = next(edge for edge in snapshot["edges"] if edge["kind"] == "build")
+        if (
+            edge["change"] != "removed"
+            or edge["declaration"]["path"] != "packages/consumer/default.nix"
+        ):
+            msg = "Removed arrows must preserve their source declarations"
+            raise AssertionError(msg)
 
     def test_runtime_os_and_persistence_are_observations(self) -> None:
         """Detect running modules and report uncertainty about disk-backed roots."""
@@ -1116,36 +1192,38 @@ class TestGui(unittest.TestCase):
                     msg = "Missing evidence must be reported as not detected"
                     raise AssertionError(msg)
 
-    def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
-        """Retain removed providers and declaration metadata in both views."""
+    def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
+        """Count prm allocation once per inode and preserve the runtime link."""
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/consumer"
-            package.mkdir(parents=True)
-            source = package / "default.nix"
-            source.write_text(
-                "{ inputs, system, ... }: { buildInputs = [ "
-                "inputs.self.packages.${system}.old ]; }\n",
+            package = Path(temporary) / "packages/example"
+            resources = package / "prm"
+            resources.mkdir(parents=True)
+            original = resources / "asset.bin"
+            original.write_bytes(b"asset" * 1024)
+            (resources / "hardlink.bin").hardlink_to(original)
+            external = Path(temporary) / "external.bin"
+            external.write_bytes(b"outside" * 8192)
+            link = resources / "link.bin"
+            link.symlink_to(external)
+            expected = sum(
+                path.lstat().st_blocks * 512 for path in (resources, original, link)
             )
-            commit_sources(root)
-            source.write_text("{}\n")
-            snapshot = app.gui_data(root)
-        records = {record["id"]: record for record in snapshot["nodes"]}
-        if not records[".:packages/old"]["removed"]:
-            msg = "Removed dependency providers must remain in the shared snapshot"
-            raise AssertionError(msg)
-        connections = records[".:packages/consumer"]["tree"]["children"][-1]
-        if connections["children"][0]["change"] != "removed":
-            msg = "Connections must retain the same change colors as GUI arrows"
-            raise AssertionError(msg)
-        edge = next(edge for edge in snapshot["edges"] if edge["kind"] == "build")
-        if (
-            edge["change"] != "removed"
-            or edge["declaration"]["path"] != "packages/consumer/default.nix"
-        ):
-            msg = "Removed arrows must preserve their source declarations"
-            raise AssertionError(msg)
+            if app.directory_disk_size(resources) != expected:
+                msg = "Disk usage must deduplicate hardlinks and ignore symlink targets"
+                raise AssertionError(msg)
+            output = package / "tmp"
+            output.mkdir()
+            storage = app.package_storage(package)
+            if [node.title for node in storage] != [
+                f"prm/: {app.format_bytes(expected)}",
+                "tmp/",
+            ] or storage[-1].directory != output.resolve():
+                msg = "Packages must show allocated prm size and existing tmp link"
+                raise AssertionError(msg)
+            output.rmdir()
+            if any(node.directory for node in app.package_storage(package)):
+                msg = "An absent output directory must not have a link"
+                raise AssertionError(msg)
 
     def test_web_browser_launch_and_port_validation(self) -> None:
         """Startup opens a loopback browser with the requested port."""
@@ -1165,84 +1243,6 @@ class TestGui(unittest.TestCase):
             msg = "Invalid ports must be rejected by the parser"
             raise AssertionError(msg)
 
-    def test_gui_serves_assets_and_live_data_without_exposing_checkout(self) -> None:
-        """Assets ship with the package; traversal and writes cannot reach files."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with TestClient(
-                app.gui_app(root),
-                base_url="http://127.0.0.1:8765",
-            ) as client:
-                for route in (
-                    "/",
-                    "/script.js",
-                    "/style.css",
-                    "/g6.js",
-                    "/icons.js",
-                ):
-                    response = client.request("GET", route)
-                    if response.status_code != HTTPStatus.OK or not response.content:
-                        msg = f"Missing packaged GUI asset: {route}"
-                        raise AssertionError(msg)
-                response = client.get("/api/overview")
-                require_output(response.status_code == HTTPStatus.OK)
-                require_output(response.json()["root"] == str(root))
-                for route in ("/../main.py", "/.git/config", "/main.py"):
-                    response = client.request("GET", route)
-                    if response.status_code != HTTPStatus.NOT_FOUND:
-                        msg = "The GUI must not serve checkout files"
-                        raise AssertionError(msg)
-                response = client.request("POST", "/api/overview", content=b"change")
-                if response.status_code != HTTPStatus.METHOD_NOT_ALLOWED:
-                    msg = "GUI requests must not write repository data"
-                    raise AssertionError(msg)
-                with patch.object(
-                    app,
-                    "gui_data",
-                    side_effect=ValueError("Invalid repository"),
-                ):
-                    response = client.request("GET", "/api/overview")
-                    if (
-                        response.status_code != HTTPStatus.INTERNAL_SERVER_ERROR
-                        or json.loads(response.content)
-                        != {"error": "Invalid repository"}
-                    ):
-                        msg = "Repository errors must return readable JSON"
-                        raise AssertionError(msg)
-
-    def test_gui_preserves_shared_resource_details_and_changes(self) -> None:
-        """Both representations use the same resources and structured changes."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            for relative, source in (
-                ("packages/sample/default.nix", "{}\n"),
-                ("packages/sample/test_main.py", "def test_old(): pass\n"),
-                ("hosts/laptop/configuration.nix", "{}\n"),
-                ("checks/sample/default.nix", "{}\n"),
-            ):
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(source)
-            commit_sources(root)
-            (root / "packages/sample/test_main.py").write_text("def test_new(): pass\n")
-            snapshot = app.gui_data(root)
-            details = resource_data(root / "packages/sample")
-        records = {record["id"]: record for record in snapshot["nodes"]}
-        package = records[".:packages/sample"]
-        require_output(package["details"] == details)
-        require_output("tree" not in snapshot)
-        source = next(
-            node
-            for node in package["tree"]["children"]
-            if node["title"] == "test_main.py"
-        )
-        tests = next(node for node in source["children"] if node["field"] == "tests")
-        require_output(
-            [(node["title"], node["change"]) for node in tests["children"]]
-            == [("- test old", "removed"), ("+ test new", "added")],
-        )
-
 
 class TestCli(unittest.TestCase):
     """Verify web-only startup."""
@@ -1256,14 +1256,6 @@ class TestCli(unittest.TestCase):
             port=8765,
             open_browser=True,
         )
-
-    def test_removed_terminal_flag_is_rejected(self) -> None:
-        """Legacy renderer selection cannot select a removed implementation."""
-        with pytest.raises(SystemExit) as error:
-            app.main(["--gui"])
-        if error.value.code != TEST_PARSER_ERROR:
-            msg = "Removed mode flags must be rejected"
-            raise AssertionError(msg)
 
     def test_launch_address_accepts_connections_before_opening_browser(self) -> None:
         """An ephemeral listening address must work while the app starts."""
@@ -1281,6 +1273,14 @@ class TestCli(unittest.TestCase):
         ):
             app.open_gui(Path.cwd(), port=0, open_browser=True)
         require_output(len(addresses) == 1)
+
+    def test_removed_terminal_flag_is_rejected(self) -> None:
+        """Legacy renderer selection cannot select a removed implementation."""
+        with pytest.raises(SystemExit) as error:
+            app.main(["--gui"])
+        if error.value.code != TEST_PARSER_ERROR:
+            msg = "Removed mode flags must be rejected"
+            raise AssertionError(msg)
 
 
 class TestRepositoryData(unittest.TestCase):
@@ -1321,6 +1321,95 @@ class TestRepositoryData(unittest.TestCase):
             if node["source_file"]
         }
 
+    def test_cli_parameters_belong_to_nested_commands(self) -> None:
+        """Command paths place changed parameters under their declared commands."""
+        before = (
+            "import argparse\ndef parser():\n    p = argparse.ArgumentParser()\n"
+            '    p.add_argument("--root")\n    commands = p.add_subparsers()\n'
+            '    run = commands.add_parser("run")\n'
+            '    run.add_argument("--old")\n    return p\n'
+        )
+        self.source.write_text(before)
+        commit_sources(self.root)
+        self.source.write_text(before.replace('"--old"', '"--new"'))
+        cli = next(
+            node
+            for node in self.files()["main.py"]["children"]
+            if node["field"] == "cli"
+        )
+        run = next(node for node in cli["children"] if node["title"] == "run")
+        require_output(
+            [node["change"] for node in run["children"]] == ["removed", "added"],
+        )
+        require_output(
+            any(
+                node["title"].startswith("--root") and node["change"] is None
+                for node in cli["children"]
+            ),
+        )
+
+    def test_dependencies_appear_in_shared_overview_and_inline_changes(self) -> None:
+        """Dependency rows and graph relationships reflect the same declarations."""
+        default = self.package / "default.nix"
+        default.write_text(
+            "{ inputs, ... }: { buildInputs = [ "
+            "inputs.self.packages.x86_64-linux.first ]; }\n",
+        )
+        commit_sources(self.root)
+        default.write_text(
+            "{ inputs, ... }: { buildInputs = [ "
+            "inputs.self.packages.x86_64-linux.second ]; }\n",
+        )
+        group = next(
+            node
+            for node in self.files()["default.nix"]["children"]
+            if node["field"] == "dependencies"
+        )
+        require_output(
+            [(node["title"], node["change"]) for node in group["children"]]
+            == [
+                ("- build: packages/first", "removed"),
+                ("+ build: packages/second", "added"),
+            ],
+        )
+
+    def test_display_labels_do_not_control_file_placement(self) -> None:
+        """Keep documentation independent of display labels."""
+        text = "Suppressions\nLines: 999\nArguments\nHelp: arbitrary text"
+        self.source.write_text(repr(text) + "\n")
+        documentation = self.files()["main.py"]["children"][0]
+        require_output(documentation["field"] == "help")
+        require_output(documentation["value"] == text)
+        require_output(self.files()["main.py"]["lines"] == 1)
+
+    def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
+        """Empty facts have no placeholder rows, while diagnostics remain visible."""
+        self.source.write_text('"""Library."""\n')
+        (self.package / "test_main.py").write_text("")
+        require_output(
+            not any(
+                node["field"] == "tests"
+                for node in self.files()["test_main.py"]["children"]
+            ),
+        )
+        (self.package / "test_main.py").write_text("def broken(\n")
+        tests = self.files()["test_main.py"]["children"][0]
+        require_output(tests["warning"] and tests["children"][0]["warning"])
+        require_output(self.record()["tree"]["warning"])
+
+    def test_high_level_diff_compares_summaries_not_source_code(self) -> None:
+        """Body-only edits do not introduce semantic changes."""
+        commit_sources(self.root)
+        self.source.write_text(self.source.read_text() + "value = 42\n")
+        record = self.record()
+
+        def changed(node: dict[str, Any]) -> bool:
+            return bool(node["change"]) or any(
+                changed(child) for child in node["children"]
+            )
+
+        require_output(not changed(record["tree"]))
+
     def test_http_navigation_reuses_source_snapshot_until_refresh(self) -> None:
         """Navigation scopes one source capture; refresh observes source edits."""
         self.source.write_text('"""Before."""\n')
@@ -1356,40 +1445,6 @@ class TestRepositoryData(unittest.TestCase):
                 == [(self.root,), (self.root,)],
             )
 
-    def test_package_details_belong_to_their_source_files(self) -> None:
-        """Keep documentation, interfaces and tests under their actual source files."""
-        files = self.files()
-        main = files["main.py"]
-        require_output(main["lines"] == len(self.source.read_text().splitlines()))
-        require_output([node["field"] for node in main["children"]] == ["help", "cli"])
-        require_output(main["children"][0]["value"] == "Example.")
-        require_output(files["test_main.py"]["children"][0]["field"] == "tests")
-        require_output(self.record()["details"] == resource_data(self.package))
-
-    def test_display_labels_do_not_control_file_placement(self) -> None:
-        """Keep documentation independent of display labels."""
-        text = "Suppressions\nLines: 999\nArguments\nHelp: arbitrary text"
-        self.source.write_text(repr(text) + "\n")
-        documentation = self.files()["main.py"]["children"][0]
-        require_output(documentation["field"] == "help")
-        require_output(documentation["value"] == text)
-        require_output(self.files()["main.py"]["lines"] == 1)
-
-    def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
-        """Empty facts have no placeholder rows, while diagnostics remain visible."""
-        self.source.write_text('"""Library."""\n')
-        (self.package / "test_main.py").write_text("")
-        require_output(
-            not any(
-                node["field"] == "tests"
-                for node in self.files()["test_main.py"]["children"]
-            ),
-        )
-        (self.package / "test_main.py").write_text("def broken(\n")
-        tests = self.files()["test_main.py"]["children"][0]
-        require_output(tests["warning"] and tests["children"][0]["warning"])
-        require_output(self.record()["tree"]["warning"])
-
     def test_metadata_changes_have_explicit_fields_and_values(self) -> None:
         """Changed metadata carries raw values independently of its display title."""
         commit_sources(self.root)
@@ -1405,6 +1460,58 @@ class TestRepositoryData(unittest.TestCase):
             [(node["value"], node["change"]) for node in rows]
             == [("Sample.", "removed"), ("Updated.", "added")],
         )
+
+    def test_package_data_uses_canonical_test_discovery(self) -> None:
+        """Browser test rows come from the shared static discovery contract."""
+        (self.package / "test_main.py").write_text(
+            "import unittest as unit\nclass Checks(unit.TestCase):\n"
+            "    def test_nested_case(self): pass\ndef test_free_case(): pass\n",
+        )
+        record = self.record()
+        require_output(record["details"] == resource_data(self.package))
+        require_output(
+            record["details"]["tests"] == ["test nested case", "test free case"],
+        )
+
+    def test_package_details_belong_to_their_source_files(self) -> None:
+        """Keep documentation, interfaces and tests under their actual source files."""
+        files = self.files()
+        main = files["main.py"]
+        require_output(main["lines"] == len(self.source.read_text().splitlines()))
+        require_output([node["field"] for node in main["children"]] == ["help", "cli"])
+        require_output(main["children"][0]["value"] == "Example.")
+        require_output(files["test_main.py"]["children"][0]["field"] == "tests")
+        require_output(self.record()["details"] == resource_data(self.package))
+
+    def test_removed_source_retains_declarations_without_current_line_counts(
+        self,
+    ) -> None:
+        """Historical declarations remain visible without inventing current metrics."""
+        commit_sources(self.root)
+        self.source.unlink()
+        main = self.files()["main.py"]
+        require_output(main["lines"] is None)
+        require_output(main["children"][0]["change"] == "removed")
+
+    def test_resolved_cli_diagnostic_does_not_warn_in_inline_history(self) -> None:
+        """A corrected interface clears warnings even when historical parsing failed."""
+        valid = self.source.read_text()
+        self.source.write_text("def main(): pass\n")
+        commit_sources(self.root)
+        self.source.write_text(valid)
+        require_output(not self.record()["tree"]["warning"])
+
+    def test_source_assets_keep_per_file_suppressions(self) -> None:
+        """Tracked source assets retain metrics outside aggregate root-source counts."""
+        resources = self.package / "prm"
+        resources.mkdir()
+        contents = "// eslint-disable-next-line\nrun();\n"
+        (resources / "script.js").write_text(contents)
+        record = self.record()
+        require_output("prm/script.js" not in record["source_metrics"]["lines"])
+        script = self.files()["prm/script.js"]
+        require_output(script["lines"] == len(contents.splitlines()))
+        require_output(script["children"][0]["field"] == "suppressions")
 
     def test_suppression_diff_changes_counts_without_repeating_labels(self) -> None:
         """Suppression changes are one structured row per source, kind and scope."""
@@ -1423,43 +1530,6 @@ class TestRepositoryData(unittest.TestCase):
             == [("noqa (local): 1 → 2", "modified")],
         )
 
-    def test_source_assets_keep_per_file_suppressions(self) -> None:
-        """Tracked source assets retain metrics outside aggregate root-source counts."""
-        resources = self.package / "prm"
-        resources.mkdir()
-        contents = "// eslint-disable-next-line\nrun();\n"
-        (resources / "script.js").write_text(contents)
-        record = self.record()
-        require_output("prm/script.js" not in record["source_metrics"]["lines"])
-        script = self.files()["prm/script.js"]
-        require_output(script["lines"] == len(contents.splitlines()))
-        require_output(script["children"][0]["field"] == "suppressions")
-
-    def test_dependencies_appear_in_shared_overview_and_inline_changes(self) -> None:
-        """Dependency rows and graph relationships reflect the same declarations."""
-        default = self.package / "default.nix"
-        default.write_text(
-            "{ inputs, ... }: { buildInputs = [ "
-            "inputs.self.packages.x86_64-linux.first ]; }\n",
-        )
-        commit_sources(self.root)
-        default.write_text(
-            "{ inputs, ... }: { buildInputs = [ "
-            "inputs.self.packages.x86_64-linux.second ]; }\n",
-        )
-        group = next(
-            node
-            for node in self.files()["default.nix"]["children"]
-            if node["field"] == "dependencies"
-        )
-        require_output(
-            [(node["title"], node["change"]) for node in group["children"]]
-            == [
-                ("- build: packages/first", "removed"),
-                ("+ build: packages/second", "added"),
-            ],
-        )
-
     def test_unavailable_cli_summary_warns_on_collapsed_package(self) -> None:
         """Parser diagnostics propagate to source and package rows."""
         self.source.write_text("def main(): pass\n")
@@ -1472,73 +1542,3 @@ class TestRepositoryData(unittest.TestCase):
             if node["field"] == "cli"
         )
         require_output(cli["children"][0]["warning"])
-
-    def test_resolved_cli_diagnostic_does_not_warn_in_inline_history(self) -> None:
-        """A corrected interface clears warnings even when historical parsing failed."""
-        valid = self.source.read_text()
-        self.source.write_text("def main(): pass\n")
-        commit_sources(self.root)
-        self.source.write_text(valid)
-        require_output(not self.record()["tree"]["warning"])
-
-    def test_package_data_uses_canonical_test_discovery(self) -> None:
-        """Browser test rows come from the shared static discovery contract."""
-        (self.package / "test_main.py").write_text(
-            "import unittest as unit\nclass Checks(unit.TestCase):\n"
-            "    def test_nested_case(self): pass\ndef test_free_case(): pass\n",
-        )
-        record = self.record()
-        require_output(record["details"] == resource_data(self.package))
-        require_output(
-            record["details"]["tests"] == ["test nested case", "test free case"],
-        )
-
-    def test_cli_parameters_belong_to_nested_commands(self) -> None:
-        """Command paths place changed parameters under their declared commands."""
-        before = (
-            "import argparse\ndef parser():\n    p = argparse.ArgumentParser()\n"
-            '    p.add_argument("--root")\n    commands = p.add_subparsers()\n'
-            '    run = commands.add_parser("run")\n'
-            '    run.add_argument("--old")\n    return p\n'
-        )
-        self.source.write_text(before)
-        commit_sources(self.root)
-        self.source.write_text(before.replace('"--old"', '"--new"'))
-        cli = next(
-            node
-            for node in self.files()["main.py"]["children"]
-            if node["field"] == "cli"
-        )
-        run = next(node for node in cli["children"] if node["title"] == "run")
-        require_output(
-            [node["change"] for node in run["children"]] == ["removed", "added"],
-        )
-        require_output(
-            any(
-                node["title"].startswith("--root") and node["change"] is None
-                for node in cli["children"]
-            ),
-        )
-
-    def test_removed_source_retains_declarations_without_current_line_counts(
-        self,
-    ) -> None:
-        """Historical declarations remain visible without inventing current metrics."""
-        commit_sources(self.root)
-        self.source.unlink()
-        main = self.files()["main.py"]
-        require_output(main["lines"] is None)
-        require_output(main["children"][0]["change"] == "removed")
-
-    def test_high_level_diff_compares_summaries_not_source_code(self) -> None:
-        """Body-only edits do not introduce semantic changes."""
-        commit_sources(self.root)
-        self.source.write_text(self.source.read_text() + "value = 42\n")
-        record = self.record()
-
-        def changed(node: dict[str, Any]) -> bool:
-            return bool(node["change"]) or any(
-                changed(child) for child in node["children"]
-            )
-
-        require_output(not changed(record["tree"]))

@@ -16,6 +16,8 @@
 !/checks/nix_remove_defaults/default.nix
 !/checks/nix_syntax/
 !/checks/nix_syntax/default.nix
+!/checks/python_test_alphabetize/
+!/checks/python_test_alphabetize/default.nix
 !/checks/remove_empty_lines/
 !/checks/remove_empty_lines/default.nix
 !/checks/remove_new_lines/
@@ -49,6 +51,10 @@
 !/packages/nix_syntax/default.nix
 !/packages/nix_syntax/main.py
 !/packages/nix_syntax/test_main.py
+!/packages/python_test_alphabetize/
+!/packages/python_test_alphabetize/default.nix
+!/packages/python_test_alphabetize/main.py
+!/packages/python_test_alphabetize/test_main.py
 !/packages/remove_empty_lines/
 !/packages/remove_empty_lines/default.nix
 !/packages/remove_empty_lines/main.py

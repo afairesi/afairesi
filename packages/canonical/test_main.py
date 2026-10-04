@@ -1399,123 +1399,117 @@ TEST_LABELS = st.lists(
 )
 
 
-@settings(deadline=None)
-@given(
-    kind=st.sampled_from(("python", "html", "latex", "nix", "host", "untracked")),
-    name=PACKAGE_NAMES,
-    payload=st.binary(max_size=40),
-)
-@example(kind="python", name="dash-case", payload=b"\x00\xff")
-@example(kind="html", name="snake_case", payload=b"HTML")
-@example(kind="latex", name="document", payload=b"LaTeX")
-@example(kind="nix", name="value", payload=b"Nix")
-@example(kind="host", name="laptop", payload=b"host")
-@example(kind="untracked", name="untracked", payload=b"untracked")
-def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR0915
-    kind: str,
-    name: str,
-    payload: bytes,
-) -> None:
-    """Add, preview, rename, converge, and remove resources without losing Git state."""
-    with _fresh_repository() as root:
-        if kind == "host":
-            name = name.replace("-", "").replace("_", "")
-        collection = "hosts" if kind == "host" else "packages"
-        original, destination = f"{collection}/a{name}", f"{collection}/b{name}"
-        package = root / original
-        if kind == "untracked":
-            package.mkdir(parents=True)
-            (package / "default.nix").write_text("{}\n")
-        else:
-            _run(root, "add", original, *(() if kind == "host" else (kind,)))
-        check = f"checks/a{name}" + ("VmWithDisko" if kind == "host" else "")
-        if kind == "python":
+def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
+    """Expose consistent commands and reject invalid requests before creating state."""
+    with TemporaryDirectory(prefix="canonical-cli-") as directory:
+        root = Path(directory)
+        commands = (
+            (),
+            ("add",),
+            ("mv",),
+            ("rm",),
+            ("init",),
+            ("converge",),
+            ("overview",),
+            ("args",),
+            ("test",),
+            ("test", "names"),
+            ("test", "coverage"),
+            ("test", "hypothesis"),
+            ("test", "mutation"),
+        )
+        for path in commands:
+            option = _run(root, *path, "--help").stdout
             _expect(
-                not (package / "test_main.py").exists() and not (root / check).exists(),
-                "new packages must be untested",
+                option == _run(root, "help", *path).stdout and "usage:" in option,
+                path,
             )
-            (package / "test_main.py").write_text(
-                (
-                    "from unittest import TestCase as Case\n"
-                    "class Reports(Case):\n"
-                    "    def test_result(self): pass\n"
-                ),
-            )
-        resource = package / "prm/nested/asset.bin"
-        resource.parent.mkdir(parents=True)
-        resource.write_bytes(payload)
-        if kind != "untracked":
-            _run(root, "converge")
-            _expect(
-                f"{original}/prm/nested/asset.bin"
-                in _git(root, "ls-files").splitlines(),
-                "resources must be indexed",
-            )
-        expected_check = kind in {"host", "python"}
-        _expect((root / check / "default.nix").is_file() == expected_check, check)
-        tracked = _git(root, "ls-files", "--", original, check).splitlines()
-        staged, working = {}, {}
-        for relative in tracked:
-            path = root / relative
-            staged[relative] = path.read_bytes() + b"\n"
-            working[relative] = staged[relative] + b"\n"
-            path.write_bytes(staged[relative])
-            _git(root, "add", "--", relative)
-            path.write_bytes(working[relative])
-        untracked = package / "prm/untracked.bin"
-        untracked.write_bytes(payload)
-        _preview(root, "mv", original, destination)
-        _run(root, "mv", original, destination)
-        new_check = check.replace(f"a{name}", f"b{name}")
-        for relative in tracked:
-            renamed = relative.replace(original, destination).replace(check, new_check)
-            _expect(
-                subprocess.run(  # noqa: S603
-                    ["git", "show", f":{renamed}"],  # noqa: S607
-                    cwd=root,
-                    capture_output=True,
-                    check=True,
-                    timeout=10,
-                ).stdout
-                == staged[relative]
-                and (root / renamed).read_bytes() == working[relative],
-                renamed,
-            )
-        _expect(
-            (root / destination / "prm/untracked.bin").read_bytes() == payload,
-            "untracked contents",
+        environment = dict(os.environ)
+        environment["PATH"] = (
+            str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
+            + os.pathsep
+            + environment["PATH"]
         )
         _expect(
-            not _git(root, "ls-files", "--", f"{destination}/prm/untracked.bin"),
-            "rename must not stage untracked assets",
+            _run(root, "help", executable="canonical", environment=environment).stdout
+            == _run(root, "--help").stdout,
+            "standalone command unavailable through PATH",
         )
+        for retired in (
+            "status",
+            "check",
+            "test-names",
+            "coverage",
+            "hypothesis",
+            "mutation",
+        ):
+            _run(root, retired, code=2)
         _expect(
-            not package.exists() and not (root / check).exists(),
-            "rename left old paths",
+            _run(root, "test").stdout == _run(root, "test", "--help").stdout,
+            "bare test must show help",
         )
+        _run(root, "test", "unknown", code=2)
+        names_help = _run(root, "test", "names", "--help").stdout
         _expect(
-            (root / new_check / "default.nix").is_file() == expected_check,
-            new_check,
+            "[target]" in names_help and "current directory" in names_help,
+            names_help,
         )
-        if kind == "untracked":
-            _expect(
-                not _git(root, "ls-files", "--", destination),
-                "rename staged an untracked package",
-            )
-            return
-        _run(root, "converge")
-        _preview(root, "rm", destination)
-        _run(root, "rm", destination)
-        _expect(
-            not (root / destination).exists() and not (root / new_check).exists(),
-            "remove left resource or check",
-        )
-        _expect(
-            not _git(root, "ls-files", "--", original, destination, check, new_check),
-            "remove left indexed paths",
-        )
-        _run(root, "converge")
-        _preview(root, "converge")
+        for option in ("--timeout", "--max-examples"):
+            _run(root, "test", "names", option, "10", code=2)
+        for command in ("names", "coverage", "hypothesis", "mutation"):
+            _run(root, "test", command, code=1)
+        for command in ("hypothesis", "mutation"):
+            for timeout in ("nan", "inf", "-inf", "0", "-1"):
+                _run(root, "test", command, str(root), f"--timeout={timeout}", code=2)
+        _run(root, "test", "hypothesis", str(root), "--max-examples", "0", code=2)
+        for arguments in (
+            ("--max-mutations", "0"),
+            ("--max-mutations", "-1"),
+            ("--lines", "0"),
+            ("--lines", "3:2"),
+            ("--lines", "bad"),
+            ("--operator", "["),
+        ):
+            _run(root, "test", "mutation", str(root), *arguments, code=2)
+        _expect(not any(root.iterdir()), "invalid CLI request created state")
+    for layout in ("empty", "nonpython", "untested", "single_untested"):
+        with _fresh_repository() as root:
+            target = root
+            if layout == "nonpython":
+                _run(root, "add", "packages/web", "html")
+            elif layout in {"untested", "single_untested"}:
+                target = _make_runner_target(root, "", "")
+                (target / "test_main.py").unlink()
+                if layout == "untested":
+                    target = root
+            before = _snapshot(root)
+            for command in ("hypothesis", "mutation"):
+                result = _run(
+                    root,
+                    "test",
+                    command,
+                    str(target),
+                    code=0 if layout == "untested" else 1,
+                )
+                if layout == "untested":
+                    _expect(
+                        "Skipping example: no test_main.py" in result.stdout
+                        and "0 passed, 0 failed, 1 skipped" in result.stdout,
+                        result,
+                    )
+                elif layout != "single_untested":
+                    _expect("no Python packages found" in result.stderr, result)
+            if layout == "empty":
+                for command in ("names", "coverage"):
+                    _expect(
+                        "no Python packages found"
+                        in _run(root, "test", command, code=1).stderr,
+                        command,
+                    )
+            _expect(_snapshot(root) == before, "nonrunnable target created state")
+    with pytest.MonkeyPatch.context() as monkeypatch:
+        _check_command_catalog(monkeypatch)
+    _check_discovery_boundaries()
 
 
 @settings(deadline=None)
@@ -1575,77 +1569,120 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
             _check_excluded_trees(validation, patch)
 
 
-@settings(deadline=None)
-@given(
-    arguments=st.sampled_from(
-        (
-            ("mv", "packages/example", "hosts/example"),
-            ("add", "packages/bad--name", "python"),
-            ("add", "hosts/bad-name"),
-            ("rm", "../outside"),
-            ("rm", "/outside"),
-            ("mv", "packages/example", "packages/taken"),
-            ("add", "packages/example", "python"),
-        ),
-    ),
-    misplaced=st.sampled_from(
-        (
-            "def test_misplaced(): pass\n",
-            (
-                "from unittest import TestCase as Case\n"
-                "class Reports(Case):\n"
-                "    def test_result(self): pass\n"
-            ),
-        ),
-    ),
-)
-@example(
-    arguments=("mv", "packages/example", "hosts/example"),
-    misplaced="def test_misplaced(): pass\n",
-)
-@example(
-    arguments=("rm", "../outside"),
-    misplaced=(
-        "from unittest import TestCase as Case\n"
-        "class Reports(Case):\n"
-        "    def test_result(self): pass\n"
-    ),
-)
-@example(arguments=("rm", "/outside"), misplaced="def test_misplaced(): pass\n")
-@example(
-    arguments=("add", "packages/bad--name", "python"),
-    misplaced="def test_misplaced(): pass\n",
-)
-@example(arguments=("add", "hosts/bad-name"), misplaced="def test_misplaced(): pass\n")
-@example(
-    arguments=("mv", "packages/example", "packages/taken"),
-    misplaced="def test_misplaced(): pass\n",
-)
-@example(
-    arguments=("add", "packages/example", "python"),
-    misplaced="def test_misplaced(): pass\n",
-)
-def test_rejected_operations_preserve_contents_modes_index_and_refs(
-    arguments: tuple[str, ...],
-    misplaced: str,
-) -> None:
-    """Reject invalid paths, collisions, and embedded tests before modifying work."""
-    with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
-        _run(root, "add", "packages/taken", "nix")
-        (root / "work-in-progress").write_text("preserve unrelated work")
+def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> None:
+    """Build real checks, measure CLI lines, and keep reports outside the checkout."""
+    with TemporaryDirectory(prefix="canonical-coverage-") as directory:
+        root = Path(directory) / "source with spaces"
+        environment = _prepare_coverage_flake(root)
         before = _snapshot(root)
-        rejected = _run(root, *arguments, code=1)
-        _expect(bool(rejected.stderr) and _snapshot(root) == before, rejected)
-        source = root / "packages/example/main.py"
-        source.write_text(misplaced)
-        before = _snapshot(root)
-        rejected = _run(root, "converge", code=1)
-        _expect(
-            "move test definitions to test_main.py" in rejected.stderr
-            and _snapshot(root) == before,
-            rejected,
+        expression = (
+            f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
+            "in f.checks.${builtins.currentSystem}.example"
         )
+        plain = _run(
+            root,
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            "--impure",
+            "--expr",
+            expression,
+            executable="nix",
+            environment=environment,
+        )
+        _expect(
+            not any(
+                path.name.startswith(".coverage")
+                or path.name in {"html", "coverage.json"}
+                for path in Path(plain.stdout.strip()).iterdir()
+            ),
+            "ordinary checks produced coverage artifacts",
+        )
+        for target in (root, root / "packages/z-last"):
+            explicit = _run_runner_cli(target, environment, "coverage")
+            current = _campaign(root, environment, "coverage", cwd=target)
+            _expect(
+                not explicit.returncode
+                and explicit.stdout == current.stdout
+                and not current.returncode,
+                (explicit, current),
+            )
+            reports = [
+                line
+                for line in explicit.stdout.splitlines()
+                if line.endswith("/html/index.html")
+            ]
+            _expect(len(reports) == (2 if target == root else 1), explicit)
+            for line in reports:
+                report = Path(line.split(": ", 1)[1]).parents[1]
+                files = json.loads((report / "coverage.json").read_text())["files"]
+                _expect(
+                    len(files) == 1 and next(iter(files)).endswith("/main.py"),
+                    files,
+                )
+                _expect(
+                    set(next(iter(files.values()))["executed_lines"])
+                    == {1, 2, 3, 4, 6},
+                    files,
+                )
+                measured = next(iter(files.values()))
+                _expect(
+                    {tuple(branch) for branch in measured["executed_branches"]}
+                    == {(3, 4), (3, 6)}
+                    and measured["contexts"]["4"]
+                    == ["test_main.py::test_cli[alternate]"]
+                    and measured["contexts"]["6"] == ["test_main.py::test_cli[ready]"],
+                    measured,
+                )
+                audit = json.loads((report / "tests.json").read_text())
+                rows = {row["nodeid"]: row for row in audit["tests"]}
+                expected_counts = {"collected_cases": 5, "functions": 4, "skipped": 2}
+                _expect(
+                    all(
+                        audit["summary"][key] == value
+                        for key, value in expected_counts.items()
+                    )
+                    and audit["summary"]["unexecuted_properties"]
+                    == ["test_main.py::test_generated_only"]
+                    and rows["test_main.py::test_generated_only"]["body_calls"] == 0
+                    and rows["test_main.py::test_explicit"]["body_calls"] == 1
+                    and rows["test_main.py::test_optional_browser"]["skip_reason"]
+                    == "optional browser"
+                    and all(row["duration"] >= 0 for row in audit["tests"]),
+                    audit,
+                )
+        _expect(
+            _snapshot(root) == before and not (root / "tmp").exists(),
+            "coverage changed repository state",
+        )
+    for failure in ("build", "report", "check", "syntax"):
+        with TemporaryDirectory(prefix="canonical-coverage-failure-") as directory:
+            root = Path(directory) / "source"
+            environment = _prepare_coverage_flake(root, failure=failure)
+            if failure == "check":
+                (root / "checks/example/default.nix").unlink()
+            if failure == "syntax":
+                (root / "packages/example/test_main.py").write_text("def invalid(")
+            untested = _make_runner_target(root, "", "", name="untested")
+            (untested / "test_main.py").unlink()
+            (root / "flake.nix").write_text(_git(root, "show", ":flake.nix"))
+            before = _snapshot(root)
+            result = _run_runner_cli(root, environment, "coverage")
+            _expect(
+                result.returncode == 1
+                and "1 passed, 1 failed, 1 skipped" in result.stdout,
+                result,
+            )
+            _expect(
+                "z-last:" in result.stdout
+                and "/html/index.html" in result.stdout
+                and "canonical test coverage: example:" in result.stderr,
+                result,
+            )
+            _expect(
+                _snapshot(root) == before,
+                f"{failure} failure changed repository state",
+            )
 
 
 def _nix_environment(root: Path) -> dict[str, str]:
@@ -1993,474 +2030,6 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
 
 
-def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
-    """Initialize remotes and preserve checkout/index state through home convergence."""
-    for remote in (
-        "https://example.test/team/project.git",
-        "ssh://git@example.test/team/project.git",
-        "git@example.test:team/project.git",
-    ):
-        with (
-            TemporaryDirectory(prefix="canonical-home-") as directory,
-            pytest.MonkeyPatch.context() as patch,
-        ):
-            _check_remote_initialization(Path(directory), patch, remote)
-    with (
-        TemporaryDirectory(prefix="canonical-bootstrap-") as directory,
-        pytest.MonkeyPatch.context() as patch,
-    ):
-        _check_flake_initialization(Path(directory), patch)
-    with TemporaryDirectory(prefix="canonical-home-") as directory:
-        root = _home_repository(Path(directory))
-        _check_home_commits(root)
-        _check_home_whitelist(root)
-        _check_home_settings(root)
-        _check_home_move(root)
-        modules = root / ".gitmodules"
-        modules.write_text(
-            modules.read_text() + "url = git@forge.example:owner/other\n",
-        )
-        before = _snapshot(root)
-        result = _run(root, "converge", code=1)
-        _expect(
-            "duplicate url field" in result.stderr and _snapshot(root) == before,
-            result,
-        )
-
-
-def _check_discovery_boundaries() -> None:
-    """Validate nested declarations and malformed inputs once per suite."""
-    with _fresh_repository() as root:
-        sentinel = (
-            "from pathlib import Path\nPath('SENTINEL').touch()\n"
-            "raise RuntimeError('must not execute')\n"
-        )
-        package = _make_test_names_package(
-            root,
-            "example",
-            sentinel + "def test_result(): pass\n",
-        )
-        for nested, path, parameter in NESTED_CONTRACTS:
-            (package / "main.py").write_text(sentinel + nested)
-            before = _snapshot(root)
-            data = next(
-                node["details"]
-                for node in _overview(root)["nodes"]
-                if node["kind"] == "package"
-            )
-            _expect(
-                _snapshot(root) == before,
-                "nested discovery executed code or changed state",
-            )
-            _expect(
-                {"path": list(path), "text": "command", "command": True} in data["cli"],
-                data,
-            )
-            _expect(
-                {"path": list(path), "text": parameter, "command": False}
-                in data["cli"],
-                data,
-            )
-            if nested.startswith("import typer"):
-                _expect(
-                    {
-                        "path": ["test"],
-                        "text": "--verbose  default=False; type=bool",
-                        "command": False,
-                    }
-                    in data["cli"],
-                    data,
-                )
-                _expect(
-                    not any(
-                        entry["path"][-1:] == ["settings"] for entry in data["cli"]
-                    ),
-                    data,
-                )
-        for unsupported in UNSUPPORTED_INTERFACES:
-            (package / "main.py").write_text(unsupported)
-            before = _snapshot(root)
-            rejected = _run(package, "args", code=1)
-            _expect(
-                "unsupported CLI interface" in rejected.stderr and not rejected.stdout,
-                rejected,
-            )
-            _expect(_snapshot(root) == before, "unsupported interface changed state")
-        for layout in ("missing", "syntax", "encoding", "linked"):
-            test_file = package / "test_main.py"
-            test_file.unlink(missing_ok=True)
-            if layout == "syntax":
-                test_file.write_text("def invalid(")
-            elif layout == "encoding":
-                test_file.write_bytes(b"\xff")
-            elif layout == "linked":
-                test_file.symlink_to(package / "main.py")
-            before = _snapshot(root)
-            rejected = _run(package, "test", "names", code=1)
-            _expect(
-                "canonical test names:" in rejected.stderr and not rejected.stdout,
-                rejected,
-            )
-            _expect(_snapshot(root) == before, "malformed test source changed state")
-
-
-@settings(deadline=None)
-@given(
-    contract=st.sampled_from(CLI_CONTRACTS),
-    labels=TEST_LABELS,
-    form=st.sampled_from(("functions", "classes", "unittest")),
-    explicit=st.booleans(),
-)
-@example(
-    contract=CLI_CONTRACTS[0],
-    labels=["double__underscore", "async_behavior"],
-    form="functions",
-    explicit=True,
-)
-@example(contract=CLI_CONTRACTS[1], labels=["result"], form="classes", explicit=False)
-@example(
-    contract=CLI_CONTRACTS[2],
-    labels=["derived", "async"],
-    form="unittest",
-    explicit=True,
-)
-@example(contract=CLI_CONTRACTS[3], labels=["complex"], form="functions", explicit=True)
-@example(contract=CLI_CONTRACTS[4], labels=["complex"], form="unittest", explicit=False)
-@example(contract=CLI_CONTRACTS[5], labels=["complex"], form="classes", explicit=True)
-@example(contract=CLI_CONTRACTS[7], labels=[], form="functions", explicit=True)
-@example(contract=CLI_CONTRACTS[6], labels=[], form="functions", explicit=False)
-@example(contract=CLI_CONTRACTS[8], labels=["public"], form="functions", explicit=False)
-@example(contract=CLI_CONTRACTS[9], labels=["aliased"], form="classes", explicit=True)
-@example(
-    contract=CLI_CONTRACTS[10],
-    labels=["aliased"],
-    form="functions",
-    explicit=False,
-)
-@example(contract=CLI_CONTRACTS[11], labels=["aliased"], form="unittest", explicit=True)
-def test_static_interfaces_and_test_sentences_match_declarations_without_execution(
-    contract: tuple[str, str],
-    labels: list[str],
-    form: str,
-    *,
-    explicit: bool,
-) -> None:
-    """Compare static declarations to expectations and continue after errors."""
-    with _fresh_repository() as root:
-        sentinel = (
-            "from pathlib import Path\n"
-            "Path('SENTINEL').touch()\n"
-            "raise RuntimeError('must not execute')\n"
-        )
-        tests = sentinel + (
-            "def helper():\n"
-            "    def test_hidden(): pass\n"
-            "class Helper:\n"
-            "    def test_hidden(self): pass\n"
-        )
-        if form == "functions":
-            tests += "".join(
-                f"@unknown_decorator()\nasync def test_{label}():\n    assert False\n"
-                for label in labels
-            )
-        else:
-            header = (
-                "class TestBehavior:\n"
-                if form == "classes"
-                else (
-                    "import unittest as unit\n"
-                    "from unittest import TestCase as Case, "
-                    "IsolatedAsyncioTestCase\n"
-                    "class Base(Case): pass\n"
-                    "class Reports(Base):\n"
-                )
-            )
-            tests += header + (
-                "    pass\n"
-                if not labels
-                else "".join(
-                    f"    async def test_{label}(self):\n        assert False\n"
-                    for label in labels
-                )
-            )
-        package = _make_test_names_package(root, "my-package", tests)
-        source, expected_args = contract
-        (package / "main.py").write_text(
-            '"""First paragraph.\n\nArguments:\n  Documentation text."""\n'
-            + sentinel
-            + source,
-        )
-        expected_names = "".join(
-            "test " + label.replace("_", " ") + "\n" for label in sorted(labels)
-        )
-        cwd = root if explicit else package
-        target = (str(package),) if explicit else ()
-        before = _snapshot(root)
-        _expect(_run(cwd, "args", *target).stdout == expected_args, contract)
-        _expect(_run(cwd, "test", "names", *target).stdout == expected_names, tests)
-        details = next(
-            node["details"]
-            for node in _overview(root)["nodes"]
-            if node["kind"] == "package"
-        )
-        _expect(
-            details["tests"] == ["test " + label.replace("_", " ") for label in labels],
-            details,
-        )
-        _expect(
-            details["help"] == "First paragraph.\n\nArguments:\n  Documentation text.",
-            details,
-        )
-        _expect(
-            _snapshot(root) == before
-            and not (root / "SENTINEL").exists()
-            and not (package / "SENTINEL").exists(),
-            "inspection changed source or executed code",
-        )
-        (package / "test_main.py").write_text(
-            tests.replace("assert False", "raise RuntimeError('changed body')"),
-        )
-        _expect(
-            _run(package, "test", "names").stdout == expected_names,
-            "body edits changed sentences",
-        )
-        (package / "test_main.py").unlink(missing_ok=True)
-        (package / "test_main.py").write_text(tests)
-        broken = _make_test_names_package(root, "alpha", "def invalid(")
-        (broken / "main.py").write_text("import sys\nprint(sys.argv)\n")
-        (package / "main.py").write_text(source)
-        missing = _make_test_names_package(root, "untested", "")
-        (missing / "test_main.py").unlink()
-        (root / "packages/linked").symlink_to(package, target_is_directory=True)
-        listed = _run(root, "test", "names", code=1)
-        _expect(
-            listed.stdout == "packages/alpha:\npackages/my-package:\n" + expected_names,
-            listed,
-        )
-        _expect(
-            "canonical test names: alpha:" in listed.stderr
-            and "Skipping untested: no test_main.py" in listed.stderr,
-            listed,
-        )
-        args = _run(root, "args", code=1)
-        _expect(
-            "packages/my-package:\n" + expected_args in args.stdout
-            and "alpha: unsupported CLI interface" in args.stderr,
-            args,
-        )
-
-
-@settings(deadline=None)
-@given(name=PACKAGE_NAMES, object_format=st.sampled_from(("sha1", "sha256")))
-@example(name="core", object_format="sha1")
-@example(name="dash-case", object_format="sha256")
-def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  # noqa: PLR0915
-    name: str,
-    object_format: str,
-) -> None:
-    """Model declarations and compare current and historical source views."""
-    with _fresh_repository(object_format=object_format) as root:
-        provider = "p" + name
-        _run(root, "add", f"packages/{provider}", "nix", "Provider")
-        _run(root, "add", "packages/consumer", "python", "Consumer")
-        _run(root, "add", "packages/computed", "nix", "Computed")
-        consumer = root / "packages/consumer"
-        (consumer / "default.nix").write_text(
-            "{ inputs, pkgs, system, ... }: "
-            "let local = inputs.self.packages.${system}; in {\n"
-            f"  propagatedBuildInputs = [ local.{provider} local.missing pkgs.git ];\n"
-            f'  installPhase = "cp ${{../{provider}/main.py}} result";\n'
-            "  # propagatedBuildInputs = [ local.fake ];\n"
-            '  text = "inputs.self.packages.system.also_fake";\n}\n',
-        )
-        (consumer / "main.py").write_text(
-            (
-                '"""Consumer help."""\n'
-                "import argparse\n"
-                'raise RuntimeError("must not run")\n'
-                "p = argparse.ArgumentParser()\n"
-                'p.add_argument("--output", help="Output path")\n'
-                "literal = '# noqa: D103 and # type: ignore are text'\n"
-                "# ruff: noqa: D\n"
-                "value = 1  # noqa: E501\n"
-                "other = 2  # type: ignore[assignment]\n"
-            ),
-        )
-        (consumer / "test_main.py").write_text(
-            "def test_result(): pass  # noqa: D103\n",
-        )
-        assets = consumer / "prm/assets"
-        assets.mkdir(parents=True)
-        snippets: tuple[tuple[str, str, list[dict[str, str | int]]], ...] = (
-            (
-                "directives.html",
-                (
-                    "<!-- html-validate-disable -->\n"
-                    "<!-- html-validate-disable-next heading-level -->\n"
-                    "<p>eslint-disable is text</p>\n"
-                ),
-                [
-                    {"kind": "html-validate-disable", "scope": "global", "count": 1},
-                    {"kind": "html-validate-disable", "scope": "local", "count": 1},
-                ],
-            ),
-            (
-                "index.html",
-                '<script>const text = "<!-- htmlhint-disable -->";</script>',
-                [],
-            ),
-            (
-                "script.js",
-                "const value = `${(() => { /* eslint-disable */ return 1; })()}`;",
-                [{"kind": "eslint-disable", "scope": "global", "count": 1}],
-            ),
-            (
-                "string.js",
-                "const value = `/* eslint-disable */`; /* eslint-disable-next-line */",
-                [{"kind": "eslint-disable", "scope": "local", "count": 1}],
-            ),
-            (
-                "style.css",
-                'p { content: "/* stylelint-disable */"; } /* stylelint-disable */',
-                [{"kind": "stylelint-disable", "scope": "global", "count": 1}],
-            ),
-        )
-        for filename, source, _ in snippets:
-            (assets / filename).write_text(source)
-        (assets / "picture.png").write_bytes(b"binary")
-        (assets / "linked.py").symlink_to(consumer / "main.py")
-        (consumer / "tmp").mkdir()
-        (consumer / "tmp/generated.py").write_text("runtime")
-        (root / "packages/computed/default.nix").write_text(
-            (
-                "{ pkgs, ... }: let one = two; two = one; in { buildInputs = "
-                "one; nativeBuildInputs = if pkgs.stdenv.isLinux then [ "
-                "pkgs.git ] else []; }"
-            ),
-        )
-        graph = _overview(root)
-        nodes = {node["id"]: node for node in graph["nodes"]}
-        _expect(
-            graph["schema"] == "canonical.overview"
-            and graph["analysis"] == "source-declarations",
-            graph,
-        )
-        _expect(
-            len(nodes) == len(graph["nodes"])
-            and nodes[".:packages/missing"]["kind"] == "package-reference",
-            graph,
-        )
-        edges = {
-            (edge["source"], edge["target"], edge["kind"])
-            for edge in graph["edges"]
-            if edge["target"] == ".:packages/consumer" and edge["kind"] != "contains"
-        }
-        _expect(
-            edges
-            == {
-                (f".:packages/{provider}", ".:packages/consumer", "runtime"),
-                (f".:packages/{provider}", ".:packages/consumer", "source"),
-                (".:packages/missing", ".:packages/consumer", "runtime"),
-            },
-            edges,
-        )
-        _expect(not nodes[".:packages/computed"]["dependencies"], nodes)
-        details = nodes[".:packages/consumer"]["details"]
-        sources = {source["path"]: source for source in details["sources"]}
-        _expect(
-            set(sources)
-            == {
-                "default.nix",
-                "main.py",
-                "test_main.py",
-                *("prm/assets/" + filename for filename, _, _ in snippets),
-            },
-            sources,
-        )
-        for filename, _, expected in snippets:
-            _expect(
-                sources["prm/assets/" + filename]["suppressions"] == expected,
-                sources,
-            )
-        _expect(
-            details["source_metrics"]["suppressions"]
-            == {"noqa (global)": 1, "noqa (local)": 2, "type: ignore (local)": 1},
-            details,
-        )
-        _expect(
-            details["tests"] == ["test result"] and details["help"] == "Consumer help.",
-            details,
-        )
-        focus = json.loads(_run(root, "overview", "packages/consumer", "--json").stdout)
-        _expect(focus["focus"] == ".:packages/consumer", focus)
-        terminal = _run(root, "overview", "--full").stdout
-        _expect(
-            "packages/consumer:\n" in terminal
-            and "runtime: packages/" + provider in terminal
-            and "  test result\n" in terminal,
-            terminal,
-        )
-        _git(root, "add", "--force", ".")
-        _test_names_git(root, "commit", "-qm", "Source snapshot")
-        before = _snapshot(root)
-        historical = json.loads(
-            _run(root, "overview", "--json", "--revision", "HEAD").stdout,
-        )
-        _expect(
-            [node.get("details") for node in historical["nodes"]]
-            == [node.get("details") for node in graph["nodes"]],
-            historical,
-        )
-        _expect(
-            _snapshot(root) == before and _overview(root) == graph,
-            "overview changed its repository",
-        )
-    with _fresh_repository() as root:
-        _check_overview_details(root)
-    with _fresh_repository() as root:
-        _check_overview_history(root)
-    with TemporaryDirectory(prefix="canonical-history-") as directory:
-        _check_missing_history(Path(directory))
-    with TemporaryDirectory(prefix="canonical-graph-") as directory:
-        _check_home_graph(_home_repository(Path(directory)))
-    with TemporaryDirectory(prefix="canonical-host-graph-") as directory:
-        _check_host_graph(_home_repository(Path(directory)))
-
-
-def _review_source(label: str, *, arguments: bool) -> str:
-    """Describe one known interface or sentence independently of the converter."""
-    if arguments:
-        return (
-            "import argparse\np = argparse.ArgumentParser()\n"
-            f"p.add_argument('--{label}')\n"
-        )
-    return f"def test_{label}(): pass\n"
-
-
-def _review_view(
-    root: Path,
-    arguments: bool,  # noqa: FBT001
-    *options: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Preserve repository state through successful and rejected Git views."""
-    before = _snapshot(root)
-    result = _run(
-        root,
-        *(("args",) if arguments else ("test", "names")),
-        *options,
-        code=code,
-    )
-    _expect(_snapshot(root) == before, options)
-    _expect(
-        "def test_" not in result.stdout
-        and "add_argument" not in result.stdout
-        and "PRIVATE_IMPLEMENTATION" not in result.stdout,
-        result,
-    )
-    return result
-
-
 @settings(deadline=None)
 @given(suffix=st.text(alphabet="abcxyz", max_size=4))
 @example(suffix="")
@@ -2655,44 +2224,115 @@ def test_git_views_preserve_native_history_filters_errors_and_source_state(  # n
         _check_definition_order(Path(directory))
 
 
-def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None:
-    """Add another offline runnable package without replacing the fixture flake."""
-    flake = (root / "flake.nix").read_text()
-    _make_runner_target(root, source, tests, name=name)
-    prefix, ending = flake.rsplit("}; }; }", 1)
-    (root / "flake.nix").write_text(
-        prefix
-        + f" {json.dumps(name)}.python.withPackages = "
-        + f"_: {json.dumps(sys.prefix)}; "
-        + "}; }; }"
-        + ending,
-    )
-    _git(root, "add", "flake.nix", f"packages/{name}")
+def _check_discovery_boundaries() -> None:
+    """Validate nested declarations and malformed inputs once per suite."""
+    with _fresh_repository() as root:
+        sentinel = (
+            "from pathlib import Path\nPath('SENTINEL').touch()\n"
+            "raise RuntimeError('must not execute')\n"
+        )
+        package = _make_test_names_package(
+            root,
+            "example",
+            sentinel + "def test_result(): pass\n",
+        )
+        for nested, path, parameter in NESTED_CONTRACTS:
+            (package / "main.py").write_text(sentinel + nested)
+            before = _snapshot(root)
+            data = next(
+                node["details"]
+                for node in _overview(root)["nodes"]
+                if node["kind"] == "package"
+            )
+            _expect(
+                _snapshot(root) == before,
+                "nested discovery executed code or changed state",
+            )
+            _expect(
+                {"path": list(path), "text": "command", "command": True} in data["cli"],
+                data,
+            )
+            _expect(
+                {"path": list(path), "text": parameter, "command": False}
+                in data["cli"],
+                data,
+            )
+            if nested.startswith("import typer"):
+                _expect(
+                    {
+                        "path": ["test"],
+                        "text": "--verbose  default=False; type=bool",
+                        "command": False,
+                    }
+                    in data["cli"],
+                    data,
+                )
+                _expect(
+                    not any(
+                        entry["path"][-1:] == ["settings"] for entry in data["cli"]
+                    ),
+                    data,
+                )
+        for unsupported in UNSUPPORTED_INTERFACES:
+            (package / "main.py").write_text(unsupported)
+            before = _snapshot(root)
+            rejected = _run(package, "args", code=1)
+            _expect(
+                "unsupported CLI interface" in rejected.stderr and not rejected.stdout,
+                rejected,
+            )
+            _expect(_snapshot(root) == before, "unsupported interface changed state")
+        for layout in ("missing", "syntax", "encoding", "linked"):
+            test_file = package / "test_main.py"
+            test_file.unlink(missing_ok=True)
+            if layout == "syntax":
+                test_file.write_text("def invalid(")
+            elif layout == "encoding":
+                test_file.write_bytes(b"\xff")
+            elif layout == "linked":
+                test_file.symlink_to(package / "main.py")
+            before = _snapshot(root)
+            rejected = _run(package, "test", "names", code=1)
+            _expect(
+                "canonical test names:" in rejected.stderr and not rejected.stdout,
+                rejected,
+            )
+            _expect(_snapshot(root) == before, "malformed test source changed state")
 
 
-def _campaign(
-    root: Path,
-    environment: dict[str, str],
-    command: str,
-    *arguments: str,
-    cwd: Path | None = None,
-) -> subprocess.CompletedProcess[str]:
-    """Run an omitted target and preserve original sources, settings, and refs."""
-    before = _snapshot(root, exclude=("tmp",))
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
-        cwd=cwd or root,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
-    )
-    _expect(
-        _snapshot(root, exclude=("tmp",)) == before,
-        "campaign changed original sources or Git state",
-    )
-    return result
+def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
+    """Initialize remotes and preserve checkout/index state through home convergence."""
+    for remote in (
+        "https://example.test/team/project.git",
+        "ssh://git@example.test/team/project.git",
+        "git@example.test:team/project.git",
+    ):
+        with (
+            TemporaryDirectory(prefix="canonical-home-") as directory,
+            pytest.MonkeyPatch.context() as patch,
+        ):
+            _check_remote_initialization(Path(directory), patch, remote)
+    with (
+        TemporaryDirectory(prefix="canonical-bootstrap-") as directory,
+        pytest.MonkeyPatch.context() as patch,
+    ):
+        _check_flake_initialization(Path(directory), patch)
+    with TemporaryDirectory(prefix="canonical-home-") as directory:
+        root = _home_repository(Path(directory))
+        _check_home_commits(root)
+        _check_home_whitelist(root)
+        _check_home_settings(root)
+        _check_home_move(root)
+        modules = root / ".gitmodules"
+        modules.write_text(
+            modules.read_text() + "url = git@forge.example:owner/other\n",
+        )
+        before = _snapshot(root)
+        result = _run(root, "converge", code=1)
+        _expect(
+            "duplicate url field" in result.stderr and _snapshot(root) == before,
+            result,
+        )
 
 
 @settings(deadline=None)
@@ -2860,6 +2500,40 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
                 not status.exists() or "State:\tZ" in status.read_text(),
                 "timed-out suite left a running descendant",
             )
+
+
+def _review_source(label: str, *, arguments: bool) -> str:
+    """Describe one known interface or sentence independently of the converter."""
+    if arguments:
+        return (
+            "import argparse\np = argparse.ArgumentParser()\n"
+            f"p.add_argument('--{label}')\n"
+        )
+    return f"def test_{label}(): pass\n"
+
+
+def _review_view(
+    root: Path,
+    arguments: bool,  # noqa: FBT001
+    *options: str,
+    code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Preserve repository state through successful and rejected Git views."""
+    before = _snapshot(root)
+    result = _run(
+        root,
+        *(("args",) if arguments else ("test", "names")),
+        *options,
+        code=code,
+    )
+    _expect(_snapshot(root) == before, options)
+    _expect(
+        "def test_" not in result.stdout
+        and "add_argument" not in result.stdout
+        and "PRIVATE_IMPLEMENTATION" not in result.stdout,
+        result,
+    )
+    return result
 
 
 @settings(deadline=None)
@@ -3043,230 +2717,556 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
         )
 
 
-def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> None:
-    """Build real checks, measure CLI lines, and keep reports outside the checkout."""
-    with TemporaryDirectory(prefix="canonical-coverage-") as directory:
-        root = Path(directory) / "source with spaces"
-        environment = _prepare_coverage_flake(root)
-        before = _snapshot(root)
-        expression = (
-            f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
-            "in f.checks.${builtins.currentSystem}.example"
-        )
-        plain = _run(
-            root,
-            "build",
-            "--no-link",
-            "--print-out-paths",
-            "--impure",
-            "--expr",
-            expression,
-            executable="nix",
-            environment=environment,
-        )
-        _expect(
-            not any(
-                path.name.startswith(".coverage")
-                or path.name in {"html", "coverage.json"}
-                for path in Path(plain.stdout.strip()).iterdir()
+def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None:
+    """Add another offline runnable package without replacing the fixture flake."""
+    flake = (root / "flake.nix").read_text()
+    _make_runner_target(root, source, tests, name=name)
+    prefix, ending = flake.rsplit("}; }; }", 1)
+    (root / "flake.nix").write_text(
+        prefix
+        + f" {json.dumps(name)}.python.withPackages = "
+        + f"_: {json.dumps(sys.prefix)}; "
+        + "}; }; }"
+        + ending,
+    )
+    _git(root, "add", "flake.nix", f"packages/{name}")
+
+
+def _campaign(
+    root: Path,
+    environment: dict[str, str],
+    command: str,
+    *arguments: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an omitted target and preserve original sources, settings, and refs."""
+    before = _snapshot(root, exclude=("tmp",))
+    result = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
+        cwd=cwd or root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
+        "campaign changed original sources or Git state",
+    )
+    return result
+
+
+@settings(deadline=None)
+@given(
+    arguments=st.sampled_from(
+        (
+            ("mv", "packages/example", "hosts/example"),
+            ("add", "packages/bad--name", "python"),
+            ("add", "hosts/bad-name"),
+            ("rm", "../outside"),
+            ("rm", "/outside"),
+            ("mv", "packages/example", "packages/taken"),
+            ("add", "packages/example", "python"),
+        ),
+    ),
+    misplaced=st.sampled_from(
+        (
+            "def test_misplaced(): pass\n",
+            (
+                "from unittest import TestCase as Case\n"
+                "class Reports(Case):\n"
+                "    def test_result(self): pass\n"
             ),
-            "ordinary checks produced coverage artifacts",
-        )
-        for target in (root, root / "packages/z-last"):
-            explicit = _run_runner_cli(target, environment, "coverage")
-            current = _campaign(root, environment, "coverage", cwd=target)
-            _expect(
-                not explicit.returncode
-                and explicit.stdout == current.stdout
-                and not current.returncode,
-                (explicit, current),
-            )
-            reports = [
-                line
-                for line in explicit.stdout.splitlines()
-                if line.endswith("/html/index.html")
-            ]
-            _expect(len(reports) == (2 if target == root else 1), explicit)
-            for line in reports:
-                report = Path(line.split(": ", 1)[1]).parents[1]
-                files = json.loads((report / "coverage.json").read_text())["files"]
-                _expect(
-                    len(files) == 1 and next(iter(files)).endswith("/main.py"),
-                    files,
-                )
-                _expect(
-                    set(next(iter(files.values()))["executed_lines"])
-                    == {1, 2, 3, 4, 6},
-                    files,
-                )
-                measured = next(iter(files.values()))
-                _expect(
-                    {tuple(branch) for branch in measured["executed_branches"]}
-                    == {(3, 4), (3, 6)}
-                    and measured["contexts"]["4"]
-                    == ["test_main.py::test_cli[alternate]"]
-                    and measured["contexts"]["6"] == ["test_main.py::test_cli[ready]"],
-                    measured,
-                )
-                audit = json.loads((report / "tests.json").read_text())
-                rows = {row["nodeid"]: row for row in audit["tests"]}
-                expected_counts = {"collected_cases": 5, "functions": 4, "skipped": 2}
-                _expect(
-                    all(
-                        audit["summary"][key] == value
-                        for key, value in expected_counts.items()
-                    )
-                    and audit["summary"]["unexecuted_properties"]
-                    == ["test_main.py::test_generated_only"]
-                    and rows["test_main.py::test_generated_only"]["body_calls"] == 0
-                    and rows["test_main.py::test_explicit"]["body_calls"] == 1
-                    and rows["test_main.py::test_optional_browser"]["skip_reason"]
-                    == "optional browser"
-                    and all(row["duration"] >= 0 for row in audit["tests"]),
-                    audit,
-                )
+        ),
+    ),
+)
+@example(
+    arguments=("mv", "packages/example", "hosts/example"),
+    misplaced="def test_misplaced(): pass\n",
+)
+@example(
+    arguments=("rm", "../outside"),
+    misplaced=(
+        "from unittest import TestCase as Case\n"
+        "class Reports(Case):\n"
+        "    def test_result(self): pass\n"
+    ),
+)
+@example(arguments=("rm", "/outside"), misplaced="def test_misplaced(): pass\n")
+@example(
+    arguments=("add", "packages/bad--name", "python"),
+    misplaced="def test_misplaced(): pass\n",
+)
+@example(arguments=("add", "hosts/bad-name"), misplaced="def test_misplaced(): pass\n")
+@example(
+    arguments=("mv", "packages/example", "packages/taken"),
+    misplaced="def test_misplaced(): pass\n",
+)
+@example(
+    arguments=("add", "packages/example", "python"),
+    misplaced="def test_misplaced(): pass\n",
+)
+def test_rejected_operations_preserve_contents_modes_index_and_refs(
+    arguments: tuple[str, ...],
+    misplaced: str,
+) -> None:
+    """Reject invalid paths, collisions, and embedded tests before modifying work."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        _run(root, "add", "packages/taken", "nix")
+        (root / "work-in-progress").write_text("preserve unrelated work")
+        before = _snapshot(root)
+        rejected = _run(root, *arguments, code=1)
+        _expect(bool(rejected.stderr) and _snapshot(root) == before, rejected)
+        source = root / "packages/example/main.py"
+        source.write_text(misplaced)
+        before = _snapshot(root)
+        rejected = _run(root, "converge", code=1)
         _expect(
-            _snapshot(root) == before and not (root / "tmp").exists(),
-            "coverage changed repository state",
+            "move test definitions to test_main.py" in rejected.stderr
+            and _snapshot(root) == before,
+            rejected,
         )
-    for failure in ("build", "report", "check", "syntax"):
-        with TemporaryDirectory(prefix="canonical-coverage-failure-") as directory:
-            root = Path(directory) / "source"
-            environment = _prepare_coverage_flake(root, failure=failure)
-            if failure == "check":
-                (root / "checks/example/default.nix").unlink()
-            if failure == "syntax":
-                (root / "packages/example/test_main.py").write_text("def invalid(")
-            untested = _make_runner_target(root, "", "", name="untested")
-            (untested / "test_main.py").unlink()
-            (root / "flake.nix").write_text(_git(root, "show", ":flake.nix"))
-            before = _snapshot(root)
-            result = _run_runner_cli(root, environment, "coverage")
-            _expect(
-                result.returncode == 1
-                and "1 passed, 1 failed, 1 skipped" in result.stdout,
-                result,
-            )
-            _expect(
-                "z-last:" in result.stdout
-                and "/html/index.html" in result.stdout
-                and "canonical test coverage: example:" in result.stderr,
-                result,
-            )
-            _expect(
-                _snapshot(root) == before,
-                f"{failure} failure changed repository state",
-            )
 
 
-def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
-    """Expose consistent commands and reject invalid requests before creating state."""
-    with TemporaryDirectory(prefix="canonical-cli-") as directory:
-        root = Path(directory)
-        commands = (
-            (),
-            ("add",),
-            ("mv",),
-            ("rm",),
-            ("init",),
-            ("converge",),
-            ("overview",),
-            ("args",),
-            ("test",),
-            ("test", "names"),
-            ("test", "coverage"),
-            ("test", "hypothesis"),
-            ("test", "mutation"),
-        )
-        for path in commands:
-            option = _run(root, *path, "--help").stdout
+@settings(deadline=None)
+@given(
+    kind=st.sampled_from(("python", "html", "latex", "nix", "host", "untracked")),
+    name=PACKAGE_NAMES,
+    payload=st.binary(max_size=40),
+)
+@example(kind="python", name="dash-case", payload=b"\x00\xff")
+@example(kind="html", name="snake_case", payload=b"HTML")
+@example(kind="latex", name="document", payload=b"LaTeX")
+@example(kind="nix", name="value", payload=b"Nix")
+@example(kind="host", name="laptop", payload=b"host")
+@example(kind="untracked", name="untracked", payload=b"untracked")
+def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR0915
+    kind: str,
+    name: str,
+    payload: bytes,
+) -> None:
+    """Add, preview, rename, converge, and remove resources without losing Git state."""
+    with _fresh_repository() as root:
+        if kind == "host":
+            name = name.replace("-", "").replace("_", "")
+        collection = "hosts" if kind == "host" else "packages"
+        original, destination = f"{collection}/a{name}", f"{collection}/b{name}"
+        package = root / original
+        if kind == "untracked":
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text("{}\n")
+        else:
+            _run(root, "add", original, *(() if kind == "host" else (kind,)))
+        check = f"checks/a{name}" + ("VmWithDisko" if kind == "host" else "")
+        if kind == "python":
             _expect(
-                option == _run(root, "help", *path).stdout and "usage:" in option,
-                path,
+                not (package / "test_main.py").exists() and not (root / check).exists(),
+                "new packages must be untested",
             )
-        environment = dict(os.environ)
-        environment["PATH"] = (
-            str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
-            + os.pathsep
-            + environment["PATH"]
+            (package / "test_main.py").write_text(
+                (
+                    "from unittest import TestCase as Case\n"
+                    "class Reports(Case):\n"
+                    "    def test_result(self): pass\n"
+                ),
+            )
+        resource = package / "prm/nested/asset.bin"
+        resource.parent.mkdir(parents=True)
+        resource.write_bytes(payload)
+        if kind != "untracked":
+            _run(root, "converge")
+            _expect(
+                f"{original}/prm/nested/asset.bin"
+                in _git(root, "ls-files").splitlines(),
+                "resources must be indexed",
+            )
+        expected_check = kind in {"host", "python"}
+        _expect((root / check / "default.nix").is_file() == expected_check, check)
+        tracked = _git(root, "ls-files", "--", original, check).splitlines()
+        staged, working = {}, {}
+        for relative in tracked:
+            path = root / relative
+            staged[relative] = path.read_bytes() + b"\n"
+            working[relative] = staged[relative] + b"\n"
+            path.write_bytes(staged[relative])
+            _git(root, "add", "--", relative)
+            path.write_bytes(working[relative])
+        untracked = package / "prm/untracked.bin"
+        untracked.write_bytes(payload)
+        _preview(root, "mv", original, destination)
+        _run(root, "mv", original, destination)
+        new_check = check.replace(f"a{name}", f"b{name}")
+        for relative in tracked:
+            renamed = relative.replace(original, destination).replace(check, new_check)
+            _expect(
+                subprocess.run(  # noqa: S603
+                    ["git", "show", f":{renamed}"],  # noqa: S607
+                    cwd=root,
+                    capture_output=True,
+                    check=True,
+                    timeout=10,
+                ).stdout
+                == staged[relative]
+                and (root / renamed).read_bytes() == working[relative],
+                renamed,
+            )
+        _expect(
+            (root / destination / "prm/untracked.bin").read_bytes() == payload,
+            "untracked contents",
         )
         _expect(
-            _run(root, "help", executable="canonical", environment=environment).stdout
-            == _run(root, "--help").stdout,
-            "standalone command unavailable through PATH",
+            not _git(root, "ls-files", "--", f"{destination}/prm/untracked.bin"),
+            "rename must not stage untracked assets",
         )
-        for retired in (
-            "status",
-            "check",
-            "test-names",
-            "coverage",
-            "hypothesis",
-            "mutation",
-        ):
-            _run(root, retired, code=2)
         _expect(
-            _run(root, "test").stdout == _run(root, "test", "--help").stdout,
-            "bare test must show help",
+            not package.exists() and not (root / check).exists(),
+            "rename left old paths",
         )
-        _run(root, "test", "unknown", code=2)
-        names_help = _run(root, "test", "names", "--help").stdout
         _expect(
-            "[target]" in names_help and "current directory" in names_help,
-            names_help,
+            (root / new_check / "default.nix").is_file() == expected_check,
+            new_check,
         )
-        for option in ("--timeout", "--max-examples"):
-            _run(root, "test", "names", option, "10", code=2)
-        for command in ("names", "coverage", "hypothesis", "mutation"):
-            _run(root, "test", command, code=1)
-        for command in ("hypothesis", "mutation"):
-            for timeout in ("nan", "inf", "-inf", "0", "-1"):
-                _run(root, "test", command, str(root), f"--timeout={timeout}", code=2)
-        _run(root, "test", "hypothesis", str(root), "--max-examples", "0", code=2)
-        for arguments in (
-            ("--max-mutations", "0"),
-            ("--max-mutations", "-1"),
-            ("--lines", "0"),
-            ("--lines", "3:2"),
-            ("--lines", "bad"),
-            ("--operator", "["),
-        ):
-            _run(root, "test", "mutation", str(root), *arguments, code=2)
-        _expect(not any(root.iterdir()), "invalid CLI request created state")
-    for layout in ("empty", "nonpython", "untested", "single_untested"):
-        with _fresh_repository() as root:
-            target = root
-            if layout == "nonpython":
-                _run(root, "add", "packages/web", "html")
-            elif layout in {"untested", "single_untested"}:
-                target = _make_runner_target(root, "", "")
-                (target / "test_main.py").unlink()
-                if layout == "untested":
-                    target = root
-            before = _snapshot(root)
-            for command in ("hypothesis", "mutation"):
-                result = _run(
-                    root,
-                    "test",
-                    command,
-                    str(target),
-                    code=0 if layout == "untested" else 1,
+        if kind == "untracked":
+            _expect(
+                not _git(root, "ls-files", "--", destination),
+                "rename staged an untracked package",
+            )
+            return
+        _run(root, "converge")
+        _preview(root, "rm", destination)
+        _run(root, "rm", destination)
+        _expect(
+            not (root / destination).exists() and not (root / new_check).exists(),
+            "remove left resource or check",
+        )
+        _expect(
+            not _git(root, "ls-files", "--", original, destination, check, new_check),
+            "remove left indexed paths",
+        )
+        _run(root, "converge")
+        _preview(root, "converge")
+
+
+@settings(deadline=None)
+@given(name=PACKAGE_NAMES, object_format=st.sampled_from(("sha1", "sha256")))
+@example(name="core", object_format="sha1")
+@example(name="dash-case", object_format="sha256")
+def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  # noqa: PLR0915
+    name: str,
+    object_format: str,
+) -> None:
+    """Model declarations and compare current and historical source views."""
+    with _fresh_repository(object_format=object_format) as root:
+        provider = "p" + name
+        _run(root, "add", f"packages/{provider}", "nix", "Provider")
+        _run(root, "add", "packages/consumer", "python", "Consumer")
+        _run(root, "add", "packages/computed", "nix", "Computed")
+        consumer = root / "packages/consumer"
+        (consumer / "default.nix").write_text(
+            "{ inputs, pkgs, system, ... }: "
+            "let local = inputs.self.packages.${system}; in {\n"
+            f"  propagatedBuildInputs = [ local.{provider} local.missing pkgs.git ];\n"
+            f'  installPhase = "cp ${{../{provider}/main.py}} result";\n'
+            "  # propagatedBuildInputs = [ local.fake ];\n"
+            '  text = "inputs.self.packages.system.also_fake";\n}\n',
+        )
+        (consumer / "main.py").write_text(
+            (
+                '"""Consumer help."""\n'
+                "import argparse\n"
+                'raise RuntimeError("must not run")\n'
+                "p = argparse.ArgumentParser()\n"
+                'p.add_argument("--output", help="Output path")\n'
+                "literal = '# noqa: D103 and # type: ignore are text'\n"
+                "# ruff: noqa: D\n"
+                "value = 1  # noqa: E501\n"
+                "other = 2  # type: ignore[assignment]\n"
+            ),
+        )
+        (consumer / "test_main.py").write_text(
+            "def test_result(): pass  # noqa: D103\n",
+        )
+        assets = consumer / "prm/assets"
+        assets.mkdir(parents=True)
+        snippets: tuple[tuple[str, str, list[dict[str, str | int]]], ...] = (
+            (
+                "directives.html",
+                (
+                    "<!-- html-validate-disable -->\n"
+                    "<!-- html-validate-disable-next heading-level -->\n"
+                    "<p>eslint-disable is text</p>\n"
+                ),
+                [
+                    {"kind": "html-validate-disable", "scope": "global", "count": 1},
+                    {"kind": "html-validate-disable", "scope": "local", "count": 1},
+                ],
+            ),
+            (
+                "index.html",
+                '<script>const text = "<!-- htmlhint-disable -->";</script>',
+                [],
+            ),
+            (
+                "script.js",
+                "const value = `${(() => { /* eslint-disable */ return 1; })()}`;",
+                [{"kind": "eslint-disable", "scope": "global", "count": 1}],
+            ),
+            (
+                "string.js",
+                "const value = `/* eslint-disable */`; /* eslint-disable-next-line */",
+                [{"kind": "eslint-disable", "scope": "local", "count": 1}],
+            ),
+            (
+                "style.css",
+                'p { content: "/* stylelint-disable */"; } /* stylelint-disable */',
+                [{"kind": "stylelint-disable", "scope": "global", "count": 1}],
+            ),
+        )
+        for filename, source, _ in snippets:
+            (assets / filename).write_text(source)
+        (assets / "picture.png").write_bytes(b"binary")
+        (assets / "linked.py").symlink_to(consumer / "main.py")
+        (consumer / "tmp").mkdir()
+        (consumer / "tmp/generated.py").write_text("runtime")
+        (root / "packages/computed/default.nix").write_text(
+            (
+                "{ pkgs, ... }: let one = two; two = one; in { buildInputs = "
+                "one; nativeBuildInputs = if pkgs.stdenv.isLinux then [ "
+                "pkgs.git ] else []; }"
+            ),
+        )
+        graph = _overview(root)
+        nodes = {node["id"]: node for node in graph["nodes"]}
+        _expect(
+            graph["schema"] == "canonical.overview"
+            and graph["analysis"] == "source-declarations",
+            graph,
+        )
+        _expect(
+            len(nodes) == len(graph["nodes"])
+            and nodes[".:packages/missing"]["kind"] == "package-reference",
+            graph,
+        )
+        edges = {
+            (edge["source"], edge["target"], edge["kind"])
+            for edge in graph["edges"]
+            if edge["target"] == ".:packages/consumer" and edge["kind"] != "contains"
+        }
+        _expect(
+            edges
+            == {
+                (f".:packages/{provider}", ".:packages/consumer", "runtime"),
+                (f".:packages/{provider}", ".:packages/consumer", "source"),
+                (".:packages/missing", ".:packages/consumer", "runtime"),
+            },
+            edges,
+        )
+        _expect(not nodes[".:packages/computed"]["dependencies"], nodes)
+        details = nodes[".:packages/consumer"]["details"]
+        sources = {source["path"]: source for source in details["sources"]}
+        _expect(
+            set(sources)
+            == {
+                "default.nix",
+                "main.py",
+                "test_main.py",
+                *("prm/assets/" + filename for filename, _, _ in snippets),
+            },
+            sources,
+        )
+        for filename, _, expected in snippets:
+            _expect(
+                sources["prm/assets/" + filename]["suppressions"] == expected,
+                sources,
+            )
+        _expect(
+            details["source_metrics"]["suppressions"]
+            == {"noqa (global)": 1, "noqa (local)": 2, "type: ignore (local)": 1},
+            details,
+        )
+        _expect(
+            details["tests"] == ["test result"] and details["help"] == "Consumer help.",
+            details,
+        )
+        focus = json.loads(_run(root, "overview", "packages/consumer", "--json").stdout)
+        _expect(focus["focus"] == ".:packages/consumer", focus)
+        terminal = _run(root, "overview", "--full").stdout
+        _expect(
+            "packages/consumer:\n" in terminal
+            and "runtime: packages/" + provider in terminal
+            and "  test result\n" in terminal,
+            terminal,
+        )
+        _git(root, "add", "--force", ".")
+        _test_names_git(root, "commit", "-qm", "Source snapshot")
+        before = _snapshot(root)
+        historical = json.loads(
+            _run(root, "overview", "--json", "--revision", "HEAD").stdout,
+        )
+        _expect(
+            [node.get("details") for node in historical["nodes"]]
+            == [node.get("details") for node in graph["nodes"]],
+            historical,
+        )
+        _expect(
+            _snapshot(root) == before and _overview(root) == graph,
+            "overview changed its repository",
+        )
+    with _fresh_repository() as root:
+        _check_overview_details(root)
+    with _fresh_repository() as root:
+        _check_overview_history(root)
+    with TemporaryDirectory(prefix="canonical-history-") as directory:
+        _check_missing_history(Path(directory))
+    with TemporaryDirectory(prefix="canonical-graph-") as directory:
+        _check_home_graph(_home_repository(Path(directory)))
+    with TemporaryDirectory(prefix="canonical-host-graph-") as directory:
+        _check_host_graph(_home_repository(Path(directory)))
+
+
+@settings(deadline=None)
+@given(
+    contract=st.sampled_from(CLI_CONTRACTS),
+    labels=TEST_LABELS,
+    form=st.sampled_from(("functions", "classes", "unittest")),
+    explicit=st.booleans(),
+)
+@example(
+    contract=CLI_CONTRACTS[0],
+    labels=["double__underscore", "async_behavior"],
+    form="functions",
+    explicit=True,
+)
+@example(contract=CLI_CONTRACTS[1], labels=["result"], form="classes", explicit=False)
+@example(
+    contract=CLI_CONTRACTS[2],
+    labels=["derived", "async"],
+    form="unittest",
+    explicit=True,
+)
+@example(contract=CLI_CONTRACTS[3], labels=["complex"], form="functions", explicit=True)
+@example(contract=CLI_CONTRACTS[4], labels=["complex"], form="unittest", explicit=False)
+@example(contract=CLI_CONTRACTS[5], labels=["complex"], form="classes", explicit=True)
+@example(contract=CLI_CONTRACTS[7], labels=[], form="functions", explicit=True)
+@example(contract=CLI_CONTRACTS[6], labels=[], form="functions", explicit=False)
+@example(contract=CLI_CONTRACTS[8], labels=["public"], form="functions", explicit=False)
+@example(contract=CLI_CONTRACTS[9], labels=["aliased"], form="classes", explicit=True)
+@example(
+    contract=CLI_CONTRACTS[10],
+    labels=["aliased"],
+    form="functions",
+    explicit=False,
+)
+@example(contract=CLI_CONTRACTS[11], labels=["aliased"], form="unittest", explicit=True)
+def test_static_interfaces_and_test_sentences_match_declarations_without_execution(
+    contract: tuple[str, str],
+    labels: list[str],
+    form: str,
+    *,
+    explicit: bool,
+) -> None:
+    """Compare static declarations to expectations and continue after errors."""
+    with _fresh_repository() as root:
+        sentinel = (
+            "from pathlib import Path\n"
+            "Path('SENTINEL').touch()\n"
+            "raise RuntimeError('must not execute')\n"
+        )
+        tests = sentinel + (
+            "def helper():\n"
+            "    def test_hidden(): pass\n"
+            "class Helper:\n"
+            "    def test_hidden(self): pass\n"
+        )
+        if form == "functions":
+            tests += "".join(
+                f"@unknown_decorator()\nasync def test_{label}():\n    assert False\n"
+                for label in labels
+            )
+        else:
+            header = (
+                "class TestBehavior:\n"
+                if form == "classes"
+                else (
+                    "import unittest as unit\n"
+                    "from unittest import TestCase as Case, "
+                    "IsolatedAsyncioTestCase\n"
+                    "class Base(Case): pass\n"
+                    "class Reports(Base):\n"
                 )
-                if layout == "untested":
-                    _expect(
-                        "Skipping example: no test_main.py" in result.stdout
-                        and "0 passed, 0 failed, 1 skipped" in result.stdout,
-                        result,
-                    )
-                elif layout != "single_untested":
-                    _expect("no Python packages found" in result.stderr, result)
-            if layout == "empty":
-                for command in ("names", "coverage"):
-                    _expect(
-                        "no Python packages found"
-                        in _run(root, "test", command, code=1).stderr,
-                        command,
-                    )
-            _expect(_snapshot(root) == before, "nonrunnable target created state")
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        _check_command_catalog(monkeypatch)
-    _check_discovery_boundaries()
+            )
+            tests += header + (
+                "    pass\n"
+                if not labels
+                else "".join(
+                    f"    async def test_{label}(self):\n        assert False\n"
+                    for label in labels
+                )
+            )
+        package = _make_test_names_package(root, "my-package", tests)
+        source, expected_args = contract
+        (package / "main.py").write_text(
+            '"""First paragraph.\n\nArguments:\n  Documentation text."""\n'
+            + sentinel
+            + source,
+        )
+        expected_names = "".join(
+            "test " + label.replace("_", " ") + "\n" for label in sorted(labels)
+        )
+        cwd = root if explicit else package
+        target = (str(package),) if explicit else ()
+        before = _snapshot(root)
+        _expect(_run(cwd, "args", *target).stdout == expected_args, contract)
+        _expect(_run(cwd, "test", "names", *target).stdout == expected_names, tests)
+        details = next(
+            node["details"]
+            for node in _overview(root)["nodes"]
+            if node["kind"] == "package"
+        )
+        _expect(
+            details["tests"] == ["test " + label.replace("_", " ") for label in labels],
+            details,
+        )
+        _expect(
+            details["help"] == "First paragraph.\n\nArguments:\n  Documentation text.",
+            details,
+        )
+        _expect(
+            _snapshot(root) == before
+            and not (root / "SENTINEL").exists()
+            and not (package / "SENTINEL").exists(),
+            "inspection changed source or executed code",
+        )
+        (package / "test_main.py").write_text(
+            tests.replace("assert False", "raise RuntimeError('changed body')"),
+        )
+        _expect(
+            _run(package, "test", "names").stdout == expected_names,
+            "body edits changed sentences",
+        )
+        (package / "test_main.py").unlink(missing_ok=True)
+        (package / "test_main.py").write_text(tests)
+        broken = _make_test_names_package(root, "alpha", "def invalid(")
+        (broken / "main.py").write_text("import sys\nprint(sys.argv)\n")
+        (package / "main.py").write_text(source)
+        missing = _make_test_names_package(root, "untested", "")
+        (missing / "test_main.py").unlink()
+        (root / "packages/linked").symlink_to(package, target_is_directory=True)
+        listed = _run(root, "test", "names", code=1)
+        _expect(
+            listed.stdout == "packages/alpha:\npackages/my-package:\n" + expected_names,
+            listed,
+        )
+        _expect(
+            "canonical test names: alpha:" in listed.stderr
+            and "Skipping untested: no test_main.py" in listed.stderr,
+            listed,
+        )
+        args = _run(root, "args", code=1)
+        _expect(
+            "packages/my-package:\n" + expected_args in args.stdout
+            and "alpha: unsupported CLI interface" in args.stderr,
+            args,
+        )
