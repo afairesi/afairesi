@@ -232,19 +232,34 @@ def _prepare_coverage_flake(
     for name in ("example", "z-last"):
         _run(root, "add", f"packages/{name}", "python")
         package = root / "packages" / name
-        source = "def main():\n    print('ready')\n"
+        source = (
+            "import os\n"
+            "def main():\n"
+            "    if os.getenv('CANONICAL_COVERAGE_CHOICE') == 'alternate':\n"
+            "        print('alternate')\n"
+            "    else:\n"
+            "        print('ready')\n"
+        )
         tests = (
-            "import os, subprocess\n"
+            "import os, subprocess, pytest\n"
             "from hypothesis import given, example, strategies as st\n"
             "@given(st.just(1))\n"
             "@example(0)\n"
             "def test_explicit(value):\n"
             "    assert value == 0\n"
-            "def test_cli():\n"
+            "@given(st.just(1))\n"
+            "def test_generated_only(value):\n"
+            "    assert value == 1\n"
+            "@pytest.mark.skip(reason='optional browser')\n"
+            "def test_optional_browser():\n"
+            "    assert False\n"
+            "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
+            "def test_cli(message, monkeypatch):\n"
+            "    monkeypatch.setenv('CANONICAL_COVERAGE_CHOICE', message)\n"
             "    result = "
             "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
             "        capture_output=True, text=True)\n"
-            "    assert result.stdout == 'ready\\n'\n"
+            "    assert result.stdout == message + '\\n'\n"
         )
         if name == "example" and failure == "build":
             tests = "def test_failure(): assert False\n"
@@ -2694,7 +2709,16 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
     """Run copied Git commands, count cases, and retain failure diagnostics."""
     with TemporaryDirectory(prefix="canonical-campaign-") as directory:
         root = Path(directory) / "source with spaces"
-        source = "def main():\n    print('ready')\n"
+        source = (
+            "import json, os\nfrom pathlib import Path\n"
+            "def main():\n"
+            "    assert not (Path.home() / 'sentinel').exists()\n"
+            "    Path('cli-environment.json').write_text(json.dumps("
+            "{name: os.environ[name] for name in "
+            "('HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', "
+            "'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR')}))\n"
+            "    print('ready')\n"
+        )
         tests = (
             "import os, subprocess\n"
             "from pathlib import Path\n"
@@ -2709,8 +2733,28 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
             "capture_output=True, text=True)\n"
             "    assert result.returncode == 0 and result.stdout == "
             "'ready\\n'\n"
+            "    import json\n"
+            "    directories = json.loads(Path('cli-environment.json').read_text())\n"
+            "    for name, directory in directories.items():\n"
+            "        assert directory == os.environ[name]\n"
+            "        assert Path(directory).is_relative_to(Path.cwd())\n"
+            "    assert not (Path.home() / 'sentinel').exists()\n"
         )
         environment = _prepare_runner_flake(root, tests, source, name="git-example")
+        caller_home = Path(directory) / "caller home"
+        caller_home.mkdir()
+        sentinel = caller_home / "sentinel"
+        sentinel.write_text("preserve")
+        for variable in (
+            "HOME",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ):
+            environment[variable] = str(caller_home)
         before = _snapshot(root, exclude=("tmp",))
         result = _run_runner_cli(
             root,
@@ -2739,6 +2783,7 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
         workspaces = list((root / "tmp").glob("python-hypothesis-git-example-*"))
         expected_workspaces = 2
         _expect(len(workspaces) == expected_workspaces, workspaces)
+        expected_case_count = 2
         for workspace in workspaces:
             _expect(
                 len((workspace / "examples").read_text().splitlines())
@@ -2750,6 +2795,21 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
                 in (workspace / "tests.log").read_text(),
                 workspace,
             )
+            report = json.loads((workspace / "tests.json").read_text())
+            rows = {row["nodeid"]: row for row in report["tests"]}
+            _expect(
+                report["summary"]["selected_cases"] == expected_case_count
+                and rows["test_main.py::test_property"]["body_calls"]
+                == max_examples + 1
+                and rows["test_main.py::test_cli"]["body_calls"] == 1
+                and not report["summary"]["unexecuted_properties"]
+                and not list(workspace.glob("test-runtime-*")),
+                report,
+            )
+        _expect(
+            sentinel.read_text() == "preserve",
+            caller_home,
+        )
         bad_tests = (
             (
                 "from hypothesis import given, strategies as st\n"
@@ -2822,12 +2882,19 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
             "    print(value())\n"
         )
         tests = (
-            "import subprocess\n"
+            "import subprocess\nfrom pathlib import Path\n"
             "def test_cli():\n"
+            "    marker = Path.home() / 'baseline-marker'\n"
+            "    assert not marker.exists()\n"
+            "    marker.write_text('created')\n"
             "    result = subprocess.run(['git', 'example'], "
             "capture_output=True, text=True)\n"
             "    assert result.returncode == 0 "
             f"and result.stdout == {str(value) + chr(10)!r}\n"
+            "def test_cli_process_success():\n"
+            "    result = subprocess.run(['git', 'example'], "
+            "capture_output=True, text=True)\n"
+            "    assert result.returncode == 0\n"
         )
         environment = _prepare_runner_flake(root, tests, source, name="git-example")
         result = _campaign(
@@ -2847,10 +2914,96 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
             and (workspace / "report.html").stat().st_size > 0,
             summary,
         )
+        target_line = 2
+        focused = _campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "-k",
+            "test_cli and not process_success",
+            "--lines",
+            str(target_line),
+            "--operator",
+            "NumberReplacer",
+            "--max-mutations",
+            "1",
+            cwd=root / "packages/git-example",
+        )
+        _expect(not focused.returncode, focused)
+        focused_workspace = next(
+            path
+            for path in (root / "tmp").glob("python-mutation-git-example-*")
+            if path != workspace
+        )
+        plan_path = focused_workspace / "mutation-plan.json"
+        plan = json.loads(plan_path.read_text())
+        defects = json.loads((focused_workspace / "mutation-results.json").read_text())
+        _expect(
+            len(plan["mutations"]) == len(defects["mutations"]) == 1
+            and defects["mutations"][0]["status"] == "killed"
+            and defects["mutations"][0]["mutations"][0]["start_pos"][0] == target_line
+            and defects["kills_by_test"]
+            == {
+                "test_main.py::test_cli": [plan["mutations"][0]["id"]],
+            },
+            defects,
+        )
+        existing_workspaces = set((root / "tmp").iterdir())
+        weaker = _campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "-k",
+            "process_success",
+            "--mutation-plan",
+            str(plan_path),
+            cwd=root / "packages/git-example",
+        )
+        _expect(not weaker.returncode, weaker)
+        (weaker_workspace,) = set((root / "tmp").iterdir()) - existing_workspaces
+        weaker_defects = json.loads(
+            (weaker_workspace / "mutation-results.json").read_text(),
+        )
+        _expect(
+            len(weaker_defects["mutations"]) == 1
+            and weaker_defects["mutations"][0]["id"] == defects["mutations"][0]["id"]
+            and weaker_defects["mutations"][0]["status"] == "survived"
+            and not weaker_defects["kills_by_test"],
+            weaker_defects,
+        )
+        package_source = root / "packages/git-example/main.py"
+        package_source.write_text(
+            source.replace(f"return {value}\n", f"return {value + 10}\n"),
+        )
+        mismatch = _campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "-k",
+            "process_success",
+            "--mutation-plan",
+            str(plan_path),
+            cwd=root / "packages/git-example",
+        )
+        _expect(
+            mismatch.returncode == 1 and "does not match" in mismatch.stderr,
+            mismatch,
+        )
+        package_source.write_text(source)
         baselines = {
             "alpha": "def test_failure():\n    assert False\n",
             "beta": "",
             "gamma": "raise ImportError('missing dependency')\n",
+            "delta": (
+                "import pytest\n@pytest.mark.skip(reason='disabled')\n"
+                "def test_skipped():\n    assert False\n"
+            ),
         }
         for name, baseline in baselines.items():
             _runner_package(root, name, baseline)
@@ -2859,7 +3012,7 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
         result = _campaign(root, environment, "mutation", "--timeout", "10")
         _expect(
             result.returncode == 1
-            and "1 passed, 3 failed, 1 skipped" in result.stdout
+            and "1 passed, 4 failed, 1 skipped" in result.stdout
             and "baseline.log" in result.stderr,
             result,
         )
@@ -2942,8 +3095,35 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
                     files,
                 )
                 _expect(
-                    set(next(iter(files.values()))["executed_lines"]) == {1, 2},
+                    set(next(iter(files.values()))["executed_lines"])
+                    == {1, 2, 3, 4, 6},
                     files,
+                )
+                measured = next(iter(files.values()))
+                _expect(
+                    {tuple(branch) for branch in measured["executed_branches"]}
+                    == {(3, 4), (3, 6)}
+                    and measured["contexts"]["4"]
+                    == ["test_main.py::test_cli[alternate]"]
+                    and measured["contexts"]["6"] == ["test_main.py::test_cli[ready]"],
+                    measured,
+                )
+                audit = json.loads((report / "tests.json").read_text())
+                rows = {row["nodeid"]: row for row in audit["tests"]}
+                expected_counts = {"collected_cases": 5, "functions": 4, "skipped": 2}
+                _expect(
+                    all(
+                        audit["summary"][key] == value
+                        for key, value in expected_counts.items()
+                    )
+                    and audit["summary"]["unexecuted_properties"]
+                    == ["test_main.py::test_generated_only"]
+                    and rows["test_main.py::test_generated_only"]["body_calls"] == 0
+                    and rows["test_main.py::test_explicit"]["body_calls"] == 1
+                    and rows["test_main.py::test_optional_browser"]["skip_reason"]
+                    == "optional browser"
+                    and all(row["duration"] >= 0 for row in audit["tests"]),
+                    audit,
                 )
         _expect(
             _snapshot(root) == before and not (root / "tmp").exists(),
@@ -3042,6 +3222,15 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             for timeout in ("nan", "inf", "-inf", "0", "-1"):
                 _run(root, "test", command, str(root), f"--timeout={timeout}", code=2)
         _run(root, "test", "hypothesis", str(root), "--max-examples", "0", code=2)
+        for arguments in (
+            ("--max-mutations", "0"),
+            ("--max-mutations", "-1"),
+            ("--lines", "0"),
+            ("--lines", "3:2"),
+            ("--lines", "bad"),
+            ("--operator", "["),
+        ):
+            _run(root, "test", "mutation", str(root), *arguments, code=2)
         _expect(not any(root.iterdir()), "invalid CLI request created state")
     for layout in ("empty", "nonpython", "untested", "single_untested"):
         with _fresh_repository() as root:
