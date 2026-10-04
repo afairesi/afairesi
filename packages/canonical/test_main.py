@@ -361,6 +361,63 @@ def test_html_template_keeps_prm_install_hook(repository: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    ("kind", "binding", "expression"),
+    [
+        (
+            "html",
+            "runtimeDeps",
+            "(let runtimeDeps = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]",
+        ),
+        (
+            "html",
+            "prmInstall",
+            "let prmInstall = \"inner\"; in ''cp /asset \"$out/prm/asset\"''",
+        ),
+        (
+            "latex",
+            "nativeDeps",
+            "(let nativeDeps = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]",
+        ),
+    ],
+)
+def test_template_bindings_use_outer_nix_scope(
+    repository: Path,
+    kind: str,
+    binding: str,
+    expression: str,
+) -> None:
+    """Preserve actual expressions while ignoring comments and nested bindings."""
+    subject = import_module("packages.canonical.main")
+    root = repository / "packages/example"
+    root.mkdir(parents=True)
+    generated = subject.scaffold(kind, "example", None)[
+        Path("packages/example/default.nix")
+    ]
+    placeholder = '""' if binding == "prmInstall" else "[ ]"
+    expected = f"{binding} = {expression};"
+    custom = generated.replace(f"{binding} = {placeholder};", expected).replace(
+        "let\n",
+        f"let\n  # {binding} = [ pkgs.fromComment ];\n"
+        f"  ignored = let {binding} = [ pkgs.fromNested ]; in null;\n",
+        1,
+    )
+    definition = root / "default.nix"
+    definition.write_text(custom)
+    package = subject.Package("example", kind, root)
+    canonical = subject.canonical_typed_default(package)
+    if canonical is None or expected not in canonical:
+        msg = "Convergence must preserve the outer binding's complete expression"
+        raise AssertionError(msg)
+    if "fromComment" in canonical or "fromNested" in canonical:
+        msg = "Comment and nested bindings must not replace template fields"
+        raise AssertionError(msg)
+    definition.write_text(canonical)
+    if subject.canonical_typed_default(package) != canonical:
+        msg = "Preserving scoped expressions must remain idempotent"
+        raise AssertionError(msg)
+
+
+@pytest.mark.parametrize(
     ("display", "wayland_display", "arguments", "expected"),
     [
         ("", "", [], []),

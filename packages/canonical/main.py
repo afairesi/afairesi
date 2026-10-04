@@ -26,7 +26,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, TypedDict, cast
-from urllib.parse import urlparse
 
 import nix_syntax
 from tree_sitter_language_pack import get_parser
@@ -235,17 +234,19 @@ def _flake_clean_arguments(*, dry_run: bool) -> list[str]:
 
 
 def hosted_remote(remote: str) -> tuple[str, str]:
-    """Parse URL- and SCP-style hosted Git remotes."""
-    parsed = urlparse(remote)
+    """Read hosted remote components with Git's native URL parser."""
+    components = [
+        _run(["git", "url-parse", "--component", component, "--", remote], check=False)
+        for component in ("scheme", "host", "path")
+    ]
+    scheme, host, path = [result.stdout.strip() for result in components]
     if (
-        parsed.scheme in {"http", "https", "ssh", "git+ssh", "git"}
-        and parsed.hostname
-        and parsed.path.strip("/")
+        all(result.returncode == 0 for result in components)
+        and scheme in {"http", "https", "ssh", "git+ssh", "git"}
+        and host
+        and path.strip("/")
     ):
-        return parsed.hostname.lower(), parsed.path.strip("/")
-    match = re.fullmatch(r"(?:[^/@:]+@)?([^/:]+):(.+)", remote)
-    if match:
-        return match.group(1).lower(), match.group(2).rstrip("/")
+        return host.lower(), path.strip("/")
     msg = f"remote URL has no canonical host and repository path: {remote}"
     raise CommandError(
         msg,
@@ -268,7 +269,7 @@ def canonical_remote_path(remote: str) -> Path:
     return Path(*components)
 
 
-def home_repositories(
+def home_submodules(
     root: Path,
     *,
     require_url: bool = True,
@@ -381,7 +382,7 @@ def _allow_home_submodule(root: Path, relative: Path, *, dry_run: bool = False) 
     return changed
 
 
-def _converge_home_repository(
+def _converge_home_submodule(
     root: Path,
     repository: dict[str, str],
     expected: Path,
@@ -449,7 +450,7 @@ def _converge_home_repository(
         if not dry_run:
             git(root, ["submodule", "update", "--init", "--", str(expected)])
     if (checkout / ".git").exists():
-        changed |= _converge_home_checkout(
+        changed |= _sync_submodule_url(
             root,
             checkout,
             expected,
@@ -459,7 +460,7 @@ def _converge_home_repository(
     return changed
 
 
-def _converge_home_checkout(
+def _sync_submodule_url(
     root: Path,
     checkout: Path,
     expected: Path,
@@ -491,9 +492,9 @@ def _converge_home_checkout(
     return changed
 
 
-def check_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: FBT001
+def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: FBT001
     """Converge a canonical home repository."""
-    repositories = home_repositories(root)
+    repositories = home_submodules(root)
     actual_paths = [Path(repository["path"]) for repository in repositories]
     expected_paths = [
         canonical_remote_path(repository["url"]) for repository in repositories
@@ -522,7 +523,7 @@ def check_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: FBT0
     for expected in expected_paths:
         changed |= _allow_home_submodule(root, expected, dry_run=dry_run)
     for repository, expected in zip(repositories, expected_paths, strict=True):
-        changed |= _converge_home_repository(
+        changed |= _converge_home_submodule(
             root,
             repository,
             expected,
@@ -1281,28 +1282,28 @@ def _python_static_template_issues(package: Package, source: str) -> list[str]:
     ]
 
 
-def _binding_value(source: str, name: str, kind: str) -> str | None:
-    """Extract one permitted template binding expression."""
-    escaped = re.escape(name)
-    patterns = {
-        "list": rf"(?s)(?<![\w.]){escaped}\s*=\s*(\[.*?\])\s*;",
-        "string": (
-            rf"(?s)(?<![\w.]){escaped}\s*=\s*"
-            r"""((?:"(?:\\.|[^"\\])*"|''.*?''))\s*;"""
+def _template_binding(document: nix_syntax.Document, name: str) -> Node | None:
+    """Find an outer template binding without interpreting comments or inner scopes."""
+    container = document.root
+    while container.type in {"function_expression", "parenthesized_expression"}:
+        container = nix_syntax.field(
+            container,
+            "body" if container.type == "function_expression" else "expression",
+        )
+    if container.type != "let_expression":
+        return None
+    bindings = next(
+        (child for child in container.named_children if child.type == "binding_set"),
+        None,
+    )
+    return next(
+        (
+            nix_syntax.field(binding, "expression")
+            for binding in ([] if bindings is None else bindings.named_children)
+            if (attrpath := nix_syntax.field(binding, "attrpath")) is not None
+            and nix_syntax.static_attrpath(document, attrpath) == (name,)
         ),
-    }
-    match = re.search(patterns[kind], source)
-    return match.group(1) if match else None
-
-
-def _replace_binding(source: str, name: str, value: str) -> str:
-    """Replace one binding expression in a generated template."""
-    escaped = re.escape(name)
-    return re.sub(
-        rf"(?s)((?<![\w.]){escaped}\s*=\s*)(?:\[.*?\]|\"(?:\\.|[^\"\\])*\"|''.*?'')(\s*;)",
-        lambda match: match.group(1) + value + match.group(2),
-        source,
-        count=1,
+        None,
     )
 
 
@@ -1480,10 +1481,15 @@ def _python_required_edits(
     template = scaffold("python", package.name, None)[
         Path("packages") / package.name / "default.nix"
     ]
-    install_phase = _binding_value(template, "installPhase", "string")
-    if install_phase is None:
+    template_document, install_expression = _metadata_expression(
+        template,
+        "installPhase",
+        (),
+    )
+    if install_expression is None:
         msg = "Python scaffold omitted its install phase"
         raise AssertionError(msg)
+    install_phase = template_document.text(install_expression)
     executable = source_python_has_main(_read_regular(package.root / "main.py"))
     if not executable:
         install_phase = "\n".join(
@@ -1589,7 +1595,7 @@ def canonical_typed_default(package: Package) -> str | None:
             if package.kind == "python"
             else rendered
         )
-    nix_syntax.parse(source, str(package.root / "default.nix"))
+    document = nix_syntax.parse(source, str(package.root / "default.nix"))
     if package.kind == "python":
         return _canonical_python_default(package, source)
     description = package_description(package)
@@ -1597,14 +1603,24 @@ def canonical_typed_default(package: Package) -> str | None:
         Path("packages") / package.name / "default.nix"
     ]
     fields = {
-        "html": (("runtimeDeps", "list"), ("prmInstall", "string")),
-        "latex": (("nativeDeps", "list"),),
+        "html": ("runtimeDeps", "prmInstall"),
+        "latex": ("nativeDeps",),
     }[package.kind]
-    for name, kind in fields:
-        value = _binding_value(source, name, kind)
-        if value is not None:
-            rendered = _replace_binding(rendered, name, value)
-    return rendered
+    template_document = nix_syntax.parse(rendered)
+    edits = []
+    for name in fields:
+        expression = _template_binding(document, name)
+        target = _template_binding(template_document, name)
+        if expression is not None and target is not None:
+            edits.append(
+                (
+                    target.start_byte,
+                    target.end_byte,
+                    document.text(expression).encode(),
+                ),
+            )
+    result: bytes = nix_syntax.apply_edits(rendered.encode(), edits)
+    return result.decode()
 
 
 def _write_managed_nix(
@@ -1794,7 +1810,7 @@ def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool: 
     return changed
 
 
-def check_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
+def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
     """Converge required files, structure, templates, and root whitelist."""
     missing = [
         name
@@ -2255,7 +2271,7 @@ def initialize_submodule(remote: str) -> None:
     _allow_home_submodule(home, relative)
     registered = any(
         Path(repository["path"]) == relative and repository["url"] == remote
-        for repository in home_repositories(home)
+        for repository in home_submodules(home)
     )
     indexed = git(home, ["ls-files", "--stage", "--", str(relative)]).stdout
     if (
@@ -2466,7 +2482,7 @@ def _print_repository_test_names(root: Path) -> bool:
     return success
 
 
-def _test_names_git_output(arguments: list[str], *, data: bytes | None = None) -> bytes:
+def _git_output(arguments: list[str], *, data: bytes | None = None) -> bytes:
     """Read Git output while preserving its diagnostics and failures."""
     return subprocess.run(  # noqa: S603
         ["git", *arguments],  # noqa: S607
@@ -2476,7 +2492,7 @@ def _test_names_git_output(arguments: list[str], *, data: bytes | None = None) -
     ).stdout
 
 
-def _test_names_git_arguments(arguments: list[str]) -> tuple[list[str], list[str]]:
+def _textconv_git_arguments(arguments: list[str]) -> tuple[list[str], list[str]]:
     """Separate Git options/revisions from explicit path filters."""
     separator = arguments.index("--") if "--" in arguments else len(arguments)
     options = arguments[:separator]
@@ -2495,7 +2511,7 @@ def _test_names_git_arguments(arguments: list[str]) -> tuple[list[str], list[str
     return options, paths
 
 
-def _check_test_names_diff_attributes(
+def _check_textconv_attributes(
     configuration: list[str],
     paths: bytes,
     driver_name: str = "python-test-names",
@@ -2503,7 +2519,7 @@ def _check_test_names_diff_attributes(
     """Refuse attribute overrides that would expose unconverted source."""
     if not paths:
         return
-    attributes = _test_names_git_output(
+    attributes = _git_output(
         [*configuration, "check-attr", "-z", "--stdin", "diff"],
         data=paths,
     ).split(b"\0")
@@ -2514,7 +2530,7 @@ def _check_test_names_diff_attributes(
             raise ValueError(message)
 
 
-def _test_names_diff_paths(raw: bytes) -> bytes:
+def _textconv_diff_paths(raw: bytes) -> bytes:
     """Collect raw diff paths and reject modes that bypass Git's textconv."""
     paths = []
     for field in raw.split(b"\0"):
@@ -2534,25 +2550,23 @@ def _test_names_diff_paths(raw: bytes) -> bytes:
     return b"\0".join(paths) + (b"\0" if paths else b"")
 
 
-def _print_test_names_git(
+def _print_git_textconv(
     command: str,
     arguments: list[str],
     *,
     package_args: bool = False,
 ) -> int:
     """Let Git compare test sentences using an invocation-local textconv driver."""
-    options, paths = _test_names_git_arguments(arguments)
+    options, paths = _textconv_git_arguments(arguments)
     if command == "show":
-        revisions = _test_names_git_output(
+        revisions = _git_output(
             ["rev-parse", "--revs-only", "--no-flags", *options],
         )
         for revision in revisions.decode().splitlines():
-            _test_names_git_output(
+            _git_output(
                 ["rev-parse", "--verify", revision.lstrip("^") + "^{commit}"],
             )
-    root = (
-        _test_names_git_output(["rev-parse", "--show-toplevel"]).decode().rstrip("\n")
-    )
+    root = _git_output(["rev-parse", "--show-toplevel"]).decode().rstrip("\n")
     view = ["args"] if package_args else ["test", "names"]
     driver = "python-package-args" if package_args else "python-test-names"
     filename = "main.py" if package_args else "test_main.py"
@@ -2571,7 +2585,7 @@ def _print_test_names_git(
             f"diff.{driver}.cachetextconv=false",
         ]
         filters = [*paths, f":(top,exclude,attr:!{driver})**"]
-        discovery = _test_names_git_output(
+        discovery = _git_output(
             [
                 *configuration,
                 command,
@@ -2590,9 +2604,9 @@ def _print_test_names_git(
                 *filters,
             ],
         )
-        _check_test_names_diff_attributes(
+        _check_textconv_attributes(
             ["-C", root, *configuration],
-            _test_names_diff_paths(discovery),
+            _textconv_diff_paths(discovery),
             driver,
         )
         return subprocess.run(  # noqa: S603
@@ -2613,7 +2627,7 @@ def _print_test_names_git(
 def _run_test_names(arguments: list[str]) -> int:
     """Dispatch Git views separately from the original listing interface."""
     if arguments and arguments[0] in {"diff", "show"}:
-        return _print_test_names_git(arguments[0], arguments[1:])
+        return _print_git_textconv(arguments[0], arguments[1:])
     if arguments[:1] == ["_textconv"]:
         converter_parser = argparse.ArgumentParser(
             prog="canonical test names _textconv",
@@ -2676,24 +2690,6 @@ class CliEntry:
 def source_package_args(source: bytes, filename: str) -> list[str]:
     """Render the static CLI contract in the established text format."""
     return [entry.render() for entry in source_package_cli(source, filename)]
-
-
-def package_cli(package: Path) -> list[CliEntry]:
-    """Read a package's static CLI contract, retaining discovery diagnostics."""
-    source = _read_regular(package / "main.py")
-    return source_cli_overview(source)
-
-
-def source_cli_overview(source: str | None) -> list[CliEntry]:
-    """Summarize a CLI, including absent or unsupported interfaces."""
-    if not source:
-        return [CliEntry((), "(not applicable)")]
-    try:
-        return source_package_cli(source.encode(), "main.py") or [
-            CliEntry((), "(none)"),
-        ]
-    except (SyntaxError, ValueError) as error:
-        return [CliEntry((), f"(unavailable: {error})")]
 
 
 def _source_argparse_args(source: bytes, filename: str) -> list[CliEntry]:  # noqa: C901, PLR0915
@@ -3838,11 +3834,6 @@ def render_resource_overview(data: ResourceData) -> str:
     )
 
 
-def source_package_overview(name: str, files: dict[str, str]) -> str:
-    """Render a package's source facts in the established terminal format."""
-    return render_resource_overview(source_resource_data(name, files))
-
-
 def package_overview(package: Path) -> str:
     """Read and summarize one package's conventional source inventory."""
     data = resource_data(package)
@@ -4055,7 +4046,7 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
     repositories = [(".", target)]
     if current_type == "home":
         repositories = []
-        for repository in home_repositories(target, require_url=False):
+        for repository in home_submodules(target, require_url=False):
             scope = repository["path"]
             checkout = (target / scope).resolve()
             if not checkout.is_relative_to(target):
@@ -4200,7 +4191,7 @@ def _run_overview(target: Path, *, full: bool) -> None:
     """Show a package catalog or the complete summary of one package."""
     if (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
         found = False
-        for repository in home_repositories(target, require_url=False):
+        for repository in home_submodules(target, require_url=False):
             relative = repository["path"]
             checkout = target / relative
             if not (checkout / "flake.nix").is_file():
@@ -4263,7 +4254,7 @@ def _print_package_args(package: Path) -> None:
 def _run_package_args(arguments: list[str]) -> int:
     """List argument declarations or compare them through Git."""
     if arguments and arguments[0] in {"diff", "show"}:
-        return _print_test_names_git(arguments[0], arguments[1:], package_args=True)
+        return _print_git_textconv(arguments[0], arguments[1:], package_args=True)
     cli = argparse.ArgumentParser(
         prog="canonical args",
         description=(
@@ -4322,7 +4313,7 @@ def _run_package_args(arguments: list[str]) -> int:
     return status
 
 
-def _dispatch_test_names(arguments: list[str], *, package_args: bool = False) -> None:
+def _dispatch_source_view(arguments: list[str], *, package_args: bool = False) -> None:
     """Report errors consistently for listing, conversion and Git commands."""
     label = "args" if package_args else "test names"
     try:
@@ -5276,7 +5267,7 @@ def main() -> None:
     arguments = _normalize_help_arguments(sys.argv[1:])
     package_args = arguments[:1] == ["args"]
     if package_args or arguments[:2] == ["test", "names"]:
-        _dispatch_test_names(
+        _dispatch_source_view(
             arguments[1:] if package_args else arguments[2:],
             package_args=package_args,
         )
@@ -5297,10 +5288,10 @@ def main() -> None:
                 msg,
             )
         if options.command == "converge":
-            check_home(
+            converge_home(
                 root,
                 options.dry_run,
-            ) if current_type == "home" else check_flake(
+            ) if current_type == "home" else converge_flake(
                 root,
                 options.dry_run,
             )

@@ -19,6 +19,7 @@ import stat
 import subprocess
 import tempfile
 import webbrowser
+from collections.abc import AsyncIterator, Awaitable, Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, replace
@@ -26,11 +27,12 @@ from datetime import UTC, datetime
 from difflib import unified_diff
 from html import escape
 from http import HTTPStatus
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
+from threading import Lock
 from typing import Any, Self
-from urllib.parse import parse_qs, urlencode, urlsplit
+from urllib.parse import urlencode
 
+import uvicorn
 from canonical import (
     CliEntry,
     ResourceData,
@@ -38,14 +40,16 @@ from canonical import (
     command_catalog,
     overview_data,
     repository_type,
-    resource_data,
     source_resource_data,
 )
 from canonical import CommandError as CanonicalError
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, StrictStr
 
 MAX_PORT = 65535
 MOUNT_FIELDS = 3
-EMPTY_ENTRIES = {"(none)", "(not applicable)", "(not declared)"}
 OUTPUT_DIFF_TIMEOUT = 120
 OUTPUT_TEXT_LIMIT = 65536
 ACTION_BODY_LIMIT = 16384
@@ -63,6 +67,9 @@ class TreeNode:  # noqa: D101
     output_diff: str | None = None
     text_diff: str | None = None
     expandable: bool = False
+    field: str | None = None
+    value: str | None = None
+    lines: int | None = None
 
 
 @dataclass
@@ -391,14 +398,13 @@ def output_diff_page(comparison: OutputComparison) -> bytes:
 
 
 class RepositoryBrowser:
-    """Read directory-scoped Canonical data with cached source snapshots."""
+    """Cache source declarations and scope them to the requested directory."""
 
     def __init__(self, cwd: str | Path | None = None) -> None:
         """Start browsing at the given directory."""
         self.cwd = Path(cwd or Path.cwd()).resolve()
         self.snapshot: dict[str, Any] = {}
-        self.status = ""
-        self.source_snapshots: dict[Path, tuple[dict[str, Any], str]] = {}
+        self.source_snapshots: dict[Path, dict[str, Any]] = {}
 
     def refresh(self) -> None:
         """Discard cached declarations and rebuild the current snapshot."""
@@ -406,323 +412,186 @@ class RepositoryBrowser:
         self.load()
 
     def load(self) -> None:
-        """Scope cached declarations to the current directory."""
-        root = browser_root(self.cwd)
+        """Scope cached declarations without changing the source snapshot."""
+        root = canonical_root(self.cwd)
         if root not in self.source_snapshots:
-            snapshot, _ = browser_snapshot(root)
-            self.source_snapshots[root] = deepcopy(snapshot), ""
-        snapshot, self.status = deepcopy(self.source_snapshots[root])
-        self.snapshot, _ = scope_snapshot(snapshot, self.cwd)
+            self.source_snapshots[root] = browser_snapshot(root)
+        self.snapshot = scope_snapshot(deepcopy(self.source_snapshots[root]), self.cwd)
 
-    def package_entries(self, *, diff: bool = False) -> list[TreeNode]:
-        """Build a collapsible package tree with high-level changes."""
-        try:
-            current = overview_data(self.cwd)
-            previous = overview_data(self.cwd, revision="HEAD")
-        except CanonicalError as exc:
-            self.status = str(exc)
-            return []
-        validate_overview(current)
-        validate_overview(previous)
-        records = merge_overviews(current, previous)["nodes"]
-        tree: dict[str, Any] = {}
-        for record in records:
-            if record["kind"] != "package":
+
+def cli_tree(current: list[CliEntry], previous: list[CliEntry]) -> list[TreeNode]:
+    """Nest interface changes by their declared command paths."""
+    roots: list[TreeNode] = []
+    commands: dict[tuple[str, ...], TreeNode] = {}
+    old, new = set(previous), set(current)
+    entries: list[tuple[CliEntry, str | None]] = [
+        (entry, "removed") for entry in previous if entry not in new
+    ]
+    entries.extend((entry, None if entry in old else "added") for entry in current)
+    for entry, change in entries:
+        children = roots
+        for depth, name in enumerate(entry.path, 1):
+            path = entry.path[:depth]
+            if path not in commands:
+                commands[path] = TreeNode(name, [])
+                children.append(commands[path])
+            node = commands[path]
+            children = node.children if node.children is not None else []
+        prefix = "- " if change == "removed" else "+ " if change == "added" else ""
+        if entry.command:
+            node.title = prefix + entry.path[-1]
+            node.change = change
+        else:
+            children.append(TreeNode(prefix + entry.text, change=change))
+    return roots
+
+
+def resource_entry(record: dict[str, Any]) -> TreeNode:  # noqa: C901
+    """Render source facts directly under their files, using structured identities."""
+    current = record["details"]
+    previous = record.get("previous_details", current)
+    files = {
+        source["path"]: TreeNode(
+            source["path"],
+            [TreeNode(f"(unavailable: {source['diagnostic']})", warning=True)]
+            if source["diagnostic"]
+            else [],
+            source_file=True,
+            lines=source["lines"],
+        )
+        for source in current["sources"]
+    }
+
+    def source(name: str) -> TreeNode:
+        return files.setdefault(name, TreeNode(name, [], source_file=True))
+
+    def fields(key: str, label: str | None = None) -> list[TreeNode]:
+        before = previous[key] if previous["sources"] else None
+        after = current[key] if current["sources"] else None
+        values = (
+            [(after, None)]
+            if before == after
+            else [(before, "removed"), (after, "added")]
+        )
+        rows = []
+        for value, change in values:
+            if value is None:
                 continue
-            entry = self.resource_entry(record)
-            if diff:
-                entry.children = self.changed_nodes(entry.children or [])
-                if not entry.children and entry.change is None:
-                    continue
-            branch = tree
-            for part in Path(record["repository"]).parts:
-                branch = branch.setdefault(part, {})
-            branch.setdefault("", []).append(entry)
+            title = f"{label}: {value}" if label else value
+            prefix = "- " if change == "removed" else "+ " if change == "added" else ""
+            rows.append(TreeNode(prefix + title, change=change, field=key, value=value))
+        return rows
 
-        def nodes(branch: dict[str, Any]) -> list[TreeNode]:
-            result = []
-            for name, children in sorted(branch.items()):
-                if name == "":
-                    result.extend(children)
-                else:
-                    result.append(TreeNode(name, nodes(children)))
-            return result
+    metadata = fields("name", "Name") + fields("description", "Description")
+    documentation = fields("help")
+    if documentation:
+        source("main.py").children = documentation + (source("main.py").children or [])
 
-        return nodes(tree)
-
-    def package_entry(
-        self,
-        root: Path,
-        name: str,
-        *,
-        diff: bool,
-        only_changes: bool = False,
-    ) -> TreeNode | None:
-        """Build one package summary or its high-level changes."""
-        directory = root / "packages" / name
-        current = resource_data(directory)
-        if not diff:
-            return TreeNode(
-                f"packages/{name}",
-                self.details_tree(current) if current["sources"] else None,
-            )
-        snapshot = overview_data(root, revision="HEAD")
-        validate_overview(snapshot)
-        previous = next(
-            (
-                record["details"]
-                for record in snapshot["nodes"]
-                if record["id"] == f".:packages/{name}"
-            ),
-            source_resource_data(name, {}),
-        )
-        summary_tree = self.merged_details_tree(previous, current)
-        if only_changes:
-            summary_tree = self.changed_nodes(summary_tree)
-            if not summary_tree:
-                return None
-        return TreeNode(f"packages/{name}", summary_tree or None)
-
-    @classmethod
-    def resource_entry(cls, record: dict[str, Any]) -> TreeNode:
-        """Render a resource identity and its structured source comparison."""
-        current = record.get(
-            "details",
-            source_resource_data(record["name"], {}, path=record["path"]),
-        )
-        previous = record.get("previous_details")
-        children = (
-            cls.merged_details_tree(previous, current)
-            if previous is not None
-            else cls.details_tree(current)
-        )
-        return TreeNode(record["path"], children, change=record.get("change"))
-
-    @classmethod
-    def changed_nodes(cls, nodes: list[TreeNode]) -> list[TreeNode]:
-        """Keep changed fields and their ancestors in a diff-only tree."""
-        result = []
-        for node in nodes:
-            children = (
-                cls.changed_nodes(node.children) if node.children is not None else None
-            )
-            if node.change is not None or children:
-                result.append(replace(node, children=children))
-        return result
-
-    @staticmethod
-    def details_tree(
-        data: ResourceData,
-        *,
-        cli: list[CliEntry] | None = None,
-    ) -> list[TreeNode]:
-        """Render source facts without parsing the terminal overview."""
-        return RepositoryBrowser.merged_details_tree(data, data, current_cli=cli)
-
-    @classmethod
-    def merged_details_tree(
-        cls,
-        previous: ResourceData,
-        current: ResourceData,
-        *,
-        previous_cli: list[CliEntry] | None = None,
-        current_cli: list[CliEntry] | None = None,
-    ) -> list[TreeNode]:
-        """Show changes to structured facts at their existing field positions."""
-        result = []
-        for field, old, new, fallback in (
-            ("Name", previous["name"], current["name"], ""),
-            (
-                "Description",
-                previous["description"],
-                current["description"],
-                "(not declared)",
-            ),
-            (
-                "Help",
-                previous["help"],
-                current["help"],
-                "(module docstring not declared)",
-            ),
-        ):
-            before = f"{field}: {old or fallback}" if previous["sources"] else None
-            after = f"{field}: {new or fallback}" if current["sources"] else None
-            if before == after:
-                if after is not None:
-                    result.append(TreeNode(after))
-            else:
-                if before is not None:
-                    result.append(TreeNode(f"- {before}", change="removed"))
-                if after is not None:
-                    result.append(TreeNode(f"+ {after}", change="added"))
-        for group in ("Arguments", "Dependencies", "Tests", "Suppressions"):
-            old_entries = cls.detail_group(previous, group)
-            new_entries = cls.detail_group(current, group)
-            children = [
-                TreeNode(f"- {item}", change="removed")
-                for item in old_entries
-                if item not in new_entries
+    def suppressions(data: ResourceData) -> dict[tuple[str, str, str], int]:
+        return {
+            (item["path"], suppression["kind"], suppression["scope"]): suppression[
+                "count"
             ]
-            children.extend(
-                TreeNode(
-                    item if item in old_entries else f"+ {item}",
-                    change=None if item in old_entries else "added",
-                    warning=item.startswith("(unavailable:"),
-                )
-                for item in new_entries
-            )
-            if group == "Suppressions":
-                children = cls.suppression_tree(previous, current)
-            if group == "Arguments":
-                children = cls.cli_tree(
-                    cls.cli_entries(current) if current_cli is None else current_cli,
-                    previous=cls.cli_entries(previous)
-                    if previous_cli is None
-                    else previous_cli,
-                )
-            children = cls.declared_children(children)
-            if children:
-                result.append(TreeNode(group, children))
-        return result
+            for item in data["sources"]
+            for suppression in item["suppressions"]
+        }
 
-    @staticmethod
-    def declared_children(children: list[TreeNode]) -> list[TreeNode]:
-        """Omit empty declarations while retaining diagnostics and actual changes."""
-        return [
-            child
-            for child in children
-            if child.title.removeprefix("- ").removeprefix("+ ") not in EMPTY_ENTRIES
-        ]
-
-    @classmethod
-    def suppression_tree(
-        cls,
-        previous: ResourceData,
-        current: ResourceData,
-    ) -> list[TreeNode]:
-        """Group suppression counts and their changes beneath each source filename."""
-
-        def counts(data: ResourceData) -> dict[tuple[str, str, str], int]:
-            return {
-                (source["path"], item["kind"], item["scope"]): item["count"]
-                for source in data["sources"]
-                for item in source["suppressions"]
-            }
-
-        before, after = counts(previous), counts(current)
-        files: dict[str, list[TreeNode]] = {}
-        for key in sorted(before.keys() | after.keys()):
-            old, new = before.get(key, 0), after.get(key, 0)
-            filename, kind, scope = key
-            kind = f"{kind} ({scope})"
-            children = files.setdefault(filename, [])
-            if old == new:
-                children.append(TreeNode(f"{kind}: {new}"))
-            else:
-                change = "added" if old == 0 else "removed" if new == 0 else "modified"
-                children.append(TreeNode(f"{kind}: {old} → {new}", change=change))
-        return [
-            TreeNode(filename, children) for filename, children in files.items()
-        ] or [
-            TreeNode("(none)"),
-        ]
-
-    @staticmethod
-    def cli_tree(
-        current: list[CliEntry],
-        *,
-        previous: list[CliEntry] | None = None,
-    ) -> list[TreeNode]:
-        """Nest CLI entries by their source-discovered command paths."""
-        roots: list[TreeNode] = []
-        commands: dict[tuple[str, ...], TreeNode] = {}
-        old = set(previous or [])
-        new = set(current)
-        entries: list[tuple[CliEntry, str | None]] = [
-            (entry, "removed") for entry in previous or [] if entry not in new
-        ]
-        entries.extend(
-            (entry, "added" if previous is not None and entry not in old else None)
-            for entry in current
+    old, new = suppressions(previous), suppressions(current)
+    for filename, kind, scope in sorted(old.keys() | new.keys()):
+        before, after = (
+            old.get((filename, kind, scope), 0),
+            new.get((filename, kind, scope), 0),
         )
-        for entry, change in entries:
-            children = roots
-            for depth, name in enumerate(entry.path, 1):
-                path = entry.path[:depth]
-                if path not in commands:
-                    node = TreeNode(name, [])
-                    commands[path] = node
-                    children.append(node)
-                node = commands[path]
-                children = node.children if node.children is not None else []
-            prefix = "" if change is None else {"removed": "- ", "added": "+ "}[change]
-            if entry.command:
-                node.title = prefix + entry.path[-1]
-                node.change = change
-            else:
-                children.append(
-                    TreeNode(
-                        prefix + entry.text,
-                        change=change,
-                        warning=entry in new and entry.text.startswith("(unavailable:"),
-                    ),
-                )
-        return roots
+        change = (
+            None
+            if before == after
+            else "added"
+            if not before
+            else "removed"
+            if not after
+            else "modified"
+        )
+        title = f"{kind} ({scope}): " + (
+            str(after) if change is None else f"{before} → {after}"
+        )
+        parent = source(filename)
+        parent.children = [
+            *(parent.children or []),
+            TreeNode(title, change=change, field="suppressions"),
+        ]
 
-    @staticmethod
-    def cli_entries(data: ResourceData) -> list[CliEntry]:
-        """Adapt the shared command records to the browser's nested rendering."""
-        if error := data["diagnostics"].get("cli"):
-            return [CliEntry((), f"(unavailable: {error})")]
+    def cli(data: ResourceData) -> list[CliEntry]:
         return [
             CliEntry(tuple(row["path"]), row["text"], row["command"])
             for row in data["cli"]
         ]
 
-    @staticmethod
-    def detail_group(data: ResourceData, name: str) -> list[str]:
-        """Format a structured group only when creating display nodes."""
-        key = {
-            "Arguments": "cli",
-            "Dependencies": "dependencies",
-            "Tests": "tests",
-        }.get(name)
-        if key and (error := data["diagnostics"].get(key)):
-            return [f"(unavailable: {error})"]
-        if name == "Arguments":
-            return [entry.render() for entry in RepositoryBrowser.cli_entries(data)]
-        if name == "Dependencies":
-            return [
-                f"{item['kind']}: {item['target']}" for item in data["dependencies"]
+    for key, title, filename in (
+        ("cli", "Arguments", "main.py"),
+        ("tests", "Tests", "test_main.py"),
+        ("dependencies", "Dependencies", current["dependency_source"]),
+    ):
+        if error := current["diagnostics"].get(key):
+            children = [TreeNode(f"(unavailable: {error})", warning=True)]
+        elif key == "cli":
+            children = cli_tree(cli(current), cli(previous))
+        else:
+            previous_values = (
+                [f"{item['kind']}: {item['target']}" for item in previous[key]]
+                if key == "dependencies"
+                else previous[key]
+            )
+            current_values = (
+                [f"{item['kind']}: {item['target']}" for item in current[key]]
+                if key == "dependencies"
+                else current[key]
+            )
+            children = [
+                TreeNode(f"- {item}", change="removed")
+                for item in previous_values
+                if item not in current_values
             ]
-        return data["tests"] if name == "Tests" else []
-
-    @staticmethod
-    def package_data(name: str, files: dict[str, str]) -> ResourceData:
-        """Use the backend's structured analysis for source snapshots."""
-        return source_resource_data(name, files)
-
-    @classmethod
-    def has_warning(cls, node: TreeNode) -> bool:
-        """Show diagnostics even when their parent groups are collapsed."""
-        return node.warning or any(
-            cls.has_warning(child) for child in node.children or []
-        )
+            children.extend(
+                TreeNode(
+                    item if item in previous_values else f"+ {item}",
+                    change=None if item in previous_values else "added",
+                )
+                for item in current_values
+            )
+        if children:
+            parent = source(filename)
+            parent.children = [
+                *(parent.children or []),
+                TreeNode(title, children, field=key),
+            ]
+    tree = TreeNode(
+        record["path"],
+        [*metadata, *(files[name] for name in sorted(files))],
+        change=record.get("change"),
+        resource_id=record["id"],
+    )
+    if record["kind"] == "host":
+        tree.children = [TreeNode("OS: NixOS (configuration)"), *(tree.children or [])]
+    return tree
 
 
 def serialize_node(node: TreeNode) -> dict[str, Any]:
     """Serialize source details and semantic changes for the web browser."""
+    children = [serialize_node(child) for child in node.children or []]
     return {
         "title": node.title,
         "change": node.change,
-        "warning": node.warning,
+        "warning": node.warning or any(child["warning"] for child in children),
         "resource_id": node.resource_id,
         "source_file": node.source_file,
         "output_diff": node.output_diff,
         "text_diff": node.text_diff,
         "expandable": node.expandable,
         "directory": str(node.directory) if node.directory is not None else None,
-        "children": [serialize_node(child) for child in node.children or []],
+        "field": node.field,
+        "value": node.value,
+        "lines": node.lines,
+        "children": children,
     }
 
 
@@ -859,44 +728,6 @@ def merge_overviews(
     return data
 
 
-def resource_tree(record: dict[str, Any], tree: TreeNode) -> TreeNode:
-    """Attach shared machine and OS details to a resource."""
-    tree.resource_id = record["id"]
-    if record["kind"] == "machine":
-        tree.title = f"Machine: {record['name']}"
-        tree.children = [TreeNode(detail) for detail in record["details"]]
-    elif record["kind"] == "host":
-        record["icon"] = "nixos"
-        tree.children = [TreeNode("OS: NixOS (configuration)"), *(tree.children or [])]
-    elif record["kind"] == "repository":
-        tree.title = record["repository"]
-        tree.children = [TreeNode(f"Repository type: {record.get('profile', 'flake')}")]
-    return tree
-
-
-def package_sources(directory: Path) -> list[TreeNode]:
-    """Render the backend's conventional source inventory."""
-    return source_nodes(resource_data(directory))
-
-
-def source_nodes(data: ResourceData) -> list[TreeNode]:
-    """Convert physical source records into browser detail rows."""
-    result = []
-    for source in data["sources"]:
-        if source["diagnostic"]:
-            children = [
-                TreeNode(f"(unavailable: {source['diagnostic']})", warning=True),
-            ]
-        else:
-            children = [TreeNode(f"Lines: {source['lines']}")]
-            children.extend(
-                TreeNode(f"{item['kind']} ({item['scope']}): {item['count']}")
-                for item in source["suppressions"]
-            )
-        result.append(TreeNode(source["path"], children, source_file=True))
-    return result
-
-
 def directory_disk_size(directory: Path) -> int:
     """Measure allocated bytes once per inode without following symbolic links."""
     seen = set()
@@ -1009,7 +840,7 @@ def output_tree(output: Path, previous: Path | None, current: Path) -> TreeNode:
         title = (
             "tmp/" if relative == Path() else relative.name + ("/" if directory else "")
         )
-        node = TreeNode(title, expandable=directory)
+        node = TreeNode(title, expandable=directory, field="tmp")
         if after != "missing" and new is not None and not new.is_symlink():
             with contextlib.suppress(ValueError, OSError):
                 _, node.directory = output_path(str(output / relative))
@@ -1046,105 +877,15 @@ def output_tree(output: Path, previous: Path | None, current: Path) -> TreeNode:
     return build(Path())
 
 
-def ordered_source(source: TreeNode, documentation: list[TreeNode]) -> TreeNode:
-    """Place source documentation and counters before interfaces and dependencies."""
-    children = sorted(
-        source.children or [],
-        key=lambda child: (
-            child not in documentation,
-            not child.title.startswith("Lines:"),
-            not re.search(r"\((?:local|global)\):", child.title),
-        ),
-    )
-    return replace(source, children=children)
-
-
-def package_file_tree(  # noqa: C901 - move each declaration to its source file
-    directory: Path,
-    tree: TreeNode,
-    sources: list[TreeNode] | None = None,
-    *,
-    dependency_source: str = "default.nix",
-) -> TreeNode:
-    """Organize declarations beneath their source files, preserving semantic diffs."""
-    files = {
-        node.title: node
-        for node in (package_sources(directory) if sources is None else sources)
-    }
-    fields = []
-    documentation = []
-
-    def source(name: str) -> TreeNode:
-        return files.setdefault(name, TreeNode(name, [], source_file=True))
-
-    def attach(name: str, node: TreeNode) -> None:
-        parent = source(name)
-        parent.children = [
-            *(child for child in parent.children or [] if child.title != node.title),
-            node,
-        ]
-
-    for node in tree.children or []:
-        title = node.title.removeprefix("- ").removeprefix("+ ")
-        if title.startswith("Language:"):
-            continue
-        if node.title == "Suppressions":
-            for file in node.children or []:
-                for suppression in file.children or []:
-                    parent = source(file.title)
-                    key = suppression.title.partition("):")[0]
-                    children = parent.children or []
-                    matching = next(
-                        (
-                            index
-                            for index, child in enumerate(children)
-                            if child.title.partition("):")[0] == key
-                        ),
-                        None,
-                    )
-                    if matching is None:
-                        children.append(suppression)
-                    else:
-                        children[matching] = suppression
-                    parent.children = children
-        elif node.title in {"Arguments", "Tests", "Dependencies"}:
-            name = {
-                "Arguments": "main.py",
-                "Tests": "test_main.py",
-                "Dependencies": dependency_source,
-            }[node.title]
-            attach(name, node)
-        elif title.startswith("Help:"):
-            if title != "Help: (module docstring not declared)":
-                node.title = node.title.replace("Help: ", "", 1)
-                documentation.append(node)
-        else:
-            fields.append(node)
-    if documentation:
-        parent = source("main.py")
-        parent.children = [*documentation, *(parent.children or [])]
-    tree.children = [
-        *fields,
-        *(ordered_source(files[name], documentation) for name in sorted(files)),
-    ]
-    tree.children.extend(package_storage(directory))
-    return tree
-
-
-def browser_snapshot(
-    root: Path,
-) -> tuple[dict[str, Any], list[TreeNode]]:
-    """Build the machine and repository model for the web browser."""
+def browser_snapshot(root: Path) -> dict[str, Any]:
+    """Build one source graph with a single detail tree per resource."""
     try:
         current = overview_data(root)
     except CanonicalError:
         if repository_type(root, "directory") != "directory":
             raise
         return directory_snapshot(root)
-    validate_overview(current)
-    previous = overview_data(root, revision="HEAD")
-    data = merge_overviews(current, previous)
-    resources: dict[str, TreeNode] = {}
+    data = merge_overviews(current, overview_data(root, revision="HEAD"))
     machine = machine_resource()
     data["machine"] = machine
     data["nodes"].insert(0, machine)
@@ -1154,68 +895,44 @@ def browser_snapshot(
         if node["kind"] == "host" and node["name"] == machine["name"]
     )
     for record in data["nodes"]:
-        identifier = record["id"]
-        tree = resource_tree(
-            record,
-            RepositoryBrowser.resource_entry(record)
-            if record["kind"] in {"package", "host", "check"}
-            else TreeNode(record["path"], [], change=record.get("change")),
-        )
-        if record["kind"] in {"package", "host", "check"}:
-            directory = root / record["repository"] / record["path"]
-            details = record["details"]
-            record["source_metrics"] = details["source_metrics"]
-            tree = package_file_tree(
-                directory,
-                tree,
-                source_nodes(details),
-                dependency_source=details["dependency_source"],
-            )
+        if record["kind"] not in {"package", "host", "check"}:
+            continue
+        if record["kind"] == "host":
+            record["icon"] = "nixos"
+        tree = resource_entry(record)
+        directory = root / record["repository"] / record["path"]
+        tree.children = [*(tree.children or []), *package_storage(directory)]
         links = [
             TreeNode(
                 f"{edge['kind']}: {edge['source']} → {edge['target']}",
                 change=edge.get("change"),
             )
             for edge in data["edges"]
-            if edge["target"] == identifier
+            if edge["target"] == record["id"]
             and edge["kind"] not in {"contains", "submodule"}
         ]
         if links:
-            tree.children = [*(tree.children or []), TreeNode("Connections", links)]
-        resources[identifier] = tree
+            tree.children = [
+                *(tree.children or []),
+                TreeNode("Connections", links, field="connections"),
+            ]
+        record["source_metrics"] = record["details"]["source_metrics"]
         record["tree"] = serialize_node(tree)
-    result = [resources[machine["id"]]]
-    for record in data["nodes"]:
-        if record["kind"] != "repository":
-            continue
-        tree = resources[record["id"]]
-        tree.children = [
-            *(tree.children or []),
-            *[
-                resources[node["id"]]
-                for node in data["nodes"]
-                if node["repository"] == record["repository"]
-                and node["kind"] not in {"machine", "repository"}
-            ],
-        ]
-        result.append(tree)
-    data["tree"] = [serialize_node(node) for node in result]
     data["root"] = str(root)
-    return data, result
-
-
-def gui_data(root: Path) -> dict[str, Any]:
-    """Return a directory-scoped machine and repository snapshot."""
-    viewer = RepositoryBrowser(root)
-    viewer.refresh()
-    data = viewer.snapshot
-    data["warning"] = viewer.status
     return data
 
 
-def browser_root(directory: Path) -> Path:
-    """Find the nearest Canonical source root for a directory-scoped view."""
-    return canonical_root(directory)
+def gui_data(
+    root: Path,
+    *,
+    browser: RepositoryBrowser | None = None,
+    refresh: bool = True,
+) -> dict[str, Any]:
+    """Return a scoped snapshot, reusing the server's source cache when provided."""
+    viewer = browser if browser is not None else RepositoryBrowser(root)
+    viewer.cwd = root
+    viewer.refresh() if refresh else viewer.load()
+    return viewer.snapshot
 
 
 def browser_parent(directory: Path) -> Path | None:
@@ -1225,49 +942,34 @@ def browser_parent(directory: Path) -> Path | None:
     return directory.parent
 
 
-def directory_snapshot(directory: Path) -> tuple[dict[str, Any], list[TreeNode]]:
-    """Show immediate directory containers outside a Canonical repository."""
-    children = [
-        child
-        for child in sorted(directory.iterdir())
-        if child.is_dir() and not child.name.startswith(".")
-    ]
-    nodes = [TreeNode(child.name, [], directory=child.resolve()) for child in children]
+def directory_snapshot(directory: Path) -> dict[str, Any]:
+    """Show directory containers outside a Canonical repository."""
     return {
         "root": str(directory),
         "machine": machine_resource(),
-        "parent": str(parent_directory)
-        if (parent_directory := browser_parent(directory))
-        else None,
+        "parent": str(parent) if (parent := browser_parent(directory)) else None,
         "nodes": [
             {
                 "id": f"{child.name}:directory",
-                "kind": "repository",
+                "kind": "directory",
                 "repository": child.name,
                 "path": ".",
-                "profile": "directory",
                 "directory": str(child.resolve()),
             }
-            for child in children
+            for child in sorted(directory.iterdir())
+            if child.is_dir() and not child.name.startswith(".")
         ],
         "edges": [],
-        "tree": [serialize_node(node) for node in nodes],
-    }, nodes
+    }
 
 
-def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct containment
-    data: dict[str, Any],
-    directory: Path,
-) -> tuple[dict[str, Any], list[TreeNode]]:
-    """Restrict resources to a directory and preserve navigable containment."""
+def scope_snapshot(data: dict[str, Any], directory: Path) -> dict[str, Any]:
+    """Restrict the graph to a directory without rebuilding its detail trees."""
     root = Path(data["root"])
     if not data["nodes"] or all(
-        record.get("profile") == "directory" for record in data["nodes"]
+        record["kind"] == "directory" for record in data["nodes"]
     ):
-        return data, [
-            TreeNode(record["repository"], [], directory=Path(record["directory"]))
-            for record in data["nodes"]
-        ]
+        return data
     nodes = []
     for record in data["nodes"]:
         repository = (root / record["repository"]).resolve()
@@ -1298,59 +1000,8 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
         if edge["source"] in known and edge["target"] in known
     ]
     data["root"] = str(directory)
-    data["parent"] = (
-        str(parent_directory)
-        if (parent_directory := browser_parent(directory))
-        else None
-    )
-    result: list[TreeNode] = []
-    containers: dict[str, TreeNode] = {}
-
-    def container(relative: Path) -> TreeNode:
-        key = str(relative)
-        if key not in containers:
-            node = TreeNode(
-                directory.name if key == "." else relative.name,
-                [],
-                directory=directory / relative,
-            )
-            containers[key] = node
-            siblings = result if key == "." else container(relative.parent).children
-            if siblings is not None:
-                siblings.append(node)
-        return containers[key]
-
-    for record in nodes:
-        if record["kind"] == "machine":
-            result.append(
-                TreeNode(
-                    record["tree"]["title"],
-                    [TreeNode(detail) for detail in record["details"]],
-                ),
-            )
-            continue
-        parent = container(Path(record["repository"]))
-        if record["kind"] == "repository":
-            continue
-
-        def deserialize(tree: dict[str, Any]) -> TreeNode:
-            return TreeNode(
-                tree["title"],
-                [deserialize(child) for child in tree["children"]],
-                change=tree["change"],
-                warning=tree["warning"],
-                resource_id=tree["resource_id"],
-                source_file=tree.get("source_file", False),
-                output_diff=tree.get("output_diff"),
-                text_diff=tree.get("text_diff"),
-                expandable=tree.get("expandable", False),
-                directory=Path(tree["directory"]) if tree.get("directory") else None,
-            )
-
-        if parent.children is not None:
-            parent.children.append(deserialize(record["tree"]))
-    data["tree"] = [serialize_node(node) for node in result]
-    return data, result
+    data["parent"] = str(parent) if (parent := browser_parent(directory)) else None
+    return data
 
 
 def output_path(requested: str) -> tuple[Path, Path]:
@@ -1598,86 +1249,134 @@ class CanonicalActions(PackageActions):
         )
 
 
-def gui_server(  # noqa: C901 - serve graph assets and package runtime output
-    root: Path,
-    port: int = 0,
-) -> HTTPServer:
-    """Serve the graph and output reports, retaining captures outside package output."""
+class ActionRequest(BaseModel):
+    """Validate the browser's command parameters without coercing their types."""
+
+    model_config = ConfigDict(extra="forbid")
+    package: StrictStr = ""
+    action: StrictStr = ""
+    args: StrictStr = ""
+
+
+def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
+    """Serve the browser with native ASGI routing, responses, and resource cleanup."""
     assets = Path(__file__).parent / "prm"
     outputs = OutputSnapshots()
     actions = PackageActions()
     commands = CanonicalActions()
-    routes = {
-        "/": ("index.html", "text/html; charset=utf-8"),
-        "/script.js": ("script.js", "text/javascript; charset=utf-8"),
-        "/g6.js": (
-            os.environ.get("CANONICAL_BROWSER_G6", "g6.js"),
-            "text/javascript; charset=utf-8",
-        ),
-        "/style.css": ("style.css", "text/css; charset=utf-8"),
-    }
+    browser = RepositoryBrowser(root)
+    lock = Lock()
 
-    def requested_data(query: str) -> dict[str, Any]:
-        parameters = parse_qs(query)
-        requested = parameters.get("directory", [str(root)])[0]
-        directory = Path(requested).resolve()
-        if not directory.is_dir():
-            msg = f"Directory not found: {directory}"
+    def requested_data(
+        directory: str | None = None,
+        *,
+        refresh: bool = False,
+    ) -> dict[str, Any]:
+        selected = Path(directory or root).resolve()
+        if not selected.is_dir():
+            msg = f"Directory not found: {selected}"
             raise ValueError(msg)
-        data = gui_data(directory)
-        outputs.observe(data, refresh=parameters.get("refresh") == ["1"])
-        actions.observe(data)
-        commands.observe(data)
-        return data
+        with lock:
+            data = gui_data(selected, browser=browser, refresh=refresh)
+            outputs.observe(data, refresh=refresh)
+            actions.observe(data)
+            commands.observe(data)
+            return data
 
-    class Handler(BaseHTTPRequestHandler):
-        def action_parameters(self) -> dict[str, str]:
-            """Read a small JSON object of string action parameters."""
-            length = int(self.headers.get("Content-Length", "0"))
+    @contextlib.asynccontextmanager
+    async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
+        try:
+            requested_data()
+            yield
+        finally:
+            actions.close()
+            commands.close()
+            outputs.close()
+
+    application = FastAPI(
+        lifespan=lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
+
+    @application.middleware("http")
+    async def local_requests(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if request.method == "POST" and request.url.path in {
+            "/api/action",
+            "/api/command",
+        }:
+            origin = request.headers.get("Origin")
+            port = request.scope["server"][1]
+            if (
+                origin is not None and origin != f"http://127.0.0.1:{port}"
+            ) or request.headers.get("Sec-Fetch-Site") == "cross-site":
+                return JSONResponse(
+                    {"error": "Local requests only"},
+                    status_code=HTTPStatus.FORBIDDEN,
+                )
+            try:
+                length = int(request.headers.get("Content-Length", "0"))
+            except ValueError:
+                length = 0
             if (
                 not 0 < length <= ACTION_BODY_LIMIT
-                or self.headers.get("Content-Type") != "application/json"
+                or request.headers.get("Content-Type") != "application/json"
             ):
-                msg = "Expected a bounded JSON request"
-                raise ValueError(msg)
-            parameters = json.loads(self.rfile.read(length))
-            if not isinstance(parameters, dict) or not all(
-                isinstance(value, str) for value in parameters.values()
-            ):
-                msg = "Action parameters must be strings"
-                raise ValueError(msg)
-            return parameters
+                return JSONResponse(
+                    {"error": "Expected a bounded JSON request"},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
+        response = await call_next(request)
+        response.headers.update(
+            {
+                "Cache-Control": "no-store",
+                "X-Content-Type-Options": "nosniff",
+                "Content-Security-Policy": (
+                    "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data:; object-src 'none'; frame-ancestors 'none'"
+                ),
+            },
+        )
+        return response
 
-        def action_response(self, *, start: bool) -> None:
-            """Serve local package actions through JSON requests."""
-            runner = commands if urlsplit(self.path).path == "/api/command" else actions
+    @application.exception_handler(RequestValidationError)
+    async def invalid_parameters(
+        _request: Request,
+        _error: RequestValidationError,
+    ) -> JSONResponse:
+        return JSONResponse(
+            {"error": "Invalid request parameters"},
+            status_code=HTTPStatus.BAD_REQUEST,
+        )
+
+    @application.get("/api/overview")
+    def overview(directory: str | None = None, refresh: str = "0") -> Response:
+        try:
+            return JSONResponse(requested_data(directory, refresh=refresh == "1"))
+        except (CanonicalError, ValueError, OSError) as exc:
+            return JSONResponse(
+                {"error": str(exc)},
+                status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
+
+    def action_response(
+        runner: PackageActions,
+        package: str,
+        parameters: ActionRequest | None = None,
+    ) -> Response:
+        with lock:
             try:
-                if start:
-                    origin = self.headers.get("Origin")
-                    if (
-                        origin is not None
-                        and origin != f"http://127.0.0.1:{server.server_port}"
-                    ) or self.headers.get("Sec-Fetch-Site") == "cross-site":
-                        self.send_error(HTTPStatus.FORBIDDEN, "Local requests only")
-                        return
-                    parameters = self.action_parameters()
-                    package = parameters.get("package", "")
-                    state = runner.start(
-                        package,
-                        parameters.get("action", ""),
-                        parameters.get("args", ""),
-                    )
-                else:
-                    package = parse_qs(urlsplit(self.path).query).get("package", [""])[
-                        0
-                    ]
-                    state = runner.status(package)
+                state = (
+                    runner.start(package, parameters.action, parameters.args)
+                    if parameters is not None
+                    else runner.status(package)
+                )
                 job = runner.jobs.get(package)
-                if (
-                    job is not None
-                    and job.process.poll() is not None
-                    and not job.observed
-                ):
+                if job is not None and state["state"] != "running" and not job.observed:
                     job.observed = True
                     comparison = outputs.comparisons.get(Path(package) / "tmp")
                     if comparison is not None:
@@ -1685,148 +1384,107 @@ def gui_server(  # noqa: C901 - serve graph assets and package runtime output
                             outputs.capture,
                             comparison,
                         )
-                content = json.dumps(state).encode()
-                status = HTTPStatus.OK
+                return JSONResponse(state)
             except (OSError, ValueError) as exc:
-                content = json.dumps({"error": str(exc)}).encode()
-                status = HTTPStatus.BAD_REQUEST
-            self.send_response(status)
-            self.send_header("Content-Type", "application/json; charset=utf-8")
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
-            self.wfile.write(content)
+                return JSONResponse(
+                    {"error": str(exc)},
+                    status_code=HTTPStatus.BAD_REQUEST,
+                )
 
-        def do_POST(self) -> None:
-            """Start package commands only through the action endpoint."""
-            if urlsplit(self.path).path in {"/api/action", "/api/command"}:
-                self.action_response(start=True)
-            else:
-                self.send_error(HTTPStatus.NOT_IMPLEMENTED)
+    @application.get("/api/action")
+    def package_status(package: str = "") -> Response:
+        return action_response(actions, package)
 
-        def do_GET(self) -> None:
-            """Return an allowlisted asset or a fresh repository snapshot."""
-            request = urlsplit(self.path)
-            route = request.path
-            status = HTTPStatus.OK
-            if route in {"/api/action", "/api/command"}:
-                self.action_response(start=False)
-                return
-            if route == "/output":
-                self.serve_output(parse_qs(request.query).get("path", [""])[0])
-                return
-            if route == "/output-diff":
-                requested = parse_qs(request.query).get("path", [""])[0]
-                comparison = outputs.comparisons.get(Path(requested))
-                if comparison is None:
-                    self.send_error(HTTPStatus.NOT_FOUND, "Output capture not found")
-                    return
-                content_type = "text/html; charset=utf-8"
-                try:
-                    comparison = outputs.entry_report(
-                        comparison,
-                        parse_qs(request.query).get("entry", [""])[0],
-                    )
-                    content = output_diff_page(comparison)
-                except (OSError, ValueError):
-                    self.send_error(HTTPStatus.NOT_FOUND, "Output report not found")
-                    return
-            elif route == "/api/overview":
-                content_type = "application/json; charset=utf-8"
-                try:
-                    content = json.dumps(requested_data(request.query)).encode()
-                except (CanonicalError, ValueError, OSError) as exc:
-                    status = HTTPStatus.INTERNAL_SERVER_ERROR
-                    content = json.dumps({"error": str(exc)}).encode()
-            elif route in routes:
-                filename, content_type = routes[route]
-                content = (assets / filename).read_bytes()
-            else:
-                self.send_error(HTTPStatus.NOT_FOUND)
-                return
-            self.send_response(status)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(len(content)))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header(
-                "Content-Security-Policy",
-                "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                "img-src 'self' data:; object-src 'none'; frame-ancestors 'none'",
-            )
-            self.end_headers()
-            self.wfile.write(content)
+    @application.post("/api/action")
+    def package_action(parameters: ActionRequest) -> Response:
+        return action_response(actions, parameters.package, parameters)
 
-        def serve_output(self, requested: str) -> None:
-            """Serve a package output listing or file for viewing in a browser tab."""
+    @application.get("/api/command")
+    def command_status(package: str = "") -> Response:
+        return action_response(commands, package)
+
+    @application.post("/api/command")
+    def command_action(parameters: ActionRequest) -> Response:
+        return action_response(commands, parameters.package, parameters)
+
+    @application.get("/output-diff")
+    def output_report(path: str = "", entry: str = "") -> Response:
+        with lock:
+            comparison = outputs.comparisons.get(Path(path))
+            if comparison is None:
+                return Response(
+                    "Output capture not found",
+                    status_code=HTTPStatus.NOT_FOUND,
+                )
             try:
-                root, target = output_path(requested)
-                if target.is_dir():
-                    diff_url = (
-                        "/output-diff?" + urlencode({"path": str(root)})
-                        if root in outputs.comparisons
-                        else None
-                    )
-                    content = output_index(root, target, diff_url)
-                    content_type = "text/html; charset=utf-8"
-                    length = len(content)
-                else:
-                    content = None
-                    content_type = (
-                        mimetypes.guess_type(target.name)[0]
-                        or "application/octet-stream"
-                    )
-                    length = target.stat().st_size
+                return HTMLResponse(
+                    output_diff_page(outputs.entry_report(comparison, entry)),
+                )
             except (OSError, ValueError):
-                self.send_error(HTTPStatus.NOT_FOUND, "Output not found")
-                return
-            self.send_response(HTTPStatus.OK)
-            self.send_header("Content-Type", content_type)
-            self.send_header("Content-Length", str(length))
-            self.send_header("Cache-Control", "no-store")
-            self.send_header("X-Content-Type-Options", "nosniff")
-            self.send_header(
-                "Content-Security-Policy",
-                "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-                "object-src 'none'; frame-ancestors 'none'",
+                return Response(
+                    "Output report not found",
+                    status_code=HTTPStatus.NOT_FOUND,
+                )
+
+    @application.api_route("/output", methods=["GET", "HEAD"])
+    def output(path: str = "") -> Response:
+        try:
+            output_root, target = output_path(path)
+            if target.is_dir():
+                diff_url = (
+                    "/output-diff?" + urlencode({"path": str(output_root)})
+                    if output_root in outputs.comparisons
+                    else None
+                )
+                return HTMLResponse(output_index(output_root, target, diff_url))
+            return FileResponse(
+                target,
+                media_type=mimetypes.guess_type(target.name)[0]
+                or "application/octet-stream",
             )
-            self.end_headers()
-            with contextlib.suppress(BrokenPipeError, ConnectionResetError):
-                if content is not None:
-                    self.wfile.write(content)
-                else:
-                    with target.open("rb") as stream:
-                        shutil.copyfileobj(stream, self.wfile)
+        except (OSError, ValueError):
+            return Response("Output not found", status_code=HTTPStatus.NOT_FOUND)
 
-        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
-            """Keep the launcher output focused on its URL."""
+    routes = {
+        "/": ("index.html", "text/html"),
+        "/script.js": ("script.js", "text/javascript"),
+        "/g6.js": (os.environ.get("CANONICAL_BROWSER_G6", "g6.js"), "text/javascript"),
+        "/icons.js": (
+            os.environ.get("CANONICAL_BROWSER_ICONS", "icons.js"),
+            "text/javascript",
+        ),
+        "/style.css": ("style.css", "text/css"),
+    }
 
-    class Server(HTTPServer):
-        def server_close(self) -> None:
-            """Finish output capture and release locks when this launch ends."""
-            super().server_close()
-            actions.close()
-            commands.close()
-            outputs.close()
+    @application.api_route("/", methods=["GET", "HEAD"])
+    @application.api_route("/script.js", methods=["GET", "HEAD"])
+    @application.api_route("/g6.js", methods=["GET", "HEAD"])
+    @application.api_route("/icons.js", methods=["GET", "HEAD"])
+    @application.api_route("/style.css", methods=["GET", "HEAD"])
+    def asset(request: Request) -> Response:
+        filename, media_type = routes[request.url.path]
+        return FileResponse(assets / filename, media_type=media_type)
 
-    server = Server(("127.0.0.1", port), Handler)
-    try:
-        requested_data("")
-    except (CanonicalError, ValueError, OSError):
-        server.server_close()
-        raise
-    return server
+    return application
 
 
 def open_gui(root: Path, *, port: int, open_browser: bool) -> None:
-    """Launch the expandable repository graph until interrupted."""
-    with gui_server(root, port) as server:
-        url = f"http://127.0.0.1:{server.server_port}"
+    """Run the loopback ASGI server and open its actual listening port."""
+    config = uvicorn.Config(
+        gui_app(root),
+        host="127.0.0.1",
+        port=port,
+        log_level="warning",
+        access_log=False,
+    )
+    with config.bind_socket() as connection:
+        connection.listen(config.backlog)
+        url = f"http://127.0.0.1:{connection.getsockname()[1]}"
         print(f"Canonical browser: {url}\nPress Ctrl+C to stop.", flush=True)  # noqa: T201
         if open_browser:
             webbrowser.open(url)
         with contextlib.suppress(KeyboardInterrupt):
-            server.serve_forever()
+            uvicorn.Server(config).run(sockets=[connection])
 
 
 def main(argv: list[str] | None = None) -> None:

@@ -74,10 +74,20 @@ function element(tag, className, text) {
   return item;
 }
 
-function svgElement(tag, attributes = {}, text) {
-  const item = document.createElementNS("http://www.w3.org/2000/svg", tag);
-  for (const [name, value] of Object.entries(attributes)) item.setAttribute(name, value);
-  if (text !== undefined) item.textContent = text;
+const iconTemplates = new Map(
+  Object.entries(window.canonicalIcons).map(([name, svg]) => [
+    name,
+    new DOMParser().parseFromString(svg, "image/svg+xml").documentElement,
+  ]),
+);
+
+function icon(name, className, label) {
+  const item = iconTemplates.get(name).cloneNode(true);
+  item.setAttribute("class", className);
+  if (label) {
+    item.setAttribute("role", "img");
+    item.setAttribute("aria-label", label);
+  } else item.setAttribute("aria-hidden", "true");
   return item;
 }
 
@@ -89,106 +99,24 @@ function kindIcon(kind) {
     host: "Computer",
     machine: "Computer",
   };
-  const paths = {
-    directory: "M3 7V5h6l2 2h10v13H3Z",
-    package: "M12 3 3 7.5v9L12 21l9-4.5v-9ZM3 7.5l9 4.5 9-4.5M12 12v9M7.5 5.25l9 4.5",
-    host: "M3 4h18v13H3ZM8 21h8M12 17v4",
+  const icons = {
+    directory: "folder",
+    package: "package",
+    "package-reference": "package",
+    host: "monitor",
+    machine: "monitor",
   };
-  const icon = svgElement("svg", {
-    class: "kind-icon",
-    viewBox: "0 0 24 24",
-    role: "img",
-    "aria-label": names[kind] || kind,
-    fill: "none",
-    stroke: "currentColor",
-    "stroke-width": "1.7",
-    "stroke-linejoin": "round",
-    "stroke-linecap": "round",
-  });
-  icon.append(
-    svgElement("path", {
-      d: paths[kind] || paths[kind === "package-reference" ? "package" : "host"],
-    }),
-  );
-  return icon;
+  return icon(icons[kind] || "monitor", "kind-icon", names[kind] || kind);
 }
 
 function actionIcon(action) {
-  const paths = {
-    check: "M5 12l4 4L19 6",
-    run: "M7 4l14 8-14 8Z",
-    stop: "M5 5h14v14H5Z",
-  };
-  const icon = svgElement("svg", {
-    class: "action-icon",
-    viewBox: "0 0 24 24",
-    "aria-hidden": "true",
-    fill: "none",
-    stroke: "currentColor",
-    "stroke-width": "1.7",
-    "stroke-linejoin": "round",
-    "stroke-linecap": "round",
-  });
-  icon.append(svgElement("path", { d: paths[action] }));
-  return icon;
+  return icon({ check: "check", run: "play", stop: "square" }[action], "action-icon");
 }
 
 function languageIcon(kind) {
   const names = { python: "Python", html: "HTML", nix: "Nix", nixos: "NixOS", latex: "LaTeX" };
-  if (!names[kind]) return null;
-  const icon = svgElement("svg", {
-    class: "language-icon",
-    viewBox: "0 0 24 24",
-    role: "img",
-    "aria-label": names[kind],
-  });
-  icon.append(svgElement("title", {}, names[kind]));
-  if (kind === "python") {
-    const snake =
-      "M12 2C6 2 6 3 6 6v3h7v1H4c-3 0-3 8 0 8h2v-3c0-3 2-4 5-4h5c2 0 3-1 3-3V6c0-3-2-4-7-4Z";
-    icon.append(
-      svgElement("path", { d: snake, fill: "#3776ab" }),
-      svgElement("path", { d: snake, fill: "#ffd343", transform: "rotate(180 12 12)" }),
-      svgElement("circle", { cx: 9, cy: 5, r: 1, fill: "white" }),
-      svgElement("circle", { cx: 15, cy: 19, r: 1, fill: "white" }),
-    );
-  } else if (kind === "html") {
-    icon.append(
-      svgElement("path", { d: "M3 2h18l-2 18-7 2-7-2Z", fill: "#e44d26" }),
-      svgElement("path", {
-        d: "M7 6h10l-.2 3H10l.2 2h6.4l-.6 6-4 1-4-1-.3-3h3l.1 1 1.2.3 1.3-.3.2-2H7.6Z",
-        fill: "white",
-      }),
-    );
-  } else if (kind === "nix" || kind === "nixos") {
-    for (let angle = 0; angle < 360; angle += 60)
-      icon.append(
-        svgElement("path", {
-          d: "M12 12V2M12 6l-4-3M12 6l4-3",
-          transform: `rotate(${angle} 12 12)`,
-          stroke: angle % 120 ? "#5277c3" : "#7ebae4",
-          "stroke-width": 2,
-          fill: "none",
-        }),
-      );
-  } else {
-    icon.append(
-      svgElement(
-        "text",
-        {
-          x: 12,
-          y: 16,
-          "text-anchor": "middle",
-          "font-family": "serif",
-          "font-size": 12,
-          "font-weight": "bold",
-          fill: "#008080",
-        },
-        "TeX",
-      ),
-    );
-  }
-  return icon;
+  const icons = { python: "python", html: "html5", nix: "nixos", nixos: "nixos", latex: "latex" };
+  return names[kind] ? icon(icons[kind], "language-icon", names[kind]) : null;
 }
 
 function hasChange(tree) {
@@ -196,8 +124,7 @@ function hasChange(tree) {
 }
 
 function countLeaves(tree) {
-  if (/^(?:[-+] )?\((none|not applicable|not declared|unavailable:.*)\)$/.test(tree.title))
-    return 0;
+  if (tree.warning && !tree.children?.length) return 0;
   return tree.children?.length
     ? tree.children.reduce((sum, child) => sum + countLeaves(child), 0)
     : 1;
@@ -229,18 +156,18 @@ function changeTally(tree) {
 }
 
 function fieldComparison(children, field) {
+  const label = { name: "Name", description: "Description", help: "Help" }[field];
   const comparison = element("section", "field-comparison");
-  comparison.append(element("div", "comparison-heading", field));
-  for (const [kind, prefix, label] of [
-    ["removed", "-", "HEAD"],
-    ["added", "+", "Working tree"],
+  comparison.append(element("div", "comparison-heading", label));
+  for (const [kind, label] of [
+    ["removed", "HEAD"],
+    ["added", "Working tree"],
   ]) {
-    const start = `${prefix} ${field}: `;
-    const declaration = children.find((child) => child.title.startsWith(start));
+    const declaration = children.find((child) => child.field === field && child.change === kind);
     const side = element("div", `comparison-side ${kind}`);
     side.append(
       element("span", "comparison-label", label),
-      element("div", "", declaration ? declaration.title.slice(start.length) : "(not declared)"),
+      element("div", "", declaration?.value ?? "(not declared)"),
     );
     comparison.append(side);
   }
@@ -272,7 +199,7 @@ function relationships() {
 
 function visibleNodes() {
   const resources = data.nodes.filter(
-    (node) => !["repository", "check", "machine"].includes(node.kind),
+    (node) => !["repository", "directory", "check", "machine"].includes(node.kind),
   );
   const matches = new Set(
     resources
@@ -332,15 +259,10 @@ function bindExpansion(details, key, matchesSearch = false, changed = false) {
 }
 
 function behaviorTree(tree, key, filterChanges) {
-  const sourceLines = tree.source_file
-    ? (tree.children || []).find((child) => /^Lines: \d+$/.test(child.title))
-    : null;
-  const children = (tree.children || []).filter(
-    (child) => child !== sourceLines && !/\((?:local|global)\): 0$/.test(child.title),
-  );
+  const children = tree.children || [];
   function appendLines(row) {
-    if (!sourceLines) return;
-    const count = Number(sourceLines.title.slice(7));
+    if (tree.lines == null) return;
+    const count = tree.lines;
     row.append(
       element(
         "span",
@@ -528,26 +450,18 @@ function resourceBlock(node) {
     if (!summary.contains(meta)) summary.append(meta);
   }
   if (node.tree) {
-    if (node.tree.children.some((child) => child.title !== "tmp/" && hasChange(child)))
+    if (node.tree.children.some((child) => child.field !== "tmp" && hasChange(child)))
       body.append(element("div", "diff-baseline", "HEAD → Working tree"));
     const compared = new Set();
     node.tree.children.forEach((child, index) => {
-      // The name and unchanged description are already fully visible in the header.
-      if (
-        child.title.startsWith("Name:") ||
-        child.title.startsWith("Description:") ||
-        child.title === "Dependencies" ||
-        child.title === "Connections"
-      )
-        return;
-      const field = child.title.match(/^[-+] (Name|Description|Help):/);
-      if (field) {
-        if (!compared.has(field[1])) {
-          compared.add(field[1]);
-          body.append(fieldComparison(node.tree.children, field[1]));
+      if (["name", "description", "help"].includes(child.field) && child.change) {
+        if (!compared.has(child.field)) {
+          compared.add(child.field);
+          body.append(fieldComparison(node.tree.children, child.field));
         }
         return;
       }
+      if (["name", "description", "dependencies", "connections"].includes(child.field)) return;
       if (!changesOnly || node.context || hasChange(child))
         body.append(behaviorTree(child, `${node.id}/tree/${index}`, changesOnly && !node.context));
     });
@@ -556,46 +470,6 @@ function resourceBlock(node) {
   details.append(body);
   blocks.set(node.id, details);
   return details;
-}
-
-function cachedDirectory(nextDirectory) {
-  if (directorySnapshots.has(nextDirectory)) return directorySnapshots.get(nextDirectory);
-  for (const snapshot of directorySnapshots.values()) {
-    if (!nextDirectory.startsWith(`${snapshot.root}/`)) continue;
-    if (snapshot.nodes.every((node) => node.profile === "directory")) continue;
-    const nodes = snapshot.nodes.flatMap((node) => {
-      if (node.kind === "machine") return [];
-      const repository = node.directory;
-      if (!repository) return [];
-      if (repository === nextDirectory || repository.startsWith(`${nextDirectory}/`))
-        return [
-          {
-            ...node,
-            repository:
-              repository === nextDirectory ? "." : repository.slice(nextDirectory.length + 1),
-          },
-        ];
-      if (!nextDirectory.startsWith(`${repository}/`) || node.profile === "home") return [];
-      const path = node.path === "." ? repository : `${repository}/${node.path}`;
-      if (
-        node.kind !== "repository" &&
-        path !== nextDirectory &&
-        !path.startsWith(`${nextDirectory}/`)
-      )
-        return [];
-      return [{ ...node, repository: "." }];
-    });
-    const ids = new Set(nodes.map((node) => node.id));
-    return {
-      ...snapshot,
-      root: nextDirectory,
-      parent: nextDirectory.slice(0, nextDirectory.lastIndexOf("/")) || "/",
-      focus: null,
-      nodes,
-      edges: snapshot.edges.filter((edge) => ids.has(edge.source) && ids.has(edge.target)),
-    };
-  }
-  return null;
 }
 
 function viewport() {
@@ -627,6 +501,10 @@ function directoryCounts(relative) {
         node.kind === "repository" && node.profile === "flake" && node.repository === relative,
     )
   ) {
+    if (nodes.some((node) => node.kind === "directory")) {
+      const directories = count("directory");
+      return `${directories.toLocaleString()} ${directories === 1 ? "directory" : "directories"}`;
+    }
     const repositories = count("repository");
     return `${repositories.toLocaleString()} ${repositories === 1 ? "repository" : "repositories"}`;
   }
@@ -655,7 +533,9 @@ function buildModel() {
   currentNodes = visibleNodes();
   if (
     !currentNodes.length &&
-    (query || changesOnly || !data.nodes.some((node) => node.kind === "repository"))
+    (query ||
+      changesOnly ||
+      !data.nodes.some((node) => ["repository", "directory"].includes(node.kind)))
   )
     return null;
   const combos = new Map();
@@ -709,7 +589,8 @@ function buildModel() {
     return parent;
   }
   if (!query && !changesOnly)
-    for (const node of data.nodes) if (node.kind === "repository") directoryCombo(node.repository);
+    for (const node of data.nodes)
+      if (["repository", "directory"].includes(node.kind)) directoryCombo(node.repository);
   const measure = $("measure");
   measure.replaceChildren();
   const nodes = currentNodes.map((node) => {
@@ -1122,7 +1003,7 @@ async function refresh(
   $("refresh").disabled = true;
   $("canvas").dataset.layout = "pending";
   try {
-    let snapshot = force ? null : cachedDirectory(nextDirectory);
+    let snapshot = force ? null : directorySnapshots.get(nextDirectory);
     if (snapshot?.output_pending) snapshot = null;
     if (!snapshot) {
       const parameters = new URLSearchParams();
