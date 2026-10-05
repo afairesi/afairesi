@@ -251,6 +251,34 @@ class TestOutputSnapshots(unittest.TestCase):
             require_output(comparison.changed)
             require_output(b"retained" in app.output_diff_page(comparison))
 
+    def test_output_tree_bounds_nested_entries_and_links_complete_listings(
+        self,
+    ) -> None:
+        """Large nested outputs stay bounded and remain browsable over HTTP."""
+        for folder in ("a", "b"):
+            directory = self.output / folder
+            directory.mkdir()
+            for index in range(10):
+                (directory / f"entry-{index:02}.txt").write_text("value\n")
+        with patch.object(app, "OUTPUT_TREE_LIMIT", 5):
+            tree = app.output_tree(self.output, None, self.output)
+        output_folder = tree.children[0]
+        require_output(
+            [child.title for child in output_folder.children]
+            == [
+                "entry-00.txt",
+                "entry-01.txt",
+                "entry-02.txt",
+                "More output entries: open directory to browse",
+            ],
+        )
+        require_output(output_folder.children[-1].warning)
+        require_output(output_folder.children[-1].directory == self.output / "a")
+        require_output(tree.children[-1].warning)
+        require_output(tree.children[-1].directory == self.output)
+        listing = app.output_index(self.output, self.output / "a")
+        require_output(b"entry-09.txt" in listing)
+
     def test_output_tree_embeds_changes_and_reports_individual_entries(self) -> None:
         """Keep nested output changes inline and scope reports to their entry."""
         nested = self.output / "nested"
@@ -661,6 +689,58 @@ class TestGui(unittest.TestCase):
                 commands.start(str(root), "not-a-command")
             with pytest.raises(ValueError, match="No closing quotation"):
                 commands.start(str(root), "overview", "'")
+
+    def test_command_transport_accepts_local_origins_and_rejects_other_origins(
+        self,
+    ) -> None:
+        """Allow loopback browser names only at the request's own origin."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for host in ("localhost", "127.0.0.1"):
+                origin = f"http://{host}:8765"
+                with TestClient(app.gui_app(root), base_url=origin) as client:
+                    for endpoint in ("/api/action", "/api/command"):
+                        for action in ("run", "check"):
+                            with patch.object(
+                                app.PackageActions
+                                if endpoint == "/api/action"
+                                else app.CanonicalActions,
+                                "start",
+                                return_value={"state": "passed", "output": ""},
+                            ) as start:
+                                response = client.post(
+                                    endpoint,
+                                    json={"directory": str(root), "action": action},
+                                    headers={
+                                        "Origin": origin,
+                                        "Sec-Fetch-Site": "same-origin",
+                                    },
+                                )
+                                require_output(response.status_code == HTTPStatus.OK)
+                                start.assert_called_once_with(str(root), action, "")
+                        for invalid_origin, site in (
+                            ("https://example.com", "cross-site"),
+                            (f"http://{host}:8766", "same-site"),
+                            (f"https://{host}:8765", "same-origin"),
+                            ("http://localhost.attacker.example:8765", "same-origin"),
+                            ("null", "same-origin"),
+                            (origin, "cross-site"),
+                            (
+                                "http://127.0.0.1:8765"
+                                if host != "127.0.0.1"
+                                else "http://localhost:8765",
+                                "same-site",
+                            ),
+                        ):
+                            response = client.post(
+                                endpoint,
+                                json={"directory": str(root), "action": "run"},
+                                headers={
+                                    "Origin": invalid_origin,
+                                    "Sec-Fetch-Site": site,
+                                },
+                            )
+                            require_output(response.status_code == HTTPStatus.FORBIDDEN)
 
     def test_command_transport_rejects_cross_site_requests_and_unknown_directories(
         self,

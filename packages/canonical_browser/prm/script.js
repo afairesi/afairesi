@@ -857,6 +857,24 @@ function renderBreadcrumbs() {
 let rebuildPending = false;
 let fitPending = false;
 let outputPoll = null;
+let pendingViewport = null;
+function captureViewport() {
+  return graph
+    ? {
+        zoom: graph.getZoom(),
+        center: graph.getCanvasByViewport([innerWidth / 2, innerHeight / 2]),
+        width: innerWidth,
+        height: innerHeight,
+      }
+    : null;
+}
+
+async function restoreViewport(viewport) {
+  await graph.zoomTo(viewport.zoom, false);
+  const point = graph.getViewportByCanvas(viewport.center);
+  await graph.translateBy([innerWidth / 2 - point[0], innerHeight / 2 - point[1]], false);
+}
+
 function scheduleLayout(rebuild = false, fit = false) {
   const focus = captureFocus();
   if (focus) {
@@ -864,6 +882,8 @@ function scheduleLayout(rebuild = false, fit = false) {
   } else if (document.activeElement !== document.body) pendingFocus = null;
   rebuildPending ||= rebuild;
   fitPending ||= fit;
+  if (fitPending || pendingView) pendingViewport = null;
+  else if (rebuild && !pendingViewport) pendingViewport = captureViewport();
   const current = ++generation;
   $("canvas").dataset.layout = "pending";
   if (pendingFrame !== null) cancelAnimationFrame(pendingFrame);
@@ -874,6 +894,7 @@ function scheduleLayout(rebuild = false, fit = false) {
       .then(async () => {
         if (current !== generation || !data) return;
         const focus = pendingFocus;
+        const viewport = !fitPending && !pendingView ? pendingViewport || captureViewport() : null;
         if (rebuildPending) {
           observer?.disconnect();
           observer = null;
@@ -895,7 +916,7 @@ function scheduleLayout(rebuild = false, fit = false) {
             );
             if (pendingView)
               $("cwd").querySelector('[aria-current="page"]').focus({ preventScroll: true });
-            pendingView = pendingFocus = null;
+            pendingView = pendingFocus = pendingViewport = null;
             fitPending = false;
             $("canvas").dataset.layout = "ready";
             updateCollapseState();
@@ -942,9 +963,7 @@ function scheduleLayout(rebuild = false, fit = false) {
             view.viewport.width === innerWidth &&
             view.viewport.height === innerHeight
           ) {
-            await graph.zoomTo(view.viewport.zoom, false);
-            const point = graph.getViewportByCanvas(view.viewport.center);
-            await graph.translateBy([innerWidth / 2 - point[0], innerHeight / 2 - point[1]], false);
+            await restoreViewport(view.viewport);
           } else await fitGraph();
           await new Promise(requestAnimationFrame);
           fitPending = false;
@@ -953,14 +972,22 @@ function scheduleLayout(rebuild = false, fit = false) {
           await fitGraph();
           fitPending = false;
           await restoreFocus(focus, false);
-        } else await restoreFocus(focus, true);
+        } else {
+          if (viewport) await restoreViewport(viewport);
+          await restoreFocus(focus, true);
+        }
         if (current !== generation) return;
+        pendingViewport = null;
         pendingFocus = null;
         $("canvas").dataset.layout = "ready";
         updateCollapseState();
         highlightEdges();
       })
-      .catch((error) => showError(`Could not arrange the diagram: ${error.message}`));
+      .catch((error) => {
+        if (current !== generation) return;
+        $("canvas").dataset.layout = "error";
+        showError(`Could not arrange the diagram: ${error.message}`);
+      });
   });
 }
 
@@ -1014,6 +1041,7 @@ async function refresh(
       if (!response.ok) throw new Error(snapshot.error || `HTTP ${response.status}`);
     }
     if (current !== requestGeneration) return;
+    const fit = !graph || snapshot.root !== data?.root;
     if (force) {
       directorySnapshots.clear();
       directoryViews.clear();
@@ -1034,11 +1062,13 @@ async function refresh(
     const focused = data.nodes.find((node) => `${node.directory}/${node.path}` === directory);
     if (!view?.viewport && focused && ["package", "host"].includes(focused.kind))
       expanded.set(focused.id, true);
-    scheduleLayout(true, true);
+    scheduleLayout(true, fit);
     if (snapshot.output_pending) outputPoll = setTimeout(() => refresh(directory, false), 2000);
   } catch (error) {
-    if (current === requestGeneration)
+    if (current === requestGeneration) {
+      $("canvas").dataset.layout = "error";
       showError(`Could not read the directory: ${error.message}. Use Refresh to try again.`);
+    }
   } finally {
     if (current === requestGeneration) $("refresh").disabled = false;
   }
@@ -1053,12 +1083,7 @@ function navigateDirectory(nextDirectory, historyMode = "push") {
       selected,
       query,
       changesOnly,
-      viewport: {
-        zoom: graph.getZoom(),
-        center: graph.getCanvasByViewport([innerWidth / 2, innerHeight / 2]),
-        width: innerWidth,
-        height: innerHeight,
-      },
+      viewport: captureViewport(),
     });
   const view = directoryViews.get(nextDirectory);
   expanded.clear();
@@ -1102,7 +1127,7 @@ $("collapse").addEventListener("click", () => {
   }
   scheduleLayout(true, true);
 });
-window.addEventListener("resize", () => scheduleLayout(true, true));
+window.addEventListener("resize", () => scheduleLayout(true));
 document.addEventListener(
   "keydown",
   (event) => {

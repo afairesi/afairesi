@@ -53,6 +53,7 @@ MAX_PORT = 65535
 MOUNT_FIELDS = 3
 OUTPUT_DIFF_TIMEOUT = 120
 OUTPUT_TEXT_LIMIT = 65536
+OUTPUT_TREE_LIMIT = 1000
 ACTION_BODY_LIMIT = 16384
 
 
@@ -816,10 +817,17 @@ def output_entry(root: Path | None, relative: Path) -> Path | None:
     return path
 
 
-def output_tree(output: Path, previous: Path | None, current: Path) -> TreeNode:
-    """Merge output entries into a collapsible tree with captured changes."""
+def output_tree(  # noqa: C901 - merge entries with a shared recursive budget
+    output: Path,
+    previous: Path | None,
+    current: Path,
+) -> TreeNode:
+    """Merge a bounded output tree, linking to full listings for large outputs."""
+    remaining = OUTPUT_TREE_LIMIT
 
-    def build(relative: Path) -> TreeNode:
+    def build(relative: Path) -> TreeNode:  # noqa: C901 - directory merge and entry diff
+        nonlocal remaining
+        remaining -= 1
         old = output_entry(previous, relative)
         new = output_entry(current, relative)
         before, after = output_kind(old), output_kind(new)
@@ -836,7 +844,17 @@ def output_tree(output: Path, previous: Path | None, current: Path) -> TreeNode:
             for path in (old, new):
                 if output_kind(path) == "directory" and path is not None:
                     names.update(child.name for child in path.iterdir())
-            node.children = [build(relative / name) for name in sorted(names)]
+            for name in sorted(names):
+                if remaining <= 0:
+                    node.children.append(
+                        TreeNode(
+                            "More output entries: open directory to browse",
+                            directory=node.directory,
+                            warning=True,
+                        ),
+                    )
+                    break
+                node.children.append(build(relative / name))
         if previous is not None:
             node.change = output_change(old, new)
             if node.change or any(
@@ -1305,8 +1323,15 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
         }:
             origin = request.headers.get("Origin")
             port = request.scope["server"][1]
+            local_origins = {
+                f"http://{host}:{port}" for host in ("127.0.0.1", "localhost")
+            }
             if (
-                origin is not None and origin != f"http://127.0.0.1:{port}"
+                origin is not None
+                and (
+                    origin not in local_origins
+                    or origin != str(request.base_url).rstrip("/")
+                )
             ) or request.headers.get("Sec-Fetch-Site") == "cross-site":
                 return JSONResponse(
                     {"error": "Local requests only"},
