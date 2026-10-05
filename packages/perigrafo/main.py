@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Canonicalize home repositories and manage canonical flake repositories."""
+"""Create, inspect, and converge Git and Nix repositories describing machines."""
 
 from __future__ import annotations
 
@@ -142,8 +142,8 @@ def repository_type(root: Path, default: str | None = None) -> str:
         raise CommandError(msg)
     msg = (
         "cannot determine the repository type; run "
-        "'canonical init home' or "
-        "'canonical init flake REMOTE'"
+        "'perigrafo init home' or "
+        "'perigrafo init flake REMOTE'"
     )
     raise CommandError(msg)
 
@@ -160,7 +160,7 @@ def _repository_type_markers(root: Path) -> tuple[bool, bool]:
 
 
 def canonical_root(directory: Path) -> Path:
-    """Find the nearest Canonical layout, or retain an ordinary directory."""
+    """Find the nearest Perigrafo layout, or retain an ordinary directory."""
     directory = directory.resolve()
     for candidate in (directory, *directory.parents):
         if any(_repository_type_markers(candidate)):
@@ -986,7 +986,7 @@ let
       };
       system.stateVersion = hostConfig.system.stateVersion;
       systemd.services.sshd.preStart = lib.optionalString (hasAge && seeded) ''
-        ${pkgs.gnugrep}/bin/grep -qx canonical-bootstrap-ok /run/agenix/canonical-probe
+        ${pkgs.gnugrep}/bin/grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe
       '';
       testing.initrdBackdoor = true;
       virtualisation = {
@@ -1013,7 +1013,7 @@ let
       age = {
         inherit (hostConfig.age) identityPaths;
         secrets = lib.optionalAttrs seeded {
-          canonical-probe.file = "${fixture}/probe.age";
+          perigrafo-probe.file = "${fixture}/probe.age";
         };
       };
     };
@@ -1028,16 +1028,16 @@ let
         ${lib.concatMapStrings (key: ''
           ssh-keygen -q -t ${lib.escapeShellArg key.type} \
             ${lib.optionalString (key ? bits) "-b ${toString key.bits}"} \
-            -N "" -C disposable-canonical-test -f "$out/key-${toString key.index}"
+            -N "" -C disposable-perigrafo-test -f "$out/key-${toString key.index}"
         '') keys}
         ${lib.optionalString hasAge ''
           ${
             assert lib.assertMsg (
               identityKeys != [ ]
-            ) "Canonical bootstrap check: agenix needs a preserved SSH host identity";
+            ) "Perigrafo bootstrap check: agenix needs a preserved SSH host identity";
             ""
           }
-          printf 'canonical-bootstrap-ok\n' | age \
+          printf 'perigrafo-bootstrap-ok\n' | age \
             ${lib.concatMapStringsSep " " (key: "-R \"$out/key-${toString key.index}.pub\"") identityKeys} \
             -o "$out/probe.age"
         ''}
@@ -1102,7 +1102,7 @@ let
           else
             directory.persistent + lib.removePrefix directory.directory key.path
         else
-          throw "Canonical bootstrap check: SSH host key ${key.path} is not preserved";
+          throw "Perigrafo bootstrap check: SSH host key ${key.path} is not preserved";
     in
     key // { inherit index preserved; }
   ) hostConfig.services.openssh.hostKeys;
@@ -1216,7 +1216,7 @@ pkgs.testers.runNixOSTest {
               source = shlex.quote(fixture + "/key-" + str(key["index"]))
               destination = shlex.quote(key["preserved"])
               seeded.succeed(f"cmp {source} {destination}")
-          ${lib.optionalString hasAge ''seeded.succeed("grep -qx canonical-bootstrap-ok /run/agenix/canonical-probe")''}
+          ${lib.optionalString hasAge ''seeded.succeed("grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe")''}
       with subtest("Generate SSH identities on empty persistent storage"):
           for key in keys:
               fresh.fail("test -e " + shlex.quote("/sysroot" + key["preserved"]))
@@ -1225,15 +1225,15 @@ pkgs.testers.runNixOSTest {
       for node in [seeded, fresh]:
           with subtest(f"{node.name}: SSH identities survive a clean-root reboot"):
               original = check_host_keys(node)
-              node.succeed("touch /canonical-unpreserved-marker")
+              node.succeed("touch /perigrafo-unpreserved-marker")
               node.reboot()
               node.wait_for_unit("default.target")
-              node.fail("test -e /sysroot/canonical-unpreserved-marker")
+              node.fail("test -e /sysroot/perigrafo-unpreserved-marker")
               node.switch_root()
               assert check_host_keys(node) == original
       ${lib.optionalString hasAge ''
         with subtest("Decrypt again after reboot without reprovisioning"):
-            seeded.succeed("grep -qx canonical-bootstrap-ok /run/agenix/canonical-probe")
+            seeded.succeed("grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe")
       ''}
       for node in [seeded, fresh]:
           node.shutdown()
@@ -1258,11 +1258,11 @@ pkgs.testers.runNixOSTest {
                 else:
                     assert machine.succeed(f"stat -Lc '%d:%i' {path}").strip() == machine.succeed(f"stat -Lc '%d:%i' {persistent}").strip()
                 if entry["directory"]:
-                    marker = shlex.quote(entry["path"] + "/.canonical-preservation-probe")
+                    marker = shlex.quote(entry["path"] + "/.perigrafo-preservation-probe")
                     if phase == "boot":
-                        machine.succeed(f"printf canonical-preserved > {marker}")
+                        machine.succeed(f"printf perigrafo-preserved > {marker}")
                     else:
-                        assert machine.succeed(f"cat {marker}") == "canonical-preserved"
+                        assert machine.succeed(f"cat {marker}") == "perigrafo-preserved"
         if phase == "boot":
             machine.reboot()
     machine.shutdown()
@@ -2385,12 +2385,12 @@ def initialize_flake(remote: str) -> None:
     try:
         flake = directory / "flake.nix"
         flake.write_text(
-            '{ inputs.canonical.url = "github:pbizopoulos/canonical"; outputs = inputs: inputs.canonical.blueprint { inherit inputs; }; }\n',  # noqa: E501
+            '{ inputs.perigrafo.url = "github:perigrafo/perigrafo"; outputs = inputs: inputs.perigrafo.blueprint { inherit inputs; }; }\n',  # noqa: E501
             encoding="utf-8",
         )
         (directory / "README").write_text(readme, encoding="utf-8")
         _run(
-            [os.environ.get("CANONICAL_NIX", "nix"), "flake", "lock"],
+            [os.environ.get("PERIGRAFO_NIX", "nix"), "flake", "lock"],
             cwd=directory,
         )
         detected_packages = detect_packages(directory)
@@ -2403,7 +2403,7 @@ def initialize_flake(remote: str) -> None:
             encoding="utf-8",
         )
         _run(
-            [os.environ.get("CANONICAL_NIX", "nix"), "fmt"],
+            [os.environ.get("PERIGRAFO_NIX", "nix"), "fmt"],
             cwd=directory,
         )
         git(directory, ["add", "--all"])
@@ -2533,7 +2533,7 @@ def _print_repository_test_names(root: Path) -> bool:
             _print_package_test_names(package)
         except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
             success = False
-            sys.stderr.write(f"canonical test names: {package.name}: {error}\n")
+            sys.stderr.write(f"perigrafo test names: {package.name}: {error}\n")
     return success
 
 
@@ -2626,7 +2626,7 @@ def _print_git_textconv(
     driver = "python-package-args" if package_args else "python-test-names"
     filename = "main.py" if package_args else "test_main.py"
     converter = shlex.join([str(Path(sys.argv[0]).resolve()), *view, "_textconv"])
-    with TemporaryDirectory(prefix="canonical-textconv-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-textconv-") as directory:
         attributes = Path(directory) / "attributes"
         attributes.write_text(
             f"/packages/*/{filename} diff={driver} {driver}\n",
@@ -2685,7 +2685,7 @@ def _run_test_names(arguments: list[str]) -> int:
         return _print_git_textconv(arguments[0], arguments[1:])
     if arguments[:1] == ["_textconv"]:
         converter_parser = argparse.ArgumentParser(
-            prog="canonical test names _textconv",
+            prog="perigrafo test names _textconv",
         )
         converter_parser.add_argument("file", type=Path)
         for name in read_test_names(
@@ -2695,7 +2695,7 @@ def _run_test_names(arguments: list[str]) -> int:
             sys.stdout.write(name + "\n")
         return 0
     parser = argparse.ArgumentParser(
-        prog="canonical test names",
+        prog="perigrafo test names",
         description="List Python test names as sentences or inspect their Git changes.",
         epilog=(
             "Repository targets list Python packages sequentially and skip packages "
@@ -4078,7 +4078,7 @@ def _collection_data(
 
 
 def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any]:  # noqa: C901, PLR0912 - traverse canonical collections
-    """Return a versioned, source-based graph for other Canonical clients."""
+    """Return a versioned, source-based graph for other Perigrafo clients."""
     target = target.resolve()
     focus = None
     if target.parent.name == "packages" and (
@@ -4212,7 +4212,7 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
                             },
                         )
     return {
-        "schema": "canonical.overview",
+        "schema": "perigrafo.overview",
         "schema_version": 1,
         "analysis": "source-declarations",
         "profile": current_type,
@@ -4300,7 +4300,7 @@ def _run_package_args(arguments: list[str]) -> int:
     if arguments and arguments[0] in {"diff", "show"}:
         return _print_git_textconv(arguments[0], arguments[1:], package_args=True)
     cli = argparse.ArgumentParser(
-        prog="canonical args",
+        prog="perigrafo args",
         description=(
             "List statically declared argparse, Click, Fire, or Typer interfaces "
             "without executing source."
@@ -4353,7 +4353,7 @@ def _run_package_args(arguments: list[str]) -> int:
             _print_package_args(package)
         except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
             status = 1
-            sys.stderr.write(f"canonical args: {package.name}: {error}\n")
+            sys.stderr.write(f"perigrafo args: {package.name}: {error}\n")
     return status
 
 
@@ -4367,10 +4367,10 @@ def _dispatch_source_view(arguments: list[str], *, package_args: bool = False) -
     except subprocess.CalledProcessError as error:
         sys.exit(error.returncode)
     except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
-        sys.stderr.write(f"canonical {label}: {error}\n")
+        sys.stderr.write(f"perigrafo {label}: {error}\n")
         sys.exit(1)
     except KeyboardInterrupt:
-        sys.stderr.write(f"canonical {label}: interrupted\n")
+        sys.stderr.write(f"perigrafo {label}: interrupted\n")
         sys.exit(130)
     sys.exit(status)
 
@@ -4544,7 +4544,7 @@ import pytest
 from hypothesis import Phase, is_hypothesis_test, settings
 tests = {}
 collection_errors = []
-owner = os.environ.setdefault("CANONICAL_TEST_REPORT_OWNER", str(os.getpid()))
+owner = os.environ.setdefault("PERIGRAFO_TEST_REPORT_OWNER", str(os.getpid()))
 def node_id(item):
     path, separator, name = item.nodeid.partition("::")
     return Path(path).name + separator + name
@@ -4583,9 +4583,9 @@ def pytest_collectreport(report):
         collection_errors.append(str(report.longrepr))
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    previous = os.environ.get("CANONICAL_TEST_CONTEXT", "")
+    previous = os.environ.get("PERIGRAFO_TEST_CONTEXT", "")
     context = node_id(item) if owner == str(os.getpid()) else previous
-    os.environ["CANONICAL_TEST_CONTEXT"] = context
+    os.environ["PERIGRAFO_TEST_CONTEXT"] = context
     try:
         import coverage
         tracer = coverage.Coverage.current()
@@ -4596,7 +4596,7 @@ def pytest_runtest_protocol(item, nextitem):
     try:
         return (yield)
     finally:
-        os.environ["CANONICAL_TEST_CONTEXT"] = previous
+        os.environ["PERIGRAFO_TEST_CONTEXT"] = previous
         if tracer is not None:
             tracer.switch_context(previous)
 @pytest.hookimpl(wrapper=True)
@@ -4659,24 +4659,24 @@ def pytest_sessionfinish(session, exitstatus):
         "duration": sum(row["duration"] for row in selected),
     })
     document = {
-        "schema": "canonical.tests",
+        "schema": "perigrafo.tests",
         "schema_version": 1,
-        "package": os.environ.get("CANONICAL_TEST_PACKAGE"),
+        "package": os.environ.get("PERIGRAFO_TEST_PACKAGE"),
         "exit_code": int(exitstatus),
         "summary": summary,
         "tests": rows,
         "collection_errors": collection_errors,
     }
-    report = Path(os.environ["CANONICAL_TEST_REPORT"])
+    report = Path(os.environ["PERIGRAFO_TEST_REPORT"])
     report.write_text(json.dumps(document, indent=2) + "\n")
-    if os.environ.get("CANONICAL_MUTATION_REPORT") == "1":
+    if os.environ.get("PERIGRAFO_MUTATION_REPORT") == "1":
         attribution = {
             "failed_tests": [
                 row["nodeid"] for row in rows if row["outcome"] == "failed"
             ],
             "collection_errors": collection_errors,
         }
-        sys.stdout.write("\nCANONICAL_TEST_REPORT " + json.dumps(attribution) + "\n")
+        sys.stdout.write("\nPERIGRAFO_TEST_REPORT " + json.dumps(attribution) + "\n")
 """
 
 
@@ -4715,7 +4715,7 @@ def _prepare_package_tests(
         " deadline=None)\n"
         '    settings.load_profile("ondemand")\n'
     )
-    (workspace / "_canonical_test_report.py").write_text(
+    (workspace / "_perigrafo_test_report.py").write_text(
         _test_report_source(),
         encoding="utf-8",
     )
@@ -4723,7 +4723,7 @@ def _prepare_package_tests(
         "-p",
         "no:cacheprovider",
         "-p",
-        "_canonical_test_report",
+        "_perigrafo_test_report",
         "-p",
         "_hypothesis_pytestplugin",
         *selection.pytest_arguments(),
@@ -4749,11 +4749,11 @@ def _prepare_package_tests(
         "os.environ.pop('PYTEST_ADDOPTS', None)\n"
         "os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'\n"
         "os.environ.pop('PYTEST_PLUGINS', None)\n"
-        "os.environ.pop('CANONICAL_TEST_REPORT_OWNER', None)\n"
-        "os.environ.pop('CANONICAL_TEST_CONTEXT', None)\n"
-        f"os.environ['CANONICAL_TEST_PACKAGE'] = {name!r}\n"
-        f"os.environ['CANONICAL_TEST_REPORT'] = {str(workspace / 'tests.json')!r}\n"
-        "os.environ['CANONICAL_MUTATION_REPORT'] = "
+        "os.environ.pop('PERIGRAFO_TEST_REPORT_OWNER', None)\n"
+        "os.environ.pop('PERIGRAFO_TEST_CONTEXT', None)\n"
+        f"os.environ['PERIGRAFO_TEST_PACKAGE'] = {name!r}\n"
+        f"os.environ['PERIGRAFO_TEST_REPORT'] = {str(workspace / 'tests.json')!r}\n"
+        "os.environ['PERIGRAFO_MUTATION_REPORT'] = "
         f"{str(int(max_examples is None))!r}\n"
         "os.environ['HYPOTHESIS_STORAGE_DIRECTORY'] = "
         f"{str(workspace / 'hypothesis')!r}\n"
@@ -4798,7 +4798,7 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
         try:
             plan = json.loads(selection.mutation_plan.read_text(encoding="utf-8"))
             if (
-                plan["schema"] != "canonical.mutation-plan"
+                plan["schema"] != "perigrafo.mutation-plan"
                 or plan["schema_version"] != 1
                 or plan["package"] != name
                 or plan["source_sha256"] != source_hash
@@ -4857,7 +4857,7 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
             WorkResult(worker_outcome=WorkerOutcome.SKIPPED, output="not selected"),
         )
         manifest = {
-            "schema": "canonical.mutation-plan",
+            "schema": "perigrafo.mutation-plan",
             "schema_version": 1,
             "package": name,
             "source_sha256": source_hash,
@@ -4891,7 +4891,7 @@ def _mutation_status(result: dict[str, Any] | None) -> str:
 def _mutation_attribution(result: dict[str, Any] | None) -> dict[str, Any]:
     """Read the pytest report captured in an individual worker's output."""
     if result is not None:
-        prefix = "CANONICAL_TEST_REPORT "
+        prefix = "PERIGRAFO_TEST_REPORT "
         for line in reversed((result["output"] or "").splitlines()):
             if line.startswith(prefix):
                 return cast("dict[str, Any]", json.loads(line.removeprefix(prefix)))
@@ -4935,7 +4935,7 @@ def _summarize_mutations(workspace: Path) -> bool:
     (workspace / "mutation-results.json").write_text(
         json.dumps(
             {
-                "schema": "canonical.mutations",
+                "schema": "perigrafo.mutations",
                 "schema_version": 1,
                 "summary": summary,
                 "mutations": sorted(mutations, key=lambda mutation: mutation["id"]),
@@ -5102,7 +5102,7 @@ def _run_test_repository(
             )
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"canonical test {command}: {package.name}: {error}\n")
+            sys.stderr.write(f"perigrafo test {command}: {package.name}: {error}\n")
     sys.stdout.write("\nRepository summary:\n")
     for package_name, status in outcomes.items():
         sys.stdout.write(f"  {package_name}: {status}\n")
@@ -5158,11 +5158,11 @@ def _dispatch_test_runner(
             selection,
         )
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-        sys.stderr.write(f"canonical test {options.test_command}: {error}\n")
+        sys.stderr.write(f"perigrafo test {options.test_command}: {error}\n")
         sys.exit(1)
     except KeyboardInterrupt:
         sys.stderr.write(
-            f"canonical test {options.test_command}: "
+            f"perigrafo test {options.test_command}: "
             "interrupted; diagnostics retained\n",
         )
         sys.exit(130)
@@ -5177,7 +5177,7 @@ def _coverage_expression(root: Path, name: str, system: str) -> str:
   packageName = PACKAGE;
   packageDrv = flake.packages.${system}.${packageName};
   check = flake.checks.${system}.${packageName};
-  reportPlugin = builtins.toFile "_canonical_test_report.py" REPORT_PLUGIN;
+  reportPlugin = builtins.toFile "_perigrafo_test_report.py" REPORT_PLUGIN;
 in
 check.overrideAttrs (previous: {
   name = "${previous.name}-coverage";
@@ -5185,11 +5185,11 @@ check.overrideAttrs (previous: {
     mkdir -p "$out/html" "$TMPDIR/coverage-startup"
     export COVERAGE_FILE="$out/.coverage"
     export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
-    export CANONICAL_TEST_REPORT="$out/tests.json"
-    export CANONICAL_TEST_PACKAGE=${packageName}
-    unset CANONICAL_TEST_REPORT_OWNER CANONICAL_MUTATION_REPORT CANONICAL_TEST_CONTEXT
-    cp "${reportPlugin}" "$TMPDIR/coverage-startup/_canonical_test_report.py"
-    export PYTEST_PLUGINS="_canonical_test_report''${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
+    export PERIGRAFO_TEST_REPORT="$out/tests.json"
+    export PERIGRAFO_TEST_PACKAGE=${packageName}
+    unset PERIGRAFO_TEST_REPORT_OWNER PERIGRAFO_MUTATION_REPORT PERIGRAFO_TEST_CONTEXT
+    cp "${reportPlugin}" "$TMPDIR/coverage-startup/_perigrafo_test_report.py"
+    export PYTEST_PLUGINS="_perigrafo_test_report''${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
     cat > "$COVERAGE_PROCESS_START" <<EOF
     [run]
     parallel = true
@@ -5202,7 +5202,7 @@ check.overrideAttrs (previous: {
         */test_main.py
         */prm/*
     EOF
-    printf '%s\\n' 'import os, coverage' 'tracer = coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("CANONICAL_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
+    printf '%s\\n' 'import os, coverage' 'tracer = coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("PERIGRAFO_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
     export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
   '' + previous.buildCommand + ''
     unset COVERAGE_PROCESS_START
@@ -5241,7 +5241,7 @@ def _build_package_coverage(package: Path, system: str) -> None:
     root = _test_target_root(package)
     check = root / "checks" / package.name / "default.nix"
     if not check.is_file():
-        message = f"missing {check}; run canonical converge to generate checks"
+        message = f"missing {check}; run perigrafo converge to generate checks"
         raise CommandError(message)
     sys.stdout.write(f"Building coverage for {package.name}...\n")
     sys.stdout.flush()
@@ -5271,7 +5271,7 @@ def _build_package_coverage(package: Path, system: str) -> None:
     if not report.is_file():
         message = (
             f"coverage check produced no HTML report for {package.name}; "
-            "run canonical converge to update the test checks"
+            "run perigrafo converge to update the test checks"
         )
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
@@ -5331,7 +5331,7 @@ def _run_coverage(target: Path) -> bool:
             outcomes[package.name] = "passed"
         except (CommandError, OSError) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"canonical test coverage: {package.name}: {error}\n")
+            sys.stderr.write(f"perigrafo test coverage: {package.name}: {error}\n")
     if repository:
         sys.stdout.write("\nRepository summary:\n")
         for name, status in outcomes.items():
@@ -5362,8 +5362,11 @@ def _mutation_lines(value: str) -> tuple[int, int]:
 def parser() -> argparse.ArgumentParser:
     """Construct the public command-line parser."""
     result = argparse.ArgumentParser(
-        prog="canonical",
-        description="Manage canonical persistent state in HOME and flake repositories.",
+        prog="perigrafo",
+        description=(
+            "Create, inspect, and converge Git and Nix repositories "
+            "describing machines."
+        ),
     )
     commands = result.add_subparsers(
         dest="command",
@@ -5476,7 +5479,7 @@ def parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""JSON format (schema_version 1):
-  schema: canonical.overview; analysis: source-declarations
+  schema: perigrafo.overview; analysis: source-declarations
   profile: home or flake; focus: requested package ID, otherwise null
   nodes: sorted by id; edges: sorted by source, target, kind and declaration
 Nodes have id, kind, name, repository and path. IDs use REPOSITORY:RESOURCE:
@@ -5534,7 +5537,7 @@ and reject unsupported schema versions.""",
         "--json",
         action="store_true",
         help=(
-            "emit deterministic canonical.overview JSON (schema version 1) "
+            "emit deterministic perigrafo.overview JSON (schema version 1) "
             "for visualization clients; includes only same-repository dependencies"
         ),
     )
@@ -5701,7 +5704,7 @@ def _dispatch_test_command(
         try:
             success = _run_coverage(options.target.resolve())
         except KeyboardInterrupt:
-            sys.stderr.write("canonical test coverage: interrupted\n")
+            sys.stderr.write("perigrafo test coverage: interrupted\n")
             sys.exit(130)
         sys.exit(0 if success else 1)
     if options.test_command in {"hypothesis", "mutation"}:
@@ -5783,7 +5786,7 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Dispatch the canonical CLI."""
+    """Dispatch the Perigrafo CLI."""
     arguments = _normalize_help_arguments(sys.argv[1:])
     package_args = arguments[:1] == ["args"]
     if package_args or arguments[:2] == ["test", "names"]:

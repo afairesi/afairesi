@@ -65,7 +65,7 @@ class DirectoryCombo extends G6.RectCombo {
     };
   }
 }
-G6.register(G6.ExtensionCategory.COMBO, "canonical-directory", DirectoryCombo);
+G6.register(G6.ExtensionCategory.COMBO, "perigrafo-directory", DirectoryCombo);
 
 function element(tag, className, text) {
   const item = document.createElement(tag);
@@ -75,7 +75,7 @@ function element(tag, className, text) {
 }
 
 const iconTemplates = new Map(
-  Object.entries(window.canonicalIcons).map(([name, svg]) => [
+  Object.entries(window.perigrafoIcons).map(([name, svg]) => [
     name,
     new DOMParser().parseFromString(svg, "image/svg+xml").documentElement,
   ]),
@@ -726,7 +726,7 @@ function createGraph() {
     zoomRange: [0.001, 4],
     node: { type: "html" },
     combo: {
-      type: (combo) => (combo.data.layoutColumn ? "rect" : "canonical-directory"),
+      type: (combo) => (combo.data.layoutColumn ? "rect" : "perigrafo-directory"),
       state: { hovered: { fill: "#e6eddf" } },
     },
     edge: {
@@ -1056,7 +1056,7 @@ async function refresh(
     url.searchParams.set("directory", directory);
     if (historyMode !== "none")
       history[historyMode === "push" ? "pushState" : "replaceState"]({ directory }, "", url);
-    document.title = `Canonical — ${directory}`;
+    document.title = `Perigrafo — ${directory}`;
     $("message").hidden = !data.warning;
     $("message").textContent = data.warning || "";
     const focused = data.nodes.find((node) => `${node.directory}/${node.path}` === directory);

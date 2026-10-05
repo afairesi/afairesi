@@ -3,7 +3,7 @@ let
   pname = baseNameOf ./.;
   python = pkgs.python3;
   runtimeInputs = [
-    inputs.self.packages.${pkgs.stdenv.system}.canonical_browser
+    inputs.self.packages.${pkgs.stdenv.system}.perigrafo_browser
     pkgs.chromium
     pkgs.ffmpeg
     pkgs.git
@@ -27,7 +27,7 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Generate an MP4 demo of canonical_browser usage";
+    description = "Generate an MP4 demo of perigrafo_browser usage";
     mainProgram = pname;
   };
   nativeBuildInputs = [ pkgs.makeWrapper ];
@@ -36,7 +36,7 @@ python.pkgs.buildPythonPackage {
     wrapProgram "$out/bin/${pname}" \
       --prefix PATH : "${pkgs.lib.makeBinPath runtimeInputs}" \
       --set PLAYWRIGHT_BROWSERS_PATH "${videoTools}" \
-      --set CANONICAL_BROWSER_VIDEO_CHROMIUM "${pkgs.chromium}/bin/chromium"
+      --set PERIGRAFO_BROWSER_VIDEO_CHROMIUM "${pkgs.chromium}/bin/chromium"
   '';
   propagatedBuildInputs = runtimeInputs ++ [ python.pkgs.playwright ];
   pyproject = false;

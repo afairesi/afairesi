@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Browse Canonical directories, packages, hosts, and changes in a web diagram."""
+"""Browse Perigrafo directories, packages, hosts, and changes in a web diagram."""
 
 import argparse
 import contextlib
@@ -34,7 +34,10 @@ from typing import Any, Self
 from urllib.parse import urlencode
 
 import uvicorn
-from canonical import (
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from perigrafo import (
     CliEntry,
     ResourceData,
     canonical_root,
@@ -43,10 +46,7 @@ from canonical import (
     repository_type,
     source_resource_data,
 )
-from canonical import CommandError as CanonicalError
-from fastapi import FastAPI, Request
-from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Response
+from perigrafo import CommandError as PerigrafoError
 from pydantic import BaseModel, ConfigDict, StrictStr
 
 MAX_PORT = 65535
@@ -193,7 +193,7 @@ class OutputSnapshots:
                 continue
             package = Path(record["directory"]) / record["path"]
             output = package / "tmp"
-            store = package.parent.parent / "tmp" / "canonical_browser" / package.name
+            store = package.parent.parent / "tmp" / "perigrafo_browser" / package.name
             if output not in self.comparisons:
                 if not output.is_dir() and not (store / "latest").is_file():
                     continue
@@ -650,12 +650,12 @@ def validate_overview(data: dict[str, Any]) -> None:
     """Reject incompatible source contracts before interpreting their records."""
     version = data.get("schema_version")
     if (
-        data.get("schema") != "canonical.overview"
+        data.get("schema") != "perigrafo.overview"
         or type(version) is not int
         or version != 1
     ):
         msg = (
-            f"Unsupported Canonical overview schema: {data.get('schema')!r}, "
+            f"Unsupported Perigrafo overview schema: {data.get('schema')!r}, "
             f"version {version!r}"
         )
         raise ValueError(msg)
@@ -886,7 +886,7 @@ def browser_snapshot(root: Path) -> dict[str, Any]:
     """Build one source graph with a single detail tree per resource."""
     try:
         current = overview_data(root)
-    except CanonicalError:
+    except PerigrafoError:
         if repository_type(root, "directory") != "directory":
             raise
         return directory_snapshot(root)
@@ -945,7 +945,7 @@ def browser_parent(directory: Path) -> Path | None:
 
 
 def directory_snapshot(directory: Path) -> dict[str, Any]:
-    """Show directory containers outside a Canonical repository."""
+    """Show directory containers outside a Perigrafo repository."""
     return {
         "root": str(directory),
         "machine": machine_resource(),
@@ -1090,7 +1090,7 @@ class CommandActions:
 
     def __init__(self) -> None:
         """Keep command logs outside the package output being compared."""
-        self.storage = tempfile.TemporaryDirectory(prefix="canonical-browser-actions-")
+        self.storage = tempfile.TemporaryDirectory(prefix="perigrafo-browser-actions-")
         self.directories: set[str] = set()
         self.jobs: dict[str, CommandJob] = {}
 
@@ -1208,7 +1208,7 @@ class PackageActions(CommandActions):
         if action == "stop":
             command = []
         elif action in tests:
-            command = ["canonical", *action.split(), *shlex.split(arguments)]
+            command = ["perigrafo", *action.split(), *shlex.split(arguments)]
         elif action == "check":
             if not check:
                 msg = "This package has no declared check"
@@ -1233,8 +1233,8 @@ class PackageActions(CommandActions):
         return self.launch(package, action, command)
 
 
-class CanonicalActions(CommandActions):
-    """Expose the Canonical CLI in directories visited during this session."""
+class PerigrafoActions(CommandActions):
+    """Expose the Perigrafo CLI in directories visited during this session."""
 
     def observe(self, data: dict[str, Any]) -> None:
         """Register the selected directory and publish the shared command catalog."""
@@ -1250,14 +1250,14 @@ class CanonicalActions(CommandActions):
         if action != "stop" and action not in {
             entry["command"] for entry in command_catalog()
         }:
-            msg = "Unknown Canonical command"
+            msg = "Unknown Perigrafo command"
             raise ValueError(msg)
         return self.launch(
             directory,
             action,
             []
             if action == "stop"
-            else ["canonical", *action.split(), *shlex.split(arguments)],
+            else ["perigrafo", *action.split(), *shlex.split(arguments)],
         )
 
 
@@ -1275,7 +1275,7 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
     assets = Path(__file__).parent / "prm"
     outputs = OutputSnapshots()
     actions = PackageActions()
-    commands = CanonicalActions()
+    commands = PerigrafoActions()
     browser = RepositoryBrowser(root)
     lock = Lock()
 
@@ -1376,14 +1376,14 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
     def overview(directory: str | None = None, refresh: str = "0") -> Response:
         try:
             return JSONResponse(requested_data(directory, refresh=refresh == "1"))
-        except (CanonicalError, ValueError, OSError) as exc:
+        except (PerigrafoError, ValueError, OSError) as exc:
             return JSONResponse(
                 {"error": str(exc)},
                 status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
             )
 
     def action_response(
-        runner: PackageActions | CanonicalActions,
+        runner: PackageActions | PerigrafoActions,
         directory: str,
         parameters: ActionRequest | None = None,
     ) -> Response:
@@ -1467,9 +1467,9 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
     routes = {
         "/": ("index.html", "text/html"),
         "/script.js": ("script.js", "text/javascript"),
-        "/g6.js": (os.environ.get("CANONICAL_BROWSER_G6", "g6.js"), "text/javascript"),
+        "/g6.js": (os.environ.get("PERIGRAFO_BROWSER_G6", "g6.js"), "text/javascript"),
         "/icons.js": (
-            os.environ.get("CANONICAL_BROWSER_ICONS", "icons.js"),
+            os.environ.get("PERIGRAFO_BROWSER_ICONS", "icons.js"),
             "text/javascript",
         ),
         "/style.css": ("style.css", "text/css"),
@@ -1496,7 +1496,7 @@ def open_gui(root: Path, *, port: int, open_browser: bool) -> None:
     with config.bind_socket() as connection:
         connection.listen(config.backlog)
         url = f"http://127.0.0.1:{connection.getsockname()[1]}"
-        print(f"Canonical browser: {url}\nPress Ctrl+C to stop.", flush=True)  # noqa: T201
+        print(f"Perigrafo browser: {url}\nPress Ctrl+C to stop.", flush=True)  # noqa: T201
         if open_browser:
             webbrowser.open(url)
         with contextlib.suppress(KeyboardInterrupt):

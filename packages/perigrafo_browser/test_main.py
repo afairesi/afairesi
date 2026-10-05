@@ -21,17 +21,17 @@ from unittest.mock import patch
 from urllib.parse import urlencode
 
 import pytest
-from canonical import (
+from fastapi import FastAPI
+from fastapi.testclient import TestClient
+from perigrafo import (
     canonical_root,
     command_catalog,
     overview_data,
     resource_data,
     source_package_cli,
 )
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
-from packages.canonical_browser import main as app
+from packages.perigrafo_browser import main as app
 
 TEST_MODIFIED_CHANGE = "modified"
 TEST_PARSER_ERROR = 2
@@ -392,13 +392,13 @@ class TestBoundary(unittest.TestCase):
     """Verify the source contract through complete browser snapshots."""
 
     def test_browser_cli_is_statically_discoverable(self) -> None:
-        """The browser's own interface must remain visible to Canonical inspection."""
+        """The browser's own interface must remain visible to Perigrafo inspection."""
         entries = source_package_cli(Path(app.__file__).read_bytes(), "main.py")
         if not all(
             any(entry.text.startswith(name) for entry in entries)
             for name in ("directory", "--no-open", "--port")
         ):
-            msg = "Canonical inspection must discover every browser CLI parameter"
+            msg = "Perigrafo inspection must discover every browser CLI parameter"
             raise AssertionError(msg)
 
     def test_empty_home_and_host_only_flake_have_no_fabricated_packages(self) -> None:
@@ -428,7 +428,7 @@ class TestBoundary(unittest.TestCase):
     def test_host_dependency_removals_and_deleted_hosts_and_checks_are_visible(
         self,
     ) -> None:
-        """Historical source comparisons must cover every Canonical resource kind."""
+        """Historical source comparisons must cover every Perigrafo resource kind."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "flake.nix").write_text("{}\n")
@@ -576,7 +576,7 @@ class TestBoundary(unittest.TestCase):
                     ),
                     pytest.raises(
                         ValueError,
-                        match="Unsupported Canonical overview schema",
+                        match="Unsupported Perigrafo overview schema",
                     ),
                 ):
                     app.browser_snapshot(root)
@@ -588,7 +588,7 @@ class TestBoundary(unittest.TestCase):
                 ),
                 pytest.raises(
                     ValueError,
-                    match="Unsupported Canonical overview schema",
+                    match="Unsupported Perigrafo overview schema",
                 ),
             ):
                 app.browser_snapshot(root)
@@ -607,89 +607,6 @@ class TestBoundary(unittest.TestCase):
 class TestGui(unittest.TestCase):
     """Verify the read-only GUI transport and shared semantic model."""
 
-    def test_canonical_commands_and_package_tests_preserve_cli_arguments(self) -> None:
-        """Run every catalog entry and test action through Canonical without a shell."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            executable = root / "canonical"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, sys, time\n"
-                "value = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
-                "print(json.dumps(value), flush=True)\n"
-                "if '--wait' in sys.argv: time.sleep(60)\n"
-                "sys.exit(7 if '--fail' in sys.argv else 0)\n",
-            )
-            executable.chmod(0o700)
-            data: dict[str, Any] = {
-                "root": str(root),
-                "nodes": [
-                    {
-                        "kind": "package",
-                        "directory": str(root),
-                        "path": "packages/example",
-                        "name": "example",
-                    },
-                ],
-            }
-            commands = app.CanonicalActions()
-            actions = app.PackageActions()
-            self.addCleanup(commands.close)
-            self.addCleanup(actions.close)
-            commands.observe(data)
-            actions.observe(data)
-            with patch.dict(
-                os.environ,
-                {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
-            ):
-                for entry in data["commands"]:
-                    command = entry["command"]
-                    commands.start(
-                        str(root),
-                        command,
-                        "'two words' '$(touch injected)'",
-                    )
-                    commands.jobs[str(root)].process.wait(timeout=10)
-                    state = commands.status(str(root))
-                    invocation = json.loads(state["output"])
-                    require_output(state["state"] == "passed")
-                    require_output(invocation["cwd"] == str(root))
-                    require_output(
-                        invocation["argv"]
-                        == [
-                            *command.split(),
-                            "two words",
-                            "$(touch injected)",
-                        ],
-                    )
-                    if command.startswith("test "):
-                        actions.start(str(package), command, "--timeout 12")
-                        actions.jobs[str(package)].process.wait(timeout=10)
-                        invocation = json.loads(actions.status(str(package))["output"])
-                        require_output(invocation["cwd"] == str(package))
-                        require_output(
-                            invocation["argv"] == [*command.split(), "--timeout", "12"],
-                        )
-                require_output(not (root / "injected").exists())
-                commands.start(str(root), "test mutation", "--fail")
-                commands.jobs[str(root)].process.wait(timeout=10)
-                require_output(
-                    commands.status(str(root))["exit_code"] == TEST_ACTION_FAILURE,
-                )
-                commands.start(str(root), "test hypothesis", "--wait")
-                with pytest.raises(ValueError, match="already running"):
-                    commands.start(str(root), "overview")
-                commands.start(str(root), "stop")
-                require_output(commands.status(str(root))["state"] == "stopped")
-            with pytest.raises(ValueError, match="Unknown directory"):
-                commands.start(str(package), "overview")
-            with pytest.raises(ValueError, match="Unknown Canonical command"):
-                commands.start(str(root), "not-a-command")
-            with pytest.raises(ValueError, match="No closing quotation"):
-                commands.start(str(root), "overview", "'")
-
     def test_command_transport_accepts_local_origins_and_rejects_other_origins(
         self,
     ) -> None:
@@ -704,7 +621,7 @@ class TestGui(unittest.TestCase):
                             with patch.object(
                                 app.PackageActions
                                 if endpoint == "/api/action"
-                                else app.CanonicalActions,
+                                else app.PerigrafoActions,
                                 "start",
                                 return_value={"state": "passed", "output": ""},
                             ) as start:
@@ -876,12 +793,12 @@ class TestGui(unittest.TestCase):
                 Path(executable).parent.parent
                 / "lib"
                 / version
-                / f"site-packages/canonical_browser/prm/{name}.js"
+                / f"site-packages/perigrafo_browser/prm/{name}.js"
             )
             if (
                 engine.read_bytes()
                 != Path(
-                    os.environ[f"CANONICAL_BROWSER_{name.upper()}"],
+                    os.environ[f"PERIGRAFO_BROWSER_{name.upper()}"],
                 ).read_bytes()
             ):
                 msg = "The packaged graph engine must match the pinned Nix dependency"
@@ -1195,6 +1112,89 @@ class TestGui(unittest.TestCase):
             if host_record["source_metrics"]["lines"] != {"configuration.nix": 1}:
                 msg = "Host source files must contribute current metrics"
                 raise AssertionError(msg)
+
+    def test_perigrafo_commands_and_package_tests_preserve_cli_arguments(self) -> None:
+        """Run every catalog entry and test action through Perigrafo without a shell."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            executable = root / "perigrafo"
+            executable.write_text(
+                f"#!{sys.executable}\n"
+                "import json, os, sys, time\n"
+                "value = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
+                "print(json.dumps(value), flush=True)\n"
+                "if '--wait' in sys.argv: time.sleep(60)\n"
+                "sys.exit(7 if '--fail' in sys.argv else 0)\n",
+            )
+            executable.chmod(0o700)
+            data: dict[str, Any] = {
+                "root": str(root),
+                "nodes": [
+                    {
+                        "kind": "package",
+                        "directory": str(root),
+                        "path": "packages/example",
+                        "name": "example",
+                    },
+                ],
+            }
+            commands = app.PerigrafoActions()
+            actions = app.PackageActions()
+            self.addCleanup(commands.close)
+            self.addCleanup(actions.close)
+            commands.observe(data)
+            actions.observe(data)
+            with patch.dict(
+                os.environ,
+                {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
+            ):
+                for entry in data["commands"]:
+                    command = entry["command"]
+                    commands.start(
+                        str(root),
+                        command,
+                        "'two words' '$(touch injected)'",
+                    )
+                    commands.jobs[str(root)].process.wait(timeout=10)
+                    state = commands.status(str(root))
+                    invocation = json.loads(state["output"])
+                    require_output(state["state"] == "passed")
+                    require_output(invocation["cwd"] == str(root))
+                    require_output(
+                        invocation["argv"]
+                        == [
+                            *command.split(),
+                            "two words",
+                            "$(touch injected)",
+                        ],
+                    )
+                    if command.startswith("test "):
+                        actions.start(str(package), command, "--timeout 12")
+                        actions.jobs[str(package)].process.wait(timeout=10)
+                        invocation = json.loads(actions.status(str(package))["output"])
+                        require_output(invocation["cwd"] == str(package))
+                        require_output(
+                            invocation["argv"] == [*command.split(), "--timeout", "12"],
+                        )
+                require_output(not (root / "injected").exists())
+                commands.start(str(root), "test mutation", "--fail")
+                commands.jobs[str(root)].process.wait(timeout=10)
+                require_output(
+                    commands.status(str(root))["exit_code"] == TEST_ACTION_FAILURE,
+                )
+                commands.start(str(root), "test hypothesis", "--wait")
+                with pytest.raises(ValueError, match="already running"):
+                    commands.start(str(root), "overview")
+                commands.start(str(root), "stop")
+                require_output(commands.status(str(root))["state"] == "stopped")
+            with pytest.raises(ValueError, match="Unknown directory"):
+                commands.start(str(package), "overview")
+            with pytest.raises(ValueError, match="Unknown Perigrafo command"):
+                commands.start(str(root), "not-a-command")
+            with pytest.raises(ValueError, match="No closing quotation"):
+                commands.start(str(root), "overview", "'")
 
     def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
         """Retain removed providers and declaration metadata in both views."""
@@ -1541,7 +1541,7 @@ class TestRepositoryData(unittest.TestCase):
             == [("Sample.", "removed"), ("Updated.", "added")],
         )
 
-    def test_package_data_uses_canonical_test_discovery(self) -> None:
+    def test_package_data_uses_perigrafo_test_discovery(self) -> None:
         """Browser test rows come from the shared static discovery contract."""
         (self.package / "test_main.py").write_text(
             "import unittest as unit\nclass Checks(unit.TestCase):\n"

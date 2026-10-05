@@ -5,7 +5,7 @@ let
       install -Dm644 dist/g6.min.js "$out/g6.js"
       install -Dm644 LICENSE "$out/share/licenses/g6/LICENSE"
       mkdir -p "$out/nix-support"
-      printf 'export CANONICAL_BROWSER_G6=%s/g6.js\n' "$out" > "$out/nix-support/setup-hook"
+      printf 'export PERIGRAFO_BROWSER_G6=%s/g6.js\n' "$out" > "$out/nix-support/setup-hook"
     '';
     pname = "g6-browser";
     src = pkgs.fetchurl {
@@ -15,7 +15,7 @@ let
     version = "5.1.1";
   };
   icons =
-    pkgs.runCommand "canonical-browser-icons"
+    pkgs.runCommand "perigrafo-browser-icons"
       {
         nativeBuildInputs = [
           pkgs.gnutar
@@ -36,12 +36,12 @@ let
         }
         for name, color in {"python": "3776ab", "html5": "e44d26", "nixos": "5277c3", "latex": "008080"}.items():
             icons[name] = Path(f"simple/icons/{name}.svg").read_text().replace("<svg ", f'<svg fill="#{color}" ')
-        Path("icons.js").write_text("window.canonicalIcons = " + json.dumps(icons) + ";\n")
+        Path("icons.js").write_text("window.perigrafoIcons = " + json.dumps(icons) + ";\n")
         PYTHON
         cp icons.js "$out/icons.js"
         cp lucide/LICENSE "$out/share/licenses/lucide/LICENSE"
         cp simple/LICENSE.md "$out/share/licenses/simple-icons/LICENSE"
-        printf 'export CANONICAL_BROWSER_ICONS=%s/icons.js\n' "$out" > "$out/nix-support/setup-hook"
+        printf 'export PERIGRAFO_BROWSER_ICONS=%s/icons.js\n' "$out" > "$out/nix-support/setup-hook"
       '';
   lucideSource = pkgs.fetchurl {
     hash = "sha256-7pl9WqhrEzQhVqVKRQrbl685EwRjQApirHF309uLjLQ=";
@@ -50,7 +50,7 @@ let
   pname = baseNameOf ./.;
   python = pkgs.python3;
   runtimeInputs = [
-    inputs.self.packages.${pkgs.stdenv.system}.canonical
+    inputs.self.packages.${pkgs.stdenv.system}.perigrafo
     pkgs.diffoscope
     pkgs.git
     pkgs.nix
@@ -72,7 +72,7 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Web diagram browser for Canonical directories, packages, hosts, and changes";
+    description = "Web diagram browser for Perigrafo directories, packages, hosts, and changes";
     mainProgram = pname;
   };
   nativeBuildInputs = [

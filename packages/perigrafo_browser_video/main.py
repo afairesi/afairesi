@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
 # ruff: noqa: S603, S607
-"""Generate a repeatable MP4 demonstration of the Canonical web browser."""
+"""Generate a repeatable MP4 demonstration of the Perigrafo web browser."""
 
 import argparse
 import os
@@ -51,7 +51,7 @@ def demo_repository(workspace: Path) -> None:
 
 
 def repository_root() -> Path:
-    """Find this canonical checkout from any working directory."""
+    """Find this Perigrafo checkout from any working directory."""
     candidates = list(Path.cwd().resolve().parents)
     candidates.insert(0, Path.cwd().resolve())
     home = Path.home()
@@ -78,17 +78,17 @@ def repository_root() -> Path:
     for candidate in candidates:
         root = candidate.resolve()
         if (root / "flake.nix").is_file() and (
-            root / "packages/canonical_browser_video/default.nix"
+            root / "packages/perigrafo_browser_video/default.nix"
         ).is_file():
             return root
-    message = "Cannot locate the canonical checkout containing canonical_browser_video"
+    message = "Cannot locate the Perigrafo checkout containing perigrafo_browser_video"
     raise RuntimeError(message)
 
 
 def record(workspace: Path, recordings: Path) -> Path:
     """Drive and record the actual GUI in Chromium."""
     with subprocess.Popen(
-        ["canonical_browser", str(workspace), "--no-open", "--port", "0"],
+        ["perigrafo_browser", str(workspace), "--no-open", "--port", "0"],
         stdout=subprocess.PIPE,
         text=True,
     ) as server:
@@ -97,14 +97,14 @@ def record(workspace: Path, recordings: Path) -> Path:
                 msg = "Browser did not provide its listening address"
                 raise RuntimeError(msg)
             address = (
-                server.stdout.readline().strip().removeprefix("Canonical browser: ")
+                server.stdout.readline().strip().removeprefix("Perigrafo browser: ")
             )
             if not address.startswith("http://127.0.0.1:"):
                 msg = f"Unexpected browser address: {address}"
                 raise RuntimeError(msg)
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(
-                    executable_path=os.environ["CANONICAL_BROWSER_VIDEO_CHROMIUM"],
+                    executable_path=os.environ["PERIGRAFO_BROWSER_VIDEO_CHROMIUM"],
                 )
                 context = browser.new_context(
                     viewport={"width": WIDTH, "height": HEIGHT},
@@ -140,10 +140,10 @@ def record(workspace: Path, recordings: Path) -> Path:
 def generate() -> Path:
     """Record the web browser and save an MP4 in this package's tmp directory."""
     output = (
-        repository_root() / "packages/canonical_browser_video/tmp/canonical_browser.mp4"
+        repository_root() / "packages/perigrafo_browser_video/tmp/perigrafo_browser.mp4"
     )
     output.parent.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="canonical-browser-video-") as temporary:
+    with tempfile.TemporaryDirectory(prefix="perigrafo-browser-video-") as temporary:
         workspace = Path(temporary) / "workspace"
         demo_repository(workspace)
         video = record(workspace, Path(temporary) / "recordings")
@@ -173,7 +173,7 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "Saves to packages/canonical_browser_video/tmp/canonical_browser.mp4 "
+            "Saves to packages/perigrafo_browser_video/tmp/perigrafo_browser.mp4 "
             "in the enclosing checkout or a checkout registered in $HOME/.gitmodules, "
             "so it can run from any working directory."
         ),
@@ -182,7 +182,7 @@ def main(argv: list[str] | None = None) -> None:
     try:
         output = generate()
     except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
-        parser.exit(1, f"canonical_browser_video: {exc}\n")
+        parser.exit(1, f"perigrafo_browser_video: {exc}\n")
     print(f"Created {output}")  # noqa: T201
 
 

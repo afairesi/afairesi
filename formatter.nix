@@ -253,9 +253,9 @@ let
   };
   wrapper = pkgs.writeShellApplication {
     name = "treefmt";
-    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.canonical ];
+    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.perigrafo ];
     text = ''
-      canonical converge
+      perigrafo converge
       exec ${rawFormatter}/bin/treefmt "$@"
     '';
   };

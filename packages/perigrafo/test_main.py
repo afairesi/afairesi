@@ -1,5 +1,5 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Check Canonical's public contracts with explicit regressions and generated cases."""
+"""Check Perigrafo's public contracts with explicit regressions and generated cases."""
 
 from __future__ import annotations
 
@@ -174,7 +174,7 @@ def _run_runner_cli(
     executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603
-        ["canonical", "test", command, str(root), *arguments],  # noqa: S607
+        ["perigrafo", "test", command, str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
@@ -235,7 +235,7 @@ def _prepare_coverage_flake(
         source = (
             "import os\n"
             "def main():\n"
-            "    if os.getenv('CANONICAL_COVERAGE_CHOICE') == 'alternate':\n"
+            "    if os.getenv('PERIGRAFO_COVERAGE_CHOICE') == 'alternate':\n"
             "        print('alternate')\n"
             "    else:\n"
             "        print('ready')\n"
@@ -255,7 +255,7 @@ def _prepare_coverage_flake(
             "    assert False\n"
             "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
             "def test_cli(message, monkeypatch):\n"
-            "    monkeypatch.setenv('CANONICAL_COVERAGE_CHOICE', message)\n"
+            "    monkeypatch.setenv('PERIGRAFO_COVERAGE_CHOICE', message)\n"
             "    result = "
             "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
             "        capture_output=True, text=True)\n"
@@ -381,7 +381,7 @@ def _check_excluded_trees(
     package = repository / "packages/example"
     (package / "stray").write_text("unsupported")
     (package / "link").symlink_to(repository / "tmp", target_is_directory=True)
-    subject = import_module("packages.canonical.main")
+    subject = import_module("packages.perigrafo.main")
     original_scandir = os.scandir
 
     def guarded_scandir(path: str | os.PathLike[str]) -> Iterator[os.DirEntry[str]]:
@@ -575,7 +575,7 @@ def _check_flake_initialization(
         encoding="utf-8",
     )
     fake_nix.chmod(0o755)
-    monkeypatch.setenv("CANONICAL_NIX", str(fake_nix))
+    monkeypatch.setenv("PERIGRAFO_NIX", str(fake_nix))
     _run(tmp_path, "init", "home")
     _git(home, "commit", "--quiet", "-m", "Home policy")
     _run(tmp_path, "init", "flake", remote)
@@ -649,7 +649,7 @@ def _check_home_whitelist(home_repository: Path) -> None:
 def _check_home_settings(
     home_repository: Path,
 ) -> None:
-    """Allow Git settings beyond the path and URL managed by Canonical."""
+    """Allow Git settings beyond the path and URL managed by Perigrafo."""
     root = home_repository
     modules = root / ".gitmodules"
     source = modules.read_text() + (
@@ -811,7 +811,7 @@ def _check_overview_history(
     repository: Path,
 ) -> None:
     """Read historical regular blobs with the same inventory as current sources."""
-    subject = import_module("packages.canonical.main")
+    subject = import_module("packages.perigrafo.main")
     for relative, content in (
         ("packages/tool/default.nix", "{}\n"),
         ("packages/tool/main.py", '"""Original help."""\n'),
@@ -885,7 +885,7 @@ def _check_missing_history(
     tmp_path: Path,
 ) -> None:
     """Recognize initialized home policy and distinguish absent HEAD from errors."""
-    subject = import_module("packages.canonical.main")
+    subject = import_module("packages.perigrafo.main")
     (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
     child = tmp_path / "forge.example"
     child.mkdir()
@@ -917,7 +917,7 @@ def _check_missing_history(
 def _check_home_graph(
     home_repository: Path,
 ) -> None:
-    """Keep same-named packages distinct and expose Canonical check relationships."""
+    """Keep same-named packages distinct and expose Perigrafo check relationships."""
     for relative in ("forge.example/owner/demo", "forge.example/owner/second"):
         root = home_repository / relative
         root.mkdir(parents=True, exist_ok=True)
@@ -1072,8 +1072,8 @@ def _check_command_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep client command menus synchronized when CLI commands are added."""
-    subject = import_module("packages.canonical.main")
-    cli = argparse.ArgumentParser(prog="canonical")
+    subject = import_module("packages.perigrafo.main")
+    cli = argparse.ArgumentParser(prog="perigrafo")
     commands = cli.add_subparsers()
     added = commands.add_parser("future")
     added.add_argument("--visible", help="Public option")
@@ -1343,7 +1343,7 @@ def _repository(root: Path, *, object_format: str = "sha1") -> Path:
 @contextmanager
 def _fresh_repository(*, object_format: str = "sha1") -> Iterator[Path]:
     """Give every generated example its own repository and cleanup."""
-    with TemporaryDirectory(prefix="canonical-contract-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-contract-") as directory:
         yield _repository(Path(directory), object_format=object_format)
 
 
@@ -1447,10 +1447,10 @@ def _template_expression(root: Path, name: str) -> str:
         "("
         + json.dumps(
             'mkdir -p "$out/bin"\ncat > "$out/bin/${attrs.name}" '
-            f"<<'CANONICAL_SCRIPT'\n#!{bash}\n",
+            f"<<'PERIGRAFO_SCRIPT'\n#!{bash}\n",
         )
         + " + attrs.text + "
-        + json.dumps('\nCANONICAL_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
+        + json.dumps('\nPERIGRAFO_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
         + ")) // attrs; }; "
         + f"package = import {root / 'packages' / name / 'default.nix'} "
         + "{ inherit pkgs; }; in "
@@ -1588,7 +1588,7 @@ def _check_discovery_boundaries() -> None:
             before = _snapshot(root)
             rejected = _run(package, "test", "names", code=1)
             _expect(
-                "canonical test names:" in rejected.stderr and not rejected.stdout,
+                "perigrafo test names:" in rejected.stderr and not rejected.stdout,
                 rejected,
             )
             _expect(_snapshot(root) == before, "malformed test source changed state")
@@ -1670,7 +1670,7 @@ def _campaign(
 
 def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
     """Expose consistent commands and reject invalid requests before creating state."""
-    with TemporaryDirectory(prefix="canonical-cli-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-cli-") as directory:
         root = Path(directory)
         commands = (
             (),
@@ -1700,7 +1700,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             + environment["PATH"]
         )
         _expect(
-            _run(root, "help", executable="canonical", environment=environment).stdout
+            _run(root, "help", executable="perigrafo", environment=environment).stdout
             == _run(root, "--help").stdout,
             "standalone command unavailable through PATH",
         )
@@ -1840,7 +1840,7 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
 
 def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> None:
     """Build real checks, measure CLI lines, and keep reports outside the checkout."""
-    with TemporaryDirectory(prefix="canonical-coverage-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-coverage-") as directory:
         root = Path(directory) / "source with spaces"
         environment = _prepare_coverage_flake(root)
         before = _snapshot(root)
@@ -1925,7 +1925,7 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
             "coverage changed repository state",
         )
     for failure in ("build", "report", "check", "syntax"):
-        with TemporaryDirectory(prefix="canonical-coverage-failure-") as directory:
+        with TemporaryDirectory(prefix="perigrafo-coverage-failure-") as directory:
             root = Path(directory) / "source"
             environment = _prepare_coverage_flake(root, failure=failure)
             if failure == "check":
@@ -1945,7 +1945,7 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
             _expect(
                 "z-last:" in result.stdout
                 and "/html/index.html" in result.stdout
-                and "canonical test coverage: example:" in result.stderr,
+                and "perigrafo test coverage: example:" in result.stderr,
                 result,
             )
             _expect(
@@ -2392,9 +2392,9 @@ def test_git_views_preserve_native_history_filters_errors_and_source_state(  # n
                 in _review_view(root, arguments, "show", initial).stdout,
                 "initial source missing",
             )
-    with TemporaryDirectory(prefix="canonical-merge-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-merge-") as directory:
         _check_merge_diff(_names_repository(Path(directory)))
-    with TemporaryDirectory(prefix="canonical-order-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-order-") as directory:
         _check_definition_order(Path(directory))
 
 
@@ -2406,16 +2406,16 @@ def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
         "git@example.test:team/project.git",
     ):
         with (
-            TemporaryDirectory(prefix="canonical-home-") as directory,
+            TemporaryDirectory(prefix="perigrafo-home-") as directory,
             pytest.MonkeyPatch.context() as patch,
         ):
             _check_remote_initialization(Path(directory), patch, remote)
     with (
-        TemporaryDirectory(prefix="canonical-bootstrap-") as directory,
+        TemporaryDirectory(prefix="perigrafo-bootstrap-") as directory,
         pytest.MonkeyPatch.context() as patch,
     ):
         _check_flake_initialization(Path(directory), patch)
-    with TemporaryDirectory(prefix="canonical-home-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-home-") as directory:
         root = _home_repository(Path(directory))
         _check_home_commits(root)
         _check_home_whitelist(root)
@@ -2445,7 +2445,7 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
     failure: str,
 ) -> None:
     """Run copied Git commands, count cases, and retain failure diagnostics."""
-    with TemporaryDirectory(prefix="canonical-campaign-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-campaign-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
             "import json, os\nfrom pathlib import Path\n"
@@ -2607,7 +2607,7 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
     value: int,
 ) -> None:
     """Report killed/surviving mutations and keep invalid baselines out of scores."""
-    with TemporaryDirectory(prefix="canonical-mutations-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-mutations-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
             "def value():\n"
@@ -2761,7 +2761,7 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
                 and not (failed / "summary.json").exists(),
                 failed,
             )
-    with TemporaryDirectory(prefix="canonical-empty-mutations-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-empty-mutations-") as directory:
         root = Path(directory) / "source"
         tests = (
             "from packages.example import main\n"
@@ -3065,7 +3065,7 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         graph = _overview(root)
         nodes = {node["id"]: node for node in graph["nodes"]}
         _expect(
-            graph["schema"] == "canonical.overview"
+            graph["schema"] == "perigrafo.overview"
             and graph["analysis"] == "source-declarations",
             graph,
         )
@@ -3144,11 +3144,11 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         _check_overview_details(root)
     with _fresh_repository() as root:
         _check_overview_history(root)
-    with TemporaryDirectory(prefix="canonical-history-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-history-") as directory:
         _check_missing_history(Path(directory))
-    with TemporaryDirectory(prefix="canonical-graph-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-graph-") as directory:
         _check_home_graph(_home_repository(Path(directory)))
-    with TemporaryDirectory(prefix="canonical-host-graph-") as directory:
+    with TemporaryDirectory(prefix="perigrafo-host-graph-") as directory:
         _check_host_graph(_home_repository(Path(directory)))
 
 
@@ -3286,7 +3286,7 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
             listed,
         )
         _expect(
-            "canonical test names: alpha:" in listed.stderr
+            "perigrafo test names: alpha:" in listed.stderr
             and "Skipping untested: no test_main.py" in listed.stderr,
             listed,
         )

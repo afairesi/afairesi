@@ -55,7 +55,7 @@ python.pkgs.buildPythonPackage {
     fi
   '';
   meta = {
-    description = "Manage canonical persistent state in home and flake repositories";
+    description = "Create, inspect, and converge Git and Nix repositories describing machines";
     mainProgram = pname;
   };
   passthru = {
