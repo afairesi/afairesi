@@ -70,7 +70,7 @@ def require_output(
 
 
 class TestOutputSnapshots(unittest.TestCase):
-    """Exercise saved output across browser launches and explicit refreshes."""
+    """Exercise output comparisons between consecutive successful actions."""
 
     def setUp(self) -> None:
         """Create an isolated package with runtime output."""
@@ -88,9 +88,9 @@ class TestOutputSnapshots(unittest.TestCase):
         *,
         refresh: bool = False,
     ) -> app.OutputComparison:
-        """Wait for one capture as the report page would."""
+        """Wait for one capture as a successful package action would."""
         data = app.gui_data(self.root)
-        snapshots.observe(data, refresh=refresh)
+        snapshots.observe(data)
         comparison = snapshots.comparisons[self.output]
         snapshots.request_capture(comparison, refresh=refresh)
         if comparison.future is None:
@@ -106,7 +106,7 @@ class TestOutputSnapshots(unittest.TestCase):
         with app.OutputSnapshots() as snapshots:
             with patch.object(app, "copy_output") as copy:
                 snapshots.observe(data)
-                snapshots.observe(data, refresh=True)
+                snapshots.observe(data)
                 copy.assert_not_called()
                 require_output(not data.get("output_pending"))
                 require_output(not (self.root / "tmp").exists())
@@ -178,7 +178,7 @@ class TestOutputSnapshots(unittest.TestCase):
                 comparison = self.capture(snapshots)
                 require_output("exit 2" in comparison.error)
                 require_output(b"&lt;failed&gt;" in app.output_diff_page(comparison))
-                previous = comparison.previous
+                previous = comparison.current
                 executable.write_text(
                     f"#!{sys.executable}\nimport time\ntime.sleep(10)\n",
                 )
@@ -190,29 +190,51 @@ class TestOutputSnapshots(unittest.TestCase):
             require_output(comparison.error == "", comparison.error)
             require_output(b"No output changes" in app.output_diff_page(comparison))
 
-    def test_failed_copy_preserves_history_and_other_browsers_cannot_rotate_it(
-        self,
-    ) -> None:
-        """Failed captures and concurrent browsers preserve the last complete output."""
-        (self.output / "value.txt").write_text("before\n")
-        with app.OutputSnapshots() as first, app.OutputSnapshots() as second:
-            comparison = self.capture(first)
-            latest = (comparison.store / "latest").read_text()
-            concurrent = self.capture(second)
-            require_output("another browser" in concurrent.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            with patch.object(shutil, "copytree", side_effect=OSError("copy failed")):
-                self.capture(first, refresh=True)
-            require_output("copy failed" in comparison.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
-            first.close()
-            self.capture(second, refresh=True)
-            require_output(concurrent.error == "", concurrent.error)
-            require_output(not concurrent.changed)
+    def test_completed_actions_queue_while_comparison_is_pending(self) -> None:
+        """Retain a second successful click while capturing the first."""
+        started = threading.Event()
+        release = threading.Event()
+        original = app.copy_output
 
-    def test_launches_compare_output_and_refresh_keeps_previous_capture(self) -> None:
-        """HTML reports compare two launches, retaining the same baseline on refresh."""
+        def delayed(
+            source: Path,
+            destination: Path,
+            *,
+            cancelled: threading.Event | None = None,
+        ) -> None:
+            started.set()
+            require_output(release.wait(10))
+            original(source, destination, cancelled=cancelled)
+
+        second = self.root / "second-result"
+        second.mkdir()
+        (second / "value.txt").write_text("second\n")
+        (self.output / "value.txt").write_text("first\n")
+        with (
+            app.OutputSnapshots() as snapshots,
+            patch.object(app, "copy_output", side_effect=delayed),
+        ):
+            snapshots.completed(self.output.parent, self.output)
+            try:
+                require_output(started.wait(10))
+                snapshots.completed(self.output.parent, second)
+            finally:
+                release.set()
+            comparison = snapshots.comparisons[self.output]
+            if comparison.future is None:
+                self.fail("Queued output was not captured")
+            comparison.future.result(timeout=20)
+            if comparison.previous is None or comparison.current is None:
+                self.fail("Both completed outputs must be retained")
+            require_output(
+                (comparison.previous / "output/value.txt").read_text() == "first\n",
+            )
+            require_output(
+                (comparison.current / "output/value.txt").read_text() == "second\n",
+            )
+
+    def test_consecutive_actions_advance_the_previous_capture(self) -> None:
+        """Each completed action compares against the immediately preceding output."""
         value = self.output / "value.json"
         value.write_text('{"value": "before"}\n')
         removed = self.output / "removed.txt"
@@ -252,7 +274,7 @@ class TestOutputSnapshots(unittest.TestCase):
             self.capture(snapshots)
             require_output(second.current == current)
             self.capture(snapshots, refresh=True)
-            require_output(second.previous == baseline)
+            require_output(second.previous == current)
             require_output(second.current != current)
             require_output(second.error == "", second.error)
             require_output(
@@ -269,6 +291,27 @@ class TestOutputSnapshots(unittest.TestCase):
             require_output(third.error == "", third.error)
             require_output(not third.changed)
             require_output(b"No output changes" in app.output_diff_page(third))
+
+    def test_failed_copy_preserves_history_and_other_browsers_cannot_rotate_it(
+        self,
+    ) -> None:
+        """Failed captures and concurrent browsers preserve the last complete output."""
+        (self.output / "value.txt").write_text("before\n")
+        with app.OutputSnapshots() as first, app.OutputSnapshots() as second:
+            comparison = self.capture(first)
+            latest = (comparison.store / "latest").read_text()
+            concurrent = self.capture(second)
+            require_output("another browser" in concurrent.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            with patch.object(shutil, "copytree", side_effect=OSError("copy failed")):
+                self.capture(first, refresh=True)
+            require_output("copy failed" in comparison.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
+            first.close()
+            self.capture(second, refresh=True)
+            require_output(concurrent.error == "", concurrent.error)
+            require_output(not concurrent.changed)
 
     def test_metadata_is_ignored_and_missing_output_reports_removals(self) -> None:
         """Ignore metadata changes and report the removal of a whole output tree."""
@@ -395,7 +438,7 @@ class TestOutputSnapshots(unittest.TestCase):
                 require_output(started.wait(10))
                 future = comparison.future
                 for _ in range(3):
-                    snapshots.observe(data, refresh=True)
+                    snapshots.observe(data)
                 require_output(comparison.future is future)
             finally:
                 release.set()
@@ -447,6 +490,9 @@ class TestOutputSnapshots(unittest.TestCase):
                 comparison = snapshots.comparisons[self.output]
                 require_output(comparison.future is None)
                 response = client.get(route)
+                require_output(comparison.future is None)
+                require_output(b"Build or Check" in response.content)
+                snapshots.completed(self.output.parent, self.output)
                 require_output(started.wait(10))
                 for _ in range(2):
                     response = client.request("GET", route)
@@ -501,6 +547,60 @@ class TestOutputSnapshots(unittest.TestCase):
             require_output(not closing.is_alive(), "Shutdown waited for diffoscope")
             require_output(all(process.poll() is not None for process in processes))
             require_output("cancelled" in comparison.error)
+
+    def test_successful_buttons_compare_changing_nix_outputs_once(self) -> None:
+        """Success rotates one package history; failed actions and browsing do not."""
+        package = self.output.parent
+        directory = str(package)
+        actions = app.PackageActions()
+        self.addCleanup(actions.close)
+        with (
+            app.OutputSnapshots() as snapshots,
+            patch.object(app, "OutputSnapshots", return_value=snapshots),
+            patch.object(app, "PackageActions", return_value=actions),
+            TestClient(
+                app.gui_app(self.root),
+                base_url="http://127.0.0.1:8765",
+            ) as client,
+        ):
+            client.get("/api/overview")
+            result = Path(actions.storage.name) / "result"
+            actions.results[directory] = result
+            previous = None
+            for index, action in enumerate(("build", "check", "check")):
+                output = self.root / f"result-{index}"
+                output.mkdir()
+                (output / "value.txt").write_text(f"value {index}\n")
+                result.unlink(missing_ok=True)
+                result.symlink_to(output)
+                actions.launch(directory, action, [sys.executable, "-c", "pass"])
+                actions.jobs[directory].process.wait(timeout=10)
+                response = client.get("/api/action", params={"directory": directory})
+                require_output(response.json()["state"] == "passed")
+                comparison = snapshots.comparisons[self.output]
+                future = comparison.future
+                if future is None:
+                    self.fail("Successful button did not capture output")
+                future.result(timeout=20)
+                require_output(comparison.previous == previous)
+                require_output(comparison.output == output)
+                previous = comparison.current
+                client.get("/api/action", params={"directory": directory})
+                overview = client.get("/api/overview", params={"refresh": "1"}).json()
+                record = next(n for n in overview["nodes"] if n["kind"] == "package")
+                client.get(record["output_diff"])
+                require_output(comparison.future is future)
+                require_output(record["output_directory"] == str(output))
+            for action, code in (("check", 1), ("run", 0)):
+                actions.launch(
+                    directory,
+                    action,
+                    [sys.executable, "-c", f"raise SystemExit({code})"],
+                )
+                actions.jobs[directory].process.wait(timeout=10)
+                client.get("/api/action", params={"directory": directory})
+                require_output(comparison.current == previous)
+                require_output(comparison.future is future)
 
 
 class TestBoundary(unittest.TestCase):
@@ -830,6 +930,38 @@ class TestGui(unittest.TestCase):
                 )
                 require_output(json.loads(response.content)["state"] == "idle")
 
+    def test_directory_actions_run_all_checks_and_reject_run(self) -> None:
+        """Parent scopes use the shared Perigrafo check command and process logs."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            actions = app.PackageActions()
+            self.addCleanup(actions.close)
+            data: dict[str, Any] = {"root": str(root), "nodes": []}
+            actions.observe(data)
+            require_output(
+                data["actions"]
+                == {
+                    "directory": str(root),
+                    "check": True,
+                    "package": False,
+                },
+            )
+            with patch.object(
+                actions,
+                "launch",
+                return_value={"state": "running"},
+            ) as launch:
+                actions.start(str(root), "check", "--untrusted")
+                launch.assert_called_once_with(
+                    str(root),
+                    "check",
+                    ["perigrafo", "check"],
+                )
+            with pytest.raises(ValueError, match="Unknown directory action"):
+                actions.start(str(root), "run")
+            with pytest.raises(ValueError, match="Unknown package"):
+                actions.start(str(root / "unknown"), "check")
+
     def test_directory_scope_excludes_sibling_resources(self) -> None:
         """Intermediate directories and package directories show only their contents."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -1081,12 +1213,82 @@ class TestGui(unittest.TestCase):
                         msg = "Output browsing must not expose source files"
                         raise AssertionError(msg)
 
+    def test_package_actions_choose_build_for_latex_and_run_for_html(self) -> None:
+        """Document and website buttons work without a corresponding test check."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            actions = app.PackageActions()
+            self.addCleanup(actions.close)
+            for kind, action in (("latex", "build"), ("html", "run")):
+                package = root / "packages" / kind
+                package.mkdir(parents=True)
+                record: dict[str, Any] = {
+                    "kind": "package",
+                    "directory": str(root),
+                    "path": f"packages/{kind}",
+                    "name": kind,
+                    "package_type": kind,
+                }
+                (package / "default.nix").write_text("{}\n")
+                actions.observe({"nodes": [record]})
+                require_output(record["actions"]["build"])
+                require_output(record["actions"]["run"] == (kind == "html"))
+                require_output(not record["actions"]["check"])
+                if kind == "latex":
+                    with pytest.raises(ValueError, match="no declared executable"):
+                        actions.start(str(package), "run")
+                with patch.object(actions, "launch", return_value={}) as launch:
+                    actions.start(str(package), action)
+                    command = launch.call_args.args[2]
+                require_output(command[:2] == ["nix", action])
+                if kind == "latex":
+                    require_output(command[-1] == f"{root}#latex")
+                    require_output(command[2] == "--out-link")
+                    require_output(Path(command[3]) == actions.results[str(package)])
+                else:
+                    require_output(command == ["nix", "run", f"{root}#html", "--"])
+
+    def test_package_actions_distinguish_python_executables_and_libraries(self) -> None:
+        """Build and check availability stay independent of executable metadata."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            default = package / "default.nix"
+            default.write_text("{ ... }: {}\n")
+            record: dict[str, Any] = {
+                "kind": "package",
+                "directory": str(root),
+                "path": "packages/example",
+                "name": "example",
+                "package_type": "python",
+            }
+            actions = app.PackageActions()
+            self.addCleanup(actions.close)
+            actions.observe({"nodes": [record]})
+            require_output(record["actions"]["build"])
+            require_output(not record["actions"]["run"])
+            require_output(not record["actions"]["check"])
+            with pytest.raises(ValueError, match="no declared executable"):
+                actions.start(str(package), "run")
+            check = root / "checks/example/default.nix"
+            check.parent.mkdir(parents=True)
+            check.write_text("{}\n")
+            default.write_text('{ ... }: { meta.mainProgram = "example"; }\n')
+            actions.observe({"nodes": [record]})
+            require_output(
+                all(record["actions"][action] for action in ("build", "run", "check")),
+            )
+
     def test_package_actions_run_checks_arguments_failures_and_stop(self) -> None:
         """Forward run arguments, execute checks and stop commands on close."""
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             package = root / "packages/example"
             package.mkdir(parents=True)
+            (package / "default.nix").write_text(
+                '{ ... }: { meta.mainProgram = "example"; }\n',
+            )
             executable = root / "nix"
             executable.write_text(
                 f"#!{sys.executable}\n"
@@ -1104,7 +1306,7 @@ class TestGui(unittest.TestCase):
                         "directory": str(root),
                         "path": "packages/example",
                         "name": "example",
-                        "package_type": "html",
+                        "package_type": "python",
                     },
                 ],
             }
@@ -1128,11 +1330,12 @@ class TestGui(unittest.TestCase):
                 command = json.loads(state["output"])
                 require_output(state["state"] == "passed")
                 require_output(
-                    command["argv"][:3] == ["build", "--no-link", "--print-build-logs"],
+                    command["argv"][:2] == ["build", "--out-link"]
+                    and command["argv"][3] == "--print-build-logs",
                 )
                 require_output(
-                    "#checks." in command["argv"][3]
-                    and command["argv"][3].endswith('."example"'),
+                    "#checks." in command["argv"][4]
+                    and command["argv"][4].endswith('."example"'),
                 )
                 actions.start(
                     str(package),
@@ -1168,6 +1371,67 @@ class TestGui(unittest.TestCase):
                 require_output(job.process.poll() is not None)
             with pytest.raises(ValueError, match="Unknown package"):
                 actions.start(str(root), "run")
+
+    def test_package_check_output_is_browsable_and_replaces_local_tmp(self) -> None:
+        """A completed check exposes its output through tmp and protects siblings."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text("{}\n")
+            local = package / "tmp"
+            local.mkdir()
+            (local / "old.txt").write_text("Old runtime output")
+            check = root / "checks/example"
+            check.mkdir(parents=True)
+            (check / "default.nix").write_text("{}\n")
+            output = root / "check-result"
+            output.mkdir()
+            (output / "report.txt").write_text("Check output")
+            outside = root / "private.txt"
+            outside.write_text("Private")
+            (output / "escape").symlink_to(outside)
+            actions = app.PackageActions()
+            with (
+                patch.object(app, "PackageActions", return_value=actions),
+                TestClient(
+                    app.gui_app(root),
+                    base_url="http://127.0.0.1:8765",
+                ) as client,
+            ):
+                client.get("/api/overview")
+                result = Path(actions.storage.name) / "check-result"
+                result.symlink_to(output)
+                actions.results[str(package)] = result
+                data = client.get("/api/overview").json()
+                record = next(
+                    node for node in data["nodes"] if node["kind"] == "package"
+                )
+                entries = [
+                    node
+                    for node in record["tree"]["children"]
+                    if node["field"] == "tmp"
+                ]
+                require_output(
+                    len(entries) == 1 and entries[0]["directory"] == str(output),
+                )
+                listing = client.get("/output", params={"path": str(output)})
+                require_output(listing.status_code == HTTPStatus.OK)
+                require_output(
+                    "report.txt" in listing.text and "escape" not in listing.text,
+                )
+                report = client.get(
+                    "/output",
+                    params={"path": str(output / "report.txt")},
+                )
+                require_output(report.text == "Check output")
+                for path in (outside, output / "escape"):
+                    require_output(
+                        client.get("/output", params={"path": str(path)}).status_code
+                        == HTTPStatus.NOT_FOUND,
+                    )
+                require_output((local / "old.txt").read_text() == "Old runtime output")
 
     def test_package_sources_count_lines_and_exclude_runtime_output(self) -> None:
         """Count blank lines and unterminated last lines, including prm sources."""

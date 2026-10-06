@@ -76,7 +76,7 @@ class TreeNode:  # noqa: D101
 
 @dataclass
 class OutputComparison:
-    """Keep one package's previous capture fixed for a browser session."""
+    """Keep the output from a package's last two successful actions."""
 
     output: Path
     store: Path
@@ -198,7 +198,7 @@ def compare_output(
 
 
 class OutputSnapshots:
-    """Capture package output only when a comparison is requested."""
+    """Compare output from consecutive successful package actions."""
 
     def __init__(self) -> None:
         """Serialize capture jobs and hold package locks until the browser closes."""
@@ -222,44 +222,48 @@ class OutputSnapshots:
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.locks.close()
 
-    def observe(self, data: dict[str, Any], *, refresh: bool = False) -> None:
+    def observe(self, data: dict[str, Any]) -> None:
         """Link reports without copying output just to browse a repository."""
         for record in data.get("nodes", []):
             if record["kind"] != "package" or record.get("change") == "removed":
                 continue
             package = Path(record["directory"]) / record["path"]
-            output = package / "tmp"
+            output = Path(record.get("output_directory", package / "tmp"))
+            key = package / "tmp"
             store = package.parent.parent / "tmp" / "perigrafo_browser" / package.name
-            if output not in self.comparisons:
+            if key not in self.comparisons:
                 if not output.is_dir() and not (store / "latest").is_file():
                     continue
                 comparison = OutputComparison(output, store)
-                self.comparisons[output] = comparison
+                self.comparisons[key] = comparison
             else:
-                comparison = self.comparisons[output]
-            if refresh and comparison.future is not None:
-                self.request_capture(comparison, refresh=True)
-            record["output_diff"] = "/output-diff?" + urlencode({"path": str(output)})
+                comparison = self.comparisons[key]
+                if comparison.future is None:
+                    comparison.output = output
+            record["output_diff"] = "/output-diff?" + urlencode({"path": str(key)})
             pending = comparison.future is not None and not comparison.future.done()
             data["output_pending"] = data.get("output_pending", False) or pending
-            tree = self.comparison_tree(comparison)
+            tree = self.comparison_tree(comparison, key)
             tree.output_diff = record["output_diff"]
             children = record["tree"]["children"]
             children[:] = [child for child in children if child["field"] != "tmp"]
             children.append(serialize_node(tree))
 
     @staticmethod
-    def comparison_tree(comparison: OutputComparison) -> TreeNode:
+    def comparison_tree(
+        comparison: OutputComparison,
+        key: Path | None = None,
+    ) -> TreeNode:
         """Reuse immutable capture contents while updating their status message."""
         pending = comparison.future is not None and not comparison.future.done()
         if comparison.future is None:
-            message = "Open output changes to capture and compare."
+            message = "Build or Check to capture output."
         elif pending:
             message = "Capturing and comparing output…"
         elif comparison.error:
             message = comparison.error
         elif comparison.previous is None:
-            message = "Initial capture saved; compare after the next browser launch."
+            message = "Initial output saved; compare after the next Build or Check."
         else:
             message = "Previous capture → Current capture"
         if comparison.current is not None and not pending:
@@ -268,6 +272,7 @@ class OutputSnapshots:
                     comparison.output,
                     comparison.previous / "output" if comparison.previous else None,
                     comparison.current / "output",
+                    diff_path=key,
                 )
             tree = deepcopy(comparison.tree)
         else:
@@ -285,14 +290,21 @@ class OutputSnapshots:
         comparison: OutputComparison,
         *,
         refresh: bool = False,
+        output: Path | None = None,
     ) -> None:
-        """Schedule at most one capture per package, including during refresh."""
+        """Queue each completed action, keeping report requests passive."""
         future = comparison.future
-        if not self.cancelled.is_set() and (
-            future is None or (refresh and future.done())
-        ):
+        if not self.cancelled.is_set() and (future is None or refresh):
             comparison.tree = None
-            comparison.future = self.executor.submit(self.capture, comparison)
+            comparison.future = self.executor.submit(self.capture, comparison, output)
+
+    def completed(self, package: Path, output: Path) -> None:
+        """Capture a successful action using a stable package history."""
+        key = package / "tmp"
+        if key not in self.comparisons:
+            store = package.parent.parent / "tmp" / "perigrafo_browser" / package.name
+            self.comparisons[key] = OutputComparison(output, store)
+        self.request_capture(self.comparisons[key], refresh=True, output=output)
 
     def entry_report(
         self,
@@ -365,7 +377,8 @@ class OutputSnapshots:
                 fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 msg = (
-                    "Output history is in use by another browser. Close it and Refresh."
+                    "Output history is in use by another browser. "
+                    "Close it and Build or Check again."
                 )
                 raise ValueError(msg) from exc
             latest = store / "latest"
@@ -386,7 +399,7 @@ class OutputSnapshots:
             self.locks.enter_context(acquired.pop_all())
         comparison.initialized = True
 
-    def capture(self, comparison: OutputComparison) -> None:
+    def capture(self, comparison: OutputComparison, output: Path | None = None) -> None:
         """Publish complete copies, retain two captures, and compare their contents."""
         capture: Path | None = None
         comparison.error = ""
@@ -394,14 +407,19 @@ class OutputSnapshots:
         try:
             self.initialize(comparison)
             capture = Path(tempfile.mkdtemp(prefix="capture-", dir=comparison.store))
-            copy_output(comparison.output, capture / "output", cancelled=self.cancelled)
+            source = output if output is not None else comparison.output
+            copy_output(source, capture / "output", cancelled=self.cancelled)
             if self.cancelled.is_set():
                 return
             (capture / "timestamp").write_text(datetime.now(UTC).isoformat())
             latest = capture / "latest"
             latest.write_text(capture.name)
             latest.replace(comparison.store / "latest")
+            if comparison.current is not None:
+                comparison.previous = comparison.current
+            comparison.output = source
             comparison.current = capture
+            comparison.tree = None
             for old in comparison.store.glob("capture-*"):
                 if old not in {comparison.previous, capture} and not old.is_symlink():
                     shutil.rmtree(old)
@@ -438,10 +456,12 @@ def output_diff_page(comparison: OutputComparison) -> bytes:
         )
     elif comparison.error:
         message = f"Could not compare output: {comparison.error}"
+    elif comparison.current is None:
+        message = "Build or Check to capture output."
     elif comparison.previous is None:
         message = (
             "Initial capture saved. "
-            "Changes will be available after the next browser launch."
+            "Changes will be available after the next Build or Check."
         )
     elif comparison.changed and comparison.current is not None:
         report = (comparison.current / comparison.report).read_bytes()
@@ -458,7 +478,8 @@ def output_diff_page(comparison: OutputComparison) -> bytes:
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         + ('<meta http-equiv="refresh" content="2">' if pending else "")
         + f"<title>{title} changes</title>"
-        + "<style>body{font:14px system-ui;margin:32px;color:#202e29;}"
+        + "<style>body{font:14px system-ui;margin:32px;"
+        + "background:#fdf6e3;color:#657b83;}"
         + "h1{font-size:18px;overflow-wrap:anywhere;}</style>"
         + heading
         + f"<p>{escape(message)}</p></html>"
@@ -858,6 +879,8 @@ def output_tree(  # noqa: C901 - merge entries with a shared recursive budget
     output: Path,
     previous: Path | None,
     current: Path,
+    *,
+    diff_path: Path | None = None,
 ) -> TreeNode:
     """Merge a bounded output tree, linking to full listings for large outputs."""
     remaining = OUTPUT_TREE_LIMIT
@@ -875,7 +898,7 @@ def output_tree(  # noqa: C901 - merge entries with a shared recursive budget
         node = TreeNode(title, expandable=directory, field="tmp")
         if after != "missing" and new is not None and not new.is_symlink():
             with contextlib.suppress(ValueError, OSError):
-                _, node.directory = output_path(str(output / relative))
+                _, node.directory = output_path(str(output / relative), roots={output})
         if directory:
             names: set[str] = set()
             for path in (old, new):
@@ -899,7 +922,7 @@ def output_tree(  # noqa: C901 - merge entries with a shared recursive budget
             ):
                 node.output_diff = "/output-diff?" + urlencode(
                     {
-                        "path": str(output),
+                        "path": str(diff_path if diff_path is not None else output),
                         "entry": str(relative) if relative != Path() else "",
                     },
                 )
@@ -1045,14 +1068,19 @@ def scope_snapshot(data: dict[str, Any], directory: Path) -> dict[str, Any]:
     return data
 
 
-def output_path(requested: str) -> tuple[Path, Path]:
+def output_path(
+    requested: str,
+    *,
+    roots: set[Path] | None = None,
+) -> tuple[Path, Path]:
     """Resolve a requested output entry within a conventional package tmp directory."""
     path = Path(requested)
     root = next(
         (
             parent
             for parent in (path, *path.parents)
-            if parent.name == "tmp" and parent.parent.parent.name == "packages"
+            if parent in (roots or set())
+            or (parent.name == "tmp" and parent.parent.parent.name == "packages")
         ),
         None,
     )
@@ -1080,7 +1108,7 @@ def output_index(root: Path, directory: Path, diff_url: str | None = None) -> by
         key=lambda path: (not path.is_dir(), path.name),
     ):
         try:
-            output_path(str(child))
+            output_path(str(child), roots={root})
         except (ValueError, OSError):
             continue
         entries.append((child.name + ("/" if child.is_dir() else ""), child))
@@ -1097,9 +1125,9 @@ def output_index(root: Path, directory: Path, diff_url: str | None = None) -> by
         '<!doctype html><html lang="en"><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
         f"<title>{title}</title>"
-        "<style>body{font:14px system-ui;margin:32px;color:#202e29;}"
+        "<style>body{font:14px system-ui;margin:32px;background:#fdf6e3;color:#657b83;}"
         "h1{font-size:18px;overflow-wrap:anywhere;}li{margin:10px 0;}"
-        "a{color:#276850;}</style>"
+        "a{color:#268bd2;}</style>"
         f"<h1>{title}</h1>"
         + (
             f'<p><a href="{escape(diff_url, quote=True)}">'
@@ -1208,10 +1236,31 @@ class PackageActions(CommandActions):
     def __init__(self) -> None:
         """Register packages separately from their command process state."""
         super().__init__()
-        self.packages: dict[str, tuple[Path, str, bool]] = {}
+        self.packages: dict[str, tuple[Path, str, bool, bool]] = {}
+        self.results: dict[str, Path] = {}
+
+    def package_output(self, package: str) -> Path | None:
+        """Resolve the output of the latest successful build in this session."""
+        result = self.results.get(package)
+        if result is None or not result.is_symlink():
+            return None
+        output = result.resolve(strict=True)
+        return output if output.is_dir() else None
+
+    def output_roots(self) -> set[Path]:
+        """Allow browsing only check outputs registered by this browser."""
+        return {
+            output
+            for package in self.results
+            if (output := self.package_output(package)) is not None
+        }
 
     def observe(self, data: dict[str, Any]) -> None:
         """Advertise actions for existing packages and their declared checks."""
+        if "root" in data:
+            directory = str(Path(data["root"]))
+            self.directories.add(directory)
+            data["actions"] = {"directory": directory, "check": True, "package": False}
         for record in data.get("nodes", []):
             if (
                 record["kind"] != "package"
@@ -1224,9 +1273,36 @@ class PackageActions(CommandActions):
             if not package.is_dir():
                 continue
             check = (repository / "checks" / record["name"] / "default.nix").is_file()
-            self.packages[str(package)] = repository, record["name"], check
+            kind = record.get("package_type", "nix")
+            default = package / "default.nix"
+            runnable = default.is_file() and (
+                kind == "html"
+                or bool(re.search(r"\bmainProgram\s*=", read_text(default)))
+            )
+            self.packages[str(package)] = repository, record["name"], check, runnable
             self.directories.add(str(package))
-            record["actions"] = {"directory": str(package), "check": check}
+            record["actions"] = {
+                "directory": str(package),
+                "build": default.is_file(),
+                "run": runnable,
+                "check": check,
+                "package": True,
+            }
+            output = self.package_output(str(package))
+            if output is not None:
+                record["output_directory"] = str(output)
+                children = record["tree"]["children"]
+                children[:] = [child for child in children if child["field"] != "tmp"]
+                children.append(
+                    serialize_node(
+                        TreeNode(
+                            "tmp/",
+                            directory=output,
+                            expandable=True,
+                            field="tmp",
+                        ),
+                    ),
+                )
 
     def start(self, package: str, action: str, arguments: str = "") -> dict[str, Any]:
         """Start an argument-list command, or stop the active process group."""
@@ -1235,31 +1311,54 @@ class PackageActions(CommandActions):
             for entry in command_catalog()
             if entry["command"].startswith("test ")
         }
+        if package in self.directories and package not in self.packages:
+            if action not in {"check", "stop"}:
+                msg = "Unknown directory action"
+                raise ValueError(msg)
+            return self.launch(
+                package,
+                action,
+                [] if action == "stop" else ["perigrafo", "check"],
+            )
         if package not in self.packages or action not in {
             "check",
+            "build",
             "run",
             "stop",
             *tests,
         }:
             msg = "Unknown package or action"
             raise ValueError(msg)
-        repository, name, check = self.packages[package]
+        repository, name, check, runnable = self.packages[package]
+        if action == "run" and not runnable:
+            msg = "This package has no declared executable"
+            raise ValueError(msg)
+        if action == "build" and not (Path(package) / "default.nix").is_file():
+            msg = "This package has no build definition"
+            raise ValueError(msg)
         if action == "stop":
             command = []
         elif action in tests:
             command = ["perigrafo", *action.split(), *shlex.split(arguments)]
-        elif action == "check":
-            if not check:
+        elif action in {"check", "build"}:
+            if action == "check" and not check:
                 msg = "This package has no declared check"
                 raise ValueError(msg)
             machine = {"arm64": "aarch64"}.get(platform.machine(), platform.machine())
             system = f"{machine}-{platform.system().lower()}"
+            result = Path(self.storage.name) / (
+                hashlib.sha256(package.encode()).hexdigest() + "-check"
+            )
+            self.results[package] = result
             command = [
                 "nix",
                 "build",
-                "--no-link",
+                "--out-link",
+                str(result),
                 "--print-build-logs",
-                f"{repository}#checks.{system}.{json.dumps(name)}",
+                f"{repository}#checks.{system}.{json.dumps(name)}"
+                if action == "check"
+                else f"{repository}#{name}",
             ]
         else:
             command = [
@@ -1329,8 +1428,8 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
             raise ValueError(msg)
         with lock:
             data = gui_data(selected, browser=browser, refresh=refresh)
-            outputs.observe(data, refresh=refresh)
             actions.observe(data)
+            outputs.observe(data)
             commands.observe(data)
             return data
 
@@ -1435,9 +1534,15 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
                 job = runner.jobs.get(directory)
                 if job is not None and state["state"] != "running" and not job.observed:
                     job.observed = True
-                    comparison = outputs.comparisons.get(Path(directory) / "tmp")
-                    if comparison is not None and comparison.future is not None:
-                        outputs.request_capture(comparison, refresh=True)
+                    if (
+                        runner is actions
+                        and directory in actions.packages
+                        and state["state"] == "passed"
+                        and job.action in {"build", "check"}
+                    ):
+                        output = actions.package_output(directory)
+                        if output is not None:
+                            outputs.completed(Path(directory), output)
                 return JSONResponse(state)
             except (OSError, ValueError) as exc:
                 return JSONResponse(
@@ -1471,7 +1576,6 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
                     status_code=HTTPStatus.NOT_FOUND,
                 )
             try:
-                outputs.request_capture(comparison)
                 return HTMLResponse(
                     output_diff_page(
                         outputs.entry_report(comparison, entry)
@@ -1488,11 +1592,19 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
     @application.api_route("/output", methods=["GET", "HEAD"])
     def output(path: str = "") -> Response:
         try:
-            output_root, target = output_path(path)
+            output_root, target = output_path(path, roots=actions.output_roots())
             if target.is_dir():
+                key = next(
+                    (
+                        key
+                        for key, comparison in outputs.comparisons.items()
+                        if output_root in (key, comparison.output)
+                    ),
+                    None,
+                )
                 diff_url = (
-                    "/output-diff?" + urlencode({"path": str(output_root)})
-                    if output_root in outputs.comparisons
+                    "/output-diff?" + urlencode({"path": str(key)})
+                    if key is not None
                     else None
                 )
                 return HTMLResponse(output_index(output_root, target, diff_url))

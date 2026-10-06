@@ -1,6 +1,11 @@
 "use strict";
 
 const $ = (id) => document.getElementById(id);
+const theme = getComputedStyle(document.documentElement);
+const colors = Object.fromEntries(
+  ["background", "surface", "text", "muted", "border", "green", "blue", "cyan", "yellow", "orange", "red"]
+    .map((name) => [name, theme.getPropertyValue(`--${name}`).trim()]),
+);
 const CARD_WIDTH = 260;
 const GROUP_PADDING = [52, 12, 12, 12];
 const LAYOUT_SPACING = { node: 8, combo: 12, rank: 24 };
@@ -12,7 +17,6 @@ const directoryViews = new Map();
 const actionStates = new Map();
 const actionViews = new Map();
 const actionTimers = new Map();
-const runArguments = new Map();
 let restoringFocus = false;
 let keyboardFocus = false;
 let pendingView = null;
@@ -110,13 +114,16 @@ function kindIcon(kind) {
 }
 
 function actionIcon(action) {
-  return icon({ check: "check", run: "play", stop: "square" }[action], "action-icon");
+  return icon({ check: "check", build: "package", run: "play", stop: "square" }[action], "action-icon");
 }
 
 function languageIcon(kind) {
   const names = { python: "Python", html: "HTML", nix: "Nix", nixos: "NixOS", latex: "LaTeX" };
   const icons = { python: "python", html: "html5", nix: "nixos", nixos: "nixos", latex: "latex" };
-  return names[kind] ? icon(icons[kind], "language-icon", names[kind]) : null;
+  if (!names[kind]) return null;
+  const item = icon(icons[kind], "language-icon", names[kind]);
+  item.dataset.language = kind;
+  return item;
 }
 
 function hasChange(tree) {
@@ -124,6 +131,7 @@ function hasChange(tree) {
 }
 
 function countLeaves(tree) {
+  if (tree.field === "dependencies") return 0;
   if (tree.warning && !tree.children?.length) return 0;
   return tree.children?.length
     ? tree.children.reduce((sum, child) => sum + countLeaves(child), 0)
@@ -258,7 +266,7 @@ function bindExpansion(details, key, matchesSearch = false, changed = false) {
 }
 
 function behaviorTree(tree, key, filterChanges) {
-  const children = tree.children || [];
+  const children = (tree.children || []).filter((child) => child.field !== "dependencies");
   function appendLines(row) {
     if (tree.lines == null) return;
     const count = tree.lines;
@@ -329,7 +337,6 @@ async function packageAction(packagePath, action = null) {
             body: JSON.stringify({
               directory: packagePath,
               action,
-              args: runArguments.get(packagePath) || "",
             }),
           }
         : {},
@@ -356,26 +363,25 @@ async function packageAction(packagePath, action = null) {
 function packageControls(node, meta, body, details) {
   const packagePath = node.actions.directory;
   const controls = element("div", "package-controls");
-  const argumentsInput = element("input", "run-arguments");
-  argumentsInput.placeholder = "Run arguments (optional)";
-  argumentsInput.setAttribute("aria-label", `Run arguments for ${node.name}`);
-  argumentsInput.value = runArguments.get(packagePath) || "";
-  argumentsInput.addEventListener("input", () =>
-    runArguments.set(packagePath, argumentsInput.value),
-  );
   const buttons = {};
-  for (const action of ["check", "run", "stop"]) {
-    const label = action[0].toUpperCase() + action.slice(1);
+  const actions = node.actions.package ? ["build", "run", "check", "stop"] : ["check", "stop"];
+  const labels = node.actions.package
+    ? { check: "Run corresponding check", build: "Build with nix build", run: "Run with nix run", stop: "Stop" }
+    : { check: "Run all enclosed checks", stop: "Stop" };
+  for (const action of actions) {
+    const label = labels[action];
     const button = element("button", "package-action");
     button.type = "button";
     button.setAttribute("aria-label", `${label} ${node.name}`);
-    if (action === "check" && !node.actions.check)
-      button.setAttribute("aria-label", `Check ${node.name}: No declared check`);
-    button.append(actionIcon(action));
+    const unavailable = { build: "No build definition", run: "No executable declared", check: "No declared check" };
+    if (action !== "stop" && !node.actions[action])
+      button.setAttribute("aria-label", `${label} ${node.name}: ${unavailable[action]}`);
+    button.title = button.getAttribute("aria-label");
+    button.append(actionIcon(action), element("span", "", action[0].toUpperCase() + action.slice(1)));
     button.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      details.open = true;
+      if (details) details.open = true;
       update({ state: "running", action, output: "Starting…" });
       packageAction(packagePath, action);
     });
@@ -390,10 +396,9 @@ function packageControls(node, meta, body, details) {
   result.setAttribute("aria-live", "polite");
   function update(state) {
     const running = state.state === "running";
-    buttons.check.disabled = running || !node.actions.check;
-    buttons.run.disabled = running;
+    for (const action of actions)
+      if (action !== "stop") buttons[action].disabled = running || !node.actions[action];
     buttons.stop.hidden = !running;
-    argumentsInput.disabled = running;
     result.hidden = state.state === "idle";
     status.textContent = `${state.action || "Command"}: ${state.state}${state.exit_code != null ? ` (exit ${state.exit_code})` : ""}`;
     output.textContent = state.output || "No output.";
@@ -401,7 +406,7 @@ function packageControls(node, meta, body, details) {
   actionViews.set(packagePath, update);
   update(actionStates.get(packagePath) || { state: "idle" });
   meta.append(controls);
-  body.append(argumentsInput, result);
+  body.append(result);
   if (!actionStates.has(packagePath)) packageAction(packagePath);
 }
 
@@ -420,12 +425,14 @@ function resourceBlock(node) {
   const summary = element("summary", "resource-header");
   const title = element("div", "resource-title");
   const icon = languageIcon(node.icon || node.package_type);
+  const icons = element("span", "resource-icons");
+  icons.append(kindIcon(node.kind));
+  if (icon) icons.append(icon);
   title.append(
-    kindIcon(node.kind),
+    icons,
     element("strong", "", node.name),
     element("span", "chevron", "›"),
   );
-  if (icon) title.insertBefore(icon, title.querySelector(".chevron"));
   summary.append(title);
   if (node.description) summary.append(element("p", "resource-description", node.description));
   if (!["package", "package-reference"].includes(node.kind))
@@ -545,7 +552,7 @@ function buildModel() {
   navigation.replaceChildren();
   function combo(id, name, parent, destination, relative) {
     const icon = kindIcon(destination ? "directory" : "machine");
-    icon.setAttribute("stroke", "#346747");
+    icon.setAttribute("stroke", colors.blue);
     const label = destination ? `${name} · ${directoryCounts(relative)}` : name;
     const result = {
       id,
@@ -556,11 +563,11 @@ function buildModel() {
         collapsedSize: [280, 40],
         labelText: label,
         labelFontSize: 12,
-        labelFill: "#346747",
+        labelFill: colors.blue,
         iconSrc: `data:image/svg+xml,${encodeURIComponent(new XMLSerializer().serializeToString(icon))}`,
-        fill: destination ? "#f1f5ec" : "#edf2f8",
-        fillOpacity: 0.6,
-        stroke: "#cfdcca",
+        fill: destination ? colors.surface : colors.background,
+        fillOpacity: 1,
+        stroke: colors.border,
         radius: 12,
       },
     };
@@ -625,7 +632,7 @@ function buildModel() {
     id: `relationship:${index}`,
     style: {
       labelText: `${edge.change === "removed" ? "− " : edge.change === "added" ? "+ " : ""}${edge.kind}`,
-      stroke: edge.change === "removed" ? "#b95656" : "#81a589",
+      stroke: edge.change === "removed" ? colors.red : colors.cyan,
     },
   }));
   // Invisible column groups let G6 stack unequal directory heights compactly.
@@ -665,6 +672,19 @@ function buildModel() {
       });
     }
   }
+  // Layout columns add hierarchy levels too: every parent must draw behind its children.
+  const depths = new Map();
+  function depth(id) {
+    if (!depths.has(id)) {
+      const parent = combos.get(id).combo;
+      depths.set(id, parent ? depth(parent) + 1 : 0);
+    }
+    return depths.get(id);
+  }
+  for (const group of combos.values()) group.style.zIndex = depth(group.id);
+  const foreground = Math.max(...depths.values()) + 1;
+  for (const edge of edges) edge.style.zIndex = foreground;
+  for (const node of nodes) node.style.zIndex = foreground + 1;
   return { nodes, edges, combos: [...combos.values()] };
 }
 
@@ -728,7 +748,7 @@ function createGraph() {
     node: { type: "html" },
     combo: {
       type: (combo) => (combo.data.layoutColumn ? "rect" : "perigrafo-directory"),
-      state: { hovered: { fill: "#e6eddf" } },
+      state: { hovered: { fill: colors.background } },
     },
     edge: {
       type: "polyline",
@@ -737,14 +757,13 @@ function createGraph() {
         radius: 5,
         lineWidth: 1.3,
         labelFontSize: 9,
-        labelFill: "#66836c",
+        labelFill: colors.muted,
         router: { type: "orth" },
       },
-      state: { related: { stroke: "#426d49", lineWidth: 2.5, labelFill: "#346747" } },
+      state: { related: { stroke: colors.blue, lineWidth: 2.5, labelFill: colors.blue } },
     },
     behaviors: [
       { type: "drag-canvas", enable: true },
-      { type: "zoom-canvas", preventDefault: true },
     ],
   });
   graph.on("combo:click", (event) => {
@@ -1050,6 +1069,17 @@ async function refresh(
     data = prepareData(snapshot);
     directory = data.root;
     renderBreadcrumbs();
+    $("scope-actions").replaceChildren();
+    $("scope-output").replaceChildren();
+    if (data.actions && !data.nodes.some(
+      (node) => node.kind === "package" && node.actions?.directory === data.root,
+    ))
+      packageControls(
+        { id: `scope:${data.root}`, name: data.root, actions: { ...data.actions, package: false } },
+        $("scope-actions"),
+        $("scope-output"),
+        null,
+      );
     const url = new URL(location.href);
     url.searchParams.delete("renderer");
     url.searchParams.set("directory", directory);
@@ -1222,20 +1252,25 @@ $("canvas").addEventListener("focusin", (event) => {
   const id = event.target.closest(".resource-block")?.dataset.nodeId;
   if (id && graph) graph.focusElement(id, false);
 });
-// G6's HTML node forwards pointer events, but its wheel events need forwarding.
+// Handle wheel gestures consistently over both the canvas and HTML cards.
 $("canvas").addEventListener(
   "wheel",
   (event) => {
-    if (!graph || !event.target.closest(".resource-block")) return;
+    if (!graph) return;
     event.preventDefault();
     const delta =
       event.deltaY *
       (event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? $("canvas").clientHeight : 1);
-    const rect = $("canvas").getBoundingClientRect();
-    graph.zoomTo(graph.getZoom() * Math.exp(-delta * 0.0015), false, [
-      event.clientX - rect.left,
-      event.clientY - rect.top,
-    ]);
+    if (event.ctrlKey) {
+      const rect = $("canvas").getBoundingClientRect();
+      graph.zoomTo(graph.getZoom() * Math.exp(-delta * 0.0015), false, [
+        event.clientX - rect.left,
+        event.clientY - rect.top,
+      ]);
+    } else {
+      const scale = event.deltaMode === 1 ? 16 : event.deltaMode === 2 ? $("canvas").clientHeight : 1;
+      graph.translateBy([-event.deltaX * scale, -delta], false);
+    }
   },
   { passive: false },
 );
