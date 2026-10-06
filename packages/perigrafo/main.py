@@ -4842,6 +4842,7 @@ check.overrideAttrs (previous: {
     export PYTEST_PLUGINS="_perigrafo_test_report''${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
     cat > "$COVERAGE_PROCESS_START" <<EOF
     [run]
+    core = ctrace
     parallel = true
     branch = true
     data_file = $out/.coverage

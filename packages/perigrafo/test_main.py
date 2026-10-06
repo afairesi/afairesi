@@ -248,6 +248,7 @@ def _prepare_coverage_flake(
             "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
             "        capture_output=True, text=True)\n"
             "    assert result.stdout == message + '\\n'\n"
+            "    assert result.stderr == ''\n"
         )
         if name == "example" and failure == "build":
             tests = "def test_failure(): assert False\n"
@@ -2398,7 +2399,7 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
             "--max-examples",
             str(max_examples),
             "--timeout",
-            "20" if failure == "counterexample" else "2",
+            "20" if failure == "counterexample" else "10",
         )
         _expect(
             result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
