@@ -1624,8 +1624,8 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             "bare perigrafo must require a repository",
         )
         _expect(
-            _run(root, "test").stdout == _run(root, "test", "--help").stdout,
-            "bare test must show help",
+            "not inside a Git repository" in _run(root, "test", code=1).stderr,
+            "bare test must require a repository",
         )
         overview_help = _run(root, "--help").stdout
         _expect(
@@ -1703,7 +1703,56 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
     _check_discovery_boundaries()
 
 
-def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
+@pytest.mark.parametrize("failure", [None, "coverage", "hypothesis", "mutation"])
+def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str | None,
+) -> None:
+    """Execute every campaign in order even when an earlier campaign fails."""
+    subject = import_module("packages.perigrafo.main")
+    _repository(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    observed: list[str] = []
+
+    def run(command: str) -> bool:
+        observed.append(command)
+        if command == failure and command != "mutation":
+            message = "campaign failed"
+            raise subject.CommandError(message)
+        return command != failure
+
+    def coverage_run(_target: Path) -> bool:
+        return run("coverage")
+
+    def runner(
+        _target: Path,
+        command: str,
+        *_arguments: object,
+    ) -> bool:
+        return run(command)
+
+    monkeypatch.setattr(subject, "_run_coverage", coverage_run)
+    monkeypatch.setattr(subject, "_run_test_repository", runner)
+    monkeypatch.setattr(sys, "argv", ["perigrafo", "test", "--help"])
+    with pytest.raises(SystemExit) as help_status:
+        subject.main()
+    _expect(help_status.value.code == 0 and not observed, observed)
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", ["perigrafo", "test"])
+    with pytest.raises(SystemExit) as completed:
+        subject.main()
+    _expect(completed.value.code == (0 if failure is None else 1), completed)
+    _expect(observed == ["coverage", "hypothesis", "mutation"], observed)
+    output = capsys.readouterr()
+    _expect("Campaign summary:" in output.out, output)
+    for command in observed:
+        status = "failed" if command == failure else "passed"
+        _expect(f"  {command}: {status}\n" in output.out, output)
+
+
+def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(  # noqa: PLR0915
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1748,6 +1797,7 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
         (),
+        ("test",),
         ("test", "coverage"),
         ("test", "hypothesis"),
         ("test", "mutation"),
@@ -1775,6 +1825,11 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
         monkeypatch.setattr(subject, runner, run)
     for cwd in (package, nested):
         monkeypatch.chdir(cwd)
+        observed.clear()
+        monkeypatch.setattr(sys, "argv", ["perigrafo", "test"])
+        with pytest.raises(SystemExit) as combined:
+            subject.main()
+        _expect(combined.value.code == 0 and observed == [root] * 3, observed)
         for path in (
             ("test", "coverage"),
             ("test", "hypothesis"),
@@ -2290,6 +2345,9 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
             "    with Path('examples').open('a') as output:\n"
             "        output.write(str(value) + '\\n')\n"
             "def test_cli():\n"
+            "    repository = subprocess.run(['git', 'rev-parse', "
+            "'--show-toplevel'], capture_output=True, text=True)\n"
+            "    assert repository.returncode != 0\n"
             "    result = subprocess.run(['git', 'example'], "
             "capture_output=True, text=True)\n"
             "    assert result.returncode == 0 and result.stdout == "

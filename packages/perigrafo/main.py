@@ -4395,6 +4395,7 @@ def _prepare_package_tests(
         f"tools = {str(launcher.parent) + os.pathsep + environment.path!r}\n"
         "os.environ['PATH'] = tools + os.pathsep + os.environ.get('PATH', '')\n"
         "os.environ['PYTHONDONTWRITEBYTECODE'] = '1'\n"
+        f"os.environ['GIT_CEILING_DIRECTORIES'] = {str(workspace.parent)!r}\n"
         "os.environ.pop('PYTHONPATH', None)\n"
         "os.environ.pop('PYTEST_ADDOPTS', None)\n"
         "os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'\n"
@@ -4671,7 +4672,7 @@ def _run_mutation_campaign(
 def _run_test_package(
     package: Path,
     command: str,
-    timeout: float,
+    timeout: float | None,
     max_examples: int | None,
     selection: TestSelection,
 ) -> bool:
@@ -4692,6 +4693,9 @@ def _run_test_package(
     _copy_test_sources(root, workspace)
     environment = _build_test_environment(root, package.name, workspace)
     if command == "mutation":
+        if timeout is None:
+            message = "mutation tests require a timeout"
+            raise CommandError(message)
         return _run_mutation_campaign(
             workspace,
             package.name,
@@ -4718,7 +4722,7 @@ def _run_test_package(
 def _run_test_repository(
     root: Path,
     command: str,
-    timeout: float,
+    timeout: float | None,
     max_examples: int | None,
     selection: TestSelection,
 ) -> bool:
@@ -4769,12 +4773,14 @@ def _run_test_repository(
 def _dispatch_test_runner(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
-) -> None:
+) -> bool:
     """Validate budgets and run an explicitly requested test campaign."""
     max_examples = getattr(options, "max_examples", None)
     if max_examples is not None and max_examples <= 0:
         cli.error("--max-examples must be positive")
-    if not math.isfinite(options.timeout) or options.timeout <= 0:
+    if options.timeout is not None and (
+        not math.isfinite(options.timeout) or options.timeout <= 0
+    ):
         cli.error("--timeout must be positive and finite")
     mutation_limit = getattr(options, "max_mutations", None)
     if mutation_limit is not None and mutation_limit <= 0:
@@ -4793,30 +4799,17 @@ def _dispatch_test_runner(
         max_mutations=mutation_limit,
         mutation_plan=getattr(options, "mutation_plan", None),
     )
-    try:
-        target = _command_target(options.target)
-        runner = (
-            _run_test_repository
-            if (target / "flake.nix").is_file()
-            else _run_test_package
-        )
-        success = runner(
-            target,
-            options.test_command,
-            options.timeout,
-            max_examples,
-            selection,
-        )
-    except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-        sys.stderr.write(f"perigrafo test {options.test_command}: {error}\n")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        sys.stderr.write(
-            f"perigrafo test {options.test_command}: "
-            "interrupted; diagnostics retained\n",
-        )
-        sys.exit(130)
-    sys.exit(0 if success else 1)
+    target = _command_target(options.target)
+    runner = (
+        _run_test_repository if (target / "flake.nix").is_file() else _run_test_package
+    )
+    return runner(
+        target,
+        options.test_command,
+        options.timeout,
+        max_examples,
+        selection,
+    )
 
 
 def _coverage_expression(root: Path, name: str, system: str) -> str:
@@ -5135,8 +5128,11 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     )
     test = commands.add_parser(
         "test",
-        help="measure coverage or run test campaigns",
-        description="Measure coverage or run test campaigns.",
+        help="run coverage, property tests, and mutation tests",
+        description=(
+            "Run coverage, Hypothesis, and mutation campaigns for the current "
+            "repository. Select a subcommand to run one campaign."
+        ),
     )
     converge = commands.add_parser(
         "converge",
@@ -5150,7 +5146,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         help="report required actions without changing the repository",
     )
     converge.add_argument("--source", type=Path, help=argparse.SUPPRESS)
-    test.set_defaults(test_command=None, test_parser=test)
+    test.set_defaults(test_command=None)
     test_commands = test.add_subparsers(dest="test_command", metavar="COMMAND")
     coverage = test_commands.add_parser(
         "coverage",
@@ -5191,10 +5187,9 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     hypothesis.add_argument(
         "--timeout",
         type=float,
-        default=60.0,
         help=(
             "seconds per test-suite invocation, excluding environment build "
-            "(default: 60)"
+            "(default: unlimited)"
         ),
     )
     hypothesis.add_argument(
@@ -5224,10 +5219,10 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     mutation.add_argument(
         "--timeout",
         type=float,
-        default=60.0,
+        default=300.0,
         help=(
             "seconds per test-suite invocation, excluding environment build "
-            "(default: 60)"
+            "(default: 300)"
         ),
     )
     hypothesis.add_argument(
@@ -5311,21 +5306,39 @@ def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
 ) -> bool:
-    """Show testing help or dispatch the selected test operation."""
-    if options.test_command is None:
-        options.test_parser.print_help()
-        return True
-    if options.test_command == "coverage":
+    """Run selected campaigns, continuing after failures and returning one status."""
+    combined = options.test_command is None
+    if combined:
+        target = _command_target(None)
+        campaigns = [
+            cli.parse_args(["test", command, str(target)])
+            for command in ("coverage", "hypothesis", "mutation")
+        ]
+    else:
+        campaigns = [options]
+    outcomes: dict[str, bool] = {}
+    for campaign in campaigns:
+        command = campaign.test_command
+        if combined:
+            sys.stdout.write(f"\nRunning {command} campaign...\n")
+            sys.stdout.flush()
         try:
-            success = _run_coverage(_command_target(options.target))
+            outcomes[command] = (
+                _run_coverage(_command_target(campaign.target))
+                if command == "coverage"
+                else _dispatch_test_runner(campaign, cli)
+            )
+        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
+            outcomes[command] = False
+            sys.stderr.write(f"perigrafo test {command}: {error}\n")
         except KeyboardInterrupt:
-            sys.stderr.write("perigrafo test coverage: interrupted\n")
+            sys.stderr.write(f"perigrafo test {command}: interrupted\n")
             sys.exit(130)
-        sys.exit(0 if success else 1)
-    if options.test_command in {"hypothesis", "mutation"}:
-        _dispatch_test_runner(options, cli)
-        return True
-    return False
+    if combined:
+        sys.stdout.write("\nCampaign summary:\n")
+        for command, success in outcomes.items():
+            sys.stdout.write(f"  {command}: {'passed' if success else 'failed'}\n")
+    sys.exit(0 if all(outcomes.values()) else 1)
 
 
 def _dispatch_overview(options: argparse.Namespace) -> None:
