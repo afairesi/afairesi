@@ -5092,18 +5092,51 @@ def _run_checks(target: Path) -> None:
         raise SystemExit(1)
 
 
-def parser() -> argparse.ArgumentParser:
+def _inspection_path(value: str) -> Path:
+    """Require an explicit inspection target to be an existing directory."""
+    path = Path(value)
+    if not path.is_dir():
+        message = f"not a directory: {value}"
+        raise argparse.ArgumentTypeError(message)
+    return path
+
+
+def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     """Construct the public command-line parser."""
     result = argparse.ArgumentParser(
         prog="perigrafo",
         description=(
             "Create, inspect, and converge Git and Nix repositories "
-            "describing machines."
+            "describing machines. Without a command, show package descriptions, "
+            "arguments, dependencies, and tests."
+        ),
+        usage="%(prog)s [-h] [--json] [PATH]\n       %(prog)s COMMAND ...",
+        epilog=(
+            "PATH selects a home, flake root, or package; "
+            "default: current repository root."
         ),
     )
+    result.set_defaults(target=None)
+    if include_target:
+        result.add_argument(
+            "target",
+            nargs="?",
+            type=_inspection_path,
+            metavar="PATH",
+            help=(
+                "home, flake root, or packages/NAME (default: current repository root)"
+            ),
+        )
+    result.add_argument(
+        "--json",
+        action="store_true",
+        help="emit package details as JSON",
+    )
+    if include_target:
+        result.set_defaults(command=None)
+        return result
     commands = result.add_subparsers(
         dest="command",
-        required=True,
         title="commands",
         metavar="COMMAND",
     )
@@ -5181,27 +5214,6 @@ def parser() -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="print removals without changing the repository",
-    )
-    overview = commands.add_parser(
-        "overview",
-        help="browse package descriptions, arguments, dependencies, and tests",
-        description=(
-            "Show package descriptions, help, arguments, "
-            "same-repository dependencies, tests, and suppressions."
-        ),
-    )
-    overview.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help="home, flake root, or packages/NAME (default: current repository root)",
-    )
-    overview.add_argument(
-        "--json",
-        action="store_true",
-        help="emit the overview as JSON",
     )
     check = commands.add_parser(
         "check",
@@ -5433,10 +5445,10 @@ def _dispatch_standalone_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
 ) -> bool:
-    """Dispatch commands that do not require discovering the current repository."""
+    """Dispatch inspection, testing, and initialization commands."""
     if options.command == "test":
         return _dispatch_test_command(options, cli)
-    if options.command == "overview":
+    if options.command is None:
         _dispatch_overview(options)
         return True
     if options.command == "check":
@@ -5489,7 +5501,14 @@ def main() -> None:
     arguments = _normalize_help_arguments(sys.argv[1:])
     try:
         cli = parser()
-        options = cli.parse_args(arguments or ["--help"])
+        commands = next(
+            action.choices
+            for action in cli._actions  # noqa: SLF001 - inspect argparse's command names
+            if isinstance(action, argparse._SubParsersAction)  # noqa: SLF001
+        )
+        if not arguments or arguments[0] not in {*commands, "-h", "--help"}:
+            cli = parser(include_target=True)
+        options = cli.parse_args(arguments)
         if _dispatch_standalone_command(options, cli):
             return
         if options.command == "converge" and options.source is not None:

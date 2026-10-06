@@ -790,7 +790,7 @@ def _check_overview_details(
     )
     _expect(record["overview"] == expected, record)
     _expect(
-        _run(repository, "overview", "packages/example").stdout == expected + "\n",
+        _run(repository, "packages/example").stdout == expected + "\n",
         expected,
     )
 
@@ -857,7 +857,7 @@ def _check_overview_history(
     ):
         msg = "Source inspection must preserve the index, working tree, and refs"
         raise AssertionError(msg)
-    output = _run(repository, "overview", "--json")
+    output = _run(repository, "--json")
     if json.loads(output.stdout) != current:
         msg = "Python and CLI current snapshots must share their public contract"
         raise AssertionError(msg)
@@ -918,7 +918,7 @@ def _check_home_graph(
         (root / "checks/same/default.nix").write_text("{}", encoding="utf-8")
     with (home_repository / ".gitmodules").open("a", encoding="utf-8") as stream:
         stream.write('[submodule "second"]\npath = forge.example/owner/second\n')
-    data = json.loads(_run(home_repository, "overview", "--json").stdout)
+    data = json.loads(_run(home_repository, "--json").stdout)
     ids = {node["id"] for node in data["nodes"]}
     for scope in ("forge.example/owner/demo", "forge.example/owner/second"):
         if f"{scope}:packages/same" not in ids:
@@ -956,7 +956,7 @@ def _check_host_graph(
         "}\n",
         encoding="utf-8",
     )
-    data = json.loads(_run(home_repository, "overview", "--json").stdout)
+    data = json.loads(_run(home_repository, "--json").stdout)
     nodes = {node["id"]: node for node in data["nodes"]}
     host_id = f"{scope}:hosts/same"
     edges = [
@@ -1001,7 +1001,6 @@ def _check_command_catalog(
             "add",
             "mv",
             "rm",
-            "overview",
             "check",
             "test",
             "test coverage",
@@ -1314,7 +1313,7 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
 
 def _overview(root: Path) -> dict[str, Any]:
     """Read the public structured source contract."""
-    return cast("dict[str, Any]", json.loads(_run(root, "overview", "--json").stdout))
+    return cast("dict[str, Any]", json.loads(_run(root, "--json").stdout))
 
 
 PACKAGE_NAMES = st.from_regex(
@@ -1514,7 +1513,7 @@ def _check_discovery_boundaries() -> None:
         for unsupported in UNSUPPORTED_INTERFACES:
             (package / "main.py").write_text(unsupported)
             before = _snapshot(root)
-            rejected = _run(package, "overview", ".")
+            rejected = _run(package, ".")
             _expect("unsupported CLI interface" in rejected.stdout, rejected)
             _expect(_snapshot(root) == before, "unsupported interface changed state")
         for layout in ("missing", "syntax", "encoding", "linked"):
@@ -1527,7 +1526,7 @@ def _check_discovery_boundaries() -> None:
             elif layout == "linked":
                 test_file.symlink_to(package / "main.py")
             before = _snapshot(root)
-            inspected = _run(package, "overview", ".")
+            inspected = _run(package, ".")
             _expect(
                 "Tests:\n  (unavailable:" in inspected.stdout
                 if layout in {"syntax", "encoding"}
@@ -1661,7 +1660,6 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             ("init",),
             ("converge",),
             ("check",),
-            ("overview",),
             ("test",),
             ("test", "coverage"),
             ("test", "hypothesis"),
@@ -1686,6 +1684,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         )
         for retired in (
             "status",
+            "overview",
             "test-names",
             "coverage",
             "hypothesis",
@@ -1697,14 +1696,14 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             "empty check scope must fail without creating state",
         )
         _expect(
-            _run(root).stdout == _run(root, "--help").stdout,
-            "bare perigrafo must show help",
+            "not inside a Git repository" in _run(root, code=1).stderr,
+            "bare perigrafo must require a repository",
         )
         _expect(
             _run(root, "test").stdout == _run(root, "test", "--help").stdout,
             "bare test must show help",
         )
-        overview_help = _run(root, "overview", "--help").stdout
+        overview_help = _run(root, "--help").stdout
         _expect(
             "--json" in overview_help
             and "--full" not in overview_help
@@ -1712,7 +1711,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             overview_help,
         )
         for removed in (("--full",), ("--revision", "HEAD")):
-            _run(root, "overview", *removed, code=2)
+            _run(root, *removed, code=2)
         _run(root, "test", "unknown", code=2)
         for path in (("args",), ("test", "names")):
             for arguments in (
@@ -1724,7 +1723,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
                 ("_textconv", "main.py"),
             ):
                 rejected = _run(root, *path, *arguments, code=2)
-                _expect("invalid choice" in rejected.stderr, rejected)
+                _expect("error:" in rejected.stderr, rejected)
         for command in ("coverage", "hypothesis", "mutation"):
             _run(root, "test", command, code=1)
         for command in ("hypothesis", "mutation"):
@@ -1798,7 +1797,7 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     _make_source_package(root, "beta", "def test_beta(): pass\n")
     nested = package / "prm/nested"
     nested.mkdir(parents=True)
-    catalog = _run(root, "overview").stdout
+    catalog = _run(root).stdout
     _expect(
         "packages/alpha:\nName: alpha\n" in catalog
         and "packages/beta:\nName: beta\n" in catalog
@@ -1806,21 +1805,25 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
         and "Tests:\n  test beta\n" in catalog,
         catalog,
     )
-    graph = _run(root, "overview", "--json").stdout
+    graph = _run(root, "--json").stdout
     for cwd in (package, nested):
-        _expect(_run(cwd, "overview").stdout == catalog, cwd)
-        _expect(_run(cwd, "overview", "--json").stdout == graph, cwd)
-    focused = json.loads(_run(package, "overview", ".", "--json").stdout)
+        _expect(_run(cwd).stdout == catalog, cwd)
+        _expect(_run(cwd, "--json").stdout == graph, cwd)
+    focused_output = _run(package, ".", "--json").stdout
+    _expect(_run(package, "--json", ".").stdout == focused_output, package)
+    focused = json.loads(focused_output)
+    _run(root, "overview", code=2)
+    _run(root, "unknown-command", code=2)
     _expect(focused["focus"] == ".:packages/alpha", focused)
-    _expect("Name: alpha\n" in _run(package, "overview", ".").stdout, package)
-    _run(nested, "overview", ".", code=1)
+    _expect("Name: alpha\n" in _run(package, ".").stdout, package)
+    _run(nested, ".", code=1)
     _expect(
-        json.loads(_run(home, "overview", "--json").stdout)["profile"] == "home",
+        json.loads(_run(home, "--json").stdout)["profile"] == "home",
         home,
     )
-    _expect(_run(tmp_path, "overview", str(root)).stdout == catalog, tmp_path)
+    _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
-        ("overview",),
+        (),
         ("check",),
         ("test", "coverage"),
         ("test", "hypothesis"),
@@ -1832,8 +1835,7 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     ordinary.mkdir()
     _git(ordinary, "init", "--quiet")
     _expect(
-        "cannot determine the repository type"
-        in _run(ordinary, "overview", code=1).stderr,
+        "cannot determine the repository type" in _run(ordinary, code=1).stderr,
         ordinary,
     )
     observed: list[Path] = []
@@ -2208,8 +2210,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
                 _expect(imported.stdout == "1\n", imported)
                 _expect(
-                    "Arguments:\n  (not applicable)\n"
-                    in _run(package, "overview", ".").stdout,
+                    "Arguments:\n  (not applicable)\n" in _run(package, ".").stdout,
                     "library contract",
                 )
                 (package / "main.py").write_text(
@@ -2246,7 +2247,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     code=2,
                 )
                 _expect(
-                    "Arguments:\n  (none)\n" in _run(package, "overview", ".").stdout,
+                    "Arguments:\n  (none)\n" in _run(package, ".").stdout,
                     "scaffold must declare an empty CLI",
                 )
         else:
@@ -3020,9 +3021,9 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
             details["tests"] == ["test result"] and details["help"] == "Consumer help.",
             details,
         )
-        focus = json.loads(_run(root, "overview", "packages/consumer", "--json").stdout)
+        focus = json.loads(_run(root, "packages/consumer", "--json").stdout)
         _expect(focus["focus"] == ".:packages/consumer", focus)
-        terminal = _run(root, "overview").stdout
+        terminal = _run(root).stdout
         _expect(
             "packages/consumer:\n" in terminal
             and "runtime: packages/" + provider in terminal
@@ -3147,7 +3148,7 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
         cwd = root if explicit else package
         target = (str(package),) if explicit else (".",)
         before = _snapshot(root)
-        inspected = _run(cwd, "overview", *target)
+        inspected = _run(cwd, *target)
         _expect(
             "Arguments:\n"
             + (
@@ -3187,7 +3188,7 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
         )
         _expect(
             "Tests:\n" + (expected_names or "  (none)\n") + "Suppressions:\n"
-            in _run(package, "overview", ".").stdout,
+            in _run(package, ".").stdout,
             "body edits changed sentences",
         )
         (package / "test_main.py").unlink(missing_ok=True)
@@ -3198,7 +3199,7 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
         missing = _make_source_package(root, "untested", "")
         (missing / "test_main.py").unlink()
         (root / "packages/linked").symlink_to(package, target_is_directory=True)
-        listed = _run(root, "overview")
+        listed = _run(root)
         _expect(
             "packages/my-package:\n" in listed.stdout
             and "Tests:\n" + (expected_names or "  (none)\n") in listed.stdout

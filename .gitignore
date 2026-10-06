@@ -14,8 +14,6 @@
 !/checks/nix_syntax/default.nix
 !/checks/perigrafo/
 !/checks/perigrafo/default.nix
-!/checks/perigrafo_browser/
-!/checks/perigrafo_browser/default.nix
 !/checks/python_test_alphabetize/
 !/checks/python_test_alphabetize/default.nix
 !/checks/remove_empty_lines/
@@ -42,13 +40,6 @@
 !/packages/perigrafo/default.nix
 !/packages/perigrafo/main.py
 !/packages/perigrafo/test_main.py
-!/packages/perigrafo_browser/
-!/packages/perigrafo_browser/default.nix
-!/packages/perigrafo_browser/main.py
-!/packages/perigrafo_browser/test_main.py
-!/packages/perigrafo_browser_video/
-!/packages/perigrafo_browser_video/default.nix
-!/packages/perigrafo_browser_video/main.py
 !/packages/python_test_alphabetize/
 !/packages/python_test_alphabetize/default.nix
 !/packages/python_test_alphabetize/main.py
