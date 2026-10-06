@@ -26,7 +26,6 @@ import tokenize
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import nix_syntax
@@ -764,7 +763,7 @@ def _python_test_placement_issue(package: Package) -> str | None:
 
 
 def has_python_tests(path: Path) -> bool:
-    """Detect the same static tests reported by the test names command."""
+    """Detect the same static tests reported by overview."""
     try:
         return bool(source_test_names(path.read_bytes(), str(path)))
     except (OSError, SyntaxError, UnicodeError) as error:
@@ -2463,15 +2462,6 @@ def _unittest_classes(module: ast.Module) -> set[str]:
     return found
 
 
-def read_test_names(path: Path, *, source_order: bool = False) -> list[str]:
-    """Read top-level test functions and methods in recognized test classes."""
-    if path.is_symlink():
-        message = f"linked test file: {path}"
-        raise ValueError(message)
-    names = source_test_names(path.read_bytes(), str(path))
-    return names if source_order else sorted(names)
-
-
 def source_test_names(source: bytes, filename: str) -> list[str]:
     """Convert Python source into sentences in definition order without executing it."""
     module = ast.parse(source, filename=filename)
@@ -2492,246 +2482,6 @@ def source_test_names(source: bytes, filename: str) -> list[str]:
     ]
 
 
-def _print_package_test_names(package: Path) -> None:
-    """Validate a canonical Python package and print its test sentences."""
-    validate_name(package.name)
-    if (
-        package.parent.name != "packages"
-        or not (package.parent.parent / "flake.nix").is_file()
-        or not all(
-            (package / name).is_file()
-            for name in ("default.nix", "main.py", "test_main.py")
-        )
-    ):
-        message = (
-            "expected a canonical packages/NAME with default.nix, main.py "
-            "and test_main.py inside a flake"
-        )
-        raise ValueError(message)
-    for name in read_test_names(package / "test_main.py"):
-        sys.stdout.write(name + "\n")
-
-
-def _print_repository_test_names(root: Path) -> bool:
-    """List packages sequentially and continue after individual parse failures."""
-    directory = root / "packages"
-    packages = (
-        sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_dir() and not path.is_symlink() and (path / "main.py").is_file()
-        )
-        if directory.is_dir()
-        else []
-    )
-    if not packages:
-        message = f"no Python packages found under {directory}"
-        raise ValueError(message)
-    success = True
-    for package in packages:
-        if not (package / "test_main.py").exists():
-            sys.stderr.write(f"Skipping {package.name}: no test_main.py\n")
-            continue
-        sys.stdout.write(f"packages/{package.name}:\n")
-        try:
-            _print_package_test_names(package)
-        except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
-            success = False
-            sys.stderr.write(f"perigrafo test names: {package.name}: {error}\n")
-    return success
-
-
-def _git_output(arguments: list[str], *, data: bytes | None = None) -> bytes:
-    """Read Git output while preserving its diagnostics and failures."""
-    return subprocess.run(  # noqa: S603
-        ["git", *arguments],  # noqa: S607
-        input=data,
-        stdout=subprocess.PIPE,
-        check=True,
-    ).stdout
-
-
-def _textconv_git_arguments(arguments: list[str]) -> tuple[list[str], list[str]]:
-    """Separate Git options/revisions from explicit path filters."""
-    separator = arguments.index("--") if "--" in arguments else len(arguments)
-    options = arguments[:separator]
-    paths = arguments[separator + 1 :]
-    for option in options:
-        if option in {
-            "--no-index",
-            "--no-textconv",
-            "--ext-diff",
-            "--check",
-        } or option.startswith(
-            ("--output", "--textconv=", "-L"),
-        ):
-            message = f"unsupported Git textconv option: {option}"
-            raise ValueError(message)
-    return options, paths
-
-
-def _check_textconv_attributes(
-    configuration: list[str],
-    paths: bytes,
-    driver_name: str = "python-test-names",
-) -> None:
-    """Refuse attribute overrides that would expose unconverted source."""
-    if not paths:
-        return
-    attributes = _git_output(
-        [*configuration, "check-attr", "-z", "--stdin", "diff"],
-        data=paths,
-    ).split(b"\0")
-    for index in range(0, len(attributes) - 1, 3):
-        path, _, driver = attributes[index : index + 3]
-        if driver != driver_name.encode():
-            message = f"conflicting diff attribute for {path.decode(errors='replace')}"
-            raise ValueError(message)
-
-
-def _textconv_diff_paths(raw: bytes) -> bytes:
-    """Collect raw diff paths and reject modes that bypass Git's textconv."""
-    paths = []
-    for field in raw.split(b"\0"):
-        if not field:
-            continue
-        header = field.lstrip(b"\n")
-        if header.startswith(b":"):
-            parents = len(header) - len(header.lstrip(b":"))
-            modes = header.lstrip(b":").split()[: parents + 1]
-            if any(mode not in {b"000000", b"100644", b"100755"} for mode in modes):
-                message = (
-                    "Git textconv requires regular files, not symlinks or submodules"
-                )
-                raise ValueError(message)
-        else:
-            paths.append(field)
-    return b"\0".join(paths) + (b"\0" if paths else b"")
-
-
-def _print_git_textconv(
-    command: str,
-    arguments: list[str],
-    *,
-    package_args: bool = False,
-) -> int:
-    """Show source summaries using an invocation-local Git textconv driver."""
-    options, paths = _textconv_git_arguments(arguments)
-    if command == "show":
-        revisions = _git_output(
-            ["rev-parse", "--revs-only", "--no-flags", *options],
-        )
-        for revision in revisions.decode().splitlines():
-            _git_output(
-                ["rev-parse", "--verify", revision.lstrip("^") + "^{commit}"],
-            )
-    root = _git_output(["rev-parse", "--show-toplevel"]).decode().rstrip("\n")
-    view = ["args"] if package_args else ["test", "names"]
-    driver = "python-package-args" if package_args else "python-test-names"
-    filename = "main.py" if package_args else "test_main.py"
-    converter = shlex.join([str(Path(sys.argv[0]).resolve()), *view, "_textconv"])
-    with TemporaryDirectory(prefix="perigrafo-textconv-") as directory:
-        attributes = Path(directory) / "attributes"
-        attributes.write_text(
-            f"/packages/*/{filename} diff={driver} {driver}\n",
-        )
-        configuration = [
-            "-c",
-            f"core.attributesFile={attributes}",
-            "-c",
-            f"diff.{driver}.textconv={converter}",
-            "-c",
-            f"diff.{driver}.cachetextconv=false",
-        ]
-        filters = [*paths, f":(top,exclude,attr:!{driver})**"]
-        discovery = _git_output(
-            [
-                *configuration,
-                command,
-                *options,
-                "--no-patch",
-                "--raw",
-                "-z",
-                "--no-relative",
-                "--no-renames",
-                "--no-ext-diff",
-                "--textconv",
-                "--no-quiet",
-                "--no-exit-code",
-                *(["--format="] if command == "show" else []),
-                "--",
-                *filters,
-            ],
-        )
-        _check_textconv_attributes(
-            ["-C", root, *configuration],
-            _textconv_diff_paths(discovery),
-            driver,
-        )
-        return subprocess.run(  # noqa: S603
-            [  # noqa: S607
-                "git",
-                *configuration,
-                command,
-                *options,
-                "--no-ext-diff",
-                "--textconv",
-                "--",
-                *filters,
-            ],
-            check=False,
-        ).returncode
-
-
-def _run_test_names(arguments: list[str]) -> int:
-    """Dispatch Git views separately from the original listing interface."""
-    if arguments and arguments[0] in {"diff", "show"}:
-        return _print_git_textconv(arguments[0], arguments[1:])
-    if arguments[:1] == ["_textconv"]:
-        converter_parser = argparse.ArgumentParser(
-            prog="perigrafo test names _textconv",
-        )
-        converter_parser.add_argument("file", type=Path)
-        for name in read_test_names(
-            converter_parser.parse_args(arguments[1:]).file,
-            source_order=True,
-        ):
-            sys.stdout.write(name + "\n")
-        return 0
-    parser = argparse.ArgumentParser(
-        prog="perigrafo test names",
-        description="List Python test names as sentences or inspect their Git changes.",
-        epilog=(
-            "Repository targets list Python packages sequentially and skip packages "
-            "without test_main.py. Test source is parsed, never executed. "
-            "Git views: diff [Git options/revisions] [-- paths...] or "
-            "show [Git options/revisions] [-- paths...]. Examples: diff; "
-            "diff --staged; diff HEAD; diff HEAD~1 HEAD; show HEAD. "
-            "Only packages/*/test_main.py sentences are compared. Git supplies "
-            "formatting, commit metadata and exit codes. Body-only edits have "
-            "no sentence hunks. These review diffs cannot be applied as source "
-            "patches. Show requires commits; --no-index, --no-textconv, "
-            "--ext-diff, --check, --output and -L are unsupported."
-        ),
-    )
-    parser.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=Path(),
-        help=(
-            "canonical packages/NAME directory or flake repository root "
-            "(default: current directory)"
-        ),
-    )
-    args = parser.parse_args(arguments)
-    target = args.target.resolve()
-    if (target / "flake.nix").is_file():
-        return 0 if _print_repository_test_names(target) else 1
-    _print_package_test_names(target)
-    return 0
-
-
 @dataclass(frozen=True)
 class CliEntry:
     """One statically discovered command or parameter at a command path."""
@@ -2741,14 +2491,9 @@ class CliEntry:
     command: bool = False
 
     def render(self) -> str:
-        """Keep the established flat argument-review format."""
+        """Render a declaration for terminal overviews."""
         prefix = " ".join(self.path)
         return (prefix + ": " if prefix else "") + self.text
-
-
-def source_package_args(source: bytes, filename: str) -> list[str]:
-    """Render the static CLI contract in the established text format."""
-    return [entry.render() for entry in source_package_cli(source, filename)]
 
 
 def _argparse_cli(module: ast.Module, filename: str) -> list[CliEntry]:  # noqa: C901, PLR0915
@@ -4278,107 +4023,6 @@ def _run_overview(target: Path, *, full: bool) -> None:
     sys.stdout.write(package_overview(target) + "\n")
 
 
-def _print_package_args(package: Path) -> None:
-    """Validate a package and print its declared CLI interface."""
-    validate_name(package.name)
-    if (
-        package.parent.name != "packages"
-        or not (package.parent.parent / "flake.nix").is_file()
-        or not (package / "default.nix").is_file()
-    ):
-        message = (
-            "expected a canonical packages/NAME with default.nix "
-            "and main.py inside a flake"
-        )
-        raise ValueError(message)
-    source = package / "main.py"
-    if source.is_symlink():
-        message = f"linked source file: {source}"
-        raise ValueError(message)
-    for line in source_package_args(source.read_bytes(), str(source)):
-        sys.stdout.write(line + "\n")
-
-
-def _run_package_args(arguments: list[str]) -> int:
-    """List argument declarations or compare them through Git."""
-    if arguments and arguments[0] in {"diff", "show"}:
-        return _print_git_textconv(arguments[0], arguments[1:], package_args=True)
-    cli = argparse.ArgumentParser(
-        prog="perigrafo args",
-        description=(
-            "List statically declared argparse, Click, Fire, or Typer interfaces "
-            "without executing source."
-        ),
-        epilog=(
-            "Git views: diff [Git options/revisions] [-- paths...] or "
-            "show [Git options/revisions] [-- paths...]. "
-            "Only packages/*/main.py declarations are compared, in source order. "
-            "Help text is included when declared statically. Dynamic declarations "
-            "and non-conventional library patterns are unsupported. "
-            "Review diffs cannot be applied as source patches. "
-            "Show requires commits; --no-index, --no-textconv, --ext-diff, "
-            "--check, --output and -L are unsupported."
-        ),
-    )
-    if arguments[:1] == ["_textconv"]:
-        cli.add_argument("file", type=Path)
-        source = cli.parse_args(arguments[1:]).file
-        for line in source_package_args(source.read_bytes(), str(source)):
-            sys.stdout.write(line + "\n")
-        return 0
-    cli.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=Path(),
-        help="packages/NAME or flake root (default: current directory)",
-    )
-    target = cli.parse_args(arguments).target.resolve()
-    if not (target / "flake.nix").is_file():
-        _print_package_args(target)
-        return 0
-    directory = target / "packages"
-    packages = (
-        sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_dir() and not path.is_symlink() and (path / "main.py").is_file()
-        )
-        if directory.is_dir()
-        else []
-    )
-    if not packages:
-        message = f"no Python packages found under {directory}"
-        raise ValueError(message)
-    status = 0
-    for package in packages:
-        sys.stdout.write(f"packages/{package.name}:\n")
-        try:
-            _print_package_args(package)
-        except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
-            status = 1
-            sys.stderr.write(f"perigrafo args: {package.name}: {error}\n")
-    return status
-
-
-def _dispatch_source_view(arguments: list[str], *, package_args: bool = False) -> None:
-    """Report errors consistently for listing, conversion and Git commands."""
-    label = "args" if package_args else "test names"
-    try:
-        status = (
-            _run_package_args(arguments) if package_args else _run_test_names(arguments)
-        )
-    except subprocess.CalledProcessError as error:
-        sys.exit(error.returncode)
-    except (CommandError, OSError, SyntaxError, UnicodeError, ValueError) as error:
-        sys.stderr.write(f"perigrafo {label}: {error}\n")
-        sys.exit(1)
-    except KeyboardInterrupt:
-        sys.stderr.write(f"perigrafo {label}: interrupted\n")
-        sys.exit(130)
-    sys.exit(status)
-
-
 def _test_target_root(package: Path) -> Path:
     """Validate the canonical target and return its flake root."""
     validate_name(package.name)
@@ -5564,12 +5208,8 @@ def parser() -> argparse.ArgumentParser:
     converge.add_argument("--source", type=Path, help=argparse.SUPPRESS)
     test = commands.add_parser(
         "test",
-        help="inspect tests, measure coverage, or run test campaigns",
-        description="Inspect tests, measure coverage, or run test campaigns.",
-    )
-    commands.add_parser(
-        "args",
-        help="list package CLI arguments or inspect their Git changes",
+        help="measure coverage or run test campaigns",
+        description="Measure coverage or run test campaigns.",
     )
     overview = commands.add_parser(
         "overview",
@@ -5578,49 +5218,6 @@ def parser() -> argparse.ArgumentParser:
             "Show a package catalog or inspect package help, arguments, "
             "same-repository dependencies, tests, and suppressions."
         ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""JSON format (schema_version 1):
-  schema: perigrafo.overview; analysis: source-declarations
-  profile: home or flake; focus: requested package ID, otherwise null
-  nodes: sorted by id; edges: sorted by source, target, kind and declaration
-Nodes have id, kind, name, repository and path. IDs use REPOSITORY:RESOURCE:
-standalone flakes use '.'; home submodules use their .gitmodules paths.
-Node kinds are repository, package, package-reference, host and check.
-Repository nodes include profile and available=false for missing submodules.
-Package nodes include package_type, description, overview and dependencies.
-Package, host and check nodes include details: name, description, help, cli,
-tests, dependencies, dependency_source, sources, diagnostics and source_metrics.
-CLI records have path (a command-name list), text and command. Source records
-have path, physical lines, suppressions (kind, scope, count) and diagnostic.
-Analysis errors use diagnostics keys cli/tests/dependencies, separate from facts.
-Sources include conventional root files and source assets under prm/, excluding
-symbolic links and tmp/. Aggregate source_metrics cover root sources only.
-Terminal overviews render the same details; clients need not parse overview text.
-Host nodes include dependencies declared in configuration.nix.
-Missing local packages remain package-reference nodes.
-Dependencies have kind, target, expression, line and resolved. Only packages
-within the same repository are included; external and unresolved dependencies
-are omitted. Kinds are runtime, build, test, source and reference. Literal lists,
-simple lexical aliases, concatenation, with scopes, local package selectors and
-relative source paths are recognized without evaluating Nix. Comments and
-ordinary strings do not create references. Computed expressions, functions,
-overrides, generated names and imported lists are not guessed. Declarations in
-embedded derivations are included; this is not an evaluated dependency closure.
-Other local package references use reference/source kinds.
-Edges have source, target and kind. Dependency arrows run from provider to
-consumer. Their declaration has repository, path, line and expression.
-Structural edges use contains/submodule; checked-by edges link matching package
-checks and NAMEVmWithDisko host checks. Clients can derive dependants from edges.
-The Python overview_data(Path) API returns the same document. Both interfaces
-read the working tree without building packages, importing package Python or
-contacting services. Identical sources produce identical sorted JSON, without
-timestamps, absolute checkout paths or store hashes. overview_data(Path,
-revision=REVISION) reads regular Git blobs without changing the checkout. Home
-views use each registered checkout's revision. Repository revision_available is
-false when HEAD does not exist; other invalid revisions raise an error.
-Clients own filtering,
-layout, icons and runtime status. Match nodes by ID, allow unknown added fields
-and reject unsupported schema versions.""",
     )
     overview.add_argument(
         "target",
@@ -5637,10 +5234,7 @@ and reject unsupported schema versions.""",
     overview.add_argument(
         "--json",
         action="store_true",
-        help=(
-            "emit deterministic perigrafo.overview JSON (schema version 1) "
-            "for visualization clients; includes only same-repository dependencies"
-        ),
+        help="emit the overview as JSON",
     )
     overview.add_argument(
         "--revision",
@@ -5648,18 +5242,14 @@ and reject unsupported schema versions.""",
     )
     test.set_defaults(test_command=None, test_parser=test)
     test_commands = test.add_subparsers(dest="test_command", metavar="COMMAND")
-    test_commands.add_parser(
-        "names",
-        help="list Python test sentences or inspect their Git changes",
-    )
     coverage = test_commands.add_parser(
         "coverage",
-        help="build instrumented test checks and print HTML report paths",
-        description="Measure explicit test examples in a separate cached Nix build.",
+        help="measure test coverage and print HTML report paths",
+        description="Measure coverage from explicit test examples.",
         epilog=(
             "Repository targets skip packages without tests and summarize results. "
-            "Builds reuse Nix's cache, leave the checkout unchanged, and store HTML "
-            "reports in the Nix store. Use converge to create or update checks."
+            "HTML reports are stored in the Nix store. "
+            "Use converge to create or update checks."
         ),
     )
     coverage.add_argument(
@@ -5703,8 +5293,8 @@ and reject unsupported schema versions.""",
     )
     mutation = test_commands.add_parser(
         "mutation",
-        help="run Cosmic Ray mutation tests in isolated package copies",
-        description="Run Cosmic Ray mutation tests in isolated package copies.",
+        help="run mutation tests in isolated package copies",
+        description="Run mutation tests in isolated package copies.",
         epilog=(
             "Repository targets run Python packages sequentially, skip packages "
             "without test_main.py, and summarize results. Logs and reports "
@@ -5774,7 +5364,7 @@ and reject unsupported schema versions.""",
         "--max-mutations",
         type=int,
         metavar="N",
-        help="cap the deterministically ordered set of selected mutations",
+        help="maximum mutations to test",
     )
     mutation.add_argument(
         "--mutation-plan",
@@ -5903,13 +5493,6 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
 def main() -> None:
     """Dispatch the Perigrafo CLI."""
     arguments = _normalize_help_arguments(sys.argv[1:])
-    package_args = arguments[:1] == ["args"]
-    if package_args or arguments[:2] == ["test", "names"]:
-        _dispatch_source_view(
-            arguments[1:] if package_args else arguments[2:],
-            package_args=package_args,
-        )
-        return
     try:
         cli = parser()
         options = cli.parse_args(arguments)

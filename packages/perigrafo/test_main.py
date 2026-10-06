@@ -58,7 +58,7 @@ def _git(root: Path, *arguments: str) -> str:
     ).stdout
 
 
-def _make_test_names_package(root: Path, name: str, source: str) -> Path:
+def _make_source_package(root: Path, name: str, source: str) -> Path:
     """Create a canonical package fixture without executing its source."""
     package = root / "packages" / name
     package.mkdir(parents=True)
@@ -69,19 +69,7 @@ def _make_test_names_package(root: Path, name: str, source: str) -> Path:
     return package
 
 
-def _run_test_names(cwd: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    """Invoke the installed command from a chosen working directory."""
-    return subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", "names", *arguments],
-        cwd=cwd,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=10,
-    )
-
-
-def _test_names_git(root: Path, *arguments: str) -> str:
+def _fixture_git(root: Path, *arguments: str) -> str:
     """Run fixture Git commands with a local identity and no signing."""
     return subprocess.run(  # noqa: S603
         [  # noqa: S607
@@ -995,79 +983,6 @@ def _check_host_graph(
         raise AssertionError(edges)
 
 
-def _check_merge_diff(
-    names_repository: Path,
-) -> None:
-    """Preserve combined merge presentation instead of inventing a first parent."""
-    _test_names_git(names_repository, "reset", "--hard", "HEAD")
-    _test_names_git(names_repository, "branch", "side", "HEAD~1")
-    _test_names_git(names_repository, "checkout", "-q", "side")
-    (names_repository / "packages/example/test_main.py").write_text(
-        "def test_side(): pass\n",
-    )
-    _test_names_git(names_repository, "commit", "-qam", "Side change")
-    _test_names_git(names_repository, "checkout", "-q", "-")
-    subprocess.run(
-        [  # noqa: S607
-            "git",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "merge",
-            "--no-commit",
-            "side",
-        ],
-        cwd=names_repository,
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    (names_repository / "packages/example/test_main.py").write_text(
-        "def test_merged(): pass\n",
-    )
-    _test_names_git(names_repository, "add", "packages/example/test_main.py")
-    _test_names_git(names_repository, "commit", "-qm", "Resolve merge")
-    result = _run_test_names(names_repository, "show", "--color=never")
-    if (
-        result.returncode != 0
-        or "diff --cc" not in result.stdout
-        or "++test merged" not in result.stdout
-    ):
-        raise AssertionError(result)
-
-
-def _check_definition_order(
-    tmp_path: Path,
-) -> None:
-    """Append methods and async tests in declaration order in patches."""
-    _test_names_git(tmp_path, "init", "-q")
-    package = _make_test_names_package(tmp_path, "example", "def test_zebra(): pass\n")
-    _test_names_git(tmp_path, "add", ".")
-    _test_names_git(tmp_path, "commit", "-qm", "Initial test")
-    source = package / "test_main.py"
-    source.write_text(
-        "def test_zebra(): pass\n"
-        "class TestBehavior:\n    def test_middle(self): pass\n"
-        "async def test_alpha(): pass\n",
-    )
-    expected = " test zebra\n+test middle\n+test alpha\n"
-    working = _run_test_names(tmp_path, "diff", "--color=never")
-    _test_names_git(tmp_path, "add", ".")
-    staged = _run_test_names(tmp_path, "diff", "--staged", "--color=never")
-    _test_names_git(tmp_path, "commit", "-qm", "Append tests")
-    committed = _run_test_names(tmp_path, "show", "--color=never")
-    for result in (working, staged, committed):
-        if result.returncode != 0 or expected not in result.stdout:
-            raise AssertionError(result)
-    listing = _run_test_names(package)
-    if (
-        listing.returncode != 0
-        or listing.stdout != "test alpha\ntest middle\ntest zebra\n"
-    ):
-        raise AssertionError(listing)
-
-
 def _check_command_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1112,27 +1027,6 @@ def _check_command_catalog(
     if "--visible" not in catalog[0]["help"] or "--internal" in catalog[0]["help"]:
         msg = "Catalog must publish public parser help without hidden options"
         raise AssertionError(msg)
-
-
-def _names_repository(tmp_path: Path) -> Path:
-    """Create distinct previous, HEAD, staged and working-tree sentences."""
-    _test_names_git(tmp_path, "init", "-q")
-    package = _make_test_names_package(
-        tmp_path,
-        "example",
-        "def test_previous(): pass\n",
-    )
-    _test_names_git(tmp_path, "add", ".")
-    _test_names_git(tmp_path, "commit", "-qm", "Initial tests")
-    source = package / "test_main.py"
-    source.write_text("def test_committed(): pass\n")
-    _test_names_git(tmp_path, "add", ".")
-    _test_names_git(tmp_path, "commit", "-qm", "Rename the test")
-    source.write_text("def test_staged(): pass\n")
-    _test_names_git(tmp_path, "add", ".")
-    source.write_text("def test_working(): pass\n")
-    (package / "main.py").write_text("PRIVATE_IMPLEMENTATION = 1\n")
-    return tmp_path
 
 
 CLI_CONTRACTS = (
@@ -1559,7 +1453,7 @@ def _check_discovery_boundaries() -> None:
             "from pathlib import Path\nPath('SENTINEL').touch()\n"
             "raise RuntimeError('must not execute')\n"
         )
-        package = _make_test_names_package(
+        package = _make_source_package(
             root,
             "example",
             sentinel + "def test_result(): pass\n",
@@ -1604,11 +1498,8 @@ def _check_discovery_boundaries() -> None:
         for unsupported in UNSUPPORTED_INTERFACES:
             (package / "main.py").write_text(unsupported)
             before = _snapshot(root)
-            rejected = _run(package, "args", code=1)
-            _expect(
-                "unsupported CLI interface" in rejected.stderr and not rejected.stdout,
-                rejected,
-            )
+            rejected = _run(package, "overview")
+            _expect("unsupported CLI interface" in rejected.stdout, rejected)
             _expect(_snapshot(root) == before, "unsupported interface changed state")
         for layout in ("missing", "syntax", "encoding", "linked"):
             test_file = package / "test_main.py"
@@ -1620,46 +1511,14 @@ def _check_discovery_boundaries() -> None:
             elif layout == "linked":
                 test_file.symlink_to(package / "main.py")
             before = _snapshot(root)
-            rejected = _run(package, "test", "names", code=1)
+            inspected = _run(package, "overview")
             _expect(
-                "perigrafo test names:" in rejected.stderr and not rejected.stdout,
-                rejected,
+                "Tests:\n  (unavailable:" in inspected.stdout
+                if layout in {"syntax", "encoding"}
+                else "Tests:\n  (not declared)" in inspected.stdout,
+                inspected,
             )
             _expect(_snapshot(root) == before, "malformed test source changed state")
-
-
-def _review_source(label: str, *, arguments: bool) -> str:
-    """Describe one known interface or sentence independently of the converter."""
-    if arguments:
-        return (
-            "import argparse\np = argparse.ArgumentParser()\n"
-            f"p.add_argument('--{label}')\n"
-        )
-    return f"def test_{label}(): pass\n"
-
-
-def _review_view(
-    root: Path,
-    arguments: bool,  # noqa: FBT001
-    *options: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Preserve repository state through successful and rejected Git views."""
-    before = _snapshot(root)
-    result = _run(
-        root,
-        *(("args",) if arguments else ("test", "names")),
-        *options,
-        code=code,
-    )
-    _expect(_snapshot(root) == before, options)
-    _expect(
-        "def test_" not in result.stdout
-        and "add_argument" not in result.stdout
-        and "PRIVATE_IMPLEMENTATION" not in result.stdout,
-        result,
-    )
-    return result
 
 
 def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None:
@@ -1787,9 +1646,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             ("converge",),
             ("check",),
             ("overview",),
-            ("args",),
             ("test",),
-            ("test", "names"),
             ("test", "coverage"),
             ("test", "hypothesis"),
             ("test", "mutation"),
@@ -1828,14 +1685,18 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             "bare test must show help",
         )
         _run(root, "test", "unknown", code=2)
-        names_help = _run(root, "test", "names", "--help").stdout
-        _expect(
-            "[target]" in names_help and "current directory" in names_help,
-            names_help,
-        )
-        for option in ("--timeout", "--max-examples"):
-            _run(root, "test", "names", option, "10", code=2)
-        for command in ("names", "coverage", "hypothesis", "mutation"):
+        for path in (("args",), ("test", "names")):
+            for arguments in (
+                (),
+                (str(root),),
+                ("diff",),
+                ("show",),
+                ("--help",),
+                ("_textconv", "main.py"),
+            ):
+                rejected = _run(root, *path, *arguments, code=2)
+                _expect("invalid choice" in rejected.stderr, rejected)
+        for command in ("coverage", "hypothesis", "mutation"):
             _run(root, "test", command, code=1)
         for command in ("hypothesis", "mutation"):
             for timeout in ("nan", "inf", "-inf", "0", "-1"):
@@ -1879,12 +1740,11 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
                 elif layout != "single_untested":
                     _expect("no Python packages found" in result.stderr, result)
             if layout == "empty":
-                for command in ("names", "coverage"):
-                    _expect(
-                        "no Python packages found"
-                        in _run(root, "test", command, code=1).stderr,
-                        command,
-                    )
+                _expect(
+                    "no Python packages found"
+                    in _run(root, "test", "coverage", code=1).stderr,
+                    "coverage",
+                )
             _expect(_snapshot(root) == before, "nonrunnable target created state")
     with pytest.MonkeyPatch.context() as monkeypatch:
         _check_command_catalog(monkeypatch)
@@ -2221,7 +2081,8 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
                 _expect(imported.stdout == "1\n", imported)
                 _expect(
-                    _run(package, "args").stdout == "(not applicable)\n",
+                    "Arguments:\n  (not applicable)\n"
+                    in _run(package, "overview").stdout,
                     "library contract",
                 )
                 (package / "main.py").write_text(
@@ -2258,7 +2119,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     code=2,
                 )
                 _expect(
-                    not _run(package, "args").stdout,
+                    "Arguments:\n  (none)\n" in _run(package, "overview").stdout,
                     "scaffold must declare an empty CLI",
                 )
         else:
@@ -2312,200 +2173,6 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     and (Path(site) / "style.css").is_file(),
                     site,
                 )
-
-
-@settings(deadline=None)
-@given(suffix=st.text(alphabet="abcxyz", max_size=4))
-@example(suffix="")
-def test_git_views_preserve_native_history_filters_errors_and_source_state(  # noqa: C901, PLR0912, PLR0915
-    suffix: str,
-) -> None:
-    """Compare known source versions through both public Git views."""
-    with _fresh_repository() as root:
-        package = _make_test_names_package(root, "example", "")
-        files = {False: package / "test_main.py", True: package / "main.py"}
-        previous, committed, staged, working = (
-            prefix + suffix for prefix in ("previous", "committed", "staged", "working")
-        )
-
-        def write_version(label: str) -> None:
-            for arguments, path in files.items():
-                path.write_text(_review_source(label, arguments=arguments))
-
-        def row(label: str, arguments: bool) -> str:  # noqa: FBT001
-            return f"--{label}  optional" if arguments else "test " + label
-
-        write_version(previous)
-        _test_names_git(root, "add", ".")
-        for arguments in files:
-            result = _review_view(root, arguments, "diff", "--staged")
-            _expect("+" + row(previous, arguments) + "\n" in result.stdout, result)
-        _test_names_git(root, "commit", "-qm", "Initial declarations")
-        initial = _git(root, "rev-parse", "HEAD").strip()
-        write_version(committed)
-        _test_names_git(root, "commit", "-qam", "Change declarations")
-        write_version(staged)
-        _test_names_git(root, "add", ".")
-        write_version(working)
-        cases = (
-            (("diff",), staged, working),
-            (("diff", "--staged"), committed, staged),
-            (("diff", "--cached"), committed, staged),
-            (("diff", "HEAD"), committed, working),
-            (("diff", "HEAD~1", "HEAD"), previous, committed),
-            (("show",), previous, committed),
-            (("diff", "-R"), working, staged),
-        )
-        for arguments, path in files.items():
-            for options, removed, added in cases:
-                result = _review_view(root, arguments, *options)
-                _expect(
-                    "-" + row(removed, arguments) + "\n" in result.stdout
-                    and "+" + row(added, arguments) + "\n" in result.stdout,
-                    result,
-                )
-            changed = _review_view(root, arguments, "diff", "--exit-code", code=1)
-            _expect("+" + row(working, arguments) in changed.stdout, changed)
-            filename = "main.py" if arguments else "test_main.py"
-            excluded = "test_main.py" if arguments else "main.py"
-            scoped = _review_view(
-                root,
-                arguments,
-                "diff",
-                "HEAD",
-                "--",
-                "packages/example",
-            )
-            local = _review_view(package, arguments, "diff", "HEAD", "--", ".")
-            _expect(local.stdout == scoped.stdout, local)
-            _expect(
-                not _review_view(
-                    root,
-                    arguments,
-                    "diff",
-                    "HEAD",
-                    "--",
-                    "packages/example/" + excluded,
-                ).stdout,
-                excluded,
-            )
-            unsupported = (
-                ("diff", "--no-index"),
-                ("diff", "--no-textconv"),
-                ("diff", "--check"),
-                ("diff", "--ext-diff"),
-                ("diff", "--output=patch"),
-            )
-            for options in unsupported:
-                rejected = _review_view(root, arguments, *options, code=1)
-                _expect(not rejected.stdout and bool(rejected.stderr), rejected)
-            for revision in (f"HEAD:packages/example/{filename}", "HEAD^{tree}"):
-                rejected = _review_view(root, arguments, "show", revision, code=128)
-                _expect(
-                    not rejected.stdout and "commit type" in rejected.stderr,
-                    rejected,
-                )
-            rejected = _review_view(
-                root,
-                arguments,
-                "diff",
-                "missing-revision",
-                code=128,
-            )
-            _expect(not rejected.stdout and bool(rejected.stderr), rejected)
-            for layout in ("attributes", "syntax", "linked", "historical-link"):
-                source = path
-                saved = source.read_bytes()
-                attributes = root / ".gitattributes"
-                if layout == "attributes":
-                    attributes.write_text(f"packages/*/{filename} diff=custom\n")
-                elif layout == "syntax":
-                    source.write_text("def invalid(")
-                else:
-                    source.unlink()
-                    source.symlink_to("PRIVATE_TARGET")
-                    if layout == "historical-link":
-                        _test_names_git(root, "add", str(source.relative_to(root)))
-                        _test_names_git(root, "commit", "-qm", "Link source")
-                        source.unlink()
-                        source.write_bytes(saved)
-                rejected = _review_view(
-                    root,
-                    arguments,
-                    "show" if layout == "historical-link" else "diff",
-                    code=128 if layout == "syntax" else 1,
-                )
-                _expect(not rejected.stdout and bool(rejected.stderr), rejected)
-                attributes.unlink(missing_ok=True)
-                source.unlink(missing_ok=True)
-                source.write_bytes(saved)
-                if layout == "historical-link":
-                    _test_names_git(root, "reset", "--hard", "HEAD~1")
-                    write_version(staged)
-                    _test_names_git(root, "add", ".")
-                    write_version(working)
-        write_version(staged)
-        for path in files.values():
-            path.write_text(
-                path.read_text() + "raise RuntimeError('body edit must not run')\n",
-            )
-        _make_test_names_package(root, "untracked", "def test_untracked(): pass\n")
-        for arguments in files:
-            _expect(
-                not _review_view(root, arguments, "diff").stdout,
-                "body or untracked edits leaked",
-            )
-        other = _make_test_names_package(root, "other", "def test_other(): pass\n")
-        (other / "main.py").write_text(_review_source("other", arguments=True))
-        _test_names_git(root, "add", "packages/other")
-        for arguments in files:
-            all_packages = _review_view(package, arguments, "diff", "HEAD")
-            scoped = _review_view(
-                root,
-                arguments,
-                "diff",
-                "HEAD",
-                "--",
-                "packages/example",
-            )
-            _expect(
-                "+" + row("other", arguments) in all_packages.stdout
-                and row("other", arguments) not in scoped.stdout,
-                all_packages,
-            )
-        _test_names_git(root, "reset", "--hard", "HEAD")
-        _test_names_git(root, "mv", "packages/example", "packages/renamed")
-        for arguments in files:
-            renamed = _review_view(root, arguments, "diff", "--staged", "-M")
-            filename = "main.py" if arguments else "test_main.py"
-            _expect("rename to packages/renamed/" + filename in renamed.stdout, renamed)
-            formatted = _review_view(
-                root,
-                arguments,
-                "show",
-                "--format=%s",
-                "--color=never",
-                "-U0",
-            )
-            _expect(formatted.stdout.startswith("Change declarations\n"), formatted)
-        _test_names_git(root, "commit", "-qm", "Rename package")
-        _test_names_git(root, "rm", "-rf", "packages/renamed")
-        _test_names_git(root, "commit", "-qm", "Delete package")
-        for arguments in files:
-            _expect(
-                "-" + row(committed, arguments)
-                in _review_view(root, arguments, "show").stdout,
-                "deleted source missing",
-            )
-            _expect(
-                "+" + row(previous, arguments)
-                in _review_view(root, arguments, "show", initial).stdout,
-                "initial source missing",
-            )
-    with TemporaryDirectory(prefix="perigrafo-merge-") as directory:
-        _check_merge_diff(_names_repository(Path(directory)))
-    with TemporaryDirectory(prefix="perigrafo-order-") as directory:
-        _check_definition_order(Path(directory))
 
 
 def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
@@ -3236,7 +2903,7 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
             terminal,
         )
         _git(root, "add", "--force", ".")
-        _test_names_git(root, "commit", "-qm", "Source snapshot")
+        _fixture_git(root, "commit", "-qm", "Source snapshot")
         before = _snapshot(root)
         historical = json.loads(
             _run(root, "overview", "--json", "--revision", "HEAD").stdout,
@@ -3341,7 +3008,7 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
                     for label in labels
                 )
             )
-        package = _make_test_names_package(root, "my-package", tests)
+        package = _make_source_package(root, "my-package", tests)
         source, expected_args = contract
         (package / "main.py").write_text(
             '"""First paragraph.\n\nArguments:\n  Documentation text."""\n'
@@ -3349,13 +3016,27 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
             + source,
         )
         expected_names = "".join(
-            "test " + label.replace("_", " ") + "\n" for label in sorted(labels)
+            "  test " + label.replace("_", " ") + "\n" for label in labels
         )
         cwd = root if explicit else package
         target = (str(package),) if explicit else ()
         before = _snapshot(root)
-        _expect(_run(cwd, "args", *target).stdout == expected_args, contract)
-        _expect(_run(cwd, "test", "names", *target).stdout == expected_names, tests)
+        inspected = _run(cwd, "overview", *target)
+        _expect(
+            "Arguments:\n"
+            + (
+                "".join("  " + line + "\n" for line in expected_args.splitlines())
+                or "  (none)\n"
+            )
+            + "Dependencies:\n"
+            in inspected.stdout,
+            contract,
+        )
+        _expect(
+            "Tests:\n" + (expected_names or "  (none)\n") + "Suppressions:\n"
+            in inspected.stdout,
+            tests,
+        )
         details = next(
             node["details"]
             for node in _overview(root)["nodes"]
@@ -3379,30 +3060,26 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
             tests.replace("assert False", "raise RuntimeError('changed body')"),
         )
         _expect(
-            _run(package, "test", "names").stdout == expected_names,
+            "Tests:\n" + (expected_names or "  (none)\n") + "Suppressions:\n"
+            in _run(package, "overview").stdout,
             "body edits changed sentences",
         )
         (package / "test_main.py").unlink(missing_ok=True)
         (package / "test_main.py").write_text(tests)
-        broken = _make_test_names_package(root, "alpha", "def invalid(")
+        broken = _make_source_package(root, "alpha", "def invalid(")
         (broken / "main.py").write_text("import sys\nprint(sys.argv)\n")
         (package / "main.py").write_text(source)
-        missing = _make_test_names_package(root, "untested", "")
+        missing = _make_source_package(root, "untested", "")
         (missing / "test_main.py").unlink()
         (root / "packages/linked").symlink_to(package, target_is_directory=True)
-        listed = _run(root, "test", "names", code=1)
+        listed = _run(root, "overview", "--full")
         _expect(
-            listed.stdout == "packages/alpha:\npackages/my-package:\n" + expected_names,
+            "packages/my-package:\n" in listed.stdout
+            and "Tests:\n" + (expected_names or "  (none)\n") in listed.stdout
+            and "Tests:\n  (unavailable:" in listed.stdout
+            and "unsupported CLI interface" in listed.stdout
+            and "packages/untested:\n" in listed.stdout
+            and "Tests:\n  (not declared)" in listed.stdout
+            and "packages/linked:" not in listed.stdout,
             listed,
-        )
-        _expect(
-            "perigrafo test names: alpha:" in listed.stderr
-            and "Skipping untested: no test_main.py" in listed.stderr,
-            listed,
-        )
-        args = _run(root, "args", code=1)
-        _expect(
-            "packages/my-package:\n" + expected_args in args.stdout
-            and "alpha: unsupported CLI interface" in args.stderr,
-            args,
         )
