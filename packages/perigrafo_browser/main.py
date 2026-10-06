@@ -1185,7 +1185,7 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
 
     for node in tree.children or []:
         title = node.title.removeprefix("- ").removeprefix("+ ")
-        if title.startswith(("Language:", "Name:")):
+        if title.startswith(("Language:", "Name:")) or node.title == "Dependencies":
             continue
         if node.title == "Suppressions":
             for file in node.children or []:
@@ -1206,11 +1206,10 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
                     else:
                         children[matching] = suppression
                     parent.children = children
-        elif node.title in {"Arguments", "Tests", "Dependencies"}:
+        elif node.title in {"Arguments", "Tests"}:
             name = {
                 "Arguments": "main.py",
                 "Tests": "test_main.py",
-                "Dependencies": "default.nix",
             }[node.title]
             attach(name, node)
         elif title.startswith("Help:"):
@@ -1228,6 +1227,34 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
     ]
     tree.children.extend(package_storage(directory))
     return tree
+
+
+def relationship_groups(
+    record: dict[str, Any],
+    edges: list[dict[str, Any]],
+) -> list[TreeNode]:
+    """Group declared local providers without repeating paths or file references."""
+    groups: dict[str, list[TreeNode]] = {}
+    for edge in edges:
+        group = {
+            "runtime": "Runtime dependencies",
+            "test": "Test dependencies",
+            "source": "Shared files",
+        }.get(edge["kind"])
+        if edge["target"] != record["id"] or group is None:
+            continue
+        repository, _, provider = edge["source"].partition(":")
+        title = provider.removeprefix("packages/")
+        if repository != record["repository"]:
+            title = f"{repository}/{provider}"
+        link = TreeNode(
+            title,
+            style={"added": 32, "removed": 31}.get(edge.get("change") or ""),
+        )
+        children = groups.setdefault(group, [])
+        if link not in children:
+            children.append(link)
+    return [TreeNode(group, groups[group]) for group in sorted(groups)]
 
 
 def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationships
@@ -1296,17 +1323,10 @@ def browser_snapshot(  # noqa: C901 - assemble resources and semantic relationsh
             record["source_metrics"] = source_metrics(sources)
             if record["kind"] == "package":
                 tree = package_file_tree(directory, tree, sources)
-        links = [
-            TreeNode(
-                f"{edge['kind']}: {edge['source']} → {edge['target']}",
-                style={"added": 32, "removed": 31}.get(edge.get("change")),
-            )
-            for edge in data["edges"]
-            if edge["target"] == identifier
-            and edge["kind"] not in {"contains", "submodule"}
+        tree.children = [
+            *(tree.children or []),
+            *relationship_groups(record, data["edges"]),
         ]
-        if links:
-            tree.children = [*(tree.children or []), TreeNode("Connections", links)]
         resources[identifier] = tree
         record["tree"] = serialize_node(tree)
     result = [resources[machine["id"]]]

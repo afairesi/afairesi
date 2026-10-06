@@ -307,7 +307,34 @@ class TestBrowserData(unittest.TestCase):
                 msg = "Host source files must contribute current metrics"
                 raise AssertionError(msg)
 
-    def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
+    def test_relationship_groups_keep_names_and_deduplicate_shared_files(self) -> None:
+        """Keep three useful groups and qualify providers from other repositories."""
+        record = {"id": ".:packages/consumer", "repository": "."}
+        edges = [
+            {"source": source, "target": record["id"], "kind": kind}
+            for kind, source in (
+                ("runtime", ".:packages/library"),
+                ("source", ".:packages/assets"),
+                ("source", ".:packages/assets"),
+                ("test", "other/repo:packages/helper"),
+                ("build", ".:packages/compiler"),
+                ("reference", ".:packages/unused"),
+                ("hostname-match", ".:machine"),
+            )
+        ]
+        groups = {
+            group.title: [child.title for child in group.children or []]
+            for group in app.relationship_groups(record, edges)
+        }
+        if groups != {
+            "Runtime dependencies": ["library"],
+            "Test dependencies": ["other/repo/packages/helper"],
+            "Shared files": ["assets"],
+        }:
+            msg = "Relationship groups must show each provider once without arrows"
+            raise AssertionError(msg)
+
+    def test_removed_dependencies_preserve_groups_and_change_colors(self) -> None:
         """Both renderers retain removed providers and their relationships."""
         tree = [
             app.TreeNode(
@@ -316,7 +343,7 @@ class TestBrowserData(unittest.TestCase):
                     app.TreeNode(
                         "Dependencies",
                         [
-                            app.TreeNode("- build: packages/old", style=31),
+                            app.TreeNode("- runtime: packages/old", style=31),
                         ],
                     ),
                 ],
@@ -348,9 +375,13 @@ class TestBrowserData(unittest.TestCase):
         if not records[".:packages/old"]["removed"]:
             msg = "Removed dependency providers must remain in the shared snapshot"
             raise AssertionError(msg)
-        connections = records[".:packages/consumer"]["tree"]["children"][-1]
-        if connections["children"][0]["change"] != "removed":
-            msg = "Connections must retain the same change colors as GUI arrows"
+        group = records[".:packages/consumer"]["tree"]["children"][-1]
+        if (
+            group["title"] != "Runtime dependencies"
+            or group["children"][0]["title"] != "old"
+            or group["children"][0]["change"] != "removed"
+        ):
+            msg = "Dependency groups must retain provider names and change colors"
             raise AssertionError(msg)
         if snapshot["edges"][0]["change"] != "removed" or not nodes:
             msg = "Both the tree and graphical relationship must preserve removal"

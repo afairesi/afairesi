@@ -1522,7 +1522,11 @@ def _check_launcher_environment(
         "optionalAttrs = condition: attrs: if condition then attrs else {}; "
         'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
         'else abort "library check requested an executable"; }; }; '
-        f"packageDrv = package // {{ inherit python; meta = {metadata}; }}; "
+        "packageDrv = package // { "
+        'checkInputs = ["check-input"]; nativeCheckInputs = ["native-check-input"]; '
+        "python = python // { withPackages = select: { selected = select { "
+        'hypothesis = "hypothesis"; pytest = "pytest"; }; }; }; '
+        f"meta = {metadata}; }}; "
         f"in import {root / 'checks' / name / 'default.nix'} {{ pkgs = checkPkgs; "
         "inputs.self.packages.${builtins.currentSystem}."
         f"{json.dumps(name)} = packageDrv; }}"
@@ -1540,6 +1544,12 @@ def _check_launcher_environment(
     attributes = json.loads(result.stdout)
     expected = None if library else "/package/bin/other-name"
     _expect(attributes.get("PACKAGE_E2E_EXECUTABLE") == expected, attributes)
+    native_inputs = attributes["nativeBuildInputs"]
+    _expect("check-input" in native_inputs, native_inputs)
+    _expect("native-check-input" in native_inputs, native_inputs)
+    python_inputs = native_inputs[-1]["selected"]
+    _expect("check-input" in python_inputs, python_inputs)
+    _expect("native-check-input" in python_inputs, python_inputs)
 
 
 def _check_discovery_boundaries() -> None:

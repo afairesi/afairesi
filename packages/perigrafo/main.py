@@ -874,6 +874,8 @@ let
     ps:
     packageDrv.propagatedBuildInputs
     ++ (packageDrv.buildInputs or [ ])
+    ++ (packageDrv.checkInputs or [ ])
+    ++ (packageDrv.nativeCheckInputs or [ ])
     ++ [
       ps.hypothesis
       ps.pytest
@@ -887,6 +889,7 @@ pkgs.runCommand packageName
       nativeBuildInputs =
         (packageDrv.nativeBuildInputs or [ ])
         ++ (packageDrv.checkInputs or [ ])
+        ++ (packageDrv.nativeCheckInputs or [ ])
         ++ packageDrv.propagatedBuildInputs
         ++ [ pythonEnv ];
     }
@@ -5203,7 +5206,7 @@ check.overrideAttrs (previous: {
         */test_main.py
         */prm/*
     EOF
-    printf '%s\\n' 'import os, coverage' 'tracer = coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("PERIGRAFO_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
+    printf '%s\\n' 'import os, coverage' 'tracer = coverage.Coverage.current() or coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("PERIGRAFO_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
     export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
   '' + previous.buildCommand + ''
     unset COVERAGE_PROCESS_START

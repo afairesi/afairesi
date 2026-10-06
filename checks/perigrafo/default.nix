@@ -6,6 +6,8 @@ let
     ps:
     packageDrv.propagatedBuildInputs
     ++ (packageDrv.buildInputs or [ ])
+    ++ (packageDrv.checkInputs or [ ])
+    ++ (packageDrv.nativeCheckInputs or [ ])
     ++ [
       ps.hypothesis
       ps.pytest
@@ -19,6 +21,7 @@ pkgs.runCommand packageName
       nativeBuildInputs =
         (packageDrv.nativeBuildInputs or [ ])
         ++ (packageDrv.checkInputs or [ ])
+        ++ (packageDrv.nativeCheckInputs or [ ])
         ++ packageDrv.propagatedBuildInputs
         ++ [ pythonEnv ];
     }
