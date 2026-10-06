@@ -124,6 +124,30 @@ class TestBrowserData(unittest.TestCase):
             msg = "Nested changes must retain their addition and removal status"
             raise AssertionError(msg)
 
+    def test_directory_paths_start_collapsed(self) -> None:
+        """Directory expansion is manual regardless of the number of packages."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            for name in ("first", "second"):
+                package = root / "packages" / name
+                package.mkdir(parents=True)
+                (package / "default.nix").write_text("{}\n")
+                (package / "main.py").write_text('"""Example."""\n')
+                viewer = app.Viewer(root)
+                viewer.refresh_overview()
+                directory = viewer.overview[0]
+                if directory.expanded or any(
+                    child.expanded for child in directory.children or []
+                ):
+                    msg = "Directories and packages must start collapsed"
+                    raise AssertionError(msg)
+                viewer.overview_rows(80)
+                viewer.navigate("l", 20, viewer.rows(80))
+                if not directory.expanded:
+                    msg = "Directory expansion must remain available manually"
+                    raise AssertionError(msg)
+
     def test_directory_scope_matches_snapshot_and_terminal(self) -> None:
         """Intermediate directories and package directories show only their contents."""
         with tempfile.TemporaryDirectory() as temporary:
@@ -183,7 +207,7 @@ class TestBrowserData(unittest.TestCase):
                     or not machine.expanded
                     or user.title != f"User: {home.name} ({home})"
                     or user.directory != home
-                    or not user.expanded
+                    or user.expanded
                     or (user.children or [])[0].title != "repository"
                     or details.expanded
                 ):
@@ -363,46 +387,6 @@ class TestBrowserData(unittest.TestCase):
                 if "Preservation: not detected" not in details:
                     msg = "Missing evidence must be reported as not detected"
                     raise AssertionError(msg)
-
-    def test_single_directory_paths_expand_without_opening_resources(self) -> None:
-        """Initial expansion stops at choices and resource details."""
-        package = app.TreeNode(
-            "packages/example",
-            [app.TreeNode("arguments")],
-            resource_id="package",
-        )
-        branch = app.TreeNode(
-            "repository",
-            [package, app.TreeNode("hosts/example")],
-            directory=Path("/home/example/repository"),
-        )
-        path = app.TreeNode("example", [branch], directory=Path("/home/example"))
-        app.expand_directory_paths([path])
-        if not (path.expanded):
-            msg = "Unexpected tree containment or expansion"
-            raise AssertionError(msg)
-        if branch.expanded:
-            msg = "Unexpected tree containment or expansion"
-            raise AssertionError(msg)
-        if package.expanded:
-            msg = "Unexpected tree containment or expansion"
-            raise AssertionError(msg)
-        branch.children = [package]
-        app.expand_directory_paths([path])
-        if not (branch.expanded):
-            msg = "Unexpected tree containment or expansion"
-            raise AssertionError(msg)
-        if package.expanded:
-            msg = "Unexpected tree containment or expansion"
-            raise AssertionError(msg)
-        viewer = app.Viewer(Path("/home/example"))
-        viewer.overview = [path]
-        viewer.overview_rows(80)
-        viewer.collapse_overview_node()
-        viewer.overview_rows(80)
-        if path.expanded:
-            msg = "Unexpected tree containment or expansion"
-            raise AssertionError(msg)
 
     def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
         """Count prm allocation once per inode and preserve the runtime link."""

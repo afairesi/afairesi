@@ -131,7 +131,6 @@ class Viewer:  # noqa: D101
         self.snapshot, self.status = deepcopy(self.source_snapshots[root])
         self.snapshot, self.full_overview = scope_snapshot(self.snapshot, self.cwd)
         self.diff_overview = self.changed_nodes(self.full_overview)
-        expand_directory_paths(self.diff_overview)
         self.select_overview()
         self.overview_loaded = True
         self.selected = self.top = 0
@@ -903,6 +902,19 @@ def serialize_node(node: TreeNode) -> dict[str, Any]:
     }
 
 
+def deserialize_node(tree: dict[str, Any]) -> TreeNode:
+    """Restore directories and resource details from the shared snapshot."""
+    return TreeNode(
+        tree["title"],
+        [deserialize_node(child) for child in tree["children"]],
+        style={"removed": 31, "added": 32, "modified": 33}.get(tree["change"]),
+        warning=tree["warning"],
+        resource_id=tree["resource_id"],
+        source_file=tree.get("source_file", False),
+        directory=Path(tree["directory"]) if tree.get("directory") else None,
+    )
+
+
 def read_text(path: Path) -> str:
     """Read optional runtime evidence without failing the repository browser."""
     try:
@@ -1375,23 +1387,12 @@ def directory_snapshot(directory: Path) -> tuple[dict[str, Any], list[TreeNode]]
     }, nodes
 
 
-def expand_directory_paths(nodes: list[TreeNode]) -> None:
-    """Reveal single-child directory paths while leaving resources collapsed."""
-    for node in nodes:
-        if node.resource_id is not None:
-            continue
-        if node.directory is not None and node.children and len(node.children) == 1:
-            node.expanded = True
-        if node.children:
-            expand_directory_paths(node.children)
-
-
 def scoped_tree(
     data: dict[str, Any],
     directory: Path,
     nodes: list[TreeNode],
 ) -> tuple[dict[str, Any], list[TreeNode]]:
-    """Nest the home user under their machine and reveal directory paths."""
+    """Nest the home user under their machine and serialize the scoped tree."""
     if directory == Path.home().resolve():
         user = next((node for node in nodes if node.directory == directory), None)
         if user is None:
@@ -1411,7 +1412,6 @@ def scoped_tree(
                 expanded=True,
             ),
         ]
-    expand_directory_paths(nodes)
     data["tree"] = [serialize_node(node) for node in nodes]
     return data, nodes
 
@@ -1428,10 +1428,7 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
         return scoped_tree(
             data,
             directory,
-            [
-                TreeNode(record["repository"], [], directory=Path(record["directory"]))
-                for record in data["nodes"]
-            ],
+            [deserialize_node(tree) for tree in data["tree"]],
         )
     nodes = []
     for record in data["nodes"]:
@@ -1491,20 +1488,8 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
         parent = container(Path(record["repository"]))
         if record["kind"] == "repository":
             continue
-
-        def deserialize(tree: dict[str, Any]) -> TreeNode:
-            return TreeNode(
-                tree["title"],
-                [deserialize(child) for child in tree["children"]],
-                style={"removed": 31, "added": 32, "modified": 33}.get(tree["change"]),
-                warning=tree["warning"],
-                resource_id=tree["resource_id"],
-                source_file=tree.get("source_file", False),
-                directory=Path(tree["directory"]) if tree.get("directory") else None,
-            )
-
         if parent.children is not None:
-            parent.children.append(deserialize(record["tree"]))
+            parent.children.append(deserialize_node(record["tree"]))
     return scoped_tree(data, directory, result)
 
 
