@@ -106,13 +106,17 @@ class TestBrowserData(unittest.TestCase):
             msg = "Checks must not appear in the terminal tree"
             raise AssertionError(msg)
         repository = snapshot["tree"][0]
-        package = repository["children"][0]
+        package = repository["children"][0]["children"][0]
         if package != records[".:packages/sample"]["tree"]:
-            msg = "Terminal and GUI package details must be identical"
+            msg = "Terminal and snapshot package details must be identical"
             raise AssertionError(msg)
         if (
             records[".:hosts/laptop"]["icon"] != "nixos"
             or len(repository["children"]) != TEST_REPOSITORY_FIELDS
+            or [child["title"] for child in repository["children"]]
+            != ["packages", "hosts"]
+            or repository["children"][1]["children"][0]["title"] != "laptop"
+            or package["title"] != "sample"
         ):
             msg = "Hosts must appear alongside packages"
             raise AssertionError(msg)
@@ -137,6 +141,15 @@ class TestBrowserData(unittest.TestCase):
                 viewer = app.Viewer(root)
                 viewer.refresh_overview()
                 directory = viewer.overview[0]
+                packages = (directory.children or [])[0]
+                expected = ["first"] if name == "first" else ["first", "second"]
+                if (
+                    packages.title != "packages"
+                    or packages.directory != root / "packages"
+                    or [child.title for child in packages.children or []] != expected
+                ):
+                    msg = "Package names must appear beneath a packages directory"
+                    raise AssertionError(msg)
                 if directory.expanded or any(
                     child.expanded for child in directory.children or []
                 ):
@@ -279,8 +292,8 @@ class TestBrowserData(unittest.TestCase):
             }:
                 msg = "Metrics must exclude prm sources and zero suppression counts"
                 raise AssertionError(msg)
-            if snapshot["tree"][0]["children"][0] != record["tree"]:
-                msg = "Source line counts must be shared by the GUI and TUI"
+            if snapshot["tree"][0]["children"][0]["children"][0] != record["tree"]:
+                msg = "Source line counts must match the terminal snapshot"
                 raise AssertionError(msg)
             host = root / "hosts/example"
             host.mkdir(parents=True)

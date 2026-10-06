@@ -1485,11 +1485,17 @@ def scope_snapshot(  # noqa: C901, PLR0912 - filter resources and reconstruct co
     for record in nodes:
         if record["kind"] == "machine":
             continue
-        parent = container(Path(record["repository"]))
         if record["kind"] == "repository":
+            container(Path(record["repository"]))
             continue
+        location = Path(record["directory"]) / record["path"]
+        relative = location.relative_to(directory)
+        parent = container(relative.parent)
+        node = deserialize_node(record["tree"])
+        node.title = location.name
+        record["tree"] = serialize_node(node)
         if parent.children is not None:
-            parent.children.append(deserialize_node(record["tree"]))
+            parent.children.append(node)
     return scoped_tree(data, directory, result)
 
 
