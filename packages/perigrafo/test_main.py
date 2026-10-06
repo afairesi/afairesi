@@ -1001,7 +1001,6 @@ def _check_command_catalog(
             "add",
             "mv",
             "rm",
-            "check",
             "test",
             "test coverage",
             "test hypothesis",
@@ -1576,78 +1575,6 @@ def _campaign(
     return result
 
 
-def test_check_continues_after_failed_repositories(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """All enclosed repositories run and any failure makes the command fail."""
-    subject = import_module("packages.perigrafo.main")
-    commands = [["nix", "flake", "check", "first"], ["nix", "flake", "check", "second"]]
-    observed: list[list[str]] = []
-    monkeypatch.setattr(subject, "check_commands", lambda _target: commands)
-
-    def run(command: list[str], *, check: bool) -> subprocess.CompletedProcess[str]:
-        _expect(not check, command)
-        observed.append(command)
-        return subprocess.CompletedProcess(command, int(command[-1] == "first"))
-
-    monkeypatch.setattr(subject.subprocess, "run", run)
-    monkeypatch.setattr(sys, "argv", ["perigrafo", "check", str(tmp_path)])
-    with pytest.raises(SystemExit) as failure:
-        subject.main()
-    _expect(failure.value.code == 1 and observed == commands, observed)
-
-
-def test_check_scopes_include_repositories_packages_and_host_checks(
-    tmp_path: Path,
-) -> None:
-    """Directory checks include flakes while collection checks stay in scope."""
-    subject = import_module("packages.perigrafo.main")
-    for repository in (tmp_path / "user/first", tmp_path / "user/second"):
-        repository.mkdir(parents=True)
-        (repository / "flake.nix").write_text("{}")
-    first = tmp_path / "user/first"
-    for relative in (
-        "packages/example",
-        "checks/example",
-        "checks/other",
-        "hosts/laptop",
-        "checks/laptopVmWithDisko",
-    ):
-        resource = first / relative
-        resource.mkdir(parents=True)
-        (resource / "default.nix").write_text("{}")
-    commands = subject.check_commands(tmp_path / "user")
-    _expect(
-        [command[-1] for command in commands]
-        == [str(tmp_path / "user/first"), str(tmp_path / "user/second")],
-        commands,
-    )
-    _expect(
-        all(command[:3] == ["nix", "flake", "check"] for command in commands),
-        commands,
-    )
-    _expect(subject.check_commands(first) == commands[:1], commands)
-    for target, names in (
-        ("packages", ["example"]),
-        ("checks", ["example", "laptopVmWithDisko", "other"]),
-        ("hosts/laptop", ["laptopVmWithDisko"]),
-    ):
-        command = subject.check_commands(first / target)[0]
-        _expect(command[:3] == ["nix", "build", "--no-link"], command)
-        _expect(
-            [argument.rsplit(".", 1)[-1] for argument in command[5:]]
-            == [json.dumps(name) for name in names],
-            command,
-        )
-    empty = tmp_path / "empty"
-    empty.mkdir()
-    with pytest.raises(subject.CommandError, match="No flake repositories"):
-        subject.check_commands(empty)
-    with pytest.raises(subject.CommandError, match="Directory not found"):
-        subject.check_commands(tmp_path / "missing")
-
-
 def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="perigrafo-cli-") as directory:
@@ -1659,7 +1586,6 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             ("rm",),
             ("init",),
             ("converge",),
-            ("check",),
             ("test",),
             ("test", "coverage"),
             ("test", "hypothesis"),
@@ -1684,6 +1610,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         )
         for retired in (
             "status",
+            "check",
             "overview",
             "test-names",
             "coverage",
@@ -1691,10 +1618,6 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             "mutation",
         ):
             _run(root, retired, code=2)
-        _expect(
-            "not inside a Git repository" in _run(root, "check", code=1).stderr,
-            "empty check scope must fail without creating state",
-        )
         _expect(
             "not inside a Git repository" in _run(root, code=1).stderr,
             "bare perigrafo must require a repository",
@@ -1824,7 +1747,6 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
         (),
-        ("check",),
         ("test", "coverage"),
         ("test", "hypothesis"),
         ("test", "mutation"),
@@ -1845,7 +1767,6 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
         return True
 
     for runner in (
-        "_run_checks",
         "_run_coverage",
         "_run_test_package",
         "_run_test_repository",
@@ -1854,7 +1775,6 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     for cwd in (package, nested):
         monkeypatch.chdir(cwd)
         for path in (
-            ("check",),
             ("test", "coverage"),
             ("test", "hypothesis"),
             ("test", "mutation"),
@@ -1864,12 +1784,9 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
             )
             for arguments, expected in targets:
                 monkeypatch.setattr(sys, "argv", ["perigrafo", *path, *arguments])
-                if path[0] == "test":
-                    with pytest.raises(SystemExit) as completed:
-                        subject.main()
-                    _expect(completed.value.code == 0, path)
-                else:
+                with pytest.raises(SystemExit) as completed:
                     subject.main()
+                _expect(completed.value.code == 0, path)
                 _expect(observed[-1] == expected, (path, arguments, observed))
 
 

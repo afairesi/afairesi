@@ -12,7 +12,6 @@ import io
 import json
 import math
 import os
-import platform
 import posixpath
 import re
 import shlex
@@ -5010,88 +5009,6 @@ def _mutation_lines(value: str) -> tuple[int, int]:
     return start, end
 
 
-def _scope_check_names(repository: Path, target: Path) -> set[str]:
-    """Map scoped resources to their corresponding declared checks."""
-    names: set[str] = set()
-    for collection in ("checks", "packages", "hosts"):
-        directory = repository / collection
-        if not directory.is_dir():
-            continue
-        for resource in directory.iterdir():
-            if not resource.is_dir() or resource.is_symlink():
-                continue
-            if resource.is_relative_to(target) or target.is_relative_to(resource):
-                name = resource.name + ("VmWithDisko" if collection == "hosts" else "")
-                if (repository / "checks" / name / "default.nix").is_file():
-                    names.add(name)
-    return names
-
-
-def check_commands(target: Path) -> list[list[str]]:
-    """Select all flake checks enclosed by a repository or directory scope."""
-    target = target.resolve()
-    if not target.is_dir():
-        msg = f"Directory not found: {target}"
-        raise CommandError(msg)
-    repository = next(
-        (path for path in (target, *target.parents) if (path / "flake.nix").is_file()),
-        None,
-    )
-    if repository is not None and repository != target:
-        names = _scope_check_names(repository, target)
-        if not names:
-            msg = f"No checks enclosed by {target}"
-            raise CommandError(msg)
-        machine = {"arm64": "aarch64"}.get(platform.machine(), platform.machine())
-        system = f"{machine}-{platform.system().lower()}"
-        return [
-            [
-                "nix",
-                "build",
-                "--no-link",
-                "--keep-going",
-                "--print-build-logs",
-                *[
-                    f"{repository}#checks.{system}.{json.dumps(name)}"
-                    for name in sorted(names)
-                ],
-            ],
-        ]
-    repositories: list[Path] = []
-    for current, children, _files in os.walk(target):
-        root = Path(current)
-        if (root / "flake.nix").is_file():
-            repositories.append(root)
-            children[:] = []
-        else:
-            children[:] = sorted(
-                name
-                for name in children
-                if not name.startswith(".")
-                and name not in {PRM_NAME, TMP_NAME}
-                and not (root / name).is_symlink()
-            )
-    if not repositories:
-        msg = f"No flake repositories enclosed by {target}"
-        raise CommandError(msg)
-    return [
-        ["nix", "flake", "check", "--keep-going", "--print-build-logs", str(root)]
-        for root in repositories
-    ]
-
-
-def _run_checks(target: Path) -> None:
-    """Run every selected repository even when an earlier check fails."""
-    failed = False
-    for command in check_commands(target):
-        sys.stdout.write(shlex.join(command) + "\n")
-        sys.stdout.flush()
-        result = subprocess.run(command, check=False)  # noqa: S603 - fixed Nix commands
-        failed |= result.returncode != 0
-    if failed:
-        raise SystemExit(1)
-
-
 def _inspection_path(value: str) -> Path:
     """Require an explicit inspection target to be an existing directory."""
     path = Path(value)
@@ -5214,21 +5131,6 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         "--dry-run",
         action="store_true",
         help="print removals without changing the repository",
-    )
-    check = commands.add_parser(
-        "check",
-        help="run all Nix checks enclosed by a repository or directory",
-    )
-    check.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        default=None,
-        metavar="PATH",
-        help=(
-            "package, collection, repository, directory, or home "
-            "(default: current repository root)"
-        ),
     )
     test = commands.add_parser(
         "test",
@@ -5450,9 +5352,6 @@ def _dispatch_standalone_command(
         return _dispatch_test_command(options, cli)
     if options.command is None:
         _dispatch_overview(options)
-        return True
-    if options.command == "check":
-        _run_checks(_command_target(options.target))
         return True
     if options.command != "init":
         return False
