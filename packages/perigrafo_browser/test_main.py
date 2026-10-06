@@ -1083,6 +1083,7 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             tree = app.TreeNode(
                 "packages/example",
                 [
+                    app.TreeNode("Name: example"),
                     app.TreeNode("Language: python"),
                     app.TreeNode("Help: Example."),
                     arguments,
@@ -1111,7 +1112,10 @@ class TestViewer(unittest.TestCase):  # noqa: D101
             files = {
                 node.title: node for node in tree.children or [] if node.source_file
             }
-            if set(files) != {"main.py", "test_main.py", "prm/script.js"}:
+            if set(files) != {"main.py", "test_main.py", "prm/script.js"} or any(
+                node.title.startswith(("Name:", "Language:"))
+                for node in tree.children or []
+            ):
                 msg = "Package details must be rooted at source files"
                 raise AssertionError(msg)
             main = {node.title: node for node in files["main.py"].children or []}

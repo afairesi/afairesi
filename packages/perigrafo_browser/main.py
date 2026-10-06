@@ -1185,7 +1185,7 @@ def package_file_tree(  # noqa: C901 - move each declaration to its source file
 
     for node in tree.children or []:
         title = node.title.removeprefix("- ").removeprefix("+ ")
-        if title.startswith("Language:"):
+        if title.startswith(("Language:", "Name:")):
             continue
         if node.title == "Suppressions":
             for file in node.children or []:
