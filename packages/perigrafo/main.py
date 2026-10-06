@@ -128,6 +128,15 @@ def repository_root(path: Path = Path()) -> Path:
     return Path(completed.stdout.strip())
 
 
+def _command_target(target: Path | None) -> Path:
+    """Honor an explicit path or select the current Perigrafo repository."""
+    if target is not None:
+        return target.resolve()
+    root = repository_root()
+    repository_type(root)
+    return root
+
+
 def repository_type(root: Path, default: str | None = None) -> str:
     """Detect home/submodule and flake repository layouts."""
     flake, home = _repository_type_markers(root)
@@ -3980,8 +3989,8 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
     }
 
 
-def _run_overview(target: Path, *, full: bool) -> None:
-    """Show a package catalog or the complete summary of one package."""
+def _run_overview(target: Path) -> None:
+    """Show complete summaries for every selected package."""
     if (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
         found = False
         for repository in home_submodules(target, require_url=False):
@@ -3991,7 +4000,7 @@ def _run_overview(target: Path, *, full: bool) -> None:
                 continue
             found = True
             sys.stdout.write(f"{relative}:\n")
-            _run_overview(checkout, full=full)
+            _run_overview(checkout)
         if not found:
             msg = f"no checked-out flake submodules found under {target}"
             raise ValueError(msg)
@@ -4002,15 +4011,9 @@ def _run_overview(target: Path, *, full: bool) -> None:
             msg = f"no packages found under {target / 'packages'}"
             raise ValueError(msg)
         for package in packages:
-            if full:
-                sys.stdout.write(
-                    f"packages/{package.name}:\n{package_overview(package.root)}\n\n",
-                )
-            else:
-                sys.stdout.write(
-                    f"packages/{package.name}: "
-                    f"{package_description(package) or '(not declared)'}\n",
-                )
+            sys.stdout.write(
+                f"packages/{package.name}:\n{package_overview(package.root)}\n\n",
+            )
         return
     validate_name(target.name)
     if (
@@ -4792,7 +4795,7 @@ def _dispatch_test_runner(
         mutation_plan=getattr(options, "mutation_plan", None),
     )
     try:
-        target = options.target.resolve()
+        target = _command_target(options.target)
         runner = (
             _run_test_repository
             if (target / "flake.nix").is_file()
@@ -5104,21 +5107,6 @@ def parser() -> argparse.ArgumentParser:
         title="commands",
         metavar="COMMAND",
     )
-    check = commands.add_parser(
-        "check",
-        help="run all Nix checks enclosed by a repository or directory",
-    )
-    check.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        default=Path(),
-        metavar="PATH",
-        help=(
-            "package, collection, repository, directory, or home "
-            "(default: current directory)"
-        ),
-    )
     init = commands.add_parser(
         "init",
         help="initialize HOME, create a flake, or add a remote submodule",
@@ -5157,22 +5145,6 @@ def parser() -> argparse.ArgumentParser:
         metavar="DESCRIPTION",
         help="optional package description",
     )
-    remove = commands.add_parser(
-        "rm",
-        help="remove a package or host",
-        description="Remove and stage a canonical package or host.",
-    )
-    remove.add_argument(
-        "resource",
-        metavar="RESOURCE",
-        help="existing packages/NAME or hosts/NAME path",
-    )
-    remove.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="print removals without changing the repository",
-    )
     move = commands.add_parser(
         "mv",
         help="rename a package or host",
@@ -5194,6 +5166,63 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="print moves without changing the repository",
     )
+    remove = commands.add_parser(
+        "rm",
+        help="remove a package or host",
+        description="Remove and stage a canonical package or host.",
+    )
+    remove.add_argument(
+        "resource",
+        metavar="RESOURCE",
+        help="existing packages/NAME or hosts/NAME path",
+    )
+    remove.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print removals without changing the repository",
+    )
+    overview = commands.add_parser(
+        "overview",
+        help="browse package descriptions, arguments, dependencies, and tests",
+        description=(
+            "Show package descriptions, help, arguments, "
+            "same-repository dependencies, tests, and suppressions."
+        ),
+    )
+    overview.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="home, flake root, or packages/NAME (default: current repository root)",
+    )
+    overview.add_argument(
+        "--json",
+        action="store_true",
+        help="emit the overview as JSON",
+    )
+    check = commands.add_parser(
+        "check",
+        help="run all Nix checks enclosed by a repository or directory",
+    )
+    check.add_argument(
+        "target",
+        nargs="?",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help=(
+            "package, collection, repository, directory, or home "
+            "(default: current repository root)"
+        ),
+    )
+    test = commands.add_parser(
+        "test",
+        help="measure coverage or run test campaigns",
+        description="Measure coverage or run test campaigns.",
+    )
     converge = commands.add_parser(
         "converge",
         help="converge the repository to its canonical layout",
@@ -5206,40 +5235,6 @@ def parser() -> argparse.ArgumentParser:
         help="report required actions without changing the repository",
     )
     converge.add_argument("--source", type=Path, help=argparse.SUPPRESS)
-    test = commands.add_parser(
-        "test",
-        help="measure coverage or run test campaigns",
-        description="Measure coverage or run test campaigns.",
-    )
-    overview = commands.add_parser(
-        "overview",
-        help="browse package descriptions, arguments, dependencies, and tests",
-        description=(
-            "Show a package catalog or inspect package help, arguments, "
-            "same-repository dependencies, tests, and suppressions."
-        ),
-    )
-    overview.add_argument(
-        "target",
-        nargs="?",
-        type=Path,
-        default=Path(),
-        help="home, flake root, or packages/NAME (default: current directory)",
-    )
-    overview.add_argument(
-        "--full",
-        action="store_true",
-        help="show full details for every package in a flake",
-    )
-    overview.add_argument(
-        "--json",
-        action="store_true",
-        help="emit the overview as JSON",
-    )
-    overview.add_argument(
-        "--revision",
-        help="read a Git revision instead of working sources (requires --json)",
-    )
     test.set_defaults(test_command=None, test_parser=test)
     test_commands = test.add_subparsers(dest="test_command", metavar="COMMAND")
     coverage = test_commands.add_parser(
@@ -5256,8 +5251,9 @@ def parser() -> argparse.ArgumentParser:
         "target",
         type=Path,
         nargs="?",
-        default=Path(),
-        help="canonical packages/NAME or flake root (default: current directory)",
+        default=None,
+        metavar="PATH",
+        help="canonical packages/NAME or flake root (default: current repository root)",
     )
     hypothesis = test_commands.add_parser(
         "hypothesis",
@@ -5273,8 +5269,9 @@ def parser() -> argparse.ArgumentParser:
         "target",
         type=Path,
         nargs="?",
-        default=Path(),
-        help="canonical packages/NAME or flake root (default: current directory)",
+        default=None,
+        metavar="PATH",
+        help="canonical packages/NAME or flake root (default: current repository root)",
     )
     hypothesis.add_argument(
         "--timeout",
@@ -5305,8 +5302,9 @@ def parser() -> argparse.ArgumentParser:
         "target",
         type=Path,
         nargs="?",
-        default=Path(),
-        help="canonical packages/NAME or flake root (default: current directory)",
+        default=None,
+        metavar="PATH",
+        help="canonical packages/NAME or flake root (default: current repository root)",
     )
     mutation.add_argument(
         "--timeout",
@@ -5404,7 +5402,7 @@ def _dispatch_test_command(
         return True
     if options.test_command == "coverage":
         try:
-            success = _run_coverage(options.target.resolve())
+            success = _run_coverage(_command_target(options.target))
         except KeyboardInterrupt:
             sys.stderr.write("perigrafo test coverage: interrupted\n")
             sys.exit(130)
@@ -5415,24 +5413,20 @@ def _dispatch_test_command(
     return False
 
 
-def _dispatch_overview(
-    options: argparse.Namespace,
-    cli: argparse.ArgumentParser,
-) -> None:
+def _dispatch_overview(options: argparse.Namespace) -> None:
     """Render current summaries or emit a selected source snapshot."""
+    target = _command_target(options.target)
     if options.json:
         sys.stdout.write(
             json.dumps(
-                overview_data(options.target, revision=options.revision),
+                overview_data(target),
                 indent=2,
                 sort_keys=True,
             )
             + "\n",
         )
     else:
-        if options.revision is not None:
-            cli.error("--revision requires --json")
-        _run_overview(options.target.resolve(), full=options.full)
+        _run_overview(target)
 
 
 def _dispatch_standalone_command(
@@ -5443,10 +5437,10 @@ def _dispatch_standalone_command(
     if options.command == "test":
         return _dispatch_test_command(options, cli)
     if options.command == "overview":
-        _dispatch_overview(options, cli)
+        _dispatch_overview(options)
         return True
     if options.command == "check":
-        _run_checks(options.target)
+        _run_checks(_command_target(options.target))
         return True
     if options.command != "init":
         return False
@@ -5495,7 +5489,7 @@ def main() -> None:
     arguments = _normalize_help_arguments(sys.argv[1:])
     try:
         cli = parser()
-        options = cli.parse_args(arguments)
+        options = cli.parse_args(arguments or ["--help"])
         if _dispatch_standalone_command(options, cli):
             return
         if options.command == "converge" and options.source is not None:

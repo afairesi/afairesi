@@ -9,7 +9,7 @@ Perigrafo uses shared Git repository and Nix flake conventions to describe a mac
 - Nix flake Git submodules under `$HOME` at `<hostname>/<repository-path>`, each with conventional `packages/`, `hosts/`, and `checks/` directories.
 - Package directories with conventional places for source, tests, tracked resources (`prm/`), and runtime output (`tmp/`) where applicable.
 - Package names and descriptions show what is available.
-- `perigrafo overview packages/NAME` shows interfaces and expected behavior; use `perigrafo overview --full` for all packages.
+- `perigrafo overview packages/NAME` shows interfaces and expected behavior; use `perigrafo overview` for all packages.
 - Read tests or source code when more detail is needed.
 
 ## Runtime constraints
