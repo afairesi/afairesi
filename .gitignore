@@ -45,8 +45,6 @@
 !/packages/perigrafo_browser/
 !/packages/perigrafo_browser/default.nix
 !/packages/perigrafo_browser/main.py
-!/packages/perigrafo_browser/prm/
-!/packages/perigrafo_browser/prm/**
 !/packages/perigrafo_browser/test_main.py
 !/packages/perigrafo_browser_video/
 !/packages/perigrafo_browser_video/default.nix
