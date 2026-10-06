@@ -20,16 +20,17 @@ import subprocess
 import tempfile
 import webbrowser
 from collections.abc import AsyncIterator, Awaitable, Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from difflib import unified_diff
-from functools import cache
+from functools import cache, partial
 from html import escape
 from http import HTTPStatus
 from pathlib import Path
-from threading import Lock
+from threading import Event, Lock
+from time import monotonic
 from typing import Any, Self
 from urllib.parse import urlencode
 
@@ -87,17 +88,37 @@ class OutputComparison:
     error: str = ""
     entry: str = ""
     report: str = "report.html"
+    tree: TreeNode | None = None
 
 
-def copy_output_file(source: str, destination: str) -> str:
+def copy_output_file(
+    source: str,
+    destination: str,
+    *,
+    cancelled: Event | None = None,
+) -> str:
     """Copy file contents without reading devices or changing the live output."""
     if not stat.S_ISREG(Path(source).lstat().st_mode):
         msg = f"Cannot capture a special output file: {source}"
         raise ValueError(msg)
-    return shutil.copyfile(source, destination)
+    with Path(source).open("rb") as incoming, Path(destination).open("wb") as outgoing:
+        while True:
+            if cancelled is not None and cancelled.is_set():
+                msg = "Output capture cancelled"
+                raise CancelledError(msg)
+            chunk = incoming.read(1024 * 1024)
+            if not chunk:
+                break
+            outgoing.write(chunk)
+    return destination
 
 
-def copy_output(source: Path, destination: Path) -> None:
+def copy_output(
+    source: Path,
+    destination: Path,
+    *,
+    cancelled: Event | None = None,
+) -> None:
     """Capture a directory or its absence, preserving links without following them."""
     if source.is_symlink() or (source.exists() and not source.is_dir()):
         msg = f"Not a regular output directory: {source}"
@@ -107,7 +128,7 @@ def copy_output(source: Path, destination: Path) -> None:
             source,
             destination,
             symlinks=True,
-            copy_function=copy_output_file,
+            copy_function=partial(copy_output_file, cancelled=cancelled),
         )
     else:
         destination.mkdir()
@@ -119,6 +140,7 @@ def compare_output(
     *,
     entry: str = "",
     report: str = "report.html",
+    cancelled: Event | None = None,
 ) -> bool:
     """Generate an offline HTML report and bound the entire comparison process."""
     executable = shutil.which("diffoscope")
@@ -146,13 +168,25 @@ def compare_output(
             start_new_session=True,
         ) as process,
     ):
+        deadline = monotonic() + OUTPUT_DIFF_TIMEOUT
         try:
-            result = process.wait(timeout=OUTPUT_DIFF_TIMEOUT)
-        except subprocess.TimeoutExpired:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(process.pid, signal.SIGKILL)
-            process.wait()
-            raise
+            while True:
+                if cancelled is not None and cancelled.is_set():
+                    msg = "Output comparison cancelled"
+                    raise CancelledError(msg)
+                remaining = deadline - monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, OUTPUT_DIFF_TIMEOUT)
+                try:
+                    result = process.wait(timeout=min(0.1, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if process.poll() is None:
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
     if result not in {0, 1}:
         diagnostic = read_text(current / "diffoscope.log")[-2000:]
         msg = f"diffoscope failed (exit {result}): {diagnostic}"
@@ -164,7 +198,7 @@ def compare_output(
 
 
 class OutputSnapshots:
-    """Capture package output in the background once per launch or explicit refresh."""
+    """Capture package output only when a comparison is requested."""
 
     def __init__(self) -> None:
         """Serialize capture jobs and hold package locks until the browser closes."""
@@ -172,6 +206,7 @@ class OutputSnapshots:
         self.reports: dict[tuple[Path, Path, str], OutputComparison] = {}
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.locks = contextlib.ExitStack()
+        self.cancelled = Event()
 
     def __enter__(self) -> Self:
         """Keep snapshots available throughout the session."""
@@ -183,13 +218,14 @@ class OutputSnapshots:
 
     def close(self) -> None:
         """Stop queued jobs and release package histories."""
+        self.cancelled.set()
         self.executor.shutdown(wait=True, cancel_futures=True)
         self.locks.close()
 
     def observe(self, data: dict[str, Any], *, refresh: bool = False) -> None:
-        """Link reports and capture newly visited or refreshed packages."""
+        """Link reports without copying output just to browse a repository."""
         for record in data.get("nodes", []):
-            if record["kind"] != "package":
+            if record["kind"] != "package" or record.get("change") == "removed":
                 continue
             package = Path(record["directory"]) / record["path"]
             output = package / "tmp"
@@ -201,34 +237,62 @@ class OutputSnapshots:
                 self.comparisons[output] = comparison
             else:
                 comparison = self.comparisons[output]
-            if comparison.future is None or refresh:
-                comparison.future = self.executor.submit(self.capture, comparison)
+            if refresh and comparison.future is not None:
+                self.request_capture(comparison, refresh=True)
             record["output_diff"] = "/output-diff?" + urlencode({"path": str(output)})
             pending = comparison.future is not None and not comparison.future.done()
             data["output_pending"] = data.get("output_pending", False) or pending
-            tree = output_tree(
-                output,
-                comparison.previous / "output"
-                if comparison.previous and not pending
-                else None,
-                comparison.current / "output"
-                if comparison.current and not pending
-                else output,
-            )
-            if pending:
-                message = "Capturing and comparing output…"
-            elif comparison.error:
-                message = comparison.error
-            elif comparison.previous is None:
-                message = (
-                    "Initial capture saved; compare after the next browser launch."
-                )
-            else:
-                message = "Previous capture → Current capture"
-            tree.children.insert(0, TreeNode(message, warning=bool(comparison.error)))
+            tree = self.comparison_tree(comparison)
+            tree.output_diff = record["output_diff"]
             children = record["tree"]["children"]
             children[:] = [child for child in children if child["field"] != "tmp"]
             children.append(serialize_node(tree))
+
+    @staticmethod
+    def comparison_tree(comparison: OutputComparison) -> TreeNode:
+        """Reuse immutable capture contents while updating their status message."""
+        pending = comparison.future is not None and not comparison.future.done()
+        if comparison.future is None:
+            message = "Open output changes to capture and compare."
+        elif pending:
+            message = "Capturing and comparing output…"
+        elif comparison.error:
+            message = comparison.error
+        elif comparison.previous is None:
+            message = "Initial capture saved; compare after the next browser launch."
+        else:
+            message = "Previous capture → Current capture"
+        if comparison.current is not None and not pending:
+            if comparison.tree is None:
+                comparison.tree = output_tree(
+                    comparison.output,
+                    comparison.previous / "output" if comparison.previous else None,
+                    comparison.current / "output",
+                )
+            tree = deepcopy(comparison.tree)
+        else:
+            tree = TreeNode(
+                "tmp/",
+                directory=comparison.output,
+                expandable=True,
+                field="tmp",
+            )
+        tree.children.insert(0, TreeNode(message, warning=bool(comparison.error)))
+        return tree
+
+    def request_capture(
+        self,
+        comparison: OutputComparison,
+        *,
+        refresh: bool = False,
+    ) -> None:
+        """Schedule at most one capture per package, including during refresh."""
+        future = comparison.future
+        if not self.cancelled.is_set() and (
+            future is None or (refresh and future.done())
+        ):
+            comparison.tree = None
+            comparison.future = self.executor.submit(self.capture, comparison)
 
     def entry_report(
         self,
@@ -267,8 +331,7 @@ class OutputSnapshots:
             self.reports[key] = report
         return self.reports[key]
 
-    @staticmethod
-    def compare_entry(comparison: OutputComparison) -> None:
+    def compare_entry(self, comparison: OutputComparison) -> None:
         """Generate a report for one entry without recapturing live output."""
         if comparison.previous is None or comparison.current is None:
             return
@@ -278,8 +341,9 @@ class OutputSnapshots:
                 comparison.current,
                 entry=comparison.entry,
                 report=comparison.report,
+                cancelled=self.cancelled,
             )
-        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        except (CancelledError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
             comparison.error = str(exc)
 
     def initialize(self, comparison: OutputComparison) -> None:
@@ -330,7 +394,9 @@ class OutputSnapshots:
         try:
             self.initialize(comparison)
             capture = Path(tempfile.mkdtemp(prefix="capture-", dir=comparison.store))
-            copy_output(comparison.output, capture / "output")
+            copy_output(comparison.output, capture / "output", cancelled=self.cancelled)
+            if self.cancelled.is_set():
+                return
             (capture / "timestamp").write_text(datetime.now(UTC).isoformat())
             latest = capture / "latest"
             latest.write_text(capture.name)
@@ -340,10 +406,14 @@ class OutputSnapshots:
                 if old not in {comparison.previous, capture} and not old.is_symlink():
                     shutil.rmtree(old)
             if comparison.previous is not None:
-                comparison.changed = compare_output(comparison.previous, capture)
+                comparison.changed = compare_output(
+                    comparison.previous,
+                    capture,
+                    cancelled=self.cancelled,
+                )
         except subprocess.TimeoutExpired:
             comparison.error = f"diffoscope exceeded {OUTPUT_DIFF_TIMEOUT} seconds"
-        except (OSError, ValueError) as exc:
+        except (CancelledError, OSError, ValueError) as exc:
             comparison.error = str(exc)
         finally:
             if capture is not None and capture != comparison.current:
@@ -412,7 +482,7 @@ class RepositoryBrowser:
     def load(self) -> None:
         """Scope cached declarations without changing the source snapshot."""
         root = canonical_root(self.cwd)
-        self.snapshot = scope_snapshot(deepcopy(self.source_snapshot(root)), self.cwd)
+        self.snapshot = deepcopy(scope_snapshot(self.source_snapshot(root), self.cwd))
 
 
 def cli_tree(current: list[CliEntry], previous: list[CliEntry]) -> list[TreeNode]:
@@ -716,48 +786,15 @@ def merge_overviews(
     return data
 
 
-def directory_disk_size(directory: Path) -> int:
-    """Measure allocated bytes once per inode without following symbolic links."""
-    seen = set()
-    total = 0
-
-    def failed(error: OSError) -> None:
-        raise error
-
-    for parent, folders, files in os.walk(directory, followlinks=False, onerror=failed):
-        for path in [Path(parent), *(Path(parent) / name for name in folders + files)]:
-            metadata = path.lstat()
-            identity = metadata.st_dev, metadata.st_ino
-            if identity not in seen:
-                seen.add(identity)
-                total += getattr(metadata, "st_blocks", 0) * 512
-    return total
-
-
-def format_bytes(count: int) -> str:
-    """Format storage amounts with binary units."""
-    size = float(count)
-    unit_bytes = 1024
-    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
-        if size < unit_bytes or unit == "TiB":
-            return f"{size:g} {unit}" if unit == "B" else f"{size:.1f} {unit}"
-        size /= unit_bytes
-    return ""
-
-
 def package_storage(directory: Path) -> list[TreeNode]:
     """Describe optional tracked storage and link to existing runtime output."""
     nodes: list[TreeNode] = []
     resources = directory / "prm"
     if resources.is_dir() and not resources.is_symlink():
-        try:
-            size = format_bytes(directory_disk_size(resources))
-        except OSError:
-            size = "unavailable"
-        nodes.append(TreeNode(f"prm/: {size}"))
+        nodes.append(TreeNode("prm/"))
     output = directory / "tmp"
     if output.is_dir() and not output.is_symlink():
-        nodes.append(output_tree(output, None, output))
+        nodes.append(TreeNode("tmp/", directory=output, expandable=True, field="tmp"))
     return nodes
 
 
@@ -967,13 +1004,15 @@ def directory_snapshot(directory: Path) -> dict[str, Any]:
 
 def scope_snapshot(data: dict[str, Any], directory: Path) -> dict[str, Any]:
     """Restrict the graph to a directory without rebuilding its detail trees."""
+    data = data.copy()
     root = Path(data["root"])
     if not data["nodes"] or all(
         record["kind"] == "directory" for record in data["nodes"]
     ):
         return data
     nodes = []
-    for record in data["nodes"]:
+    for source_record in data["nodes"]:
+        record = source_record.copy()
         repository = (root / record["repository"]).resolve()
         location = repository / record["path"]
         if record["kind"] == "machine":
@@ -1298,7 +1337,6 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
     @contextlib.asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
         try:
-            requested_data()
             yield
         finally:
             actions.close()
@@ -1398,11 +1436,8 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
                 if job is not None and state["state"] != "running" and not job.observed:
                     job.observed = True
                     comparison = outputs.comparisons.get(Path(directory) / "tmp")
-                    if comparison is not None:
-                        comparison.future = outputs.executor.submit(
-                            outputs.capture,
-                            comparison,
-                        )
+                    if comparison is not None and comparison.future is not None:
+                        outputs.request_capture(comparison, refresh=True)
                 return JSONResponse(state)
             except (OSError, ValueError) as exc:
                 return JSONResponse(
@@ -1436,8 +1471,13 @@ def gui_app(root: Path) -> FastAPI:  # noqa: C901, PLR0915
                     status_code=HTTPStatus.NOT_FOUND,
                 )
             try:
+                outputs.request_capture(comparison)
                 return HTMLResponse(
-                    output_diff_page(outputs.entry_report(comparison, entry)),
+                    output_diff_page(
+                        outputs.entry_report(comparison, entry)
+                        if comparison.future is not None and comparison.future.done()
+                        else comparison,
+                    ),
                 )
             except (OSError, ValueError):
                 return Response(

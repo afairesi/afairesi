@@ -92,11 +92,49 @@ class TestOutputSnapshots(unittest.TestCase):
         data = app.gui_data(self.root)
         snapshots.observe(data, refresh=refresh)
         comparison = snapshots.comparisons[self.output]
+        snapshots.request_capture(comparison, refresh=refresh)
         if comparison.future is None:
             msg = "Output capture was not scheduled"
             raise AssertionError(msg)
         comparison.future.result(timeout=20)
         return comparison
+
+    def test_browsing_does_not_capture_and_completed_trees_are_reused(self) -> None:
+        """Overview requests avoid output I/O until explicitly comparing output."""
+        (self.output / "value.txt").write_text("value\n")
+        data = app.gui_data(self.root)
+        with app.OutputSnapshots() as snapshots:
+            with patch.object(app, "copy_output") as copy:
+                snapshots.observe(data)
+                snapshots.observe(data, refresh=True)
+                copy.assert_not_called()
+                require_output(not data.get("output_pending"))
+                require_output(not (self.root / "tmp").exists())
+            comparison = self.capture(snapshots)
+            with patch.object(app, "output_tree", wraps=app.output_tree) as tree:
+                snapshots.observe(data)
+                snapshots.observe(data)
+                tree.assert_called_once()
+            require_output(comparison.current is not None)
+
+    def test_cancelled_copy_does_not_publish_an_incomplete_capture(self) -> None:
+        """Cancelled copies keep the previous history intact."""
+        (self.output / "value.txt").write_text("value\n")
+        (self.output / "other.txt").write_text("other\n")
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            latest = (comparison.store / "latest").read_text()
+            snapshots.cancelled.set()
+            with patch.object(
+                app,
+                "copy_output_file",
+                wraps=app.copy_output_file,
+            ) as copy:
+                snapshots.capture(comparison)
+                copy.assert_called_once()
+            require_output("cancelled" in comparison.error)
+            require_output((comparison.store / "latest").read_text() == latest)
+            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
 
     def test_capture_preserves_symlinks_without_reading_external_targets(self) -> None:
         """Compare symlink destinations without exposing external file contents."""
@@ -329,6 +367,42 @@ class TestOutputSnapshots(unittest.TestCase):
             with pytest.raises(ValueError, match="escapes capture"):
                 snapshots.entry_report(comparison, "external/flake.nix")
 
+    def test_refresh_does_not_queue_duplicate_captures(self) -> None:
+        """Refresh while copying retains one job and does not rotate history twice."""
+        started = threading.Event()
+        release = threading.Event()
+        original = app.copy_output
+
+        def delayed(
+            source: Path,
+            destination: Path,
+            *,
+            cancelled: threading.Event | None = None,
+        ) -> None:
+            started.set()
+            require_output(release.wait(10))
+            original(source, destination, cancelled=cancelled)
+
+        data = app.gui_data(self.root)
+        with (
+            app.OutputSnapshots() as snapshots,
+            patch.object(app, "copy_output", side_effect=delayed) as copy,
+        ):
+            snapshots.observe(data)
+            comparison = snapshots.comparisons[self.output]
+            snapshots.request_capture(comparison)
+            try:
+                require_output(started.wait(10))
+                future = comparison.future
+                for _ in range(3):
+                    snapshots.observe(data, refresh=True)
+                require_output(comparison.future is future)
+            finally:
+                release.set()
+            if comparison.future is not None:
+                comparison.future.result(timeout=10)
+            copy.assert_called_once()
+
     def test_report_requests_reuse_captures_while_the_server_stays_responsive(
         self,
     ) -> None:
@@ -342,12 +416,17 @@ class TestOutputSnapshots(unittest.TestCase):
         release = threading.Event()
         original = app.compare_output
 
-        def delayed(previous: Path, current: Path) -> bool:
+        def delayed(
+            previous: Path,
+            current: Path,
+            *,
+            cancelled: threading.Event | None = None,
+        ) -> bool:
             started.set()
             if not release.wait(10):
                 msg = "Comparison was not released"
                 raise ValueError(msg)
-            return original(previous, current)
+            return original(previous, current, cancelled=cancelled)
 
         with (
             app.OutputSnapshots() as snapshots,
@@ -359,7 +438,6 @@ class TestOutputSnapshots(unittest.TestCase):
             ) as client,
         ):
             try:
-                require_output(started.wait(10))
                 response = client.request("GET", "/api/overview")
                 data = json.loads(response.content)
                 package = next(
@@ -367,6 +445,9 @@ class TestOutputSnapshots(unittest.TestCase):
                 )
                 route = package["output_diff"]
                 comparison = snapshots.comparisons[self.output]
+                require_output(comparison.future is None)
+                response = client.get(route)
+                require_output(started.wait(10))
                 for _ in range(2):
                     response = client.request("GET", route)
                     require_output(response.status_code == HTTPStatus.OK)
@@ -386,6 +467,40 @@ class TestOutputSnapshots(unittest.TestCase):
                 compare.assert_called_once()
             finally:
                 release.set()
+
+    def test_shutdown_cancels_comparison_and_reaps_process(self) -> None:
+        """Closing the browser stops a long comparison promptly."""
+        with app.OutputSnapshots() as snapshots:
+            self.capture(snapshots)
+        started = threading.Event()
+        processes: list[subprocess.Popen[bytes]] = []
+        original = subprocess.Popen
+        tool = self.root / "diffoscope"
+        tool.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
+        tool.chmod(0o700)
+
+        def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:  # noqa: ANN401 - forward Popen arguments
+            process = original(*args, **kwargs)
+            processes.append(process)
+            started.set()
+            return process
+
+        data = app.gui_data(self.root)
+        with (
+            app.OutputSnapshots() as snapshots,
+            patch.object(shutil, "which", return_value=str(tool)),
+            patch.object(subprocess, "Popen", side_effect=launch),
+        ):
+            snapshots.observe(data)
+            comparison = snapshots.comparisons[self.output]
+            snapshots.request_capture(comparison)
+            require_output(started.wait(10))
+            closing = threading.Thread(target=snapshots.close)
+            closing.start()
+            closing.join(timeout=3)
+            require_output(not closing.is_alive(), "Shutdown waited for diffoscope")
+            require_output(all(process.poll() is not None for process in processes))
+            require_output("cancelled" in comparison.error)
 
 
 class TestBoundary(unittest.TestCase):
@@ -1272,8 +1387,8 @@ class TestGui(unittest.TestCase):
                     msg = "Missing evidence must be reported as not detected"
                     raise AssertionError(msg)
 
-    def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
-        """Count prm allocation once per inode and preserve the runtime link."""
+    def test_storage_links_output_without_walking_resources(self) -> None:
+        """Storage inspection does not traverse resource or output contents."""
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary) / "packages/example"
             resources = package / "prm"
@@ -1285,20 +1400,15 @@ class TestGui(unittest.TestCase):
             external.write_bytes(b"outside" * 8192)
             link = resources / "link.bin"
             link.symlink_to(external)
-            expected = sum(
-                path.lstat().st_blocks * 512 for path in (resources, original, link)
-            )
-            if app.directory_disk_size(resources) != expected:
-                msg = "Disk usage must deduplicate hardlinks and ignore symlink targets"
-                raise AssertionError(msg)
             output = package / "tmp"
             output.mkdir()
-            storage = app.package_storage(package)
+            with patch.object(Path, "iterdir", side_effect=AssertionError("Traversal")):
+                storage = app.package_storage(package)
             if [node.title for node in storage] != [
-                f"prm/: {app.format_bytes(expected)}",
+                "prm/",
                 "tmp/",
             ] or storage[-1].directory != output.resolve():
-                msg = "Packages must show allocated prm size and existing tmp link"
+                msg = "Packages must show prm and existing tmp link"
                 raise AssertionError(msg)
             output.rmdir()
             if any(node.directory for node in app.package_storage(package)):
@@ -1504,6 +1614,8 @@ class TestRepositoryData(unittest.TestCase):
                 base_url="http://127.0.0.1:8765",
             ) as client,
         ):
+            collect.assert_not_called()
+            client.get("/api/overview")
             self.source.write_text('"""After."""\n')
             for query in ({}, {"directory": str(self.package)}, {}):
                 response = client.get("/api/overview", params=query)
