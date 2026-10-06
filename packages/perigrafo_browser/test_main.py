@@ -1,1003 +1,130 @@
 # Copyright (c) 2026 VALAB/ITI
 # ruff: noqa: S603, S607
-"""Verify browser transport, directory scopes, and semantic package diffs."""
+"""Verify package browsing, summary diffs, and terminal navigation."""
 
+import curses
 import json
 import os
 import platform
-import re
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
-import threading
+import unicodedata
 import unittest
-import zipfile
-from http import HTTPStatus
 from pathlib import Path
-from typing import Any
-from unittest.mock import patch
-from urllib.parse import urlencode
+from unittest.mock import MagicMock, patch
 
-import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
-from perigrafo import (
-    canonical_root,
-    command_catalog,
-    overview_data,
-    resource_data,
-    source_package_cli,
-)
+from perigrafo import CliEntry
 
 from packages.perigrafo_browser import main as app
 
-TEST_MODIFIED_CHANGE = "modified"
+TEST_MODIFIED_STYLE = 33
+TEST_EXPECTED_BUILDS = 2
+TEST_PAGE_HEIGHT = 2
+TEST_EXPECTED_VISIBLE = 2
 TEST_PARSER_ERROR = 2
-TEST_REPOSITORY_FIELDS = 3
-TEST_ACTION_FAILURE = 7
-TEST_READ_ONLY_DIRECTORY_MODE = 0o555
+TEST_REPOSITORY_FIELDS = 2
 
 
-def commit_sources(root: Path) -> None:
-    """Record an isolated baseline without changing the user's Git configuration."""
-    subprocess.run(["git", "-C", str(root), "init", "-q"], check=True)
-    subprocess.run(["git", "-C", str(root), "add", "."], check=True)
-    subprocess.run(
-        [
-            "git",
-            "-C",
-            str(root),
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.com",
-            "commit",
-            "-qm",
-            "baseline",
-        ],
-        check=True,
-    )
+class TestBrowserData(unittest.TestCase):
+    """Verify the browser resource model and semantic changes."""
 
-
-def require_output(
-    condition: bool,  # noqa: FBT001 - assertion helper
-    message: str = "Unexpected output snapshot or report",
-) -> None:
-    """Fail a behavioral check with a readable explanation."""
-    if not condition:
-        raise AssertionError(message)
-
-
-class TestOutputSnapshots(unittest.TestCase):
-    """Exercise output comparisons between consecutive successful actions."""
-
-    def setUp(self) -> None:
-        """Create an isolated package with runtime output."""
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        (self.root / "flake.nix").write_text("{}\n")
-        self.output = self.root / "packages/example/tmp"
-        self.output.mkdir(parents=True)
-        (self.output.parent / "main.py").write_text('"""Example."""\n')
-
-    def capture(
-        self,
-        snapshots: app.OutputSnapshots,
-        *,
-        refresh: bool = False,
-    ) -> app.OutputComparison:
-        """Wait for one capture as a successful package action would."""
-        data = app.gui_data(self.root)
-        snapshots.observe(data)
-        comparison = snapshots.comparisons[self.output]
-        snapshots.request_capture(comparison, refresh=refresh)
-        if comparison.future is None:
-            msg = "Output capture was not scheduled"
-            raise AssertionError(msg)
-        comparison.future.result(timeout=20)
-        return comparison
-
-    def test_browsing_does_not_capture_and_completed_trees_are_reused(self) -> None:
-        """Overview requests avoid output I/O until explicitly comparing output."""
-        (self.output / "value.txt").write_text("value\n")
-        data = app.gui_data(self.root)
-        with app.OutputSnapshots() as snapshots:
-            with patch.object(app, "copy_output") as copy:
-                snapshots.observe(data)
-                snapshots.observe(data)
-                copy.assert_not_called()
-                require_output(not data.get("output_pending"))
-                require_output(not (self.root / "tmp").exists())
-            comparison = self.capture(snapshots)
-            with patch.object(app, "output_tree", wraps=app.output_tree) as tree:
-                snapshots.observe(data)
-                snapshots.observe(data)
-                tree.assert_called_once()
-            require_output(comparison.current is not None)
-
-    def test_cancelled_copy_does_not_publish_an_incomplete_capture(self) -> None:
-        """Cancelled copies keep the previous history intact."""
-        (self.output / "value.txt").write_text("value\n")
-        (self.output / "other.txt").write_text("other\n")
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            latest = (comparison.store / "latest").read_text()
-            snapshots.cancelled.set()
-            with patch.object(
-                app,
-                "copy_output_file",
-                wraps=app.copy_output_file,
-            ) as copy:
-                snapshots.capture(comparison)
-                copy.assert_called_once()
-            require_output("cancelled" in comparison.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
-
-    def test_capture_preserves_symlinks_without_reading_external_targets(self) -> None:
-        """Compare symlink destinations without exposing external file contents."""
-        secret = self.root / "private.txt"
-        secret.write_text("PRIVATE-CONTENT-MUST-NOT-APPEAR\n")
-        link = self.output / "link"
-        link.symlink_to(secret)
-        with app.OutputSnapshots() as snapshots:
-            first = self.capture(snapshots)
-            require_output(first.error == "", first.error)
-            if first.current is None:
-                msg = "Expected a complete initial capture"
-                raise AssertionError(msg)
-            require_output((first.current / "output/link").is_symlink())
-        link.unlink()
-        link.symlink_to(self.root / "missing.txt")
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            require_output(comparison.error == "", comparison.error)
-            report = re.sub(rb"<[^>]+>", b"", app.output_diff_page(comparison))
-            require_output(b"private.txt" in report)
-            require_output(b"missing.txt" in report)
-            require_output(b"PRIVATE-CONTENT-MUST-NOT-APPEAR" not in report)
-
-    def test_comparison_failures_and_timeouts_are_visible_and_refresh_can_retry(
-        self,
-    ) -> None:
-        """Show tool failures and timeouts while retaining captures for retry."""
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        tools = self.root / "tools"
-        tools.mkdir()
-        executable = tools / "diffoscope"
-        executable.write_text(
-            f"#!{sys.executable}\nimport sys\n"
-            "sys.stderr.write('<failed>')\nsys.exit(2)\n",
-        )
-        executable.chmod(0o700)
-        with app.OutputSnapshots() as snapshots:
-            with patch.dict(os.environ, {"PATH": f"{tools}:{os.environ['PATH']}"}):
-                comparison = self.capture(snapshots)
-                require_output("exit 2" in comparison.error)
-                require_output(b"&lt;failed&gt;" in app.output_diff_page(comparison))
-                previous = comparison.current
-                executable.write_text(
-                    f"#!{sys.executable}\nimport time\ntime.sleep(10)\n",
-                )
-                with patch.object(app, "OUTPUT_DIFF_TIMEOUT", 0.05):
-                    self.capture(snapshots, refresh=True)
-                require_output("exceeded" in comparison.error)
-                require_output(comparison.previous == previous)
-            self.capture(snapshots, refresh=True)
-            require_output(comparison.error == "", comparison.error)
-            require_output(b"No output changes" in app.output_diff_page(comparison))
-
-    def test_completed_actions_queue_while_comparison_is_pending(self) -> None:
-        """Retain a second successful click while capturing the first."""
-        started = threading.Event()
-        release = threading.Event()
-        original = app.copy_output
-
-        def delayed(
-            source: Path,
-            destination: Path,
-            *,
-            cancelled: threading.Event | None = None,
-        ) -> None:
-            started.set()
-            require_output(release.wait(10))
-            original(source, destination, cancelled=cancelled)
-
-        second = self.root / "second-result"
-        second.mkdir()
-        (second / "value.txt").write_text("second\n")
-        (self.output / "value.txt").write_text("first\n")
-        with (
-            app.OutputSnapshots() as snapshots,
-            patch.object(app, "copy_output", side_effect=delayed),
-        ):
-            snapshots.completed(self.output.parent, self.output)
-            try:
-                require_output(started.wait(10))
-                snapshots.completed(self.output.parent, second)
-            finally:
-                release.set()
-            comparison = snapshots.comparisons[self.output]
-            if comparison.future is None:
-                self.fail("Queued output was not captured")
-            comparison.future.result(timeout=20)
-            if comparison.previous is None or comparison.current is None:
-                self.fail("Both completed outputs must be retained")
-            require_output(
-                (comparison.previous / "output/value.txt").read_text() == "first\n",
-            )
-            require_output(
-                (comparison.current / "output/value.txt").read_text() == "second\n",
-            )
-
-    def test_consecutive_actions_advance_the_previous_capture(self) -> None:
-        """Each completed action compares against the immediately preceding output."""
-        value = self.output / "value.json"
-        value.write_text('{"value": "before"}\n')
-        removed = self.output / "removed.txt"
-        removed.write_text("old output\n")
-        archive = self.output / "archive.zip"
-        with zipfile.ZipFile(archive, "w") as stream:
-            stream.writestr("nested.txt", "old archive content\n")
-        with app.OutputSnapshots() as snapshots:
-            first = self.capture(snapshots)
-            require_output(first.error == "", first.error)
-            require_output(b"Initial capture saved" in app.output_diff_page(first))
-            baseline = first.current
-        value.write_text('{"value": "after"}\n')
-        removed.unlink()
-        (self.output / "added.txt").write_text("new output\n")
-        with zipfile.ZipFile(archive, "w") as stream:
-            stream.writestr("nested.txt", "new archive content\n")
-        with app.OutputSnapshots() as snapshots:
-            second = self.capture(snapshots)
-            require_output(second.error == "", second.error)
-            require_output(second.previous == baseline)
-            require_output(second.changed)
-            for text in (
-                b"before",
-                b"after",
-                b"removed.txt",
-                b"added.txt",
-                b"nested.txt",
-                b"Previous capture:",
-                b"Current capture:",
-            ):
-                require_output(
-                    text in re.sub(b"<[^>]+>", b"", app.output_diff_page(second)),
-                )
-            current = second.current
-            value.write_text('{"value": "refreshed"}\n')
-            self.capture(snapshots)
-            require_output(second.current == current)
-            self.capture(snapshots, refresh=True)
-            require_output(second.previous == current)
-            require_output(second.current != current)
-            require_output(second.error == "", second.error)
-            require_output(
-                b"refreshed" in re.sub(b"<[^>]+>", b"", app.output_diff_page(second)),
-            )
-            require_output(
-                set(second.store.glob("capture-*"))
-                == {second.previous, second.current},
-            )
-            latest = second.current
-        with app.OutputSnapshots() as snapshots:
-            third = self.capture(snapshots)
-            require_output(third.previous == latest)
-            require_output(third.error == "", third.error)
-            require_output(not third.changed)
-            require_output(b"No output changes" in app.output_diff_page(third))
-
-    def test_failed_copy_preserves_history_and_other_browsers_cannot_rotate_it(
-        self,
-    ) -> None:
-        """Failed captures and concurrent browsers preserve the last complete output."""
-        (self.output / "value.txt").write_text("before\n")
-        with app.OutputSnapshots() as first, app.OutputSnapshots() as second:
-            comparison = self.capture(first)
-            latest = (comparison.store / "latest").read_text()
-            concurrent = self.capture(second)
-            require_output("another browser" in concurrent.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            with patch.object(shutil, "copytree", side_effect=OSError("copy failed")):
-                self.capture(first, refresh=True)
-            require_output("copy failed" in comparison.error)
-            require_output((comparison.store / "latest").read_text() == latest)
-            require_output(len(list(comparison.store.glob("capture-*"))) == 1)
-            first.close()
-            self.capture(second, refresh=True)
-            require_output(concurrent.error == "", concurrent.error)
-            require_output(not concurrent.changed)
-
-    def test_metadata_is_ignored_and_missing_output_reports_removals(self) -> None:
-        """Ignore metadata changes and report the removal of a whole output tree."""
-        value = self.output / "value.txt"
-        value.write_text("retained contents\n")
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        value.chmod(0o700)
-        os.utime(value, (1, 1))
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            require_output(comparison.error == "", comparison.error)
-            require_output(not comparison.changed)
-            value.unlink()
-            self.output.rmdir()
-            self.capture(snapshots, refresh=True)
-            require_output(comparison.error == "", comparison.error)
-            require_output(comparison.changed)
-            require_output(b"retained" in app.output_diff_page(comparison))
-
-    def test_output_tree_bounds_nested_entries_and_links_complete_listings(
-        self,
-    ) -> None:
-        """Large nested outputs stay bounded and remain browsable over HTTP."""
-        for folder in ("a", "b"):
-            directory = self.output / folder
-            directory.mkdir()
-            for index in range(10):
-                (directory / f"entry-{index:02}.txt").write_text("value\n")
-        with patch.object(app, "OUTPUT_TREE_LIMIT", 5):
-            tree = app.output_tree(self.output, None, self.output)
-        output_folder = tree.children[0]
-        require_output(
-            [child.title for child in output_folder.children]
-            == [
-                "entry-00.txt",
-                "entry-01.txt",
-                "entry-02.txt",
-                "More output entries: open directory to browse",
-            ],
-        )
-        require_output(output_folder.children[-1].warning)
-        require_output(output_folder.children[-1].directory == self.output / "a")
-        require_output(tree.children[-1].warning)
-        require_output(tree.children[-1].directory == self.output)
-        listing = app.output_index(self.output, self.output / "a")
-        require_output(b"entry-09.txt" in listing)
-
-    def test_output_tree_embeds_changes_and_reports_individual_entries(self) -> None:
-        """Keep nested output changes inline and scope reports to their entry."""
-        nested = self.output / "nested"
-        nested.mkdir()
-        changed = nested / "value.txt"
-        changed.write_text("before\n")
-        (self.output / "unchanged.txt").write_text("same\n")
-        removed = self.output / "removed.txt"
-        removed.write_text("removed\n")
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        changed.write_text("after\n")
-        removed.unlink()
-        (self.output / "added.txt").write_text("added\n")
-        (self.output / "binary").write_bytes(b"\0binary")
-        (self.output / "external").symlink_to(self.root)
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            data = app.gui_data(self.root)
-            snapshots.observe(data)
-            package = next(node for node in data["nodes"] if node["kind"] == "package")
-            tree = next(
-                child
-                for child in package["tree"]["children"]
-                if child["title"] == "tmp/"
-            )
-            require_output(tree["expandable"] and bool(tree["output_diff"]))
-            entries = {child["title"]: child for child in tree["children"]}
-            require_output(entries["removed.txt"]["change"] == "removed")
-            require_output(entries["added.txt"]["change"] == "added")
-            require_output(entries["unchanged.txt"]["output_diff"] is None)
-            require_output(entries["binary"]["text_diff"] is None)
-            require_output(not entries["external"]["children"])
-            value = entries["nested/"]["children"][0]
-            require_output(
-                "-before" in value["text_diff"] and "+after" in value["text_diff"],
-            )
-            report = snapshots.entry_report(comparison, "nested/value.txt")
-            if report.future is None:
-                self.fail("Entry report was not scheduled")
-            report.future.result(timeout=20)
-            require_output(report.error == "", report.error)
-            content = re.sub(b"<[^>]+>", b"", app.output_diff_page(report))
-            require_output(b"before" in content and b"after" in content)
-            require_output(b"unchanged.txt" not in content)
-            with pytest.raises(ValueError, match="Invalid output entry"):
-                snapshots.entry_report(comparison, "../timestamp")
-            with pytest.raises(ValueError, match="escapes capture"):
-                snapshots.entry_report(comparison, "external/flake.nix")
-
-    def test_read_only_nix_outputs_and_legacy_captures_can_rotate(self) -> None:
-        """Repeated builds prune read-only snapshots without changing Nix or links."""
-        nested = self.output / "nested"
-        nested.mkdir()
-        (nested / "ms.pdf").write_bytes(b"PDF output")
-        external = self.root / "external"
-        external.mkdir()
-        (external / "private.txt").write_text("Private output")
-        (self.output / "link").symlink_to(external, target_is_directory=True)
-        for directory in (self.output, nested, external):
-            directory.chmod(0o555)
-        self.addCleanup(app.writable_capture_directories, self.root)
-        with app.OutputSnapshots() as snapshots:
-            comparison = self.capture(snapshots)
-            require_output(comparison.error == "", comparison.error)
-            if comparison.current is None:
-                self.fail("Initial output was not captured")
-            legacy = comparison.current
-            for directory in (legacy / "output/nested", legacy / "output"):
-                directory.chmod(0o555)
-            for _ in range(2):
-                self.capture(snapshots, refresh=True)
-                require_output(comparison.error == "", comparison.error)
-                require_output(not comparison.changed)
-            require_output(not legacy.exists())
-            require_output(
-                set(comparison.store.glob("capture-*"))
-                == {comparison.previous, comparison.current},
-            )
-            for directory in (self.output, nested, external):
-                require_output(
-                    directory.stat().st_mode & 0o777 == TEST_READ_ONLY_DIRECTORY_MODE,
-                )
-
-    def test_refresh_does_not_queue_duplicate_captures(self) -> None:
-        """Refresh while copying retains one job and does not rotate history twice."""
-        started = threading.Event()
-        release = threading.Event()
-        original = app.copy_output
-
-        def delayed(
-            source: Path,
-            destination: Path,
-            *,
-            cancelled: threading.Event | None = None,
-        ) -> None:
-            started.set()
-            require_output(release.wait(10))
-            original(source, destination, cancelled=cancelled)
-
-        data = app.gui_data(self.root)
-        with (
-            app.OutputSnapshots() as snapshots,
-            patch.object(app, "copy_output", side_effect=delayed) as copy,
-        ):
-            snapshots.observe(data)
-            comparison = snapshots.comparisons[self.output]
-            snapshots.request_capture(comparison)
-            try:
-                require_output(started.wait(10))
-                future = comparison.future
-                for _ in range(3):
-                    snapshots.observe(data)
-                require_output(comparison.future is future)
-            finally:
-                release.set()
-            if comparison.future is not None:
-                comparison.future.result(timeout=10)
-            copy.assert_called_once()
-
-    def test_report_requests_reuse_captures_while_the_server_stays_responsive(
-        self,
-    ) -> None:
-        """Reuse captures for reports and keep browsing during a comparison."""
-        value = self.output / "value.txt"
-        value.write_text("before\n")
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        value.write_text("after\n")
-        started = threading.Event()
-        release = threading.Event()
-        original = app.compare_output
-
-        def delayed(
-            previous: Path,
-            current: Path,
-            *,
-            cancelled: threading.Event | None = None,
-        ) -> bool:
-            started.set()
-            if not release.wait(10):
-                msg = "Comparison was not released"
-                raise ValueError(msg)
-            return original(previous, current, cancelled=cancelled)
-
-        with (
-            app.OutputSnapshots() as snapshots,
-            patch.object(app, "OutputSnapshots", return_value=snapshots),
-            patch.object(app, "compare_output", side_effect=delayed) as compare,
-            TestClient(
-                app.gui_app(self.root),
-                base_url="http://127.0.0.1:8765",
-            ) as client,
-        ):
-            try:
-                response = client.request("GET", "/api/overview")
-                data = json.loads(response.content)
-                package = next(
-                    node for node in data["nodes"] if node["kind"] == "package"
-                )
-                route = package["output_diff"]
-                comparison = snapshots.comparisons[self.output]
-                require_output(comparison.future is None)
-                response = client.get(route)
-                require_output(comparison.future is None)
-                require_output(b"Build or Check" in response.content)
-                snapshots.completed(self.output.parent, self.output)
-                require_output(started.wait(10))
-                for _ in range(2):
-                    response = client.request("GET", route)
-                    require_output(response.status_code == HTTPStatus.OK)
-                    require_output(b"updates automatically" in response.content)
-                response = client.request(
-                    "GET",
-                    "/output-diff?" + urlencode({"path": str(self.root)}),
-                )
-                require_output(response.status_code == HTTPStatus.NOT_FOUND)
-                release.set()
-                if comparison.future is not None:
-                    comparison.future.result(timeout=20)
-                response = client.request("GET", route)
-                report = re.sub(rb"<[^>]+>", b"", response.content)
-                require_output(b"before" in report)
-                require_output(b"after" in report)
-                compare.assert_called_once()
-            finally:
-                release.set()
-
-    def test_shutdown_cancels_comparison_and_reaps_process(self) -> None:
-        """Closing the browser stops a long comparison promptly."""
-        with app.OutputSnapshots() as snapshots:
-            self.capture(snapshots)
-        started = threading.Event()
-        processes: list[subprocess.Popen[bytes]] = []
-        original = subprocess.Popen
-        tool = self.root / "diffoscope"
-        tool.write_text(f"#!{sys.executable}\nimport time\ntime.sleep(60)\n")
-        tool.chmod(0o700)
-
-        def launch(*args: Any, **kwargs: Any) -> subprocess.Popen[bytes]:  # noqa: ANN401 - forward Popen arguments
-            process = original(*args, **kwargs)
-            processes.append(process)
-            started.set()
-            return process
-
-        data = app.gui_data(self.root)
-        with (
-            app.OutputSnapshots() as snapshots,
-            patch.object(shutil, "which", return_value=str(tool)),
-            patch.object(subprocess, "Popen", side_effect=launch),
-        ):
-            snapshots.observe(data)
-            comparison = snapshots.comparisons[self.output]
-            snapshots.request_capture(comparison)
-            require_output(started.wait(10))
-            closing = threading.Thread(target=snapshots.close)
-            closing.start()
-            closing.join(timeout=3)
-            require_output(not closing.is_alive(), "Shutdown waited for diffoscope")
-            require_output(all(process.poll() is not None for process in processes))
-            require_output("cancelled" in comparison.error)
-
-    def test_successful_buttons_compare_changing_nix_outputs_once(self) -> None:
-        """Success rotates one package history; failed actions and browsing do not."""
-        package = self.output.parent
-        directory = str(package)
-        actions = app.PackageActions()
-        self.addCleanup(actions.close)
-        with (
-            app.OutputSnapshots() as snapshots,
-            patch.object(app, "OutputSnapshots", return_value=snapshots),
-            patch.object(app, "PackageActions", return_value=actions),
-            TestClient(
-                app.gui_app(self.root),
-                base_url="http://127.0.0.1:8765",
-            ) as client,
-        ):
-            client.get("/api/overview")
-            result = Path(actions.storage.name) / "result"
-            actions.results[directory] = result
-            previous = None
-            for index, action in enumerate(("build", "check", "check")):
-                output = self.root / f"result-{index}"
-                output.mkdir()
-                (output / "value.txt").write_text(f"value {index}\n")
-                result.unlink(missing_ok=True)
-                result.symlink_to(output)
-                actions.launch(directory, action, [sys.executable, "-c", "pass"])
-                actions.jobs[directory].process.wait(timeout=10)
-                response = client.get("/api/action", params={"directory": directory})
-                require_output(response.json()["state"] == "passed")
-                comparison = snapshots.comparisons[self.output]
-                future = comparison.future
-                if future is None:
-                    self.fail("Successful button did not capture output")
-                future.result(timeout=20)
-                require_output(comparison.previous == previous)
-                require_output(comparison.output == output)
-                previous = comparison.current
-                client.get("/api/action", params={"directory": directory})
-                overview = client.get("/api/overview", params={"refresh": "1"}).json()
-                record = next(n for n in overview["nodes"] if n["kind"] == "package")
-                client.get(record["output_diff"])
-                require_output(comparison.future is future)
-                require_output(record["output_directory"] == str(output))
-            for action, code in (("check", 1), ("run", 0)):
-                actions.launch(
-                    directory,
-                    action,
-                    [sys.executable, "-c", f"raise SystemExit({code})"],
-                )
-                actions.jobs[directory].process.wait(timeout=10)
-                client.get("/api/action", params={"directory": directory})
-                require_output(comparison.current == previous)
-                require_output(comparison.future is future)
-
-
-class TestBoundary(unittest.TestCase):
-    """Verify the source contract through complete browser snapshots."""
-
-    def test_browser_cli_is_statically_discoverable(self) -> None:
-        """The browser's own interface must remain visible to Perigrafo inspection."""
-        entries = source_package_cli(Path(app.__file__).read_bytes(), "main.py")
-        if not all(
-            any(entry.text.startswith(name) for entry in entries)
-            for name in ("directory", "--no-open", "--port")
-        ):
-            msg = "Perigrafo inspection must discover every browser CLI parameter"
-            raise AssertionError(msg)
-
-    def test_empty_home_and_host_only_flake_have_no_fabricated_packages(self) -> None:
-        """Only backend resource identities may appear in the browser graph."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
-            child = root / "forge.example"
-            child.mkdir()
-            if canonical_root(child) != root:
-                msg = "Empty home layouts must share the backend's root recognition"
-                raise AssertionError(msg)
-            home = app.gui_data(root)
-            (root / ".gitignore").unlink()
-            (root / "flake.nix").write_text("{}\n")
-            source = root / "hosts/laptop/configuration.nix"
-            source.parent.mkdir(parents=True)
-            source.write_text("{}\n")
-            flake = app.gui_data(root)
-        if [node["id"] for node in home["nodes"]] != [".:repository"]:
-            msg = "An empty home must not fabricate a removed packages directory"
-            raise AssertionError(msg)
-        if any(node["kind"] == "package" for node in flake["nodes"]):
-            msg = "Host-only flakes must not fabricate package resources"
-            raise AssertionError(msg)
-
-    def test_host_dependency_removals_and_deleted_hosts_and_checks_are_visible(
-        self,
-    ) -> None:
-        """Historical source comparisons must cover every Perigrafo resource kind."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            host = root / "hosts/laptop/configuration.nix"
-            host.parent.mkdir(parents=True)
-            host.write_text(
-                "{ inputs, system, ... }: { environment.systemPackages = [ "
-                "inputs.self.packages.${system}.tool ]; }\n",
-            )
-            check = root / "checks/laptopVmWithDisko/default.nix"
-            check.parent.mkdir(parents=True)
-            check.write_text("{}\n")
-            commit_sources(root)
-            host.write_text("{}\n")
-            changed = app.gui_data(root)
-            host.unlink()
-            check.unlink()
-            removed = app.gui_data(root)
-        edge = next(edge for edge in changed["edges"] if edge["kind"] == "runtime")
-        if (
-            edge["change"] != "removed"
-            or edge["declaration"]["path"] != "hosts/laptop/configuration.nix"
-        ):
-            msg = "Host dependency removals must retain their declaration metadata"
-            raise AssertionError(msg)
-        host_record = next(node for node in changed["nodes"] if node["kind"] == "host")
-        if "- runtime: packages/tool" not in json.dumps(host_record["tree"]):
-            msg = "Host dependency removals must appear in the source details"
-            raise AssertionError(msg)
-        records = {node["id"]: node for node in removed["nodes"]}
-        for identifier in (".:hosts/laptop", ".:checks/laptopVmWithDisko"):
-            if (
-                not records[identifier]["removed"]
-                or records[identifier]["tree"]["change"] != "removed"
-            ):
-                msg = (
-                    "Deleted hosts and checks must remain visible as removed resources"
-                )
-                raise AssertionError(msg)
-        host_tree = records[".:hosts/laptop"]["tree"]
-        source = next(
-            child
-            for child in host_tree["children"]
-            if child["title"] == "configuration.nix"
-        )
-        if not any(child["title"] == "Dependencies" for child in source["children"]):
-            msg = "Removed host dependencies must retain their original source filename"
-            raise AssertionError(msg)
-
-    def test_multiline_help_changes_remain_under_the_source_file(self) -> None:
-        """Documentation containing summary labels must retain every paragraph."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            source = root / "packages/example/main.py"
-            source.parent.mkdir(parents=True)
-            before = (
-                "First paragraph.\n\nDependencies:\n"
-                "  Documentation, not declarations.\nOriginal last paragraph."
-            )
-            source.write_text(
-                f'"""{before}"""\nraise RuntimeError("must not execute")\n',
-            )
-            commit_sources(root)
-            after = before.replace("Original", "Changed")
-            source.write_text(
-                f'"""{after}"""\nraise RuntimeError("must not execute")\n',
-            )
-            snapshot = app.gui_data(root)
-        package = next(node for node in snapshot["nodes"] if node["kind"] == "package")
-        file = next(
-            child
-            for child in package["tree"]["children"]
-            if child["title"] == "main.py"
-        )
-        documentation = [
-            (child["title"], child["change"])
-            for child in file["children"]
-            if child["change"]
+    def test_browser_preserves_packages_and_hosts_and_hides_checks(self) -> None:
+        """Show packages, hosts, and semantic changes while hiding checks."""
+        root = Path("/workspace")
+        nodes = [
+            app.TreeNode(
+                "packages/sample",
+                [
+                    app.TreeNode(
+                        "Tests",
+                        [
+                            app.TreeNode("+ test new", style=32),
+                            app.TreeNode("- test old", style=31),
+                        ],
+                    ),
+                ],
+            ),
         ]
-        if documentation != [("- " + before, "removed"), ("+ " + after, "added")]:
-            msg = "Multiline documentation must be compared as a complete source fact"
-            raise AssertionError(msg)
-        if any(child["title"] == "Dependencies" for child in file["children"]):
-            msg = "Documentation labels must not become declaration groups"
-            raise AssertionError(msg)
-
-    def test_prm_suppression_edits_and_deleted_sources_keep_changes(self) -> None:
-        """Current and historical asset inventories must use the same source rules."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            (package / "default.nix").write_text("{}\n")
-            asset = package / "prm/nested/script.js"
-            asset.parent.mkdir(parents=True)
-            asset.write_text("/* eslint-disable no-alert */\n")
-            commit_sources(root)
-            asset.write_text(
-                "/* eslint-disable no-alert */\n/* eslint-disable no-console */\n",
-            )
-            changed = app.gui_data(root)
-            asset.unlink()
-            removed = app.gui_data(root)
-        for snapshot, transition, change in (
-            (changed, "1 → 2", "modified"),
-            (removed, "1 → 0", "removed"),
-        ):
-            package = next(
-                node for node in snapshot["nodes"] if node["kind"] == "package"
-            )
-            source_node = next(
-                child
-                for child in package["tree"]["children"]
-                if child["title"] == "prm/nested/script.js"
-            )
-            if not any(
-                child["title"] == f"eslint-disable (global): {transition}"
-                and child["change"] == change
-                for child in source_node["children"]
-            ):
-                msg = (
-                    "Tracked asset suppression changes must retain their source parents"
-                )
-                raise AssertionError(msg)
-        if source_node["lines"] is not None:
-            msg = "A removed source must not claim current line counts"
-            raise AssertionError(msg)
-
-    def test_schema_versions_are_checked_and_added_fields_are_allowed(self) -> None:
-        """Reject incompatible documents before rendering, without mutating inputs."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            current = overview_data(root)
-            previous = overview_data(root, revision="HEAD")
-            for version in (None, 0, 2, "1", True):
-                with (
-                    self.subTest(version=version),
-                    patch.object(
-                        app,
-                        "overview_data",
-                        return_value={**current, "schema_version": version},
-                    ),
-                    pytest.raises(
-                        ValueError,
-                        match="Unsupported Perigrafo overview schema",
-                    ),
-                ):
-                    app.browser_snapshot(root)
-            with (
-                patch.object(
-                    app,
-                    "overview_data",
-                    side_effect=[current, {**previous, "schema": "other.overview"}],
-                ),
-                pytest.raises(
-                    ValueError,
-                    match="Unsupported Perigrafo overview schema",
-                ),
-            ):
-                app.browser_snapshot(root)
-            current["future_field"] = {"optional": True}
-            original = json.dumps(current)
-            with patch.object(app, "overview_data", side_effect=[current, previous]):
-                snapshot = app.browser_snapshot(root)
-            if (
-                snapshot["future_field"] != {"optional": True}
-                or json.dumps(current) != original
-            ):
-                msg = "Optional fields must survive without modifying backend snapshots"
-                raise AssertionError(msg)
-
-
-class TestGui(unittest.TestCase):
-    """Verify the read-only GUI transport and shared semantic model."""
-
-    def test_command_transport_accepts_local_origins_and_rejects_other_origins(
-        self,
-    ) -> None:
-        """Allow loopback browser names only at the request's own origin."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            for host in ("localhost", "127.0.0.1"):
-                origin = f"http://{host}:8765"
-                with TestClient(app.gui_app(root), base_url=origin) as client:
-                    for endpoint in ("/api/action", "/api/command"):
-                        for action in ("run", "check"):
-                            with patch.object(
-                                app.PackageActions
-                                if endpoint == "/api/action"
-                                else app.PerigrafoActions,
-                                "start",
-                                return_value={"state": "passed", "output": ""},
-                            ) as start:
-                                response = client.post(
-                                    endpoint,
-                                    json={"directory": str(root), "action": action},
-                                    headers={
-                                        "Origin": origin,
-                                        "Sec-Fetch-Site": "same-origin",
-                                    },
-                                )
-                                require_output(response.status_code == HTTPStatus.OK)
-                                start.assert_called_once_with(str(root), action, "")
-                        for invalid_origin, site in (
-                            ("https://example.com", "cross-site"),
-                            (f"http://{host}:8766", "same-site"),
-                            (f"https://{host}:8765", "same-origin"),
-                            ("http://localhost.attacker.example:8765", "same-origin"),
-                            ("null", "same-origin"),
-                            (origin, "cross-site"),
-                            (
-                                "http://127.0.0.1:8765"
-                                if host != "127.0.0.1"
-                                else "http://localhost:8765",
-                                "same-site",
-                            ),
-                        ):
-                            response = client.post(
-                                endpoint,
-                                json={"directory": str(root), "action": "run"},
-                                headers={
-                                    "Origin": invalid_origin,
-                                    "Sec-Fetch-Site": site,
-                                },
-                            )
-                            require_output(response.status_code == HTTPStatus.FORBIDDEN)
-
-    def test_command_transport_rejects_cross_site_requests_and_unknown_directories(
-        self,
-    ) -> None:
-        """Protect command execution and publish the same catalog over HTTP."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with TestClient(
-                app.gui_app(root),
-                base_url="http://127.0.0.1:8765",
-            ) as client:
-                response = client.request("GET", "/api/overview")
-                data = json.loads(response.content)
-                require_output(data["commands"] == command_catalog())
-                body = json.dumps({"directory": str(root), "action": "overview"})
-                response = client.request(
-                    "POST",
-                    "/api/command",
-                    content=body,
-                    headers={
-                        "Content-Type": "application/json",
-                        "Origin": "https://example.com",
-                    },
-                )
-                require_output(response.status_code == HTTPStatus.FORBIDDEN)
-                for invalid_body in (
-                    "{",
-                    "null",
-                    "[]",
-                    json.dumps({"directory": str(root), "args": 42}),
-                    json.dumps({"directory": str(root), "unexpected": "value"}),
-                    " " * (app.ACTION_BODY_LIMIT + 1),
-                ):
-                    response = client.post(
-                        "/api/command",
-                        content=invalid_body,
-                        headers={"Content-Type": "application/json"},
-                    )
-                    require_output(response.status_code == HTTPStatus.BAD_REQUEST)
-                response = client.request(
-                    "POST",
-                    "/api/command",
-                    content=json.dumps(
-                        {"directory": str(root / "unknown"), "action": "overview"},
-                    ),
-                    headers={"Content-Type": "application/json"},
-                )
-                require_output(response.status_code == HTTPStatus.BAD_REQUEST)
-                require_output(
-                    "Unknown directory" in json.loads(response.content)["error"],
-                )
-                response = client.request(
-                    "GET",
-                    "/api/command?" + urlencode({"directory": str(root)}),
-                )
-                require_output(json.loads(response.content)["state"] == "idle")
-
-    def test_directory_actions_run_all_checks_and_reject_run(self) -> None:
-        """Parent scopes use the shared Perigrafo check command and process logs."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            actions = app.PackageActions()
-            self.addCleanup(actions.close)
-            data: dict[str, Any] = {"root": str(root), "nodes": []}
-            actions.observe(data)
-            require_output(
-                data["actions"]
-                == {
-                    "directory": str(root),
-                    "check": True,
-                    "package": False,
+        with (
+            patch.object(
+                app,
+                "overview_data",
+                return_value={
+                    "nodes": [
+                        {
+                            "id": ".:repository",
+                            "kind": "repository",
+                            "repository": ".",
+                            "path": ".",
+                            "profile": "flake",
+                        },
+                        {
+                            "id": ".:packages/sample",
+                            "kind": "package",
+                            "repository": ".",
+                            "path": "packages/sample",
+                            "name": "sample",
+                            "package_type": "python",
+                        },
+                        {
+                            "id": ".:hosts/laptop",
+                            "kind": "host",
+                            "repository": ".",
+                            "path": "hosts/laptop",
+                            "name": "laptop",
+                        },
+                        {
+                            "id": ".:checks/sample",
+                            "kind": "check",
+                            "repository": ".",
+                            "path": "checks/sample",
+                            "name": "sample",
+                        },
+                    ],
+                    "edges": [
+                        {
+                            "source": ".:packages/sample",
+                            "target": ".:checks/sample",
+                            "kind": "checked-by",
+                        },
+                    ],
                 },
-            )
-            with patch.object(
-                actions,
-                "launch",
-                return_value={"state": "running"},
-            ) as launch:
-                actions.start(str(root), "check", "--untrusted")
-                launch.assert_called_once_with(
-                    str(root),
-                    "check",
-                    ["perigrafo", "check"],
-                )
-            with pytest.raises(ValueError, match="Unknown directory action"):
-                actions.start(str(root), "run")
-            with pytest.raises(ValueError, match="Unknown package"):
-                actions.start(str(root / "unknown"), "check")
+            ),
+            patch.object(app.Viewer, "package_entries", return_value=nodes),
+        ):
+            snapshot = app.browser_data(root)
+        records = {record["id"]: record for record in snapshot["nodes"]}
+        if (
+            any(record["kind"] == "check" for record in records.values())
+            or snapshot["edges"]
+        ):
+            msg = "Check resources and their connections must stay hidden"
+            raise AssertionError(msg)
+        if "checks/" in json.dumps(snapshot["tree"]):
+            msg = "Checks must not appear in the terminal tree"
+            raise AssertionError(msg)
+        repository = snapshot["tree"][0]
+        package = repository["children"][0]
+        if package != records[".:packages/sample"]["tree"]:
+            msg = "Terminal and GUI package details must be identical"
+            raise AssertionError(msg)
+        if (
+            records[".:hosts/laptop"]["icon"] != "nixos"
+            or len(repository["children"]) != TEST_REPOSITORY_FIELDS
+        ):
+            msg = "Hosts must appear alongside packages"
+            raise AssertionError(msg)
+        file = next(
+            child for child in package["children"] if child["title"] == "test_main.py"
+        )
+        leaves = file["children"][0]["children"]
+        if [node["change"] for node in leaves] != ["added", "removed"]:
+            msg = "Nested changes must retain their addition and removal status"
+            raise AssertionError(msg)
 
-    def test_directory_scope_excludes_sibling_resources(self) -> None:
+    def test_directory_scope_matches_snapshot_and_terminal(self) -> None:
         """Intermediate directories and package directories show only their contents."""
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
@@ -1017,8 +144,8 @@ class TestGui(unittest.TestCase):
                     (package / "default.nix").write_text("{}\n")
                     (package / "main.py").write_text('"""Example."""\n')
             scoped = home / "github.com"
-            viewer = app.RepositoryBrowser(scoped)
-            viewer.refresh()
+            viewer = app.Viewer(scoped)
+            viewer.refresh_overview()
             snapshot = viewer.snapshot
             if snapshot["root"] != str(scoped) or snapshot["parent"] != str(home):
                 msg = "The current directory and its parent must define navigation"
@@ -1027,8 +154,13 @@ class TestGui(unittest.TestCase):
             if repositories != {"example/one"}:
                 msg = "A directory scope must exclude sibling repositories"
                 raise AssertionError(msg)
+            if snapshot["tree"] != [
+                app.serialize_node(node) for node in viewer.overview
+            ]:
+                msg = "The snapshot and TUI must share the scoped hierarchy"
+                raise AssertionError(msg)
             package = scoped / "example/one/packages/first"
-            snapshot = app.gui_data(package)
+            snapshot = app.browser_data(package)
             names = [
                 node["name"] for node in snapshot["nodes"] if node["kind"] == "package"
             ]
@@ -1036,437 +168,42 @@ class TestGui(unittest.TestCase):
                 msg = "Starting inside a package must exclude other packages"
                 raise AssertionError(msg)
 
-    def test_directory_scopes_reuse_data_until_refresh(self) -> None:
-        """Changing scopes must preserve cached declarations until explicit refresh."""
+    def test_home_tree_nests_user_under_machine(self) -> None:
+        """Home containment and collapsed machine details match both views."""
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            source = package / "main.py"
-            source.write_text('"""Before."""\n')
-            browser = app.RepositoryBrowser(root)
-            browser.load()
-            before = browser.snapshot
-            source.write_text('"""After."""\n')
-            browser.cwd = package
-            browser.load()
-            if "Before." not in json.dumps(browser.snapshot):
-                msg = "Child navigation must reuse the cached snapshot"
-                raise AssertionError(msg)
-            browser.cwd = root
-            browser.load()
-            if browser.snapshot != before:
-                msg = "Parent navigation must reuse the cached snapshot"
-                raise AssertionError(msg)
-            browser.refresh()
-            if "After." not in json.dumps(browser.snapshot):
-                msg = "Refresh must load new declarations"
-                raise AssertionError(msg)
-
-    def test_gui_package_includes_offline_layout_engine(self) -> None:
-        """The installed app must include the same engine served by source tests."""
-        executable = os.environ.get("PACKAGE_E2E_EXECUTABLE")
-        if not executable:
-            self.skipTest("Nix package executable not supplied")
-        version = f"python{sys.version_info.major}.{sys.version_info.minor}"
-        for name in ("g6",):
-            engine = (
-                Path(executable).parent.parent
-                / "lib"
-                / version
-                / f"site-packages/perigrafo_browser/prm/{name}.js"
-            )
-            if (
-                engine.read_bytes()
-                != Path(
-                    os.environ[f"PERIGRAFO_BROWSER_{name.upper()}"],
-                ).read_bytes()
-            ):
-                msg = "The packaged graph engine must match the pinned Nix dependency"
-                raise AssertionError(msg)
-
-    def test_gui_preserves_shared_resource_details_and_changes(self) -> None:
-        """Both representations use the same resources and structured changes."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            for relative, source in (
-                ("packages/sample/default.nix", "{}\n"),
-                ("packages/sample/test_main.py", "def test_old(): pass\n"),
-                ("hosts/laptop/configuration.nix", "{}\n"),
-                ("checks/sample/default.nix", "{}\n"),
-            ):
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text(source)
-            commit_sources(root)
-            (root / "packages/sample/test_main.py").write_text("def test_new(): pass\n")
-            snapshot = app.gui_data(root)
-            details = resource_data(root / "packages/sample")
-        records = {record["id"]: record for record in snapshot["nodes"]}
-        package = records[".:packages/sample"]
-        require_output(package["details"] == details)
-        require_output("tree" not in snapshot)
-        source = next(
-            node
-            for node in package["tree"]["children"]
-            if node["title"] == "test_main.py"
-        )
-        tests = next(node for node in source["children"] if node["field"] == "tests")
-        require_output(
-            [(node["title"], node["change"]) for node in tests["children"]]
-            == [("- test old", "removed"), ("+ test new", "added")],
-        )
-
-    def test_gui_serves_assets_and_live_data_without_exposing_checkout(self) -> None:
-        """Assets ship with the package; traversal and writes cannot reach files."""
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            with TestClient(
-                app.gui_app(root),
-                base_url="http://127.0.0.1:8765",
-            ) as client:
-                for route in (
-                    "/",
-                    "/script.js",
-                    "/style.css",
-                    "/g6.js",
-                    "/icons.js",
-                ):
-                    response = client.request("GET", route)
-                    if response.status_code != HTTPStatus.OK or not response.content:
-                        msg = f"Missing packaged GUI asset: {route}"
-                        raise AssertionError(msg)
-                response = client.get("/api/overview")
-                require_output(response.status_code == HTTPStatus.OK)
-                require_output(response.json()["root"] == str(root))
-                for route in ("/../main.py", "/.git/config", "/main.py"):
-                    response = client.request("GET", route)
-                    if response.status_code != HTTPStatus.NOT_FOUND:
-                        msg = "The GUI must not serve checkout files"
-                        raise AssertionError(msg)
-                response = client.request("POST", "/api/overview", content=b"change")
-                if response.status_code != HTTPStatus.METHOD_NOT_ALLOWED:
-                    msg = "GUI requests must not write repository data"
-                    raise AssertionError(msg)
-                with patch.object(
-                    app,
-                    "gui_data",
-                    side_effect=ValueError("Invalid repository"),
-                ):
-                    response = client.request("GET", "/api/overview")
-                    if (
-                        response.status_code != HTTPStatus.INTERNAL_SERVER_ERROR
-                        or json.loads(response.content)
-                        != {"error": "Invalid repository"}
-                    ):
-                        msg = "Repository errors must return readable JSON"
-                        raise AssertionError(msg)
-
-    def test_home_is_the_upper_navigation_boundary(self) -> None:
-        """Home scopes have no parent, including a home with a flake."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            with patch.object(Path, "home", return_value=root):
-                if app.directory_snapshot(root)["parent"] is not None:
-                    msg = "Directory home must have no parent"
-                    raise AssertionError(msg)
-                (root / "flake.nix").write_text("{}\n")
-                if app.gui_data(root)["parent"] is not None:
-                    msg = "Flake home must have no parent"
-                    raise AssertionError(msg)
-
-    def test_output_browser_serves_files_inside_tmp_only(self) -> None:
-        """List output, escape filenames, and reject traversal and symlink escapes."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            output = root / "packages/example/tmp"
-            nested = output / "nested"
-            nested.mkdir(parents=True)
-            name = "report & <one>.txt"
-            (output / name).write_text("Generated output")
-            source = output.parent / "main.py"
-            source.write_text("Source must stay private")
-            (output / "escaped.py").symlink_to(source)
-            with TestClient(
-                app.gui_app(root),
-                base_url="http://127.0.0.1:8765",
-            ) as client:
-                response = client.request(
-                    "GET",
-                    "/output?" + urlencode({"path": str(output)}),
-                )
-                listing = response.content.decode()
+            home = Path(temporary)
+            (home / "repository").mkdir()
+            with patch.object(Path, "home", return_value=home):
+                viewer = app.Viewer(home)
+                viewer.refresh_overview()
+                machine = viewer.overview[0]
+                user, details = machine.children or []
                 if (
-                    response.status_code != HTTPStatus.OK
-                    or "report &amp; &lt;one&gt;.txt" not in listing
-                    or "escaped.py" in listing
+                    machine.title != f"Machine: {platform.node()}"
+                    or not machine.expanded
+                    or user.title != f"User: {home.name} ({home})"
+                    or user.directory != home
+                    or not user.expanded
+                    or (user.children or [])[0].title != "repository"
+                    or details.expanded
                 ):
-                    msg = "Output listings must escape names and omit escaped links"
+                    msg = "Home must nest its visible user below the machine"
                     raise AssertionError(msg)
-                response = client.request(
-                    "GET",
-                    "/output?" + urlencode({"path": str(output / name)}),
-                )
-                if (
-                    response.status_code != HTTPStatus.OK
-                    or response.content != b"Generated output"
-                ):
-                    msg = "Output files must open directly in the web browser"
+                if viewer.snapshot["tree"] != [
+                    app.serialize_node(node) for node in viewer.overview
+                ]:
+                    msg = "Snapshot and terminal must share the home hierarchy"
                     raise AssertionError(msg)
-                route = "/output?" + urlencode({"path": str(output / name)})
-                response = client.head(route)
-                require_output(response.status_code == HTTPStatus.OK)
-                require_output(response.content == b"")
-                require_output(
-                    int(response.headers["Content-Length"]) == len(b"Generated output"),
-                )
-                response = client.get(route, headers={"Range": "bytes=0-8"})
-                require_output(response.status_code == HTTPStatus.PARTIAL_CONTENT)
-                require_output(response.content == b"Generated")
-                response = client.request(
-                    "GET",
-                    "/output?" + urlencode({"path": str(nested)}),
-                )
-                if (
-                    response.status_code != HTTPStatus.OK
-                    or "../" not in response.content.decode()
-                ):
-                    msg = "Nested output listings must link to their parent"
+                (home / "flake.nix").write_text("{}\n")
+                viewer.refresh_overview()
+                machine = viewer.overview[0]
+                user = (machine.children or [])[0]
+                if user.directory != home:
+                    msg = "Unexpected tree containment or expansion"
                     raise AssertionError(msg)
-                for path in (
-                    source,
-                    output / ".." / "main.py",
-                    output / "escaped.py",
-                ):
-                    response = client.request(
-                        "GET",
-                        "/output?" + urlencode({"path": str(path)}),
-                    )
-                    if response.status_code != HTTPStatus.NOT_FOUND:
-                        msg = "Output browsing must not expose source files"
-                        raise AssertionError(msg)
-
-    def test_package_actions_choose_build_for_latex_and_run_for_html(self) -> None:
-        """Document and website buttons work without a corresponding test check."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            actions = app.PackageActions()
-            self.addCleanup(actions.close)
-            for kind, action in (("latex", "build"), ("html", "run")):
-                package = root / "packages" / kind
-                package.mkdir(parents=True)
-                record: dict[str, Any] = {
-                    "kind": "package",
-                    "directory": str(root),
-                    "path": f"packages/{kind}",
-                    "name": kind,
-                    "package_type": kind,
-                }
-                (package / "default.nix").write_text("{}\n")
-                actions.observe({"nodes": [record]})
-                require_output(record["actions"]["build"])
-                require_output(record["actions"]["run"] == (kind == "html"))
-                require_output(not record["actions"]["check"])
-                if kind == "latex":
-                    with pytest.raises(ValueError, match="no declared executable"):
-                        actions.start(str(package), "run")
-                with patch.object(actions, "launch", return_value={}) as launch:
-                    actions.start(str(package), action)
-                    command = launch.call_args.args[2]
-                require_output(command[:2] == ["nix", action])
-                if kind == "latex":
-                    require_output(command[-1] == f"{root}#latex")
-                    require_output(command[2] == "--out-link")
-                    require_output(Path(command[3]) == actions.results[str(package)])
-                else:
-                    require_output(command == ["nix", "run", f"{root}#html", "--"])
-
-    def test_package_actions_distinguish_python_executables_and_libraries(self) -> None:
-        """Build and check availability stay independent of executable metadata."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            default = package / "default.nix"
-            default.write_text("{ ... }: {}\n")
-            record: dict[str, Any] = {
-                "kind": "package",
-                "directory": str(root),
-                "path": "packages/example",
-                "name": "example",
-                "package_type": "python",
-            }
-            actions = app.PackageActions()
-            self.addCleanup(actions.close)
-            actions.observe({"nodes": [record]})
-            require_output(record["actions"]["build"])
-            require_output(not record["actions"]["run"])
-            require_output(not record["actions"]["check"])
-            with pytest.raises(ValueError, match="no declared executable"):
-                actions.start(str(package), "run")
-            check = root / "checks/example/default.nix"
-            check.parent.mkdir(parents=True)
-            check.write_text("{}\n")
-            default.write_text('{ ... }: { meta.mainProgram = "example"; }\n')
-            actions.observe({"nodes": [record]})
-            require_output(
-                all(record["actions"][action] for action in ("build", "run", "check")),
-            )
-
-    def test_package_actions_run_checks_arguments_failures_and_stop(self) -> None:
-        """Forward run arguments, execute checks and stop commands on close."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            (package / "default.nix").write_text(
-                '{ ... }: { meta.mainProgram = "example"; }\n',
-            )
-            executable = root / "nix"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, sys, time\n"
-                "value = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
-                "print(json.dumps(value), flush=True)\n"
-                "if '--wait' in sys.argv: time.sleep(60)\n"
-                "sys.exit(7 if '--fail' in sys.argv else 0)\n",
-            )
-            executable.chmod(0o700)
-            data: dict[str, Any] = {
-                "nodes": [
-                    {
-                        "kind": "package",
-                        "directory": str(root),
-                        "path": "packages/example",
-                        "name": "example",
-                        "package_type": "python",
-                    },
-                ],
-            }
-            actions = app.PackageActions()
-            self.addCleanup(actions.close)
-            with patch.dict(
-                os.environ,
-                {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
-            ):
-                actions.observe(data)
-                require_output(not data["nodes"][0]["actions"]["check"])
-                with pytest.raises(ValueError, match="no declared check"):
-                    actions.start(str(package), "check")
-                check = root / "checks/example"
-                check.mkdir(parents=True)
-                (check / "default.nix").write_text("{}\n")
-                actions.observe(data)
-                actions.start(str(package), "check")
-                actions.jobs[str(package)].process.wait(timeout=10)
-                state = actions.status(str(package))
-                command = json.loads(state["output"])
-                require_output(state["state"] == "passed")
-                require_output(
-                    command["argv"][:2] == ["build", "--out-link"]
-                    and command["argv"][3] == "--print-build-logs",
-                )
-                require_output(
-                    "#checks." in command["argv"][4]
-                    and command["argv"][4].endswith('."example"'),
-                )
-                actions.start(
-                    str(package),
-                    "run",
-                    "'two words' '$(touch injected)' --fail",
-                )
-                actions.jobs[str(package)].process.wait(timeout=10)
-                state = actions.status(str(package))
-                command = json.loads(state["output"])
-                require_output(
-                    state["state"] == "failed"
-                    and state["exit_code"] == TEST_ACTION_FAILURE,
-                )
-                require_output(command["cwd"] == str(package))
-                require_output(
-                    command["argv"][:3] == ["run", f"{root}#example", "--"],
-                )
-                require_output(
-                    command["argv"][-3:]
-                    == ["two words", "$(touch injected)", "--fail"],
-                )
-                require_output(not (package / "injected").exists())
-                data["nodes"][0]["package_type"] = "python"
-                actions.observe(data)
-                actions.start(str(package), "run", "--wait")
-                with pytest.raises(ValueError, match="already running"):
-                    actions.start(str(package), "run")
-                actions.start(str(package), "stop")
-                require_output(actions.status(str(package))["state"] == "stopped")
-                actions.start(str(package), "run", "--wait")
-                job = actions.jobs[str(package)]
-                actions.close()
-                require_output(job.process.poll() is not None)
-            with pytest.raises(ValueError, match="Unknown package"):
-                actions.start(str(root), "run")
-
-    def test_package_check_output_is_browsable_and_replaces_local_tmp(self) -> None:
-        """A completed check exposes its output through tmp and protects siblings."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            (package / "default.nix").write_text("{}\n")
-            local = package / "tmp"
-            local.mkdir()
-            (local / "old.txt").write_text("Old runtime output")
-            check = root / "checks/example"
-            check.mkdir(parents=True)
-            (check / "default.nix").write_text("{}\n")
-            output = root / "check-result"
-            output.mkdir()
-            (output / "report.txt").write_text("Check output")
-            outside = root / "private.txt"
-            outside.write_text("Private")
-            (output / "escape").symlink_to(outside)
-            actions = app.PackageActions()
-            with (
-                patch.object(app, "PackageActions", return_value=actions),
-                TestClient(
-                    app.gui_app(root),
-                    base_url="http://127.0.0.1:8765",
-                ) as client,
-            ):
-                client.get("/api/overview")
-                result = Path(actions.storage.name) / "check-result"
-                result.symlink_to(output)
-                actions.results[str(package)] = result
-                data = client.get("/api/overview").json()
-                record = next(
-                    node for node in data["nodes"] if node["kind"] == "package"
-                )
-                entries = [
-                    node
-                    for node in record["tree"]["children"]
-                    if node["field"] == "tmp"
-                ]
-                require_output(
-                    len(entries) == 1 and entries[0]["directory"] == str(output),
-                )
-                listing = client.get("/output", params={"path": str(output)})
-                require_output(listing.status_code == HTTPStatus.OK)
-                require_output(
-                    "report.txt" in listing.text and "escape" not in listing.text,
-                )
-                report = client.get(
-                    "/output",
-                    params={"path": str(output / "report.txt")},
-                )
-                require_output(report.text == "Check output")
-                for path in (outside, output / "escape"):
-                    require_output(
-                        client.get("/output", params={"path": str(path)}).status_code
-                        == HTTPStatus.NOT_FOUND,
-                    )
-                require_output((local / "old.txt").read_text() == "Old runtime output")
+                if user.title != f"User: {home.name} ({home})":
+                    msg = "Unexpected tree containment or expansion"
+                    raise AssertionError(msg)
 
     def test_package_sources_count_lines_and_exclude_runtime_output(self) -> None:
         """Count blank lines and unterminated last lines, including prm sources."""
@@ -1487,20 +224,24 @@ class TestGui(unittest.TestCase):
             (resources / "linked.py").symlink_to(package / "main.py")
             (package / "tmp").mkdir()
             (package / "tmp/generated.py").write_bytes(b"runtime\n")
-            snapshot = app.gui_data(root)
+            snapshot = app.browser_data(root)
             record = next(
                 node for node in snapshot["nodes"] if node["kind"] == "package"
             )
             sources = {
-                child["title"]: child["lines"]
+                child["title"]: next(
+                    item["title"]
+                    for item in child["children"]
+                    if item["title"].startswith("Lines:")
+                )
                 for child in record["tree"]["children"]
                 if child["source_file"]
             }
             if sources != {
-                "default.nix": 1,
-                "main.py": 3,
-                "prm/web/script.js": 3,
-                "test_main.py": 0,
+                "default.nix": "Lines: 1",
+                "main.py": "Lines: 3",
+                "prm/web/script.js": "Lines: 3",
+                "test_main.py": "Lines: 0",
             }:
                 msg = "Source counts must exclude output, binary assets, and links"
                 raise AssertionError(msg)
@@ -1514,117 +255,58 @@ class TestGui(unittest.TestCase):
             }:
                 msg = "Metrics must exclude prm sources and zero suppression counts"
                 raise AssertionError(msg)
-            if record["details"] != resource_data(package):
-                msg = "Source line counts must match current file contents"
+            if snapshot["tree"][0]["children"][0] != record["tree"]:
+                msg = "Source line counts must be shared by the GUI and TUI"
                 raise AssertionError(msg)
             host = root / "hosts/example"
             host.mkdir(parents=True)
             (host / "configuration.nix").write_text("{}\n")
             host_record = next(
-                node for node in app.gui_data(root)["nodes"] if node["kind"] == "host"
+                node
+                for node in app.browser_data(root)["nodes"]
+                if node["kind"] == "host"
             )
             if host_record["source_metrics"]["lines"] != {"configuration.nix": 1}:
                 msg = "Host source files must contribute current metrics"
                 raise AssertionError(msg)
 
-    def test_perigrafo_commands_and_package_tests_preserve_cli_arguments(self) -> None:
-        """Run every catalog entry and test action through Perigrafo without a shell."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            package = root / "packages/example"
-            package.mkdir(parents=True)
-            executable = root / "perigrafo"
-            executable.write_text(
-                f"#!{sys.executable}\n"
-                "import json, os, sys, time\n"
-                "value = {'argv': sys.argv[1:], 'cwd': os.getcwd()}\n"
-                "print(json.dumps(value), flush=True)\n"
-                "if '--wait' in sys.argv: time.sleep(60)\n"
-                "sys.exit(7 if '--fail' in sys.argv else 0)\n",
-            )
-            executable.chmod(0o700)
-            data: dict[str, Any] = {
-                "root": str(root),
+    def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
+        """Both renderers retain removed providers and their relationships."""
+        tree = [
+            app.TreeNode(
+                "packages/consumer",
+                [
+                    app.TreeNode(
+                        "Dependencies",
+                        [
+                            app.TreeNode("- build: packages/old", style=31),
+                        ],
+                    ),
+                ],
+            ),
+        ]
+        with patch.object(
+            app,
+            "overview_data",
+            return_value={
                 "nodes": [
                     {
+                        "id": ".:repository",
+                        "kind": "repository",
+                        "repository": ".",
+                        "path": ".",
+                    },
+                    {
+                        "id": ".:packages/consumer",
                         "kind": "package",
-                        "directory": str(root),
-                        "path": "packages/example",
-                        "name": "example",
+                        "repository": ".",
+                        "path": "packages/consumer",
                     },
                 ],
-            }
-            commands = app.PerigrafoActions()
-            actions = app.PackageActions()
-            self.addCleanup(commands.close)
-            self.addCleanup(actions.close)
-            commands.observe(data)
-            actions.observe(data)
-            with patch.dict(
-                os.environ,
-                {"PATH": str(root) + os.pathsep + os.environ["PATH"]},
-            ):
-                for entry in data["commands"]:
-                    command = entry["command"]
-                    commands.start(
-                        str(root),
-                        command,
-                        "'two words' '$(touch injected)'",
-                    )
-                    commands.jobs[str(root)].process.wait(timeout=10)
-                    state = commands.status(str(root))
-                    invocation = json.loads(state["output"])
-                    require_output(state["state"] == "passed")
-                    require_output(invocation["cwd"] == str(root))
-                    require_output(
-                        invocation["argv"]
-                        == [
-                            *command.split(),
-                            "two words",
-                            "$(touch injected)",
-                        ],
-                    )
-                    if command.startswith("test "):
-                        actions.start(str(package), command, "--timeout 12")
-                        actions.jobs[str(package)].process.wait(timeout=10)
-                        invocation = json.loads(actions.status(str(package))["output"])
-                        require_output(invocation["cwd"] == str(package))
-                        require_output(
-                            invocation["argv"] == [*command.split(), "--timeout", "12"],
-                        )
-                require_output(not (root / "injected").exists())
-                commands.start(str(root), "test mutation", "--fail")
-                commands.jobs[str(root)].process.wait(timeout=10)
-                require_output(
-                    commands.status(str(root))["exit_code"] == TEST_ACTION_FAILURE,
-                )
-                commands.start(str(root), "test hypothesis", "--wait")
-                with pytest.raises(ValueError, match="already running"):
-                    commands.start(str(root), "overview")
-                commands.start(str(root), "stop")
-                require_output(commands.status(str(root))["state"] == "stopped")
-            with pytest.raises(ValueError, match="Unknown directory"):
-                commands.start(str(package), "overview")
-            with pytest.raises(ValueError, match="Unknown Perigrafo command"):
-                commands.start(str(root), "not-a-command")
-            with pytest.raises(ValueError, match="No closing quotation"):
-                commands.start(str(root), "overview", "'")
-
-    def test_removed_dependencies_share_connections_and_change_colors(self) -> None:
-        """Retain removed providers and declaration metadata in both views."""
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "flake.nix").write_text("{}\n")
-            package = root / "packages/consumer"
-            package.mkdir(parents=True)
-            source = package / "default.nix"
-            source.write_text(
-                "{ inputs, system, ... }: { buildInputs = [ "
-                "inputs.self.packages.${system}.old ]; }\n",
-            )
-            commit_sources(root)
-            source.write_text("{}\n")
-            snapshot = app.gui_data(root)
+                "edges": [],
+            },
+        ):
+            snapshot, nodes = app.browser_snapshot(Path("/workspace"), tree)
         records = {record["id"]: record for record in snapshot["nodes"]}
         if not records[".:packages/old"]["removed"]:
             msg = "Removed dependency providers must remain in the shared snapshot"
@@ -1633,12 +315,8 @@ class TestGui(unittest.TestCase):
         if connections["children"][0]["change"] != "removed":
             msg = "Connections must retain the same change colors as GUI arrows"
             raise AssertionError(msg)
-        edge = next(edge for edge in snapshot["edges"] if edge["kind"] == "build")
-        if (
-            edge["change"] != "removed"
-            or edge["declaration"]["path"] != "packages/consumer/default.nix"
-        ):
-            msg = "Removed arrows must preserve their source declarations"
+        if snapshot["edges"][0]["change"] != "removed" or not nodes:
+            msg = "Both the tree and graphical relationship must preserve removal"
             raise AssertionError(msg)
 
     def test_runtime_os_and_persistence_are_observations(self) -> None:
@@ -1686,8 +364,48 @@ class TestGui(unittest.TestCase):
                     msg = "Missing evidence must be reported as not detected"
                     raise AssertionError(msg)
 
-    def test_storage_links_output_without_walking_resources(self) -> None:
-        """Storage inspection does not traverse resource or output contents."""
+    def test_single_directory_paths_expand_without_opening_resources(self) -> None:
+        """Initial expansion stops at choices and resource details."""
+        package = app.TreeNode(
+            "packages/example",
+            [app.TreeNode("arguments")],
+            resource_id="package",
+        )
+        branch = app.TreeNode(
+            "repository",
+            [package, app.TreeNode("hosts/example")],
+            directory=Path("/home/example/repository"),
+        )
+        path = app.TreeNode("example", [branch], directory=Path("/home/example"))
+        app.expand_directory_paths([path])
+        if not (path.expanded):
+            msg = "Unexpected tree containment or expansion"
+            raise AssertionError(msg)
+        if branch.expanded:
+            msg = "Unexpected tree containment or expansion"
+            raise AssertionError(msg)
+        if package.expanded:
+            msg = "Unexpected tree containment or expansion"
+            raise AssertionError(msg)
+        branch.children = [package]
+        app.expand_directory_paths([path])
+        if not (branch.expanded):
+            msg = "Unexpected tree containment or expansion"
+            raise AssertionError(msg)
+        if package.expanded:
+            msg = "Unexpected tree containment or expansion"
+            raise AssertionError(msg)
+        viewer = app.Viewer(Path("/home/example"))
+        viewer.overview = [path]
+        viewer.overview_rows(80)
+        viewer.collapse_overview_node()
+        viewer.overview_rows(80)
+        if path.expanded:
+            msg = "Unexpected tree containment or expansion"
+            raise AssertionError(msg)
+
+    def test_storage_counts_disk_blocks_and_links_existing_output(self) -> None:
+        """Count prm allocation once per inode and preserve the runtime link."""
         with tempfile.TemporaryDirectory() as temporary:
             package = Path(temporary) / "packages/example"
             resources = package / "prm"
@@ -1699,337 +417,1094 @@ class TestGui(unittest.TestCase):
             external.write_bytes(b"outside" * 8192)
             link = resources / "link.bin"
             link.symlink_to(external)
+            expected = sum(
+                path.lstat().st_blocks * 512 for path in (resources, original, link)
+            )
+            if app.directory_disk_size(resources) != expected:
+                msg = "Disk usage must deduplicate hardlinks and ignore symlink targets"
+                raise AssertionError(msg)
             output = package / "tmp"
             output.mkdir()
-            with patch.object(Path, "iterdir", side_effect=AssertionError("Traversal")):
-                storage = app.package_storage(package)
+            storage = app.package_storage(package)
             if [node.title for node in storage] != [
-                "prm/",
+                f"prm/: {app.format_bytes(expected)}",
                 "tmp/",
             ] or storage[-1].directory != output.resolve():
-                msg = "Packages must show prm and existing tmp link"
+                msg = "Packages must show allocated prm size and existing tmp link"
                 raise AssertionError(msg)
             output.rmdir()
             if any(node.directory for node in app.package_storage(package)):
                 msg = "An absent output directory must not have a link"
                 raise AssertionError(msg)
 
-    def test_web_browser_launch_and_port_validation(self) -> None:
-        """Startup opens a loopback browser with the requested port."""
-        with (
-            patch.object(sys.stdin, "isatty", return_value=False),
-            patch.object(app, "open_gui") as launch,
-        ):
-            app.main(["--no-open", "--port", "0"])
-        launch.assert_called_once_with(
-            Path.cwd().resolve(),
-            port=0,
-            open_browser=False,
-        )
-        with pytest.raises(SystemExit) as error:
-            app.main(["--port", "-1"])
-        if error.value.code != TEST_PARSER_ERROR:
-            msg = "Invalid ports must be rejected by the parser"
-            raise AssertionError(msg)
+    def test_terminal_directory_navigation_and_parent(self) -> None:
+        """Enter and Backspace navigate directories independently of tree expansion."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            child = root / "child"
+            child.mkdir()
+            viewer = app.Viewer(root)
+            viewer.refresh_overview()
+            viewer.navigate("\n", 20, viewer.rows(80))
+            if viewer.cwd != child:
+                msg = "Enter must open the selected directory"
+                raise AssertionError(msg)
+            viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+            if viewer.cwd != root:
+                msg = "Parent navigation must work even in an empty directory"
+                raise AssertionError(msg)
+            with (
+                patch.object(Path, "home", return_value=root),
+                patch.object(viewer, "load_overview") as load,
+            ):
+                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+                load.assert_not_called()
+                if (
+                    viewer.cwd != root
+                    or app.directory_snapshot(root)[0]["parent"] is not None
+                ):
+                    msg = "Home must be the upper navigation boundary"
+                    raise AssertionError(msg)
+                (root / "flake.nix").write_text("{}\n")
+                if app.browser_data(root)["parent"] is not None:
+                    msg = "Canonical home snapshots must also stop parent navigation"
+                    raise AssertionError(msg)
 
 
 class TestCli(unittest.TestCase):
-    """Verify web-only startup."""
+    """Verify direct browser startup and the terminal requirement."""
 
-    def test_default_launch_opens_web_browser(self) -> None:
-        """The browser starts from cwd without a GUI mode flag."""
-        with patch.object(app, "open_gui") as launch:
-            app.main([])
-        launch.assert_called_once_with(
-            Path.cwd().resolve(),
-            port=8765,
-            open_browser=True,
+    def test_nonterminal_executable_explains_text_alternative(self) -> None:
+        """Piped execution fails clearly instead of entering a prompt loop."""
+        executable = os.environ.get("PACKAGE_E2E_EXECUTABLE")
+        if not executable:
+            self.skipTest("Nix package executable not supplied")
+        result = subprocess.run(
+            [executable],
+            input="",
+            text=True,
+            capture_output=True,
+            timeout=10,
+            check=False,
         )
-
-    def test_launch_address_accepts_connections_before_opening_browser(self) -> None:
-        """An ephemeral listening address must work while the app starts."""
-        addresses = []
-
-        def open_browser(address: str) -> None:
-            port = int(address.rsplit(":", 1)[1])
-            with socket.create_connection(("127.0.0.1", port), timeout=1):
-                addresses.append(address)
-
-        with (
-            patch.object(app, "gui_app", return_value=FastAPI()),
-            patch("uvicorn.Server.run"),
-            patch("webbrowser.open", side_effect=open_browser),
-        ):
-            app.open_gui(Path.cwd(), port=0, open_browser=True)
-        require_output(len(addresses) == 1)
-
-    def test_removed_terminal_flag_is_rejected(self) -> None:
-        """Legacy renderer selection cannot select a removed implementation."""
-        with pytest.raises(SystemExit) as error:
-            app.main(["--gui"])
-        if error.value.code != TEST_PARSER_ERROR:
-            msg = "Removed mode flags must be rejected"
+        if result.returncode != 1 or "perigrafo overview" not in result.stderr:
+            msg = "Expected a terminal error with the text-output alternative"
+            raise AssertionError(msg)
+        if result.stdout:
+            msg = "Nonterminal execution must not display a chat prompt"
             raise AssertionError(msg)
 
+    def test_terminal_opens_browser_directly(self) -> None:
+        """Startup opens the viewer without creating an agent or history."""
+        with (
+            patch.object(sys.stdin, "isatty", return_value=True),
+            patch.object(sys.stdout, "isatty", return_value=True),
+            patch.object(app.Viewer, "view") as view,
+        ):
+            app.main([])
+        view.assert_called_once_with()
 
-class TestRepositoryData(unittest.TestCase):
-    """Exercise file-organized details through the browser's production data API."""
 
-    def setUp(self) -> None:
-        """Create a disposable flake with a conventional Python package."""
-        storage = tempfile.TemporaryDirectory()
-        self.addCleanup(storage.cleanup)
-        self.root = Path(storage.name)
-        (self.root / "flake.nix").write_text("{}\n")
-        self.package = self.root / "packages/sample"
-        self.package.mkdir(parents=True)
-        (self.package / "default.nix").write_text(
-            '{ pkgs, ... }: { meta.description = "Sample."; }\n',
-        )
-        self.source = self.package / "main.py"
-        self.source.write_text(
-            '"""Example."""\nimport argparse\ndef parser():\n'
-            "    p = argparse.ArgumentParser()\n"
-            '    p.add_argument("--value", help="Value")\n    return p\n',
-        )
-        (self.package / "test_main.py").write_text("def test_one(): pass\n")
-
-    def record(self) -> dict[str, Any]:
-        """Read the package through the same graph pipeline as HTTP requests."""
-        return next(
-            node
-            for node in app.gui_data(self.root)["nodes"]
-            if node["id"] == ".:packages/sample"
-        )
-
-    def files(self) -> dict[str, Any]:
-        """Select the file rows without interpreting their display labels."""
-        return {
-            node["title"]: node
-            for node in self.record()["tree"]["children"]
-            if node["source_file"]
-        }
-
-    def test_cli_parameters_belong_to_nested_commands(self) -> None:
-        """Command paths place changed parameters under their declared commands."""
-        before = (
-            "import argparse\ndef parser():\n    p = argparse.ArgumentParser()\n"
-            '    p.add_argument("--root")\n    commands = p.add_subparsers()\n'
-            '    run = commands.add_parser("run")\n'
-            '    run.add_argument("--old")\n    return p\n'
-        )
-        self.source.write_text(before)
-        commit_sources(self.root)
-        self.source.write_text(before.replace('"--old"', '"--new"'))
-        cli = next(
-            node
-            for node in self.files()["main.py"]["children"]
-            if node["field"] == "cli"
-        )
-        run = next(node for node in cli["children"] if node["title"] == "run")
-        require_output(
-            [node["change"] for node in run["children"]] == ["removed", "added"],
-        )
-        require_output(
-            any(
-                node["title"].startswith("--root") and node["change"] is None
-                for node in cli["children"]
-            ),
-        )
+class TestViewer(unittest.TestCase):  # noqa: D101
+    def test_current_package_view_uses_canonical_overview(self) -> None:  # noqa: D102
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            viewer = app.Viewer(root)
+            with patch.object(
+                app,
+                "package_overview",
+                return_value="Name: shared",
+            ) as read:
+                entry = viewer.package_entry(root, "sample", diff=False)
+            read.assert_called_once_with(root / "packages/sample")
+            if (
+                entry is None
+                or not entry.children
+                or entry.children[0].title != "Name: shared"
+            ):
+                msg = "Package view did not display the canonical overview"
+                raise AssertionError(msg)
 
     def test_dependencies_appear_in_shared_overview_and_inline_changes(self) -> None:
-        """Dependency rows and graph relationships reflect the same declarations."""
-        default = self.package / "default.nix"
-        default.write_text(
-            "{ inputs, ... }: { buildInputs = [ "
-            "inputs.self.packages.x86_64-linux.first ]; }\n",
+        """Show dependency declarations and edits using the shared summary."""
+        before = app.Viewer.package_summary(
+            "consumer",
+            {
+                "default.nix": (
+                    "{inputs, system, ...}: { buildInputs = ["
+                    "inputs.self.packages.${system}.core]; }"
+                ),
+            },
         )
-        commit_sources(self.root)
-        default.write_text(
-            "{ inputs, ... }: { buildInputs = [ "
-            "inputs.self.packages.x86_64-linux.second ]; }\n",
+        after = app.Viewer.package_summary(
+            "consumer",
+            {
+                "default.nix": (
+                    "{inputs, system, ...}: { buildInputs = ["
+                    "inputs.self.packages.${system}.engine]; }"
+                ),
+            },
         )
-        group = next(
+        dependencies = next(
             node
-            for node in self.files()["default.nix"]["children"]
-            if node["field"] == "dependencies"
+            for node in app.Viewer.summary_tree(after)
+            if node.title == "Dependencies"
         )
-        require_output(
-            [(node["title"], node["change"]) for node in group["children"]]
-            == [
-                ("- build: packages/first", "removed"),
-                ("+ build: packages/second", "added"),
-            ],
-        )
-
-    def test_display_labels_do_not_control_file_placement(self) -> None:
-        """Keep documentation independent of display labels."""
-        text = "Suppressions\nLines: 999\nArguments\nHelp: arbitrary text"
-        self.source.write_text(repr(text) + "\n")
-        documentation = self.files()["main.py"]["children"][0]
-        require_output(documentation["field"] == "help")
-        require_output(documentation["value"] == text)
-        require_output(self.files()["main.py"]["lines"] == 1)
-
-    def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
-        """Empty facts have no placeholder rows, while diagnostics remain visible."""
-        self.source.write_text('"""Library."""\n')
-        (self.package / "test_main.py").write_text("")
-        require_output(
-            not any(
-                node["field"] == "tests"
-                for node in self.files()["test_main.py"]["children"]
-            ),
-        )
-        (self.package / "test_main.py").write_text("def broken(\n")
-        tests = self.files()["test_main.py"]["children"][0]
-        require_output(tests["warning"] and tests["children"][0]["warning"])
-        require_output(self.record()["tree"]["warning"])
-
-    def test_high_level_diff_compares_summaries_not_source_code(self) -> None:
-        """Body-only edits do not introduce semantic changes."""
-        commit_sources(self.root)
-        self.source.write_text(self.source.read_text() + "value = 42\n")
-        record = self.record()
-
-        def changed(node: dict[str, Any]) -> bool:
-            return bool(node["change"]) or any(
-                changed(child) for child in node["children"]
+        if [node.title for node in dependencies.children or []] != [
+            "build: packages/engine",
+        ]:
+            raise AssertionError(dependencies)
+        for render in (app.Viewer.merged_summary_tree, app.Viewer.summary_changes):
+            changes = next(
+                node for node in render(before, after) if node.title == "Dependencies"
             )
+            if {node.title for node in changes.children or []} != {
+                "- build: packages/core",
+                "+ build: packages/engine",
+            }:
+                raise AssertionError(changes)
 
-        require_output(not changed(record["tree"]))
-
-    def test_http_navigation_reuses_source_snapshot_until_refresh(self) -> None:
-        """Navigation scopes one source capture; refresh observes source edits."""
-        self.source.write_text('"""Before."""\n')
+    def test_diff_key_uses_cached_views_and_refreshes_only_on_request(self) -> None:
+        """D switches cached trees, and r explicitly rebuilds the current snapshot."""
+        viewer = app.Viewer()
+        screen = MagicMock()
+        screen.getmaxyx.return_value = (12, 80)
+        screen.get_wch.side_effect = ["D", "r", "L", "D", "q"]
         with (
+            patch.object(
+                viewer,
+                "package_entries",
+                return_value=[
+                    app.TreeNode(
+                        "packages/example",
+                        [
+                            app.TreeNode("unchanged"),
+                            app.TreeNode("+ changed", style=32),
+                        ],
+                    ),
+                ],
+            ) as build,
+            patch.object(curses, "has_colors", return_value=False),
+            patch.object(curses, "curs_set"),
             patch.object(
                 app,
                 "browser_snapshot",
-                wraps=app.browser_snapshot,
-            ) as collect,
-            TestClient(
-                app.gui_app(self.root),
-                base_url="http://127.0.0.1:8765",
-            ) as client,
+                side_effect=lambda _root, tree: ({}, tree),
+            ),
+            patch.object(
+                app,
+                "scope_snapshot",
+                side_effect=lambda data, _directory: (data, viewer.full_overview),
+            ),
         ):
-            collect.assert_not_called()
-            client.get("/api/overview")
-            self.source.write_text('"""After."""\n')
-            for query in ({}, {"directory": str(self.package)}, {}):
-                response = client.get("/api/overview", params=query)
-                require_output(response.status_code == HTTPStatus.OK)
-                package = next(
-                    node
-                    for node in response.json()["nodes"]
-                    if node["kind"] == "package"
-                )
-                require_output(package["details"]["help"] == "Before.")
-            collect.assert_called_once_with(self.root)
-            refreshed = client.get("/api/overview", params={"refresh": "1"})
-            package = next(
-                node for node in refreshed.json()["nodes"] if node["kind"] == "package"
-            )
-            require_output(package["details"]["help"] == "After.")
-            require_output(
-                [invocation.args for invocation in collect.call_args_list]
-                == [(self.root,), (self.root,)],
-            )
+            viewer.ensure_overview()
+            viewer.screen(screen)
+        if [item.kwargs for item in build.call_args_list] != [
+            {"diff": False},
+            {"diff": False},
+        ] or viewer.mode != "high-level":
+            msg = "Only startup and r may recalculate the overview"
+            raise AssertionError(msg)
+        if any("high-level" in item.args[2] for item in screen.addnstr.call_args_list):
+            msg = "The footer must omit the view name"
+            raise AssertionError(msg)
+        if [node.title for node in viewer.full_overview[0].children or []] != [
+            "unchanged",
+            "+ changed",
+        ] or [node.title for node in viewer.diff_overview[0].children or []] != [
+            "+ changed",
+        ]:
+            msg = "Filtering must preserve the complete cached overview"
+            raise AssertionError(msg)
 
-    def test_metadata_changes_have_explicit_fields_and_values(self) -> None:
-        """Changed metadata carries raw values independently of its display title."""
-        commit_sources(self.root)
-        (self.package / "default.nix").write_text(
-            '{ ... }: { meta.description = "Updated."; }\n',
+    def test_diff_only_omits_unchanged_fields_and_keeps_command_ancestors(self) -> None:
+        """Filtering removes unchanged details while retaining nested change context."""
+        before = (
+            "Name: sample\nDescription: Before\nArguments:\n"
+            "  --same\nTests:\n  test same"
         )
-        rows = [
+        after = before.replace("Before", "After")
+        nodes = app.Viewer.merged_summary_tree(before, after)
+        nodes.append(
+            app.TreeNode(
+                "command",
+                [app.TreeNode("--same"), app.TreeNode("+ --new", style=32)],
+            ),
+        )
+        changes = app.Viewer.changed_nodes(nodes)
+        if [node.title for node in changes] != [
+            "- Description: Before",
+            "+ Description: After",
+            "command",
+        ] or [node.title for node in changes[-1].children or []] != ["+ --new"]:
+            msg = "Diff-only trees must contain changes and their command ancestors"
+            raise AssertionError(msg)
+
+    def test_directory_navigation_reuses_source_snapshot_until_refresh(self) -> None:
+        """Parent navigation rescopes declarations; Refresh reads new evidence."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "flake.nix").write_text("{}\n")
+            package = root / "packages/example"
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text("{}\n")
+            (package / "main.py").write_text('"""Before."""\n')
+            viewer = app.Viewer(package)
+            with patch.object(
+                app,
+                "browser_snapshot",
+                wraps=app.browser_snapshot,
+            ) as build:
+                viewer.ensure_overview()
+                (package / "main.py").write_text('"""After."""\n')
+                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+                viewer.navigate(curses.KEY_BACKSPACE, 20, viewer.rows(80))
+                if viewer.cwd != root or build.call_count != 1:
+                    msg = "Navigating within a repository must reuse its declarations"
+                    raise AssertionError(msg)
+                serialized = json.dumps(viewer.snapshot)
+                if "Before." not in serialized or "After." in serialized:
+                    msg = "Navigation must retain the snapshot until explicit Refresh"
+                    raise AssertionError(msg)
+                viewer.refresh_overview()
+                if build.call_count != TEST_EXPECTED_BUILDS:
+                    msg = "Refresh must reread declarations"
+                    raise AssertionError(msg)
+                if "After." not in json.dumps(viewer.snapshot):
+                    msg = "Refresh must display the new declarations"
+                    raise AssertionError(msg)
+
+    def test_empty_groups_are_hidden_but_diagnostics_and_removals_remain(self) -> None:
+        """Placeholder declarations are neither entries nor semantic changes."""
+        empty = (
+            "Name: sample\nArguments:\n  (not applicable)\n"
+            "Dependencies:\n  (not declared)\nTests:\n  (none)\n"
+            "Suppressions:\n  (none)\n"
+        )
+        for tree in (
+            app.Viewer.summary_tree(empty, cli=[CliEntry((), "(not applicable)")]),
+            app.Viewer.merged_summary_tree(empty, empty),
+        ):
+            if [node.title for node in tree] != ["Name: sample"]:
+                msg = "Empty declaration groups must be omitted in both views"
+                raise AssertionError(msg)
+        previous = empty.replace("Tests:\n  (none)", "Tests:\n  test existing")
+        changed = app.Viewer.merged_summary_tree(previous, empty)
+        tests = next(node for node in changed if node.title == "Tests")
+        if [node.title for node in tests.children or []] != ["- test existing"]:
+            msg = "Removing the last test must remain visible in the diff"
+            raise AssertionError(msg)
+        diagnostic = empty.replace(
+            "Tests:\n  (none)",
+            "Tests:\n  (unavailable: syntax error)",
+        )
+        tests = next(
             node
-            for node in self.record()["tree"]["children"]
-            if node["field"] == "description"
-        ]
-        require_output(
-            [(node["value"], node["change"]) for node in rows]
-            == [("Sample.", "removed"), ("Updated.", "added")],
+            for node in app.Viewer.summary_tree(diagnostic)
+            if node.title == "Tests"
         )
+        if not app.Viewer.has_warning(tests):
+            msg = "Unavailable analysis must remain visible as a diagnostic"
+            raise AssertionError(msg)
 
-    def test_package_data_uses_perigrafo_test_discovery(self) -> None:
-        """Browser test rows come from the shared static discovery contract."""
-        (self.package / "test_main.py").write_text(
-            "import unittest as unit\nclass Checks(unit.TestCase):\n"
-            "    def test_nested_case(self): pass\ndef test_free_case(): pass\n",
+    def test_g_and_capital_g_move_cursor_to_viewport_edges(self) -> None:  # noqa: D102
+        for mode in ("high-level", "high-level diff"):
+            viewer = app.Viewer()
+            viewer.mode = mode
+            viewer.overview = [app.TreeNode(str(index)) for index in range(5)]
+            rows = viewer.rows(80)
+            viewer.navigate("G", TEST_PAGE_HEIGHT, rows)
+            if (
+                viewer.top != len(rows) - TEST_PAGE_HEIGHT
+                or viewer.selected != rows[-1].owner
+            ):
+                msg = f"G must place the cursor on the bottom row in {mode} mode"
+                raise AssertionError(msg)
+            viewer.navigate("g", TEST_PAGE_HEIGHT, viewer.rows(80))
+            if viewer.top != 0 or viewer.selected != 0:
+                msg = f"g must place the cursor on the top row in {mode} mode"
+                raise AssertionError(msg)
+
+    def test_high_level_diff_compares_summaries_not_source_code(self) -> None:  # noqa: D102, PLR0915
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Test"],
+                check=True,
+            )
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            (package / "default.nix").write_text(
+                '{ meta.description = "Before"; }\n',
+                encoding="utf-8",
+            )
+            (package / "main.py").write_text(
+                '"""Same help."""\n'
+                "import argparse\n"
+                "parser = argparse.ArgumentParser()\n"
+                'parser.add_argument("--old", help="Old option")\n'
+                "value = 1\n",
+                encoding="utf-8",
+            )
+            (package / "test_main.py").write_text(
+                "def test_old(): pass\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            (package / "default.nix").write_text(
+                '{ meta.description = "After"; }\n',
+                encoding="utf-8",
+            )
+            (package / "main.py").write_text(
+                '"""Same help."""\n'
+                "import argparse\n"
+                "parser = argparse.ArgumentParser()\n"
+                'parser.add_argument("--new", help="New option")\n'
+                "value = 2\n",
+                encoding="utf-8",
+            )
+            (package / "test_main.py").write_text(
+                "def test_new(): pass\n",
+                encoding="utf-8",
+            )
+            added = root / "packages/added"
+            added.mkdir()
+            (added / "main.py").write_text('"""New package."""\n', encoding="utf-8")
+            removed = root / "packages/removed"
+            removed.mkdir()
+            (removed / "default.nix").write_text(
+                '{ meta.description = "Gone"; }\n',
+                encoding="utf-8",
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "add", "packages/removed"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "add removed"],
+                check=True,
+            )
+            shutil.rmtree(removed)
+            viewer = app.Viewer(root)
+            entries = {node.title: node for node in viewer.package_entries(diff=True)}
+            sample_diff = entries["packages/sample"]
+            changed_fields = {node.title for node in sample_diff.children or []}
+            if (
+                "- Description: Before" not in changed_fields
+                or "+ Description: After" not in changed_fields
+            ):
+                msg = "Diff must include changed summary metadata"
+                raise AssertionError(msg)
+            tests = next(
+                node for node in sample_diff.children or [] if node.title == "Tests"
+            )
+            if {node.title for node in tests.children or []} != {
+                "- test old",
+                "+ test new",
+            }:
+                msg = "Diff must show removed and added test names"
+                raise AssertionError(msg)
+            arguments = next(
+                node for node in sample_diff.children or [] if node.title == "Arguments"
+            )
+            if {node.title for node in arguments.children or []} != {
+                "- --old  optional; help='Old option'",
+                "+ --new  optional; help='New option'",
+            }:
+                msg = "Argument diff must show removed and added CLI options"
+                raise AssertionError(msg)
+            viewer.mode = "high-level diff"
+            viewer.overview = [sample_diff]
+            viewer.selected = 0
+            viewer.navigate("l", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "test old" in visible or "test new" in visible:
+                msg = "Test-name diff children must be collapsed under Tests"
+                raise AssertionError(msg)
+            if "--old" in visible or "--new" in visible:
+                msg = "Argument diff entries must be collapsed under Arguments"
+                raise AssertionError(msg)
+            arguments_row = next(
+                row
+                for row in viewer.rows(80)
+                if row.text.rstrip().endswith("Arguments")
+            )
+            viewer.selected = arguments_row.owner
+            viewer.navigate("l", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "--old" not in visible or "--new" not in visible:
+                msg = "Expanding Arguments in a diff must show changed options"
+                raise AssertionError(msg)
+            tests_row = next(
+                row for row in viewer.rows(80) if row.text.rstrip().endswith("Tests")
+            )
+            viewer.selected = tests_row.owner
+            viewer.navigate("l", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "test old" not in visible or "test new" not in visible:
+                msg = "Expanding Tests in a diff must show changed test names"
+                raise AssertionError(msg)
+            if "packages/added" not in entries or "packages/removed" not in entries:
+                msg = "High-level diff must include added and removed packages"
+                raise AssertionError(msg)
+            if any("value =" in node.title for node in sample_diff.children or []):
+                msg = "High-level diff must omit source-code changes"
+                raise AssertionError(msg)
+
+    def test_high_level_diff_omits_unchanged_summaries_and_colors_changes(self) -> None:  # noqa: D102
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.email", "test@example.com"],
+                check=True,
+            )
+            subprocess.run(
+                ["git", "-C", str(root), "config", "user.name", "Test"],
+                check=True,
+            )
+            package = root / "packages/same"
+            package.mkdir(parents=True)
+            (package / "main.py").write_text(
+                '"""Help."""\nvalue = 1\n',
+                encoding="utf-8",
+            )
+            (package / "test_main.py").write_text(
+                "def test_one(): pass\n",
+                encoding="utf-8",
+            )
+            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            subprocess.run(
+                ["git", "-C", str(root), "commit", "-qm", "baseline"],
+                check=True,
+            )
+            (package / "main.py").write_text(
+                '"""Help."""\nvalue = 2\n',
+                encoding="utf-8",
+            )
+            viewer = app.Viewer(root)
+            overview = viewer.package_entries()
+            if not overview or overview[0].title != "packages/same":
+                msg = "The regular high-level view must retain unchanged summaries"
+                raise AssertionError(msg)
+            if viewer.package_entries(diff=True):
+                msg = "Source-only changes must not appear in a high-level diff"
+                raise AssertionError(msg)
+            viewer.mode = "high-level diff"
+            viewer.overview = [
+                app.TreeNode(
+                    "packages/change",
+                    [
+                        app.TreeNode("- old", style=31),
+                        app.TreeNode("+ new", style=32),
+                    ],
+                    expanded=True,
+                ),
+            ]
+            rows = viewer.rows(80)
+            if viewer.styles(rows[1]) != [31] or viewer.styles(rows[2]) != [32]:
+                msg = "Removed and added summary lines must be red and green"
+                raise AssertionError(msg)
+
+    def test_home_high_level_preserves_repository_directory_structure(self) -> None:  # noqa: D102
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            (root / ".gitmodules").write_text(
+                '[submodule "github.com/example/project"]\n'
+                "\tpath = github.com/example/project\n",
+                encoding="utf-8",
+            )
+            package = root / "github.com/example/project/packages/sample"
+            package.mkdir(parents=True)
+            (package / "main.py").write_text('"""Sample help."""\n', encoding="utf-8")
+            viewer = app.Viewer(root)
+            entries = viewer.package_entries()
+            if [node.title for node in entries] != ["github.com"]:
+                msg = "Home overview must start with the repository path parent"
+                raise AssertionError(msg)
+            domain = entries[0].children or []
+            organization = domain[0].children or []
+            repository = organization[0].children or []
+            if repository[0].title != "packages/sample":
+                msg = "Home overview must preserve repository and package hierarchy"
+                raise AssertionError(msg)
+
+    def test_nested_cli_diff_keeps_changes_under_their_commands(self) -> None:
+        """Show changed parameters and removed commands at their original paths."""
+        before = [
+            CliEntry(("test",), "command", command=True),
+            CliEntry(("test", "coverage"), "command", command=True),
+            CliEntry(("test", "coverage"), "--jobs  default=2"),
+            CliEntry(("retired",), "command", command=True),
+        ]
+        after = [*before[:2], CliEntry(("test", "coverage"), "--jobs  default=4")]
+        tree = app.Viewer.cli_tree(after, previous=before)
+        test = next(node for node in tree if node.title == "test")
+        coverage = (test.children or [])[0]
+        if [(node.title, node.style) for node in coverage.children or []] != [
+            ("- --jobs  default=2", 31),
+            ("+ --jobs  default=4", 32),
+        ]:
+            msg = "Changed CLI parameters must retain their path and colors"
+            raise AssertionError(msg)
+        retired = next(node for node in tree if node.title == "- retired")
+        if (retired.title, retired.style) != ("- retired", 31):
+            msg = "Removed commands must retain removal styling"
+            raise AssertionError(msg)
+
+    def test_overview_child_collapse_and_cursor_follow(self) -> None:  # noqa: D102
+        viewer = app.Viewer()
+        viewer.mode = "high-level"
+        leaf = app.TreeNode("leaf")
+        branch = app.TreeNode("branch", [leaf])
+        viewer.overview = [app.TreeNode("root", [branch])]
+        viewer.height = 2
+        viewer.navigate("l", 2, viewer.rows(80))
+        viewer.navigate("j", 2, viewer.rows(80))
+        viewer.navigate("l", 2, viewer.rows(80))
+        viewer.navigate("j", 2, viewer.rows(80))
+        visible = viewer.rows(80)
+        selected_row = next(
+            index for index, row in enumerate(visible) if row.owner == viewer.selected
         )
-        record = self.record()
-        require_output(record["details"] == resource_data(self.package))
-        require_output(
-            record["details"]["tests"] == ["test nested case", "test free case"],
+        if not viewer.top <= selected_row < viewer.top + viewer.height:
+            msg = "Moving down must scroll the selected tree row into view"
+            raise AssertionError(msg)
+        viewer.navigate("h", 2, visible)
+        visible = viewer.rows(80)
+        if (
+            viewer.overview_visible[viewer.selected].title != "branch"
+            or len(visible) != TEST_EXPECTED_VISIBLE
+        ):
+            msg = "h on a nested child must collapse its parent and select that parent"
+            raise AssertionError(msg)
+
+    def test_overview_is_cached_until_refreshed(self) -> None:  # noqa: D102
+        viewer = app.Viewer()
+        with (
+            patch.object(
+                viewer,
+                "package_entries",
+                side_effect=[[app.TreeNode("first")], [app.TreeNode("second")]],
+            ) as build,
+            patch.object(
+                app,
+                "browser_snapshot",
+                side_effect=lambda _root, tree: ({}, tree),
+            ),
+            patch.object(
+                app,
+                "scope_snapshot",
+                side_effect=lambda data, _directory: (data, viewer.full_overview),
+            ),
+        ):
+            viewer.ensure_overview()
+            viewer.ensure_overview()
+            if build.call_count != 1 or viewer.overview[0].title != "first":
+                msg = "The startup overview must be built only once"
+                raise AssertionError(msg)
+            viewer.selected = viewer.top = 3
+            viewer.refresh_overview()
+            if (
+                build.call_count != TEST_EXPECTED_BUILDS
+                or viewer.overview[0].title != "second"
+            ):
+                msg = "Refreshing must rebuild the overview"
+                raise AssertionError(msg)
+            if viewer.selected != 0 or viewer.top != 0:
+                msg = "Refreshing must reset navigation to the start"
+                raise AssertionError(msg)
+
+    def test_overview_nests_commands_and_search_reveals_parameters(self) -> None:
+        """Keep root options visible and nested command parameters collapsible."""
+        source = (
+            "import argparse\n"
+            "p = argparse.ArgumentParser()\n"
+            "p.add_argument('--verbose')\n"
+            "commands = p.add_subparsers()\n"
+            "test = commands.add_parser('test')\n"
+            "children = test.add_subparsers()\n"
+            "coverage = children.add_parser('coverage')\n"
+            "coverage.add_argument('--jobs', type=int, default=2)\n"
         )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            (package / "main.py").write_text(source, encoding="utf-8")
+            viewer = app.Viewer(root)
+            viewer.mode = "high-level"
+            viewer.overview = viewer.package_entries()
+            entry = viewer.overview[0]
+            arguments = next(
+                node for node in entry.children or [] if node.title == "Arguments"
+            )
+            children = arguments.children or []
+            if [node.title for node in children] != ["--verbose  optional", "test"]:
+                msg = "Arguments must contain root options and command nodes"
+                raise AssertionError(msg)
+            test = children[1]
+            coverage = (test.children or [])[0]
+            if coverage.title != "coverage" or [
+                node.title for node in coverage.children or []
+            ] != ["--jobs  optional; default=2; type=int"]:
+                msg = "Nested command must own its parameters"
+                raise AssertionError(msg)
+            entry.expanded = arguments.expanded = True
+            visible = "\n".join(row.text for row in viewer.rows(100))
+            if "--jobs" in visible or "test: command" in visible:
+                msg = "Command details must stay collapsed without redundant labels"
+                raise AssertionError(msg)
+            viewer.pattern = "--jobs"
+            viewer.search(1)
+            visible = "\n".join(row.text for row in viewer.rows(100))
+            if "--jobs" not in visible or not test.expanded or not coverage.expanded:
+                msg = "Search must open every ancestor of a CLI parameter"
+                raise AssertionError(msg)
 
     def test_package_details_belong_to_their_source_files(self) -> None:
-        """Keep documentation, interfaces and tests under their actual source files."""
-        files = self.files()
-        main = files["main.py"]
-        require_output(main["lines"] == len(self.source.read_text().splitlines()))
-        require_output([node["field"] for node in main["children"]] == ["help", "cli"])
-        require_output(main["children"][0]["value"] == "Example.")
-        require_output(files["test_main.py"]["children"][0]["field"] == "tests")
-        require_output(self.record()["details"] == resource_data(self.package))
+        """Keep arguments, tests, documentation, and suppression diffs under sources."""
+        with tempfile.TemporaryDirectory() as temporary:
+            package = Path(temporary)
+            (package / "main.py").write_text('"""Example."""\n# noqa\n')
+            (package / "prm").mkdir()
+            (package / "prm/script.js").write_text(
+                "// eslint-disable-next-line\nrun();\n",
+            )
+            arguments = app.TreeNode("Arguments", [app.TreeNode("+ --help", style=32)])
+            tests = app.TreeNode("Tests", [app.TreeNode("- test old", style=31)])
+            tree = app.TreeNode(
+                "packages/example",
+                [
+                    app.TreeNode("Language: python"),
+                    app.TreeNode("Help: Example."),
+                    arguments,
+                    tests,
+                    app.TreeNode(
+                        "Suppressions",
+                        [
+                            app.TreeNode(
+                                "main.py",
+                                [app.TreeNode("noqa (global): 1 → 2", style=33)],
+                            ),
+                            app.TreeNode(
+                                "test_main.py",
+                                [app.TreeNode("type: ignore (local): 1 → 0", style=31)],
+                            ),
+                        ],
+                    ),
+                ],
+            )
+            sources = app.package_sources(package)
+            metrics = app.source_metrics(sources)
+            app.package_file_tree(package, tree, sources)
+            if metrics["suppressions"].get("noqa (global)", 0) != 0:
+                msg = "Current metrics must ignore suppression diff baselines"
+                raise AssertionError(msg)
+            files = {
+                node.title: node for node in tree.children or [] if node.source_file
+            }
+            if set(files) != {"main.py", "test_main.py", "prm/script.js"}:
+                msg = "Package details must be rooted at source files"
+                raise AssertionError(msg)
+            main = {node.title: node for node in files["main.py"].children or []}
+            if main["Arguments"] is not arguments or "Example." not in main:
+                msg = "Arguments and documentation must belong to main.py"
+                raise AssertionError(msg)
+            if [node.title for node in files["main.py"].children or []][:4] != [
+                "Example.",
+                "Lines: 2",
+                "noqa (local): 1",
+                "noqa (global): 1 → 2",
+            ]:
+                msg = "Documentation, lines, and flat Python counts must stay ordered"
+                raise AssertionError(msg)
+            if main["noqa (global): 1 → 2"].style != TEST_MODIFIED_STYLE:
+                msg = "Flat suppression rows must preserve semantic diff styling"
+                raise AssertionError(msg)
+            test = {node.title: node for node in files["test_main.py"].children or []}
+            if test["Tests"] is not tests or "Lines: 0" in test:
+                msg = "Removed files must retain test diffs without claiming zero lines"
+                raise AssertionError(msg)
+            script = {
+                node.title: node for node in files["prm/script.js"].children or []
+            }
+            if "eslint-disable (local): 1" not in script or "Suppressions" in script:
+                msg = "Source assets must have direct suppression rows"
+                raise AssertionError(msg)
+            changed = app.Viewer.changed_nodes([tree])[0]
+            if {node.title for node in changed.children or []} != {
+                "main.py",
+                "test_main.py",
+            }:
+                msg = "Diff filtering must preserve source ancestors of changed details"
+                raise AssertionError(msg)
+            if any(
+                "Lines:" in str(app.serialize_node(node))
+                for node in changed.children or []
+            ):
+                msg = "Informational line counts must not create semantic changes"
+                raise AssertionError(msg)
 
-    def test_removed_source_retains_declarations_without_current_line_counts(
-        self,
-    ) -> None:
-        """Historical declarations remain visible without inventing current metrics."""
-        commit_sources(self.root)
-        self.source.unlink()
-        main = self.files()["main.py"]
-        require_output(main["lines"] is None)
-        require_output(main["children"][0]["change"] == "removed")
+    def test_package_summary_fields_and_test_name_children(self) -> None:  # noqa: D102
+        files = {
+            "default.nix": '{ meta.description = "Useful package"; }\n',
+            "main.py": (
+                '"""Package help."""\n'
+                "import argparse\n"
+                "parser = argparse.ArgumentParser()\n"
+                'parser.add_argument("--input", help="Input path")\n'
+            ),
+            "test_main.py": "def test_alpha(): pass\ndef test_beta(): pass\n",
+        }
+        summary = app.Viewer.package_summary("sample", files)
+        if not all(
+            value in summary
+            for value in (
+                "Name: sample",
+                "Description: Useful package",
+                "Help: Package help.",
+                "--input  optional; help='Input path'",
+                "  test alpha",
+                "  test beta",
+            )
+        ):
+            msg = "Package summary must show metadata and test names"
+            raise AssertionError(msg)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            for filename, content in files.items():
+                (package / filename).write_text(content, encoding="utf-8")
+            viewer = app.Viewer(root)
+            viewer.mode = "high-level"
+            viewer.overview = viewer.package_entries()
+            if len(viewer.rows(80)) != 1:
+                msg = "Package children must be collapsed by default"
+                raise AssertionError(msg)
+            viewer.navigate("l", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "Tests" not in visible or "test_alpha" in visible:
+                msg = "Expanding a package must reveal a collapsed Tests group"
+                raise AssertionError(msg)
+            arguments_row = next(
+                row
+                for row in viewer.rows(80)
+                if row.text.rstrip().endswith("Arguments")
+            )
+            viewer.selected = arguments_row.owner
+            viewer.navigate("l", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "--input  optional; help='Input path'" not in visible:
+                msg = "Expanding Arguments must show declared options"
+                raise AssertionError(msg)
+            viewer.navigate("h", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "--input  optional; help='Input path'" in visible:
+                msg = "Collapsing Arguments must hide argument entries"
+                raise AssertionError(msg)
+            tests_row = next(
+                row for row in viewer.rows(80) if row.text.rstrip().endswith("Tests")
+            )
+            viewer.selected = tests_row.owner
+            viewer.navigate("l", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "test alpha" not in visible or "test beta" not in visible:
+                msg = "Expanding Tests must reveal each test name"
+                raise AssertionError(msg)
+            viewer.navigate("h", 20, viewer.rows(80))
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "test alpha" in visible or "test beta" in visible:
+                msg = "Collapsing Tests must hide its test-name children"
+                raise AssertionError(msg)
+            viewer.selected = 0
+            viewer.navigate("h", 20, viewer.rows(80))
+            if len(viewer.rows(80)) != 1:
+                msg = "Collapsing a package must hide all package children"
+                raise AssertionError(msg)
+
+    def test_package_summary_uses_canonical_cli_parser(self) -> None:  # noqa: D102
+        source = (
+            "import argparse\n"
+            "parser = argparse.ArgumentParser()\n"
+            "commands = parser.add_subparsers()\n"
+            "build = commands.add_parser('build')\n"
+            "build.add_argument('--jobs', type=int, default=2, help='Worker count')\n"
+        )
+        arguments = app.Viewer.summary_group(
+            app.Viewer.package_summary("sample", {"main.py": source}),
+            "Arguments",
+        )
+        if arguments != [
+            "build: command",
+            "build: --jobs  optional; default=2; type=int; help='Worker count'",
+        ]:
+            msg = f"Unexpected canonical CLI summary: {arguments!r}"
+            raise AssertionError(msg)
+
+    def test_package_summary_uses_canonical_test_discovery(self) -> None:  # noqa: D102
+        files = {
+            "test_main.py": (
+                "def test_top_level(): pass\n"
+                "def helper_test(): pass\n"
+                "class TestCases:\n"
+                "    def test_method_case(self): pass\n"
+                "    def helper(self): pass\n"
+                "class Helpers:\n"
+                "    def test_not_a_case(self): pass\n"
+            ),
+        }
+        summary = app.Viewer.package_summary("sample", files)
+        tests = app.Viewer.summary_group(summary, "Tests")
+        if tests != ["test top level", "test method case"]:
+            msg = f"Unexpected canonical test names: {tests!r}"
+            raise AssertionError(msg)
+
+    def test_paging_at_last_parent_does_not_jump_backwards(self) -> None:  # noqa: D102
+        viewer = app.Viewer()
+        viewer.overview = [app.TreeNode(str(index)) for index in range(30)]
+        for _ in viewer.overview:
+            viewer.navigate("j", 10, viewer.rows(80))
+        top = viewer.top
+        viewer.navigate(" ", 10, viewer.rows(80))
+        if viewer.top < top:
+            msg = "Forward paging at the final parent must not scroll backwards"
+            raise AssertionError(msg)
 
     def test_resolved_cli_diagnostic_does_not_warn_in_inline_history(self) -> None:
-        """A corrected interface clears warnings even when historical parsing failed."""
-        valid = self.source.read_text()
-        self.source.write_text("def main(): pass\n")
-        commit_sources(self.root)
-        self.source.write_text(valid)
-        require_output(not self.record()["tree"]["warning"])
+        """Keep removed diagnostics visible without marking a fixed package."""
+        before = "def main():\n    pass\n"
+        after = (
+            "import argparse\ndef parser():\n"
+            "    return argparse.ArgumentParser()\n"
+            "def main():\n    parser().parse_args()\n"
+        )
+        tree = app.Viewer.merged_summary_tree(
+            app.Viewer.package_summary("sample", {"main.py": before}),
+            app.Viewer.package_summary("sample", {"main.py": after}),
+            previous_cli=app.source_cli_overview(before),
+            current_cli=app.source_cli_overview(after),
+        )
+        entry = app.TreeNode("packages/sample", tree)
+        if app.Viewer.has_warning(entry):
+            msg = "Historical diagnostics must not keep a resolved warning active"
+            raise AssertionError(msg)
+        arguments = next(node for node in tree if node.title == "Arguments")
+        if not any(
+            node.title.startswith("- (unavailable:")
+            for node in arguments.children or []
+        ):
+            msg = "Resolved diagnostics must remain visible as removals"
+            raise AssertionError(msg)
+        current = app.TreeNode(
+            "packages/sample",
+            app.Viewer.cli_tree(
+                app.source_cli_overview(before),
+                previous=app.source_cli_overview(after),
+            ),
+        )
+        if not app.Viewer.has_warning(current):
+            msg = "New diagnostics must still mark the package as unavailable"
+            raise AssertionError(msg)
 
-    def test_source_assets_keep_per_file_suppressions(self) -> None:
-        """Tracked source assets retain metrics outside aggregate root-source counts."""
-        resources = self.package / "prm"
-        resources.mkdir()
-        contents = "// eslint-disable-next-line\nrun();\n"
-        (resources / "script.js").write_text(contents)
-        record = self.record()
-        require_output("prm/script.js" not in record["source_metrics"]["lines"])
-        script = self.files()["prm/script.js"]
-        require_output(script["lines"] == len(contents.splitlines()))
-        require_output(script["children"][0]["field"] == "suppressions")
+    def test_suppression_counts_appear_in_overview_and_diff(self) -> None:
+        """Keep suppression counts visible in the shared package summary."""
+        before = app.Viewer.package_summary(
+            "sample",
+            {"index.html": "<main></main>\n"},
+        )
+        after = app.Viewer.package_summary(
+            "sample",
+            {
+                "index.html": (
+                    "<!-- html-validate-disable -->\n"
+                    "<!-- html-validate-disable-next -->\n"
+                ),
+            },
+        )
+        tree = app.Viewer.summary_tree(after)
+        suppressions = next(node for node in tree if node.title == "Suppressions")
+        files = {node.title: node for node in suppressions.children or []}
+        if list(files) != ["index.html"] or {
+            node.title for node in files["index.html"].children or []
+        } != {
+            "html-validate-disable (global): 1",
+            "html-validate-disable (local): 1",
+        }:
+            msg = "Overview must distinguish global and local HTML directives"
+            raise AssertionError(msg)
+        diff = app.Viewer.merged_summary_tree(before, after)
+        changes = next(node for node in diff if node.title == "Suppressions")
+        if not any(
+            child.title == "html-validate-disable (global): 0 → 1"
+            for node in changes.children or []
+            if node.title == "index.html"
+            for child in node.children or []
+        ):
+            msg = "Summary diff must show new suppression counts"
+            raise AssertionError(msg)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            subprocess.run(["git", "init", "-q", str(root)], check=True)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            html = package / "index.html"
+            html.write_text("<main></main>\n", encoding="utf-8")
+            subprocess.run(["git", "-C", str(root), "add", "packages"], check=True)
+            html.write_text("<!-- html-validate-disable -->\n", encoding="utf-8")
+            viewer = app.Viewer(root)
+            entry = viewer.package_entry(root, "sample", diff=True)
+            actual = (
+                next(
+                    node
+                    for node in entry.children or []
+                    if node.title == "Suppressions"
+                )
+                if entry
+                else None
+            )
+            if actual is None or not any(
+                child.title == "html-validate-disable (global): 0 → 1"
+                for node in actual.children or []
+                if node.title == "index.html"
+                for child in node.children or []
+            ):
+                msg = "HTML diff must compare the previous file contents"
+                raise AssertionError(msg)
 
     def test_suppression_diff_changes_counts_without_repeating_labels(self) -> None:
-        """Suppression changes are one structured row per source, kind and scope."""
-        self.source.write_text(self.source.read_text() + "# noqa\n")
-        commit_sources(self.root)
-        self.source.write_text(
-            self.source.read_text() + "# noqa: F401\nvalue = '# noqa'\n",
+        """Include bare and tagged type ignores, excluding string contents."""
+        before = app.Viewer.package_summary(
+            "sample",
+            {
+                "main.py": "value = 1  # type: ignore[assignment]\n# noqa\n",
+                "test_main.py": "# type: ignore\n",
+            },
         )
-        rows = [
-            node
-            for node in self.files()["main.py"]["children"]
-            if node["field"] == "suppressions"
-        ]
-        require_output(
-            [(node["title"], node["change"]) for node in rows]
-            == [("noqa (local): 1 → 2", "modified")],
+        after = app.Viewer.package_summary(
+            "sample",
+            {
+                "main.py": (
+                    "value = 1  # type: ignore[assignment]\n"
+                    "other = 2  # type: ignore\n"
+                    "# noqa\n"
+                    'text = "# type: ignore"\n'
+                ),
+                "test_main.py": "",
+            },
         )
+        tree = app.Viewer.merged_summary_tree(before, after)
+        group = next(node for node in tree if node.title == "Suppressions")
+        files = {node.title: node for node in group.children or []}
+        if list(files) != ["main.py", "test_main.py"] or any(
+            node.expanded for node in files.values()
+        ):
+            msg = "Suppression filenames must be separate, collapsed groups"
+            raise AssertionError(msg)
+        if [node.title for node in files["main.py"].children or []] != [
+            "noqa (local): 1",
+            "type: ignore (local): 1 → 2",
+        ] or [node.title for node in files["test_main.py"].children or []] != [
+            "type: ignore (local): 1 → 0",
+        ]:
+            msg = "Each filename must contain its own suppression count transitions"
+            raise AssertionError(msg)
+        changes = app.Viewer.changed_nodes([group])[0]
+        changed_files = {node.title: node for node in changes.children or []}
+        if [node.title for node in changed_files["main.py"].children or []] != [
+            "type: ignore (local): 1 → 2",
+        ] or "test_main.py" not in changed_files:
+            msg = "Diff-only views must keep file parents and omit unchanged counts"
+            raise AssertionError(msg)
+        viewer = app.Viewer()
+        viewer.overview = [changes]
+        viewer.navigate("l", 20, viewer.rows(80))
+        if any("type: ignore" in row.text for row in viewer.rows(80)):
+            msg = "Suppression counts must stay hidden until their file is expanded"
+            raise AssertionError(msg)
+        viewer.navigate("j", 20, viewer.rows(80))
+        viewer.navigate("l", 20, viewer.rows(80))
+        if not any(
+            "type: ignore (local): 1 → 2" in row.text for row in viewer.rows(80)
+        ):
+            msg = "Expanding a file must reveal its count changes"
+            raise AssertionError(msg)
 
     def test_unavailable_cli_summary_warns_on_collapsed_package(self) -> None:
-        """Parser diagnostics propagate to source and package rows."""
-        self.source.write_text("def main(): pass\n")
-        record = self.record()
-        require_output(record["tree"]["warning"])
-        require_output(self.files()["main.py"]["warning"])
-        cli = next(
-            node
-            for node in self.files()["main.py"]["children"]
-            if node["field"] == "cli"
-        )
-        require_output(cli["children"][0]["warning"])
+        """Expose parser diagnostics without opening the package tree."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / "packages/sample"
+            package.mkdir(parents=True)
+            (package / "main.py").write_text(
+                '"""Example."""\ndef main():\n    pass\n',
+                encoding="utf-8",
+            )
+            viewer = app.Viewer(root)
+            entry = viewer.package_entry(root, "sample", diff=False)
+            if entry is None:
+                msg = "Expected a package entry"
+                raise AssertionError(msg)
+            viewer.mode = "high-level"
+            viewer.overview = [entry]
+            rows = viewer.rows(80)
+            if not rows[0].text.endswith("packages/sample [!]"):
+                msg = "Collapsed package must show a warning marker"
+                raise AssertionError(msg)
+            if viewer.styles(rows[0]) != [33, 7]:
+                msg = "Package warning must be visible in the overview"
+                raise AssertionError(msg)
+            entry.expanded = True
+            arguments = next(
+                node for node in entry.children or [] if node.title == "Arguments"
+            )
+            arguments.expanded = True
+            visible = "\n".join(row.text for row in viewer.rows(80))
+            if "(unavailable: unsupported CLI interface" not in visible:
+                msg = "Expanding Arguments must reveal the original diagnostic"
+                raise AssertionError(msg)
+            (package / "main.py").write_text(
+                "import argparse\nparser = argparse.ArgumentParser()\n",
+                encoding="utf-8",
+            )
+            fixed = viewer.package_entry(root, "sample", diff=False)
+            if fixed is None or viewer.has_warning(fixed):
+                msg = "Warning must clear when the CLI summary becomes available"
+                raise AssertionError(msg)
+
+    def test_unicode_and_tiny_terminals(self) -> None:  # noqa: D102
+        viewer = app.Viewer()
+        viewer.overview = [app.TreeNode("界e\u0301界界")]
+        for width in (1, 2, 4, 20):
+            for _start, content in viewer.wrap("界e\u0301界界", width):
+                cells = sum(
+                    0
+                    if unicodedata.combining(char)
+                    else 2
+                    if unicodedata.east_asian_width(char) in {"W", "F"}
+                    else 1
+                    for char in content
+                )
+                if cells > width:
+                    msg = "Wide characters and indentation must fit the terminal"
+                    raise AssertionError(msg)
+
+    def test_wrapping_and_control_characters(self) -> None:  # noqa: D102
+        viewer = app.Viewer()
+        viewer.overview = [app.TreeNode("\x1b[31m" + "x" * 100)]
+        width = 20
+        rows = viewer.rows(width)
+        if any(len(row.text) > width or "\x1b" in row.text for row in rows):
+            msg = "Output must wrap and must not execute terminal escape sequences"
+            raise AssertionError(msg)

@@ -5724,19 +5724,30 @@ and reject unsupported schema versions.""",
             "(default: 60)"
         ),
     )
-    for campaign in (hypothesis, mutation):
-        campaign.add_argument(
-            "-k",
-            dest="keywords",
-            default="",
-            help="run pytest cases matching this keyword expression",
-        )
-        campaign.add_argument(
-            "-m",
-            dest="markers",
-            default="",
-            help="run pytest cases matching this marker expression",
-        )
+    hypothesis.add_argument(
+        "-k",
+        dest="keywords",
+        default="",
+        help="run pytest cases matching this keyword expression",
+    )
+    hypothesis.add_argument(
+        "-m",
+        dest="markers",
+        default="",
+        help="run pytest cases matching this marker expression",
+    )
+    mutation.add_argument(
+        "-k",
+        dest="keywords",
+        default="",
+        help="run pytest cases matching this keyword expression",
+    )
+    mutation.add_argument(
+        "-m",
+        dest="markers",
+        default="",
+        help="run pytest cases matching this marker expression",
+    )
     mutation.add_argument(
         "--lines",
         type=_mutation_lines,

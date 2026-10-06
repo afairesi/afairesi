@@ -1073,6 +1073,30 @@ def _check_command_catalog(
 ) -> None:
     """Keep client command menus synchronized when CLI commands are added."""
     subject = import_module("packages.perigrafo.main")
+    source = Path(__file__).with_name("main.py").read_bytes()
+    entries = subject.source_package_cli(source, "main.py")
+    discovered = {" ".join(entry.path) for entry in entries if entry.command}
+    _expect(
+        discovered == {entry["command"] for entry in subject.command_catalog()},
+        "Perigrafo must discover its own complete command interface",
+    )
+    for campaign in ("hypothesis", "mutation"):
+        path = ("test", campaign)
+        for flag in ("-k", "-m"):
+            _expect(
+                any(
+                    entry.path == path and entry.text.startswith(flag + "  ")
+                    for entry in entries
+                ),
+                f"Static discovery must include {flag} for {campaign}",
+            )
+        options = subject.parser().parse_args(
+            ["test", campaign, "-k", "keyword", "-m", "marker"],
+        )
+        _expect(
+            options.keywords == "keyword" and options.markers == "marker",
+            "Campaign filter arguments must retain their runtime behavior",
+        )
     cli = argparse.ArgumentParser(prog="perigrafo")
     commands = cli.add_subparsers()
     added = commands.add_parser("future")
