@@ -113,6 +113,20 @@ def copy_output_file(
     return destination
 
 
+def writable_capture_directories(capture: Path) -> None:
+    """Allow removing private copies of read-only Nix output without following links."""
+    if not capture.is_dir() or capture.is_symlink():
+        return
+    for directory, _, _ in capture.walk(follow_symlinks=False):
+        directory.chmod(directory.stat().st_mode | stat.S_IRWXU)
+
+
+def remove_output_capture(capture: Path) -> None:
+    """Remove snapshot history, including copies saved with Nix directory modes."""
+    writable_capture_directories(capture)
+    shutil.rmtree(capture)
+
+
 def copy_output(
     source: Path,
     destination: Path,
@@ -124,12 +138,15 @@ def copy_output(
         msg = f"Not a regular output directory: {source}"
         raise ValueError(msg)
     if source.is_dir():
-        shutil.copytree(
-            source,
-            destination,
-            symlinks=True,
-            copy_function=partial(copy_output_file, cancelled=cancelled),
-        )
+        try:
+            shutil.copytree(
+                source,
+                destination,
+                symlinks=True,
+                copy_function=partial(copy_output_file, cancelled=cancelled),
+            )
+        finally:
+            writable_capture_directories(destination)
     else:
         destination.mkdir()
 
@@ -422,7 +439,7 @@ class OutputSnapshots:
             comparison.tree = None
             for old in comparison.store.glob("capture-*"):
                 if old not in {comparison.previous, capture} and not old.is_symlink():
-                    shutil.rmtree(old)
+                    remove_output_capture(old)
             if comparison.previous is not None:
                 comparison.changed = compare_output(
                     comparison.previous,
@@ -435,7 +452,8 @@ class OutputSnapshots:
             comparison.error = str(exc)
         finally:
             if capture is not None and capture != comparison.current:
-                shutil.rmtree(capture, ignore_errors=True)
+                with contextlib.suppress(OSError):
+                    remove_output_capture(capture)
 
 
 def output_diff_page(comparison: OutputComparison) -> bytes:

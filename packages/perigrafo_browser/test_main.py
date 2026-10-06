@@ -37,6 +37,7 @@ TEST_MODIFIED_CHANGE = "modified"
 TEST_PARSER_ERROR = 2
 TEST_REPOSITORY_FIELDS = 3
 TEST_ACTION_FAILURE = 7
+TEST_READ_ONLY_DIRECTORY_MODE = 0o555
 
 
 def commit_sources(root: Path) -> None:
@@ -409,6 +410,40 @@ class TestOutputSnapshots(unittest.TestCase):
                 snapshots.entry_report(comparison, "../timestamp")
             with pytest.raises(ValueError, match="escapes capture"):
                 snapshots.entry_report(comparison, "external/flake.nix")
+
+    def test_read_only_nix_outputs_and_legacy_captures_can_rotate(self) -> None:
+        """Repeated builds prune read-only snapshots without changing Nix or links."""
+        nested = self.output / "nested"
+        nested.mkdir()
+        (nested / "ms.pdf").write_bytes(b"PDF output")
+        external = self.root / "external"
+        external.mkdir()
+        (external / "private.txt").write_text("Private output")
+        (self.output / "link").symlink_to(external, target_is_directory=True)
+        for directory in (self.output, nested, external):
+            directory.chmod(0o555)
+        self.addCleanup(app.writable_capture_directories, self.root)
+        with app.OutputSnapshots() as snapshots:
+            comparison = self.capture(snapshots)
+            require_output(comparison.error == "", comparison.error)
+            if comparison.current is None:
+                self.fail("Initial output was not captured")
+            legacy = comparison.current
+            for directory in (legacy / "output/nested", legacy / "output"):
+                directory.chmod(0o555)
+            for _ in range(2):
+                self.capture(snapshots, refresh=True)
+                require_output(comparison.error == "", comparison.error)
+                require_output(not comparison.changed)
+            require_output(not legacy.exists())
+            require_output(
+                set(comparison.store.glob("capture-*"))
+                == {comparison.previous, comparison.current},
+            )
+            for directory in (self.output, nested, external):
+                require_output(
+                    directory.stat().st_mode & 0o777 == TEST_READ_ONLY_DIRECTORY_MODE,
+                )
 
     def test_refresh_does_not_queue_duplicate_captures(self) -> None:
         """Refresh while copying retains one job and does not rotate history twice."""
