@@ -16,7 +16,6 @@
       class="canvas"
       aria-label="Expandable repository and dependency graph"
       aria-keyshortcuts="ArrowLeft ArrowRight ArrowUp ArrowDown"
-      title="Click directory titles to open them. Use the path above or Alt + Up to go to a parent. Drag empty space to pan."
       tabindex="0"
     ></div>
     <div id="measure" aria-hidden="true"></div>
@@ -27,13 +26,13 @@
     <nav id="directories" class="directory-navigation" aria-label="Directory navigation"></nav>
     <div class="graph-controls" role="toolbar" aria-label="Graph controls">
       <input id="search" type="search" placeholder="Search…" aria-label="Search graph" />
-      <button id="refresh" class="quiet-button" title="Refresh graph" aria-label="Refresh graph">
+      <button id="refresh" class="quiet-button" aria-label="Refresh graph">
         ↻
       </button>
-      <button id="collapse" class="quiet-button" title="Collapse all" aria-label="Collapse all">
+      <button id="collapse" class="quiet-button" aria-label="Collapse all">
         ⊟
       </button>
-      <button id="fit" class="quiet-button" title="Fit screen" aria-label="Fit screen">
+      <button id="fit" class="quiet-button" aria-label="Fit screen">
         <svg
           viewBox="0 0 24 24"
           aria-hidden="true"
@@ -46,8 +45,8 @@
           <path d="M8 3H3v5M16 3h5v5M3 16v5h5M21 16v5h-5M8 8h8v8H8Z" />
         </svg>
       </button>
-      <label class="toggle" title="Semantic changes only"
-        ><input id="changes" type="checkbox" /><span>Δ</span></label
+      <label class="toggle"
+        ><input id="changes" type="checkbox" aria-label="Semantic changes only" /><span>Δ</span></label
       >
     </div>
     <nav id="cwd" class="current-directory" aria-label="Current directory" hidden></nav>

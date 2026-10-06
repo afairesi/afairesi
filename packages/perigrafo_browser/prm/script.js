@@ -149,7 +149,7 @@ function changeTally(tree) {
   ]) {
     if (!counts[kind]) continue;
     const value = element("span", kind, `${symbol}${counts[kind]}`);
-    value.title = `${counts[kind]} ${kind}`;
+    value.setAttribute("aria-label", `${counts[kind]} ${kind}`);
     tally.append(value);
   }
   return tally;
@@ -235,7 +235,6 @@ function updateCollapseState() {
   const label = canCollapse ? "Collapse all" : "Expand all";
   button.disabled = !canCollapse && !document.querySelector("#canvas details");
   button.textContent = canCollapse ? "⊟" : "⊞";
-  button.title = label;
   button.setAttribute("aria-label", label);
 }
 
@@ -277,7 +276,7 @@ function behaviorTree(tree, key, filterChanges) {
     link.href = tree.output_diff;
     link.target = "_blank";
     link.rel = "noopener";
-    link.title = `Compare ${tree.title} with the previous capture`;
+    link.setAttribute("aria-label", `Compare ${tree.title} with the previous capture`);
     link.addEventListener("click", (event) => event.stopPropagation());
     row.append(link);
   }
@@ -370,7 +369,8 @@ function packageControls(node, meta, body, details) {
     const button = element("button", "package-action");
     button.type = "button";
     button.setAttribute("aria-label", `${label} ${node.name}`);
-    button.title = action === "check" && !node.actions.check ? "No declared check" : label;
+    if (action === "check" && !node.actions.check)
+      button.setAttribute("aria-label", `Check ${node.name}: No declared check`);
     button.append(actionIcon(action));
     button.addEventListener("click", (event) => {
       event.preventDefault();
@@ -685,6 +685,7 @@ function graphOptions() {
     padding: [area.top, 16, 16, 16],
     layout: {
       type: "combo-combined",
+      preLayout: true,
       nodeSize: (node) => sizes.get(node.id) || [320, 80],
       nodeSpacing: LAYOUT_SPACING.node,
       comboSpacing: LAYOUT_SPACING.combo,
@@ -805,7 +806,6 @@ async function restoreFocus(focus, anchor) {
   if (anchor) {
     const rect = element.getBoundingClientRect();
     await graph.translateBy([focus.point[0] - rect.left, focus.point[1] - rect.top], false);
-    await new Promise(requestAnimationFrame);
   }
 }
 
@@ -833,7 +833,7 @@ function renderBreadcrumbs() {
       const url = new URL(location.href);
       url.searchParams.set("directory", destination);
       item.href = url;
-      item.title = `Open ${destination}`;
+      item.setAttribute("aria-label", `Open ${destination}`);
       item.addEventListener("click", (event) => {
         if (event.button || event.ctrlKey || event.metaKey || event.shiftKey || event.altKey)
           return;
@@ -850,7 +850,6 @@ function renderBreadcrumbs() {
     crumbs.push(root);
   }
   $("cwd").replaceChildren(...crumbs);
-  $("cwd").title = directory;
   $("cwd").hidden = false;
 }
 
@@ -932,12 +931,14 @@ function scheduleLayout(rebuild = false, fit = false) {
         if (!graph) {
           $("canvas").replaceChildren();
           createGraph();
+          await graph.render();
         } else {
           graph.setOptions(graphOptions());
           graph.setData(model);
+          // Compute final positions before drawing resized blocks and their edges.
+          await graph.layout();
+          await graph.draw();
         }
-        await graph.render();
-        await new Promise(requestAnimationFrame);
         if (current !== generation) return;
         if (!observer) {
           const heights = new WeakMap();
@@ -965,7 +966,6 @@ function scheduleLayout(rebuild = false, fit = false) {
           ) {
             await restoreViewport(view.viewport);
           } else await fitGraph();
-          await new Promise(requestAnimationFrame);
           fitPending = false;
           $("cwd").querySelector('[aria-current="page"]').focus({ preventScroll: true });
         } else if (fitPending) {
@@ -995,7 +995,6 @@ async function fitGraph() {
   if (!graph) return;
   await graph.fitView({ when: "always" }, false);
   if (graph.getZoom() > 1) await graph.zoomTo(1, false);
-  await new Promise(requestAnimationFrame);
 }
 
 function highlightEdges() {
@@ -1115,7 +1114,7 @@ $("changes").addEventListener("change", (event) => {
   scheduleLayout(true, true);
 });
 $("collapse").addEventListener("click", () => {
-  const expand = $("collapse").title === "Expand all";
+  const expand = $("collapse").getAttribute("aria-label") === "Expand all";
   expanded.clear();
   selected = null;
   for (const details of $("canvas").querySelectorAll("details")) {
