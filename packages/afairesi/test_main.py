@@ -1704,76 +1704,6 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
         _expect(f"  {command}: {status}\n" in output.out, output)
 
 
-def test_explicit_targets_preserve_repository_scope(
-    tmp_path: Path,
-) -> None:
-    """Discover nested repositories and preserve explicit target scope."""
-    home = tmp_path / "home"
-    home.mkdir()
-    _git(home, "init", "--quiet")
-    (home / ".gitignore").write_text("*\n!/.gitmodules\n")
-    (home / ".gitmodules").touch()
-    root = home / "forge.example/team/demo"
-    root.mkdir(parents=True)
-    _repository(root)
-    package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
-    _make_source_package(root, "beta", "def test_beta(): pass\n")
-    nested = package / "prm/nested"
-    nested.mkdir(parents=True)
-    catalog = _run(root, str(root)).stdout
-    _expect(
-        _resource_output(catalog, "alpha") == "tests:\n  - alpha\n"
-        and _resource_output(catalog, "beta") == "tests:\n  - beta\n",
-        catalog,
-    )
-    summaries = _run(root, "--json", str(root)).stdout
-    for cwd in (package, nested):
-        _expect(_run(cwd, str(root)).stdout == catalog, cwd)
-        _expect(_run(cwd, "--json", str(root)).stdout == summaries, cwd)
-    focused_output = _run(package, ".", "--json").stdout
-    _expect(_run(package, "--json", ".").stdout == focused_output, package)
-    focused = _overview(package)
-    _run(root, "overview", code=2)
-    _run(root, "unknown-command", code=2)
-    _expect(
-        focused == {"packages": {"alpha": {"tests": ["alpha"]}}},
-        focused,
-    )
-    _expect(
-        _resource_output(_run(package, ".").stdout, "alpha") == "tests:\n  - alpha\n",
-        package,
-    )
-    _run(nested, ".", code=1)
-    _run(home, "--json", str(home))
-    (home / ".gitmodules").write_text(
-        '[submodule "demo"]\npath = forge.example/team/demo\n',
-    )
-    expected = json.loads(summaries)
-    expected[socket.gethostname()][getpass.getuser()]["home"] = {
-        "path": str(home),
-        "preserved": ["!/.gitmodules"],
-    }
-    _expect(_overview_tree(home) == expected, home)
-    _run(nested, ".", "--json", code=1)
-    _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
-    for path in (
-        ("test",),
-        ("test", "coverage"),
-        ("test", "hypothesis"),
-        ("test", "mutation"),
-    ):
-        rejected = _run(tmp_path, *path, code=1)
-        _expect("not inside a Git repository" in rejected.stderr, rejected)
-    ordinary = tmp_path / "ordinary"
-    ordinary.mkdir()
-    _git(ordinary, "init", "--quiet")
-    _expect(
-        "expected a canonical packages/NAME or hosts/NAME"
-        in _run(ordinary, ".", code=1).stderr,
-        ordinary,
-    )
-
-
 def test_convergence_preserves_formatted_checks() -> None:
     """Keep generated checks stable after the real formatting pipeline."""
     with _fresh_repository() as root:
@@ -2225,6 +2155,76 @@ def test_discovery_handles_nested_interfaces_and_malformed_sources() -> None:
             _expect(_snapshot(root) == before, "malformed test source changed state")
 
 
+def test_explicit_targets_preserve_repository_scope(
+    tmp_path: Path,
+) -> None:
+    """Discover nested repositories and preserve explicit target scope."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _git(home, "init", "--quiet")
+    (home / ".gitignore").write_text("*\n!/.gitmodules\n")
+    (home / ".gitmodules").touch()
+    root = home / "forge.example/team/demo"
+    root.mkdir(parents=True)
+    _repository(root)
+    package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
+    _make_source_package(root, "beta", "def test_beta(): pass\n")
+    nested = package / "prm/nested"
+    nested.mkdir(parents=True)
+    catalog = _run(root, str(root)).stdout
+    _expect(
+        _resource_output(catalog, "alpha") == "tests:\n  - alpha\n"
+        and _resource_output(catalog, "beta") == "tests:\n  - beta\n",
+        catalog,
+    )
+    summaries = _run(root, "--json", str(root)).stdout
+    for cwd in (package, nested):
+        _expect(_run(cwd, str(root)).stdout == catalog, cwd)
+        _expect(_run(cwd, "--json", str(root)).stdout == summaries, cwd)
+    focused_output = _run(package, ".", "--json").stdout
+    _expect(_run(package, "--json", ".").stdout == focused_output, package)
+    focused = _overview(package)
+    _run(root, "overview", code=2)
+    _run(root, "unknown-command", code=2)
+    _expect(
+        focused == {"packages": {"alpha": {"tests": ["alpha"]}}},
+        focused,
+    )
+    _expect(
+        _resource_output(_run(package, ".").stdout, "alpha") == "tests:\n  - alpha\n",
+        package,
+    )
+    _run(nested, ".", code=1)
+    _run(home, "--json", str(home))
+    (home / ".gitmodules").write_text(
+        '[submodule "demo"]\npath = forge.example/team/demo\n',
+    )
+    expected = json.loads(summaries)
+    expected[socket.gethostname()][getpass.getuser()]["home"] = {
+        "path": str(home),
+        "preserved": ["!/.gitmodules"],
+    }
+    _expect(_overview_tree(home) == expected, home)
+    _run(nested, ".", "--json", code=1)
+    _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
+    for path in (
+        ("test",),
+        ("test", "coverage"),
+        ("test", "hypothesis"),
+        ("test", "mutation"),
+    ):
+        rejected = _run(tmp_path, *path, code=1)
+        _expect("not inside a Git repository" in rejected.stderr, rejected)
+    ordinary = tmp_path / "ordinary"
+    ordinary.mkdir()
+    _git(ordinary, "init", "--quiet")
+    _expect(
+        "expected a canonical packages/NAME or hosts/NAME"
+        in _run(ordinary, ".", code=1).stderr,
+        ordinary,
+    )
+
+
 @settings(deadline=None)
 @given(
     kind=st.sampled_from(("python", "html", "latex", "nix")),
@@ -2498,6 +2498,27 @@ def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
         )
 
 
+def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> None:
+    """Inspect an empty home without requiring any checked-out flakes."""
+    (tmp_path / ".gitmodules").touch()
+    (tmp_path / ".gitignore").write_text("*\n# policy\n!/.ssh/\n!/.ssh/key\n")
+    subject = import_module("packages.afairesi.main")
+    _expect(
+        subject.overview_summary(tmp_path)
+        == {
+            socket.gethostname(): {
+                getpass.getuser(): {
+                    "home": {
+                        "path": str(tmp_path),
+                        "preserved": ["!/.ssh/", "!/.ssh/key"],
+                    },
+                },
+            },
+        },
+        tmp_path,
+    )
+
+
 @pytest.mark.parametrize("failure", ["counterexample", "timeout"])
 def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
     """Retain counterexamples and terminate stalled descendants before continuing."""
@@ -2663,6 +2684,85 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
             sentinel.read_text() == "preserve",
             caller_home,
         )
+
+
+def test_machine_home_whitelist_replaces_stored_home_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Represent a stored home once through its policy even without submodules."""
+    subject = import_module("packages.afairesi.main")
+    (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n")
+    home_tree: dict[str, Any] = {"untracked-file": {}}
+    for component in reversed(tmp_path.parts[2:]):
+        home_tree = {component: home_tree}
+    stored_tree = {"/" + tmp_path.parts[1]: home_tree, "/etc": {"machine-id": {}}}
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(subject, "persistent_summary", lambda _root: stored_tree)
+    machine = subject.machine_summary()[socket.gethostname()]
+    branch = machine["/" + tmp_path.parts[1]]
+    for component in tmp_path.parts[2:]:
+        branch = branch[component]
+    _expect(branch == {"preserved": ["!/.ssh/"]}, branch)
+    _expect(machine["/etc"] == {"machine-id": {}}, machine)
+
+
+def test_machine_overview_defaults_ignore_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Show storage, home policy, and repositories from any working directory."""
+    subject = import_module("packages.afairesi.main")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitignore").write_text("*\n!/.gitmodules\n!/.ssh/\n!/.ssh/key\n")
+    (home / ".gitmodules").write_text(
+        '[submodule "demo"]\npath = forge.example/team/demo\n',
+    )
+    repository = home / "forge.example/team/demo"
+    repository.mkdir(parents=True)
+    _repository(repository)
+    _make_source_package(repository, "example", "def test_example(): pass\n")
+    storage = tmp_path / "persistent"
+    (storage / "etc").mkdir(parents=True)
+    (storage / "etc/machine-id").write_text("secret contents must not be shown")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    inventory = subject.persistent_summary
+    monkeypatch.setattr(subject, "persistent_summary", lambda _root: inventory(storage))
+    expected_home = {
+        "preserved": ["!/.gitmodules", "!/.ssh/", "!/.ssh/key"],
+        "forge.example": {
+            "team": {
+                "demo": {
+                    "packages": {"example": {"tests": ["example"]}},
+                },
+            },
+        },
+    }
+    expected_paths = expected_home
+    for component in reversed(home.parts[2:]):
+        expected_paths = {component: expected_paths}
+    expected = {
+        socket.gethostname(): {
+            "/etc": {"machine-id": {}},
+            "/" + home.parts[1]: expected_paths,
+        },
+    }
+    for cwd in (tmp_path, repository, repository / "packages/example"):
+        monkeypatch.chdir(cwd)
+        for arguments in ([], ["--json"]):
+            monkeypatch.setattr(sys, "argv", ["afairesi", *arguments])
+            subject.main()
+            output = capsys.readouterr().out
+            _expect(
+                "persistent" not in output and "secret contents" not in output,
+                output,
+            )
+            if arguments:
+                _expect(json.loads(output) == expected, output)
+            else:
+                _expect(output == subject.render_overview(expected) + "\n", output)
 
 
 def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
@@ -2929,140 +3029,6 @@ def test_overview_formats_share_machine_user_repository_hierarchy(
     _expect(_snapshot(tmp_path) == before, "inspection changed Git or source state")
 
 
-def test_machine_overview_defaults_ignore_working_directory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Show storage, home policy, and repositories from any working directory."""
-    subject = import_module("packages.afairesi.main")
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / ".gitignore").write_text("*\n!/.gitmodules\n!/.ssh/\n!/.ssh/key\n")
-    (home / ".gitmodules").write_text(
-        '[submodule "demo"]\npath = forge.example/team/demo\n',
-    )
-    repository = home / "forge.example/team/demo"
-    repository.mkdir(parents=True)
-    _repository(repository)
-    _make_source_package(repository, "example", "def test_example(): pass\n")
-    storage = tmp_path / "persistent"
-    (storage / "etc").mkdir(parents=True)
-    (storage / "etc/machine-id").write_text("secret contents must not be shown")
-    monkeypatch.setattr(Path, "home", lambda: home)
-    inventory = subject.persistent_summary
-    monkeypatch.setattr(subject, "persistent_summary", lambda _root: inventory(storage))
-    expected_home = {
-        "preserved": ["!/.gitmodules", "!/.ssh/", "!/.ssh/key"],
-        "forge.example": {
-            "team": {
-                "demo": {
-                    "packages": {"example": {"tests": ["example"]}},
-                },
-            },
-        },
-    }
-    expected_paths = expected_home
-    for component in reversed(home.parts[2:]):
-        expected_paths = {component: expected_paths}
-    expected = {
-        socket.gethostname(): {
-            "/etc": {"machine-id": {}},
-            "/" + home.parts[1]: expected_paths,
-        },
-    }
-    for cwd in (tmp_path, repository, repository / "packages/example"):
-        monkeypatch.chdir(cwd)
-        for arguments in ([], ["--json"]):
-            monkeypatch.setattr(sys, "argv", ["afairesi", *arguments])
-            subject.main()
-            output = capsys.readouterr().out
-            _expect(
-                "persistent" not in output and "secret contents" not in output,
-                output,
-            )
-            if arguments:
-                _expect(json.loads(output) == expected, output)
-            else:
-                _expect(output == subject.render_overview(expected) + "\n", output)
-
-
-def test_machine_home_whitelist_replaces_stored_home_contents(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Represent a stored home once through its policy even without submodules."""
-    subject = import_module("packages.afairesi.main")
-    (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n")
-    home_tree: dict[str, Any] = {"untracked-file": {}}
-    for component in reversed(tmp_path.parts[2:]):
-        home_tree = {component: home_tree}
-    stored_tree = {"/" + tmp_path.parts[1]: home_tree, "/etc": {"machine-id": {}}}
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    monkeypatch.setattr(subject, "persistent_summary", lambda _root: stored_tree)
-    machine = subject.machine_summary()[socket.gethostname()]
-    branch = machine["/" + tmp_path.parts[1]]
-    for component in tmp_path.parts[2:]:
-        branch = branch[component]
-    _expect(branch == {"preserved": ["!/.ssh/"]}, branch)
-    _expect(machine["/etc"] == {"machine-id": {}}, machine)
-
-
-def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep service data compact and do not follow links or hide access failures."""
-    subject = import_module("packages.afairesi.main")
-    storage = tmp_path / "persistent"
-    (storage / "var/lib/service").mkdir(parents=True)
-    (storage / "var/lib/service/hidden").write_text("runtime")
-    (storage / "link").symlink_to(storage, target_is_directory=True)
-    blocked = storage / "private"
-    blocked.mkdir()
-    iterdir = Path.iterdir
-
-    def restricted_iterdir(path: Path) -> Iterator[Path]:
-        if path == blocked:
-            raise PermissionError(13, "Permission denied", str(path))
-        return iterdir(path)
-
-    monkeypatch.setattr(Path, "iterdir", restricted_iterdir)
-    details = subject.persistent_summary(storage)
-    _expect(
-        details
-        == {
-            "/link": {},
-            "/private": {"diagnostics": ["Permission denied"]},
-            "/var": {"lib": {"service": {}}},
-        },
-        details,
-    )
-    missing = subject.persistent_summary(tmp_path / "missing")
-    _expect(missing == {"diagnostics": ["No such file or directory"]}, missing)
-
-
-def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> None:
-    """Inspect an empty home without requiring any checked-out flakes."""
-    (tmp_path / ".gitmodules").touch()
-    (tmp_path / ".gitignore").write_text("*\n# policy\n!/.ssh/\n!/.ssh/key\n")
-    subject = import_module("packages.afairesi.main")
-    _expect(
-        subject.overview_summary(tmp_path)
-        == {
-            socket.gethostname(): {
-                getpass.getuser(): {
-                    "home": {
-                        "path": str(tmp_path),
-                        "preserved": ["!/.ssh/", "!/.ssh/key"],
-                    },
-                },
-            },
-        },
-        tmp_path,
-    )
-
-
 def test_overview_groups_home_repositories_and_rejects_escaping_submodules() -> None:
     """Keep same-named resources separate across repositories."""
     with TemporaryDirectory(prefix="afairesi-summaries-") as directory:
@@ -3157,6 +3123,40 @@ def test_overview_summarizes_host_only_repositories() -> None:
     """Preserve host dependencies, diagnostics, and explicit scope."""
     with _fresh_repository() as root:
         _check_host_summaries(root)
+
+
+def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep service data compact and do not follow links or hide access failures."""
+    subject = import_module("packages.afairesi.main")
+    storage = tmp_path / "persistent"
+    (storage / "var/lib/service").mkdir(parents=True)
+    (storage / "var/lib/service/hidden").write_text("runtime")
+    (storage / "link").symlink_to(storage, target_is_directory=True)
+    blocked = storage / "private"
+    blocked.mkdir()
+    iterdir = Path.iterdir
+
+    def restricted_iterdir(path: Path) -> Iterator[Path]:
+        if path == blocked:
+            raise PermissionError(13, "Permission denied", str(path))
+        return iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", restricted_iterdir)
+    details = subject.persistent_summary(storage)
+    _expect(
+        details
+        == {
+            "/link": {},
+            "/private": {"diagnostics": ["Permission denied"]},
+            "/var": {"lib": {"service": {}}},
+        },
+        details,
+    )
+    missing = subject.persistent_summary(tmp_path / "missing")
+    _expect(missing == {"diagnostics": ["No such file or directory"]}, missing)
 
 
 def test_python_packages_require_the_shared_constructor() -> None:
