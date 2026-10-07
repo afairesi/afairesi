@@ -12,11 +12,11 @@ check.overrideAttrs (previous: {
     mkdir -p "$out/html" "$TMPDIR/coverage-startup"
     export COVERAGE_FILE="$out/.coverage"
     export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
-    export PERIGRAFO_TEST_REPORT="$out/tests.json"
-    export PERIGRAFO_TEST_PACKAGE=${packageName}
-    unset PERIGRAFO_TEST_REPORT_OWNER PERIGRAFO_MUTATION_REPORT PERIGRAFO_TEST_CONTEXT
-    cp "${reportPlugin}" "$TMPDIR/coverage-startup/_perigrafo_test_report.py"
-    export PYTEST_PLUGINS="_perigrafo_test_report''${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
+    export AFAIRESI_TEST_REPORT="$out/tests.json"
+    export AFAIRESI_TEST_PACKAGE=${packageName}
+    unset AFAIRESI_TEST_REPORT_OWNER AFAIRESI_MUTATION_REPORT AFAIRESI_TEST_CONTEXT
+    cp "${reportPlugin}" "$TMPDIR/coverage-startup/_afairesi_test_report.py"
+    export PYTEST_PLUGINS="_afairesi_test_report''${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
     cat > "$COVERAGE_PROCESS_START" <<EOF
     [run]
     core = ctrace
@@ -30,7 +30,7 @@ check.overrideAttrs (previous: {
         */test_main.py
         */prm/*
     EOF
-    printf '%s\n' 'import os, coverage' 'tracer = coverage.Coverage.current() or coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("PERIGRAFO_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
+    printf '%s\n' 'import os, coverage' 'tracer = coverage.Coverage.current() or coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("AFAIRESI_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
     export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
   ''
   + previous.buildCommand

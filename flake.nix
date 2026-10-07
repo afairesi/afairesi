@@ -14,7 +14,7 @@
     inputs:
     let
       lib = builtins.removeAttrs shared [ "blueprint" ];
-      shared = import ./packages/perigrafo/prm/flake.nix { inherit inputs; };
+      shared = import ./packages/afairesi/prm/flake.nix { inherit inputs; };
     in
     shared.blueprint { inherit inputs; }
     // {

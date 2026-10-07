@@ -253,9 +253,9 @@ let
   };
   wrapper = pkgs.writeShellApplication {
     name = "treefmt";
-    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.perigrafo ];
+    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.afairesi ];
     text = ''
-      perigrafo converge
+      afairesi converge
       exec ${rawFormatter}/bin/treefmt "$@"
     '';
   };

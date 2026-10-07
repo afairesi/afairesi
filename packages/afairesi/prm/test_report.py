@@ -9,7 +9,7 @@ from hypothesis import Phase, is_hypothesis_test, settings
 
 tests = {}
 collection_errors = []
-owner = os.environ.setdefault("PERIGRAFO_TEST_REPORT_OWNER", str(os.getpid()))
+owner = os.environ.setdefault("AFAIRESI_TEST_REPORT_OWNER", str(os.getpid()))
 
 
 def node_id(item):
@@ -61,9 +61,9 @@ def pytest_collectreport(report):
 
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_protocol(item, nextitem):
-    previous = os.environ.get("PERIGRAFO_TEST_CONTEXT", "")
+    previous = os.environ.get("AFAIRESI_TEST_CONTEXT", "")
     context = node_id(item) if owner == str(os.getpid()) else previous
-    os.environ["PERIGRAFO_TEST_CONTEXT"] = context
+    os.environ["AFAIRESI_TEST_CONTEXT"] = context
     try:
         import coverage
 
@@ -75,7 +75,7 @@ def pytest_runtest_protocol(item, nextitem):
     try:
         return (yield)
     finally:
-        os.environ["PERIGRAFO_TEST_CONTEXT"] = previous
+        os.environ["AFAIRESI_TEST_CONTEXT"] = previous
         if tracer is not None:
             tracer.switch_context(previous)
 
@@ -149,21 +149,21 @@ def pytest_sessionfinish(session, exitstatus):
         }
     )
     document = {
-        "schema": "perigrafo.tests",
+        "schema": "afairesi.tests",
         "schema_version": 1,
-        "package": os.environ.get("PERIGRAFO_TEST_PACKAGE"),
+        "package": os.environ.get("AFAIRESI_TEST_PACKAGE"),
         "exit_code": int(exitstatus),
         "summary": summary,
         "tests": rows,
         "collection_errors": collection_errors,
     }
-    report = Path(os.environ["PERIGRAFO_TEST_REPORT"])
+    report = Path(os.environ["AFAIRESI_TEST_REPORT"])
     report.write_text(json.dumps(document, indent=2) + "\n")
-    if os.environ.get("PERIGRAFO_MUTATION_REPORT") == "1":
+    if os.environ.get("AFAIRESI_MUTATION_REPORT") == "1":
         attribution = {
             "failed_tests": [
                 row["nodeid"] for row in rows if row["outcome"] == "failed"
             ],
             "collection_errors": collection_errors,
         }
-        sys.stdout.write("\nPERIGRAFO_TEST_REPORT " + json.dumps(attribution) + "\n")
+        sys.stdout.write("\nAFAIRESI_TEST_REPORT " + json.dumps(attribution) + "\n")

@@ -69,7 +69,7 @@ let
       };
       system.stateVersion = hostConfig.system.stateVersion;
       systemd.services.sshd.preStart = lib.optionalString (hasAge && seeded) ''
-        ${pkgs.gnugrep}/bin/grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe
+        ${pkgs.gnugrep}/bin/grep -qx afairesi-bootstrap-ok /run/agenix/afairesi-probe
       '';
       testing.initrdBackdoor = true;
       virtualisation = {
@@ -96,7 +96,7 @@ let
       age = {
         inherit (hostConfig.age) identityPaths;
         secrets = lib.optionalAttrs seeded {
-          perigrafo-probe.file = "${fixture}/probe.age";
+          afairesi-probe.file = "${fixture}/probe.age";
         };
       };
     };
@@ -111,16 +111,16 @@ let
         ${lib.concatMapStrings (key: ''
           ssh-keygen -q -t ${lib.escapeShellArg key.type} \
             ${lib.optionalString (key ? bits) "-b ${toString key.bits}"} \
-            -N "" -C disposable-perigrafo-test -f "$out/key-${toString key.index}"
+            -N "" -C disposable-afairesi-test -f "$out/key-${toString key.index}"
         '') keys}
         ${lib.optionalString hasAge ''
           ${
             assert lib.assertMsg (
               identityKeys != [ ]
-            ) "Perigrafo bootstrap check: agenix needs a preserved SSH host identity";
+            ) "Afairesi bootstrap check: agenix needs a preserved SSH host identity";
             ""
           }
-          printf 'perigrafo-bootstrap-ok\n' | age \
+          printf 'afairesi-bootstrap-ok\n' | age \
             ${lib.concatMapStringsSep " " (key: "-R \"$out/key-${toString key.index}.pub\"") identityKeys} \
             -o "$out/probe.age"
         ''}
@@ -184,7 +184,7 @@ let
           else
             directory.persistent + lib.removePrefix directory.directory key.path
         else
-          throw "Perigrafo bootstrap check: SSH host key ${key.path} is not preserved";
+          throw "Afairesi bootstrap check: SSH host key ${key.path} is not preserved";
     in
     key // { inherit index preserved; }
   ) hostConfig.services.openssh.hostKeys;
@@ -298,7 +298,7 @@ pkgs.testers.runNixOSTest {
               source = shlex.quote(fixture + "/key-" + str(key["index"]))
               destination = shlex.quote(key["preserved"])
               seeded.succeed(f"cmp {source} {destination}")
-          ${lib.optionalString hasAge ''seeded.succeed("grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe")''}
+          ${lib.optionalString hasAge ''seeded.succeed("grep -qx afairesi-bootstrap-ok /run/agenix/afairesi-probe")''}
       with subtest("Generate SSH identities on empty persistent storage"):
           for key in keys:
               fresh.fail("test -e " + shlex.quote("/sysroot" + key["preserved"]))
@@ -307,15 +307,15 @@ pkgs.testers.runNixOSTest {
       for node in [seeded, fresh]:
           with subtest(f"{node.name}: SSH identities survive a clean-root reboot"):
               original = check_host_keys(node)
-              node.succeed("touch /perigrafo-unpreserved-marker")
+              node.succeed("touch /afairesi-unpreserved-marker")
               node.reboot()
               node.wait_for_unit("default.target")
-              node.fail("test -e /sysroot/perigrafo-unpreserved-marker")
+              node.fail("test -e /sysroot/afairesi-unpreserved-marker")
               node.switch_root()
               assert check_host_keys(node) == original
       ${lib.optionalString hasAge ''
         with subtest("Decrypt again after reboot without reprovisioning"):
-            seeded.succeed("grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe")
+            seeded.succeed("grep -qx afairesi-bootstrap-ok /run/agenix/afairesi-probe")
       ''}
       for node in [seeded, fresh]:
           node.shutdown()
@@ -340,11 +340,11 @@ pkgs.testers.runNixOSTest {
                 else:
                     assert machine.succeed(f"stat -Lc '%d:%i' {path}").strip() == machine.succeed(f"stat -Lc '%d:%i' {persistent}").strip()
                 if entry["directory"]:
-                    marker = shlex.quote(entry["path"] + "/.perigrafo-preservation-probe")
+                    marker = shlex.quote(entry["path"] + "/.afairesi-preservation-probe")
                     if phase == "boot":
-                        machine.succeed(f"printf perigrafo-preserved > {marker}")
+                        machine.succeed(f"printf afairesi-preserved > {marker}")
                     else:
-                        assert machine.succeed(f"cat {marker}") == "perigrafo-preserved"
+                        assert machine.succeed(f"cat {marker}") == "afairesi-preserved"
         if phase == "boot":
             machine.reboot()
     machine.shutdown()

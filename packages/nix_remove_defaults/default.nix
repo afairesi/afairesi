@@ -1,5 +1,5 @@
 { inputs, pkgs, ... }:
-(inputs.perigrafo or inputs.self).lib.mkPythonPackage {
+(inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   meta.description = "Remove literal NixOS and treefmt assignments equal to option defaults";

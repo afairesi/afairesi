@@ -64,7 +64,7 @@ let
           in
           assert nixlib.assertMsg (
             builtins.intersectAttrs (base.legacyPackages.${system} or { }) generated == { }
-          ) "Perigrafo generated test outputs collide with package names";
+          ) "Afairesi generated test outputs collide with package names";
           (base.legacyPackages.${system} or { }) // generated
         );
         devShells = nixlib.genAttrs systems (

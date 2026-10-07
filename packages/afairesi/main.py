@@ -128,7 +128,7 @@ def repository_root(path: Path = Path()) -> Path:
 
 
 def _command_target(target: Path | None) -> Path:
-    """Honor an explicit path or select the current Perigrafo repository."""
+    """Honor an explicit path or select the current Afairesi repository."""
     if target is not None:
         return target.resolve()
     root = repository_root()
@@ -150,8 +150,8 @@ def repository_type(root: Path, default: str | None = None) -> str:
         raise CommandError(msg)
     msg = (
         "cannot determine the repository type; run "
-        "'perigrafo init home' or "
-        "'perigrafo init flake REMOTE'"
+        "'afairesi init home' or "
+        "'afairesi init flake REMOTE'"
     )
     raise CommandError(msg)
 
@@ -168,7 +168,7 @@ def _repository_type_markers(root: Path) -> tuple[bool, bool]:
 
 
 def canonical_root(directory: Path) -> Path:
-    """Find the nearest Perigrafo layout, or retain an ordinary directory."""
+    """Find the nearest Afairesi layout, or retain an ordinary directory."""
     directory = directory.resolve()
     for candidate in (directory, *directory.parents):
         if any(_repository_type_markers(candidate)):
@@ -872,7 +872,7 @@ def _check_test_default(root: Path, package: Package) -> None:
 def _current_python_test_source() -> str:
     """Render a check using the repository's pinned shared builder."""
     return """{ inputs, pkgs, ... }:
-(inputs.perigrafo or inputs.self).lib.mkPythonCheck {
+(inputs.afairesi or inputs.self).lib.mkPythonCheck {
   inherit pkgs;
   packageDrv = inputs.self.packages.${pkgs.stdenv.system}.${baseNameOf ./.};
   packageName = baseNameOf ./.;
@@ -883,7 +883,7 @@ def _current_python_test_source() -> str:
 def _current_host_check_source() -> str:
     """Render a host check using the repository's pinned shared builder."""
     return """{ inputs, pkgs, ... }:
-(inputs.perigrafo or inputs.self).lib.mkHostCheck {
+(inputs.afairesi or inputs.self).lib.mkHostCheck {
   inherit inputs pkgs;
   host = pkgs.lib.removeSuffix "VmWithDisko" (baseNameOf ./.);
 }
@@ -1065,7 +1065,7 @@ def _python_required_edits(
     _scope, body = _package_body(document)
     argument = body.child_by_field_name("argument")
     function = body.child_by_field_name("function")
-    constructor = "(inputs.perigrafo or inputs.self).lib.mkPythonPackage"
+    constructor = "(inputs.afairesi or inputs.self).lib.mkPythonPackage"
     if (
         body.type != "apply_expression"
         or function is None
@@ -1511,7 +1511,7 @@ def scaffold(
     root = Path("packages") / name
     defaults = {
         "python": """{ inputs, pkgs, ... }:
-(inputs.perigrafo or inputs.self).lib.mkPythonPackage {
+(inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   meta.description = __DESCRIPTION__;
@@ -1876,12 +1876,12 @@ def initialize_flake(remote: str) -> None:
     try:
         flake = directory / "flake.nix"
         flake.write_text(
-            '{ inputs.perigrafo.url = "github:perigrafo/perigrafo"; outputs = inputs: inputs.perigrafo.blueprint { inherit inputs; }; }\n',  # noqa: E501
+            '{ inputs.afairesi.url = "github:afairesi/afairesi"; outputs = inputs: inputs.afairesi.blueprint { inherit inputs; }; }\n',  # noqa: E501
             encoding="utf-8",
         )
         (directory / "README").write_text(readme, encoding="utf-8")
         _run(
-            [os.environ.get("PERIGRAFO_NIX", "nix"), "flake", "lock"],
+            [os.environ.get("AFAIRESI_NIX", "nix"), "flake", "lock"],
             cwd=directory,
         )
         detected_packages = detect_packages(directory)
@@ -1894,7 +1894,7 @@ def initialize_flake(remote: str) -> None:
             encoding="utf-8",
         )
         _run(
-            [os.environ.get("PERIGRAFO_NIX", "nix"), "fmt"],
+            [os.environ.get("AFAIRESI_NIX", "nix"), "fmt"],
             cwd=directory,
         )
         git(directory, ["add", "--all"])
@@ -3315,7 +3315,7 @@ def _collection_data(
 
 
 def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any]:  # noqa: C901, PLR0912 - traverse canonical collections
-    """Return a versioned, source-based graph for other Perigrafo clients."""
+    """Return a versioned, source-based graph for other Afairesi clients."""
     target = target.resolve()
     focus = None
     if target.parent.name == "packages" and (
@@ -3449,7 +3449,7 @@ def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any
                             },
                         )
     return {
-        "schema": "perigrafo.overview",
+        "schema": "afairesi.overview",
         "schema_version": 1,
         "analysis": "source-declarations",
         "profile": current_type,
@@ -3682,7 +3682,7 @@ def _prepare_package_tests(
         " deadline=None)\n"
         '    settings.load_profile("ondemand")\n'
     )
-    (workspace / "_perigrafo_test_report.py").write_text(
+    (workspace / "_afairesi_test_report.py").write_text(
         _test_report_source(),
         encoding="utf-8",
     )
@@ -3690,7 +3690,7 @@ def _prepare_package_tests(
         "-p",
         "no:cacheprovider",
         "-p",
-        "_perigrafo_test_report",
+        "_afairesi_test_report",
         "-p",
         "_hypothesis_pytestplugin",
         *selection.pytest_arguments(),
@@ -3717,11 +3717,11 @@ def _prepare_package_tests(
         "os.environ.pop('PYTEST_ADDOPTS', None)\n"
         "os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'\n"
         "os.environ.pop('PYTEST_PLUGINS', None)\n"
-        "os.environ.pop('PERIGRAFO_TEST_REPORT_OWNER', None)\n"
-        "os.environ.pop('PERIGRAFO_TEST_CONTEXT', None)\n"
-        f"os.environ['PERIGRAFO_TEST_PACKAGE'] = {name!r}\n"
-        f"os.environ['PERIGRAFO_TEST_REPORT'] = {str(workspace / 'tests.json')!r}\n"
-        "os.environ['PERIGRAFO_MUTATION_REPORT'] = "
+        "os.environ.pop('AFAIRESI_TEST_REPORT_OWNER', None)\n"
+        "os.environ.pop('AFAIRESI_TEST_CONTEXT', None)\n"
+        f"os.environ['AFAIRESI_TEST_PACKAGE'] = {name!r}\n"
+        f"os.environ['AFAIRESI_TEST_REPORT'] = {str(workspace / 'tests.json')!r}\n"
+        "os.environ['AFAIRESI_MUTATION_REPORT'] = "
         f"{str(int(max_examples is None))!r}\n"
         "os.environ['HYPOTHESIS_STORAGE_DIRECTORY'] = "
         f"{str(workspace / 'hypothesis')!r}\n"
@@ -3766,7 +3766,7 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
         try:
             plan = json.loads(selection.mutation_plan.read_text(encoding="utf-8"))
             if (
-                plan["schema"] != "perigrafo.mutation-plan"
+                plan["schema"] != "afairesi.mutation-plan"
                 or plan["schema_version"] != 1
                 or plan["package"] != name
                 or plan["source_sha256"] != source_hash
@@ -3825,7 +3825,7 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
             WorkResult(worker_outcome=WorkerOutcome.SKIPPED, output="not selected"),
         )
         manifest = {
-            "schema": "perigrafo.mutation-plan",
+            "schema": "afairesi.mutation-plan",
             "schema_version": 1,
             "package": name,
             "source_sha256": source_hash,
@@ -3859,7 +3859,7 @@ def _mutation_status(result: dict[str, Any] | None) -> str:
 def _mutation_attribution(result: dict[str, Any] | None) -> dict[str, Any]:
     """Read the pytest report captured in an individual worker's output."""
     if result is not None:
-        prefix = "PERIGRAFO_TEST_REPORT "
+        prefix = "AFAIRESI_TEST_REPORT "
         for line in reversed((result["output"] or "").splitlines()):
             if line.startswith(prefix):
                 return cast("dict[str, Any]", json.loads(line.removeprefix(prefix)))
@@ -3903,7 +3903,7 @@ def _summarize_mutations(workspace: Path) -> bool:
     (workspace / "mutation-results.json").write_text(
         json.dumps(
             {
-                "schema": "perigrafo.mutations",
+                "schema": "afairesi.mutations",
                 "schema_version": 1,
                 "summary": summary,
                 "mutations": sorted(mutations, key=lambda mutation: mutation["id"]),
@@ -4073,7 +4073,7 @@ def _run_test_repository(
             )
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"perigrafo test {command}: {package.name}: {error}\n")
+            sys.stderr.write(f"afairesi test {command}: {package.name}: {error}\n")
     sys.stdout.write("\nRepository summary:\n")
     for package_name, status in outcomes.items():
         sys.stdout.write(f"  {package_name}: {status}\n")
@@ -4139,7 +4139,7 @@ def _build_package_coverage(package: Path) -> None:
     root = _test_target_root(package)
     check = root / "checks" / package.name / "default.nix"
     if not check.is_file():
-        message = f"missing {check}; run perigrafo converge to generate checks"
+        message = f"missing {check}; run afairesi converge to generate checks"
         raise CommandError(message)
     sys.stdout.write(f"Building coverage for {package.name}...\n")
     sys.stdout.flush()
@@ -4167,7 +4167,7 @@ def _build_package_coverage(package: Path) -> None:
     if not report.is_file():
         message = (
             f"coverage check produced no HTML report for {package.name}; "
-            "run perigrafo converge to update the test checks"
+            "run afairesi converge to update the test checks"
         )
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
@@ -4224,7 +4224,7 @@ def _run_coverage(target: Path) -> bool:
             outcomes[package.name] = "passed"
         except (CommandError, OSError) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"perigrafo test coverage: {package.name}: {error}\n")
+            sys.stderr.write(f"afairesi test coverage: {package.name}: {error}\n")
     if repository:
         sys.stdout.write("\nRepository summary:\n")
         for name, status in outcomes.items():
@@ -4264,7 +4264,7 @@ def _inspection_path(value: str) -> Path:
 def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     """Construct the public command-line parser."""
     result = argparse.ArgumentParser(
-        prog="perigrafo",
+        prog="afairesi",
         description=(
             "Create, inspect, and converge Git and Nix repositories "
             "describing machines. Without a command, show package descriptions, "
@@ -4579,9 +4579,9 @@ def _dispatch_test_command(
             )
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[command] = False
-            sys.stderr.write(f"perigrafo test {command}: {error}\n")
+            sys.stderr.write(f"afairesi test {command}: {error}\n")
         except KeyboardInterrupt:
-            sys.stderr.write(f"perigrafo test {command}: interrupted\n")
+            sys.stderr.write(f"afairesi test {command}: interrupted\n")
             sys.exit(130)
     if combined:
         sys.stdout.write("\nCampaign summary:\n")
@@ -4652,7 +4652,7 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
 
 
 def main() -> None:
-    """Dispatch the Perigrafo CLI."""
+    """Dispatch the Afairesi CLI."""
     arguments = sys.argv[1:]
     try:
         cli = parser()

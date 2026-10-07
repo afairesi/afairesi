@@ -5,7 +5,7 @@ let
       self = consumer // {
         outPath = ./consumer-contract;
       };
-      perigrafo = inputs.self;
+      afairesi = inputs.self;
     };
     systems = [ pkgs.stdenv.hostPlatform.system ];
     nixpkgs.config = {
@@ -27,4 +27,4 @@ assert consumer.legacyPackages.${system} ? example-test-environment;
 assert consumer.legacyPackages.${system} ? example-coverage;
 assert consumer.devShells.${system} ? example-test;
 assert !(inputs.self.lib ? mkFlake);
-pkgs.runCommand "perigrafo-consumer-contract" { } "mkdir -p $out"
+pkgs.runCommand "afairesi-consumer-contract" { } "mkdir -p $out"

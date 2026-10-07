@@ -1,5 +1,5 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Check Perigrafo's public contracts with explicit regressions and generated cases."""
+"""Check Afairesi's public contracts with explicit regressions and generated cases."""
 
 from __future__ import annotations
 
@@ -168,7 +168,7 @@ def _run_runner_cli(
     executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603
-        ["perigrafo", "test", command, str(root), *arguments],  # noqa: S607
+        ["afairesi", "test", command, str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
@@ -231,7 +231,7 @@ def _prepare_coverage_flake(
         source = (
             "import os\n"
             "def main():\n"
-            "    if os.getenv('PERIGRAFO_COVERAGE_CHOICE') == 'alternate':\n"
+            "    if os.getenv('AFAIRESI_COVERAGE_CHOICE') == 'alternate':\n"
             "        print('alternate')\n"
             "    else:\n"
             "        print('ready')\n"
@@ -251,7 +251,7 @@ def _prepare_coverage_flake(
             "    assert False\n"
             "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
             "def test_cli(message, monkeypatch):\n"
-            "    monkeypatch.setenv('PERIGRAFO_COVERAGE_CHOICE', message)\n"
+            "    monkeypatch.setenv('AFAIRESI_COVERAGE_CHOICE', message)\n"
             "    result = "
             "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
             "        capture_output=True, text=True)\n"
@@ -387,7 +387,7 @@ def _check_excluded_trees(
     package = repository / "packages/example"
     (package / "stray").write_text("unsupported")
     (package / "link").symlink_to(repository / "tmp", target_is_directory=True)
-    subject = import_module("packages.perigrafo.main")
+    subject = import_module("packages.afairesi.main")
     original_scandir = os.scandir
 
     def guarded_scandir(path: str | os.PathLike[str]) -> Iterator[os.DirEntry[str]]:
@@ -587,7 +587,7 @@ def _check_flake_initialization(
         encoding="utf-8",
     )
     fake_nix.chmod(0o755)
-    monkeypatch.setenv("PERIGRAFO_NIX", str(fake_nix))
+    monkeypatch.setenv("AFAIRESI_NIX", str(fake_nix))
     _run(tmp_path, "init", "home")
     _git(home, "commit", "--quiet", "-m", "Home policy")
     _run(tmp_path, "init", "flake", remote)
@@ -661,7 +661,7 @@ def _check_home_whitelist(home_repository: Path) -> None:
 def _check_home_settings(
     home_repository: Path,
 ) -> None:
-    """Allow Git settings beyond the path and URL managed by Perigrafo."""
+    """Allow Git settings beyond the path and URL managed by Afairesi."""
     root = home_repository
     modules = root / ".gitmodules"
     source = modules.read_text() + (
@@ -823,7 +823,7 @@ def _check_overview_history(
     repository: Path,
 ) -> None:
     """Read historical regular blobs with the same inventory as current sources."""
-    subject = import_module("packages.perigrafo.main")
+    subject = import_module("packages.afairesi.main")
     for relative, content in (
         ("packages/tool/default.nix", "{}\n"),
         ("packages/tool/main.py", '"""Original help."""\n'),
@@ -896,7 +896,7 @@ def _check_missing_history(
     tmp_path: Path,
 ) -> None:
     """Recognize initialized home policy and distinguish absent HEAD from errors."""
-    subject = import_module("packages.perigrafo.main")
+    subject = import_module("packages.afairesi.main")
     (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
     child = tmp_path / "forge.example"
     child.mkdir()
@@ -928,7 +928,7 @@ def _check_missing_history(
 def _check_home_graph(
     home_repository: Path,
 ) -> None:
-    """Keep same-named packages distinct and expose Perigrafo check relationships."""
+    """Keep same-named packages distinct and expose Afairesi check relationships."""
     for relative in ("forge.example/owner/demo", "forge.example/owner/second"):
         root = home_repository / relative
         root.mkdir(parents=True, exist_ok=True)
@@ -1010,13 +1010,13 @@ def _check_command_catalog(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep client command menus synchronized when CLI commands are added."""
-    subject = import_module("packages.perigrafo.main")
+    subject = import_module("packages.afairesi.main")
     source = Path(__file__).with_name("main.py").read_bytes()
     entries = subject.source_package_cli(source, "main.py")
     discovered = {" ".join(entry.path) for entry in entries if entry.command}
     _expect(
         discovered == {entry["command"] for entry in subject.command_catalog()},
-        "Perigrafo must discover its own complete command interface",
+        "Afairesi must discover its own complete command interface",
     )
     _expect(
         [entry["command"] for entry in subject.command_catalog()]
@@ -1050,7 +1050,7 @@ def _check_command_catalog(
             options.keywords == "keyword" and options.markers == "marker",
             "Campaign filter arguments must retain their runtime behavior",
         )
-    cli = argparse.ArgumentParser(prog="perigrafo")
+    cli = argparse.ArgumentParser(prog="afairesi")
     commands = cli.add_subparsers()
     added = commands.add_parser("future")
     added.add_argument("--visible", help="Public option")
@@ -1299,7 +1299,7 @@ def _repository(root: Path, *, object_format: str = "sha1") -> Path:
 @contextmanager
 def _fresh_repository(*, object_format: str = "sha1") -> Iterator[Path]:
     """Give every generated example its own repository and cleanup."""
-    with TemporaryDirectory(prefix="perigrafo-contract-") as directory:
+    with TemporaryDirectory(prefix="afairesi-contract-") as directory:
         yield _repository(Path(directory), object_format=object_format)
 
 
@@ -1405,10 +1405,10 @@ def _template_expression(root: Path, name: str) -> str:
         "("
         + json.dumps(
             'mkdir -p "$out/bin"\ncat > "$out/bin/${attrs.name}" '
-            f"<<'PERIGRAFO_SCRIPT'\n#!{bash}\n",
+            f"<<'AFAIRESI_SCRIPT'\n#!{bash}\n",
         )
         + " + attrs.text + "
-        + json.dumps('\nPERIGRAFO_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
+        + json.dumps('\nAFAIRESI_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
         + ")) // attrs; }; "
         + f"package = import {root / 'packages' / name / 'default.nix'} "
         + "{ inherit pkgs; "
@@ -1602,7 +1602,7 @@ def _campaign(
 
 def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
     """Expose consistent commands and reject invalid requests before creating state."""
-    with TemporaryDirectory(prefix="perigrafo-cli-") as directory:
+    with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
         commands = (
             (),
@@ -1629,7 +1629,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             + environment["PATH"]
         )
         _expect(
-            _run(root, "--help", executable="perigrafo", environment=environment).stdout
+            _run(root, "--help", executable="afairesi", environment=environment).stdout
             == _run(root, "--help").stdout,
             "standalone command unavailable through PATH",
         )
@@ -1646,7 +1646,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             _run(root, retired, code=2)
         _expect(
             "not inside a Git repository" in _run(root, code=1).stderr,
-            "bare perigrafo must require a repository",
+            "bare afairesi must require a repository",
         )
         _expect(
             "not inside a Git repository" in _run(root, "test", code=1).stderr,
@@ -1736,7 +1736,7 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
     failure: str | None,
 ) -> None:
     """Execute every campaign in order even when an earlier campaign fails."""
-    subject = import_module("packages.perigrafo.main")
+    subject = import_module("packages.afairesi.main")
     _repository(tmp_path)
     monkeypatch.chdir(tmp_path)
     observed: list[str] = []
@@ -1760,12 +1760,12 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
 
     monkeypatch.setattr(subject, "_run_coverage", coverage_run)
     monkeypatch.setattr(subject, "_run_test_repository", runner)
-    monkeypatch.setattr(sys, "argv", ["perigrafo", "test", "--help"])
+    monkeypatch.setattr(sys, "argv", ["afairesi", "test", "--help"])
     with pytest.raises(SystemExit) as help_status:
         subject.main()
     _expect(help_status.value.code == 0 and not observed, observed)
     capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["perigrafo", "test"])
+    monkeypatch.setattr(sys, "argv", ["afairesi", "test"])
     with pytest.raises(SystemExit) as completed:
         subject.main()
     _expect(completed.value.code == (0 if failure is None else 1), completed)
@@ -1782,7 +1782,7 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Discover nested repositories and preserve explicit target scope."""
-    subject = import_module("packages.perigrafo.main")
+    subject = import_module("packages.afairesi.main")
     home = tmp_path / "home"
     home.mkdir()
     _git(home, "init", "--quiet")
@@ -1851,7 +1851,7 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     for cwd in (package, nested):
         monkeypatch.chdir(cwd)
         observed.clear()
-        monkeypatch.setattr(sys, "argv", ["perigrafo", "test"])
+        monkeypatch.setattr(sys, "argv", ["afairesi", "test"])
         with pytest.raises(SystemExit) as combined:
             subject.main()
         _expect(combined.value.code == 0 and observed == [root] * 3, observed)
@@ -1864,7 +1864,7 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
                 (((), root), ((".",), package)) if cwd == package else (((), root),)
             )
             for arguments, expected in targets:
-                monkeypatch.setattr(sys, "argv", ["perigrafo", *path, *arguments])
+                monkeypatch.setattr(sys, "argv", ["afairesi", *path, *arguments])
                 with pytest.raises(SystemExit) as completed:
                     subject.main()
                 _expect(completed.value.code == 0, path)
@@ -1930,7 +1930,7 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
 
 def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> None:
     """Build real checks, measure CLI lines, and keep reports outside the checkout."""
-    with TemporaryDirectory(prefix="perigrafo-coverage-") as directory:
+    with TemporaryDirectory(prefix="afairesi-coverage-") as directory:
         root = Path(directory) / "source with spaces"
         environment = _prepare_coverage_flake(root)
         before = _snapshot(root)
@@ -2022,7 +2022,7 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
             "coverage changed repository state",
         )
     for failure in ("build", "report", "check", "syntax"):
-        with TemporaryDirectory(prefix="perigrafo-coverage-failure-") as directory:
+        with TemporaryDirectory(prefix="afairesi-coverage-failure-") as directory:
             root = Path(directory) / "source"
             environment = _prepare_coverage_flake(root, failure=failure)
             if failure == "check":
@@ -2042,7 +2042,7 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
             _expect(
                 "z-last:" in result.stdout
                 and "/html/index.html" in result.stdout
-                and "perigrafo test coverage: example:" in result.stderr,
+                and "afairesi test coverage: example:" in result.stderr,
                 result,
             )
             _expect(
@@ -2300,16 +2300,16 @@ def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
         "git@example.test:team/project.git",
     ):
         with (
-            TemporaryDirectory(prefix="perigrafo-home-") as directory,
+            TemporaryDirectory(prefix="afairesi-home-") as directory,
             pytest.MonkeyPatch.context() as patch,
         ):
             _check_remote_initialization(Path(directory), patch, remote)
     with (
-        TemporaryDirectory(prefix="perigrafo-bootstrap-") as directory,
+        TemporaryDirectory(prefix="afairesi-bootstrap-") as directory,
         pytest.MonkeyPatch.context() as patch,
     ):
         _check_flake_initialization(Path(directory), patch)
-    with TemporaryDirectory(prefix="perigrafo-home-") as directory:
+    with TemporaryDirectory(prefix="afairesi-home-") as directory:
         root = _home_repository(Path(directory))
         _check_home_commits(root)
         _check_home_whitelist(root)
@@ -2339,7 +2339,7 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
     failure: str,
 ) -> None:
     """Run copied Git commands, count cases, and retain failure diagnostics."""
-    with TemporaryDirectory(prefix="perigrafo-campaign-") as directory:
+    with TemporaryDirectory(prefix="afairesi-campaign-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
             "import json, os\nfrom pathlib import Path\n"
@@ -2499,7 +2499,7 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
 
 def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
     """Check fixed baseline failures once, independently of generated values."""
-    with TemporaryDirectory(prefix="perigrafo-baselines-") as directory:
+    with TemporaryDirectory(prefix="afairesi-baselines-") as directory:
         root = Path(directory) / "source with spaces"
         environment = _prepare_runner_flake(
             root,
@@ -2545,7 +2545,7 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
 
 def test_mutation_campaigns_report_empty_plans() -> None:
     """Accept an empty mutation plan when explicit baseline examples pass."""
-    with TemporaryDirectory(prefix="perigrafo-empty-mutations-") as directory:
+    with TemporaryDirectory(prefix="afairesi-empty-mutations-") as directory:
         root = Path(directory) / "source"
         tests = (
             "from packages.example import main\n"
@@ -2572,7 +2572,7 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
     value: int,
 ) -> None:
     """Report killed/surviving mutations and replay plans across generated values."""
-    with TemporaryDirectory(prefix="perigrafo-mutations-") as directory:
+    with TemporaryDirectory(prefix="afairesi-mutations-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
             "def value():\n"
@@ -3004,7 +3004,7 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         graph = _overview(root)
         nodes = {node["id"]: node for node in graph["nodes"]}
         _expect(
-            graph["schema"] == "perigrafo.overview"
+            graph["schema"] == "afairesi.overview"
             and graph["analysis"] == "source-declarations",
             graph,
         )
@@ -3067,7 +3067,7 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         _git(root, "add", "--force", ".")
         _fixture_git(root, "commit", "-qm", "Source snapshot")
         before = _snapshot(root)
-        subject = import_module("packages.perigrafo.main")
+        subject = import_module("packages.afairesi.main")
         historical = subject.overview_data(root, revision="HEAD")
         _expect(
             [node.get("details") for node in historical["nodes"]]
@@ -3082,11 +3082,11 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         _check_overview_details(root)
     with _fresh_repository() as root:
         _check_overview_history(root)
-    with TemporaryDirectory(prefix="perigrafo-history-") as directory:
+    with TemporaryDirectory(prefix="afairesi-history-") as directory:
         _check_missing_history(Path(directory))
-    with TemporaryDirectory(prefix="perigrafo-graph-") as directory:
+    with TemporaryDirectory(prefix="afairesi-graph-") as directory:
         _check_home_graph(_home_repository(Path(directory)))
-    with TemporaryDirectory(prefix="perigrafo-host-graph-") as directory:
+    with TemporaryDirectory(prefix="afairesi-host-graph-") as directory:
         _check_host_graph(_home_repository(Path(directory)))
 
 

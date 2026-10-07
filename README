@@ -1,6 +1,6 @@
-# Perigrafo
+# Afairesi
 
-Perigrafo uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `perigrafo` creates, inspects, and converges those repositories.
+Afairesi uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `afairesi` creates, inspects, and converges those repositories.
 
 ## Canonical state
 
@@ -9,17 +9,17 @@ Perigrafo uses shared Git repository and Nix flake conventions to describe a mac
 - Nix flake Git submodules under `$HOME` at `<hostname>/<repository-path>`, each with conventional `packages/`, `hosts/`, and `checks/` directories.
 - Package directories with conventional places for source, tests, tracked resources (`prm/`), and runtime output (`tmp/`) where applicable.
 - Package names and descriptions show what is available.
-- `perigrafo packages/NAME` shows interfaces and expected behavior; use `perigrafo` for all packages.
+- `afairesi packages/NAME` shows interfaces and expected behavior; use `afairesi` for all packages.
 - Read tests or source code when more detail is needed.
 
 ## Runtime constraints
 
-- Use `perigrafo` for persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
+- Use `afairesi` for persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
 - Use `prm/` for tracked files that do not fit the conventional layout.
 
 ## Canonical state convergence
 
 - Reboot to restore impermanent NixOS state.
 - Run `nix flake check` and `nix fmt` for flake repositories.
-- Run `perigrafo converge` for `$HOME` and flake repositories.
+- Run `afairesi converge` for `$HOME` and flake repositories.
 - Use `git clean` to remove untracked state when intended; it is destructive.

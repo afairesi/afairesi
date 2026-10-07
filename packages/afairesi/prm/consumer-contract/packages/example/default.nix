@@ -1,5 +1,5 @@
 { inputs, pkgs, ... }:
-inputs.perigrafo.lib.mkPythonPackage {
+inputs.afairesi.lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   passthru.consumerConfig = {
