@@ -2009,7 +2009,7 @@ def source_test_names(source: bytes, filename: str) -> list[str]:
         else:
             definitions.append(node)
     return [
-        node.name.replace("_", " ")
+        node.name.removeprefix("test_").replace("_", " ")
         for node in definitions
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name.startswith("test_")
@@ -3145,16 +3145,71 @@ def _repository_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
     }
 
 
-def overview_summary(target: Path) -> dict[str, Any]:
-    """Build the machine, user, domain, owner, repository, and resource tree."""
-    target = target.resolve()
+def home_preservation(root: Path) -> dict[str, Any]:
+    """List the home whitelist without expanding patterns or reading file contents."""
+    source = _read_regular(root / ".gitignore") or ""
+    return {
+        "path": str(root),
+        "preserved": [line for line in source.splitlines() if line.startswith("!/")],
+    }
+
+
+def persistent_summary(root: Path) -> dict[str, Any]:
+    """Map stored paths to a logical filesystem tree without following links."""
+    tree: dict[str, Any] = {}
+
+    def visit(directory: Path, branch: dict[str, Any], depth: int) -> None:
+        try:
+            entries = sorted(directory.iterdir())
+        except OSError as error:
+            branch.setdefault("diagnostics", []).append(error.strerror)
+            return
+        for entry in entries:
+            name = "/" + entry.name if depth == 1 else entry.name
+            child: dict[str, Any] = {}
+            branch[name] = child
+            try:
+                mode = entry.lstat().st_mode
+            except OSError as error:
+                child["diagnostics"] = [error.strerror]
+                continue
+            if stat.S_ISDIR(mode) and depth < 3:  # noqa: PLR2004 - compact storage inventory
+                visit(entry, child, depth + 1)
+
+    visit(root, tree, 1)
+    return tree
+
+
+def machine_summary() -> dict[str, Any]:
+    """Inspect preservation conventions independently of the working directory."""
+    home = Path.home()
+    machine = persistent_summary(Path("/persistent"))
+    branch = machine
+    for index, component in enumerate(home.parts[1:]):
+        name = "/" + component if index == 0 else component
+        branch = branch.setdefault(name, {})
+    branch.clear()
+    if (home / ".gitmodules").is_file() and not (home / "flake.nix").exists():
+        user = overview_summary(home)[socket.gethostname()][getpass.getuser()]
+        preservation = user.pop("home")
+        branch.update(preservation)
+        branch.update(user)
+    else:
+        branch.update(home_preservation(home))
+    branch.pop("path", None)
+    return {socket.gethostname(): machine}
+
+
+def _overview_repositories(target: Path) -> list[tuple[Path, Path]]:
+    """Select a resource, a flake, or checked-out home flake submodules."""
     repositories = [(target, target)]
+    is_home = (target / ".gitmodules").is_file() and not (target / "flake.nix").exists()
     if (
         target.parent.name in {"packages", "hosts"}
         and not (target / "flake.nix").is_file()
     ):
         repositories = [(target.parent.parent, target)]
-    elif (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
+    elif is_home:
         repositories = []
         for repository in home_submodules(target, require_url=False):
             relative = repository["path"]
@@ -3164,16 +3219,28 @@ def overview_summary(target: Path) -> dict[str, Any]:
                 raise CommandError(msg)
             if (checkout / "flake.nix").is_file():
                 repositories.append((checkout, checkout))
-        if not repositories:
-            msg = f"no checked-out flake submodules found under {target}"
-            raise ValueError(msg)
+    return repositories
+
+
+def overview_summary(target: Path) -> dict[str, Any]:
+    """Build the machine, user, domain, owner, repository, and resource tree."""
+    target = target.resolve()
+    is_home = (target / ".gitmodules").is_file() and not (target / "flake.nix").exists()
     tree: dict[str, Any] = {}
     user = tree.setdefault(socket.gethostname(), {}).setdefault(getpass.getuser(), {})
-    for root, selected in repositories:
-        groups = _repository_summary(selected)
+    if is_home:
+        user["home"] = home_preservation(target)
+    for root, selected in _overview_repositories(target):
         branch = user
         for component in _repository_identity(root):
             branch = branch.setdefault(component, {})
+        try:
+            groups = _repository_summary(selected)
+        except ValueError as error:
+            if not is_home:
+                raise
+            branch["diagnostics"] = [str(error)]
+            continue
         for collection, resources in groups.items():
             branch.setdefault(collection, {}).update(resources)
     return tree
@@ -3969,13 +4036,13 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         prog="afairesi",
         description=(
             "Create, inspect, and converge Git and Nix repositories "
-            "describing machines. Without a command, show host and package "
+            "describing machines. Without a command, show "
+            "preserved machine paths, the home whitelist, and repository "
             "descriptions, arguments, dependencies, and tests."
         ),
         usage="%(prog)s [-h] [--json] [PATH]\n       %(prog)s COMMAND ...",
         epilog=(
-            "PATH selects a home, flake root, package, or host; "
-            "default: current repository root."
+            "PATH selects a home, flake root, package, or host; default: whole machine."
         ),
     )
     result.set_defaults(target=None)
@@ -3987,13 +4054,13 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
             metavar="PATH",
             help=(
                 "home, flake root, packages/NAME, or hosts/NAME "
-                "(default: current repository root)"
+                "(default: whole machine)"
             ),
         )
     result.add_argument(
         "--json",
         action="store_true",
-        help="emit package and host summaries as JSON, omitting empty fields",
+        help="emit the selected overview as JSON",
     )
     if include_target:
         result.set_defaults(command=None)
@@ -4279,7 +4346,11 @@ def _dispatch_test_command(
 
 def _dispatch_overview(options: argparse.Namespace) -> None:
     """Render the selected hierarchy as indented text or JSON."""
-    tree = overview_summary(_command_target(options.target))
+    tree = (
+        machine_summary()
+        if options.target is None
+        else overview_summary(options.target)
+    )
     if options.json:
         sys.stdout.write(
             json.dumps(

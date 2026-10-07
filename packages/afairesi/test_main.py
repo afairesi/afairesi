@@ -784,7 +784,7 @@ def _check_overview_details(
     (package / "tmp/generated.py").write_text("runtime\n")
     data = _overview(repository)
     details = subject.resource_data(package)
-    if details["description"] != "Example" or details["tests"] != ["test result"]:
+    if details["description"] != "Example" or details["tests"] != ["result"]:
         msg = "Descriptions and test sentences must be preserved as separate facts"
         raise AssertionError(msg)
     if details["cli"] != [
@@ -814,7 +814,7 @@ def _check_overview_details(
         "arguments:\n  - build: command\n  - build: --jobs  optional; default=2\n"
         "description: Example\n"
         "suppressions:\n  - prm/nested/script.js: eslint-disable (global): 1\n"
-        "tests:\n  - test result\n"
+        "tests:\n  - result\n"
     )
     _expect(
         data
@@ -826,7 +826,7 @@ def _check_overview_details(
                         "build: command",
                         "build: --jobs  optional; default=2",
                     ],
-                    "tests": ["test result"],
+                    "tests": ["result"],
                     "suppressions": [
                         "prm/nested/script.js: eslint-disable (global): 1",
                     ],
@@ -885,6 +885,16 @@ def _check_home_summaries(home_repository: Path) -> None:
         == {
             socket.gethostname(): {
                 getpass.getuser(): {
+                    "home": {
+                        "path": str(home_repository),
+                        "preserved": [
+                            line
+                            for line in (home_repository / ".gitignore")
+                            .read_text()
+                            .splitlines()
+                            if line.startswith("!/")
+                        ],
+                    },
                     "forge.example": {
                         "owner": {
                             name: {
@@ -901,7 +911,7 @@ def _check_home_summaries(home_repository: Path) -> None:
     )
     _expect(_snapshot(home_repository) == before, "JSON inspection changed the home")
     _git(home_repository, "config", "-f", ".gitmodules", "submodule.second.path", "..")
-    rejected = _run(home_repository, "--json", code=1)
+    rejected = _run(home_repository, "--json", str(home_repository), code=1)
     _expect("submodule path escapes" in rejected.stderr, rejected)
 
 
@@ -929,13 +939,16 @@ def _check_host_summaries(repository: Path) -> None:
     before = _snapshot(repository)
     _expect(_overview(repository) == expected, expected)
     _expect(_overview(host) == expected, expected)
-    _expect(_run(host).stdout == _run(repository).stdout, expected)
+    _expect(
+        _run(host, str(host)).stdout == _run(repository, str(repository)).stdout,
+        expected,
+    )
     _expect(_snapshot(repository) == before, "host inspection changed source")
     configuration.write_text("{ invalid =")
     broken = _overview(host)["hosts"]["laptop"]
     _expect("dependencies" in broken["diagnostics"] and "name" not in broken, broken)
     configuration.unlink()
-    _run(repository, "--json", code=1)
+    _run(repository, "--json", str(repository), code=1)
 
 
 CLI_CONTRACTS = (
@@ -1557,8 +1570,13 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         ):
             _run(root, retired, code=2)
         _expect(
-            "not inside a Git repository" in _run(root, code=1).stderr,
-            "bare afairesi must require a repository",
+            any(
+                name.startswith("/")
+                for name in json.loads(_run(root, "--json").stdout)[
+                    socket.gethostname()
+                ]
+            ),
+            "bare afairesi must show machine preservation outside repositories",
         )
         _expect(
             "not inside a Git repository" in _run(root, "test", code=1).stderr,
@@ -1686,7 +1704,7 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
         _expect(f"  {command}: {status}\n" in output.out, output)
 
 
-def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
+def test_explicit_targets_preserve_repository_scope(
     tmp_path: Path,
 ) -> None:
     """Discover nested repositories and preserve explicit target scope."""
@@ -1702,40 +1720,43 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     _make_source_package(root, "beta", "def test_beta(): pass\n")
     nested = package / "prm/nested"
     nested.mkdir(parents=True)
-    catalog = _run(root).stdout
+    catalog = _run(root, str(root)).stdout
     _expect(
-        _resource_output(catalog, "alpha") == "tests:\n  - test alpha\n"
-        and _resource_output(catalog, "beta") == "tests:\n  - test beta\n",
+        _resource_output(catalog, "alpha") == "tests:\n  - alpha\n"
+        and _resource_output(catalog, "beta") == "tests:\n  - beta\n",
         catalog,
     )
-    summaries = _run(root, "--json").stdout
+    summaries = _run(root, "--json", str(root)).stdout
     for cwd in (package, nested):
-        _expect(_run(cwd).stdout == catalog, cwd)
-        _expect(_run(cwd, "--json").stdout == summaries, cwd)
+        _expect(_run(cwd, str(root)).stdout == catalog, cwd)
+        _expect(_run(cwd, "--json", str(root)).stdout == summaries, cwd)
     focused_output = _run(package, ".", "--json").stdout
     _expect(_run(package, "--json", ".").stdout == focused_output, package)
     focused = _overview(package)
     _run(root, "overview", code=2)
     _run(root, "unknown-command", code=2)
     _expect(
-        focused == {"packages": {"alpha": {"tests": ["test alpha"]}}},
+        focused == {"packages": {"alpha": {"tests": ["alpha"]}}},
         focused,
     )
     _expect(
-        _resource_output(_run(package, ".").stdout, "alpha")
-        == "tests:\n  - test alpha\n",
+        _resource_output(_run(package, ".").stdout, "alpha") == "tests:\n  - alpha\n",
         package,
     )
     _run(nested, ".", code=1)
-    _run(home, "--json", code=1)
+    _run(home, "--json", str(home))
     (home / ".gitmodules").write_text(
         '[submodule "demo"]\npath = forge.example/team/demo\n',
     )
-    _expect(_overview_tree(home) == json.loads(summaries), home)
+    expected = json.loads(summaries)
+    expected[socket.gethostname()][getpass.getuser()]["home"] = {
+        "path": str(home),
+        "preserved": ["!/.gitmodules"],
+    }
+    _expect(_overview_tree(home) == expected, home)
     _run(nested, ".", "--json", code=1)
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
-        (),
         ("test",),
         ("test", "coverage"),
         ("test", "hypothesis"),
@@ -1747,7 +1768,8 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     ordinary.mkdir()
     _git(ordinary, "init", "--quiet")
     _expect(
-        "cannot determine the repository type" in _run(ordinary, code=1).stderr,
+        "expected a canonical packages/NAME or hosts/NAME"
+        in _run(ordinary, ".", code=1).stderr,
         ordinary,
     )
 
@@ -2878,7 +2900,7 @@ def test_overview_formats_share_machine_user_repository_hierarchy(
     expected = {machine: {user: {"forge.example": {"owner": {"demo": groups}}}}}
     before = _snapshot(tmp_path)
     _expect(_overview_tree(tmp_path) == expected, expected)
-    terminal = _run(tmp_path).stdout
+    terminal = _run(tmp_path, str(tmp_path)).stdout
     _expect(
         terminal
         == (
@@ -2901,10 +2923,144 @@ def test_overview_formats_share_machine_user_repository_hierarchy(
             },
         }
         _expect(_overview_tree(selected) == focused, focused)
-        output = _run(selected).stdout
+        output = _run(selected, str(tmp_path)).stdout
         _expect(f"{machine}:\n  {user}:\n    forge.example:\n" in output, output)
         _expect(f"          {collection}:\n            shared:\n" in output, output)
     _expect(_snapshot(tmp_path) == before, "inspection changed Git or source state")
+
+
+def test_machine_overview_defaults_ignore_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Show storage, home policy, and repositories from any working directory."""
+    subject = import_module("packages.afairesi.main")
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / ".gitignore").write_text("*\n!/.gitmodules\n!/.ssh/\n!/.ssh/key\n")
+    (home / ".gitmodules").write_text(
+        '[submodule "demo"]\npath = forge.example/team/demo\n',
+    )
+    repository = home / "forge.example/team/demo"
+    repository.mkdir(parents=True)
+    _repository(repository)
+    _make_source_package(repository, "example", "def test_example(): pass\n")
+    storage = tmp_path / "persistent"
+    (storage / "etc").mkdir(parents=True)
+    (storage / "etc/machine-id").write_text("secret contents must not be shown")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    inventory = subject.persistent_summary
+    monkeypatch.setattr(subject, "persistent_summary", lambda _root: inventory(storage))
+    expected_home = {
+        "preserved": ["!/.gitmodules", "!/.ssh/", "!/.ssh/key"],
+        "forge.example": {
+            "team": {
+                "demo": {
+                    "packages": {"example": {"tests": ["example"]}},
+                },
+            },
+        },
+    }
+    expected_paths = expected_home
+    for component in reversed(home.parts[2:]):
+        expected_paths = {component: expected_paths}
+    expected = {
+        socket.gethostname(): {
+            "/etc": {"machine-id": {}},
+            "/" + home.parts[1]: expected_paths,
+        },
+    }
+    for cwd in (tmp_path, repository, repository / "packages/example"):
+        monkeypatch.chdir(cwd)
+        for arguments in ([], ["--json"]):
+            monkeypatch.setattr(sys, "argv", ["afairesi", *arguments])
+            subject.main()
+            output = capsys.readouterr().out
+            _expect(
+                "persistent" not in output and "secret contents" not in output,
+                output,
+            )
+            if arguments:
+                _expect(json.loads(output) == expected, output)
+            else:
+                _expect(output == subject.render_overview(expected) + "\n", output)
+
+
+def test_machine_home_whitelist_replaces_stored_home_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Represent a stored home once through its policy even without submodules."""
+    subject = import_module("packages.afairesi.main")
+    (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n")
+    home_tree: dict[str, Any] = {"untracked-file": {}}
+    for component in reversed(tmp_path.parts[2:]):
+        home_tree = {component: home_tree}
+    stored_tree = {"/" + tmp_path.parts[1]: home_tree, "/etc": {"machine-id": {}}}
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(subject, "persistent_summary", lambda _root: stored_tree)
+    machine = subject.machine_summary()[socket.gethostname()]
+    branch = machine["/" + tmp_path.parts[1]]
+    for component in tmp_path.parts[2:]:
+        branch = branch[component]
+    _expect(branch == {"preserved": ["!/.ssh/"]}, branch)
+    _expect(machine["/etc"] == {"machine-id": {}}, machine)
+
+
+def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep service data compact and do not follow links or hide access failures."""
+    subject = import_module("packages.afairesi.main")
+    storage = tmp_path / "persistent"
+    (storage / "var/lib/service").mkdir(parents=True)
+    (storage / "var/lib/service/hidden").write_text("runtime")
+    (storage / "link").symlink_to(storage, target_is_directory=True)
+    blocked = storage / "private"
+    blocked.mkdir()
+    iterdir = Path.iterdir
+
+    def restricted_iterdir(path: Path) -> Iterator[Path]:
+        if path == blocked:
+            raise PermissionError(13, "Permission denied", str(path))
+        return iterdir(path)
+
+    monkeypatch.setattr(Path, "iterdir", restricted_iterdir)
+    details = subject.persistent_summary(storage)
+    _expect(
+        details
+        == {
+            "/link": {},
+            "/private": {"diagnostics": ["Permission denied"]},
+            "/var": {"lib": {"service": {}}},
+        },
+        details,
+    )
+    missing = subject.persistent_summary(tmp_path / "missing")
+    _expect(missing == {"diagnostics": ["No such file or directory"]}, missing)
+
+
+def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> None:
+    """Inspect an empty home without requiring any checked-out flakes."""
+    (tmp_path / ".gitmodules").touch()
+    (tmp_path / ".gitignore").write_text("*\n# policy\n!/.ssh/\n!/.ssh/key\n")
+    subject = import_module("packages.afairesi.main")
+    _expect(
+        subject.overview_summary(tmp_path)
+        == {
+            socket.gethostname(): {
+                getpass.getuser(): {
+                    "home": {
+                        "path": str(tmp_path),
+                        "preserved": ["!/.ssh/", "!/.ssh/key"],
+                    },
+                },
+            },
+        },
+        tmp_path,
+    )
 
 
 def test_overview_groups_home_repositories_and_rejects_escaping_submodules() -> None:
@@ -2938,7 +3094,7 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
             + source,
         )
         expected_names = "".join(
-            "  - test " + label.replace("_", " ") + "\n" for label in labels
+            "  - " + label.replace("_", " ") + "\n" for label in labels
         )
         before = _snapshot(root)
         inspected = _run(root, str(package))
@@ -2962,7 +3118,7 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
         )
         details = import_module("packages.afairesi.main").resource_data(package)
         _expect(
-            details["tests"] == ["test " + label.replace("_", " ") for label in labels],
+            details["tests"] == [label.replace("_", " ") for label in labels],
             details,
         )
         _expect("help" not in details and "Help:" not in inspected.stdout, details)
@@ -2978,7 +3134,7 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
         missing = _make_source_package(root, "untested", "")
         (missing / "test_main.py").unlink()
         (root / "packages/linked").symlink_to(package, target_is_directory=True)
-        listed = _run(root)
+        listed = _run(root, str(root))
         package_summary = _resource_output(listed.stdout, "my-package")
         _expect(
             "tests:\n" + expected_names.rstrip("\n") in package_summary
@@ -3311,7 +3467,7 @@ def test_source_overviews_preserve_declarations_and_source_facts(
                 sources,
             )
         _expect(
-            details["tests"] == ["test result"],
+            details["tests"] == ["result"],
             details,
         )
         focus = _overview(consumer)
@@ -3319,11 +3475,11 @@ def test_source_overviews_preserve_declarations_and_source_facts(
             focus == {"packages": {"consumer": summaries["packages"]["consumer"]}},
             focus,
         )
-        terminal = _run(root).stdout
+        terminal = _run(root, str(root)).stdout
         _expect(
             "consumer:\n" in terminal
             and "runtime: packages/" + provider in terminal
-            and "- test result\n" in terminal,
+            and "- result\n" in terminal,
             terminal,
         )
         _git(root, "add", "--force", ".")
@@ -3404,7 +3560,7 @@ def test_static_test_sentences_follow_public_definitions_without_execution(
     """Ignore hidden helpers and preserve public definition order and spelling."""
     subject = import_module("packages.afairesi.main")
     source = _test_declarations(labels, form)
-    expected = ["test " + label.replace("_", " ") for label in labels]
+    expected = [label.replace("_", " ") for label in labels]
     _expect(
         subject.source_test_names(source.encode(), "test_main.py") == expected,
         source,
