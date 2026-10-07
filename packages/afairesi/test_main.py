@@ -2510,6 +2510,28 @@ def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> N
     )
 
 
+def test_home_whitelist_merges_paths_and_rejects_escaping_entries(
+    tmp_path: Path,
+) -> None:
+    """Merge shared parents without scanning or reading whitelisted files."""
+    subject = import_module("packages.afairesi.main")
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text(
+        "*\n# comment\n!/.ssh/\n!/.ssh/key\n!/.ssh/public\n!/assets/*.png\n",
+    )
+    _expect(
+        subject.home_preservation(tmp_path)
+        == {
+            ".ssh": {"key": {}, "public": {}},
+            "assets": {"*.png": {}},
+        },
+        tmp_path,
+    )
+    ignore.write_text("*\n!/../outside\n")
+    with pytest.raises(subject.CommandError, match="invalid whitelist path"):
+        subject.home_preservation(tmp_path)
+
+
 @pytest.mark.parametrize("failure", ["counterexample", "timeout"])
 def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
     """Retain counterexamples and terminate stalled descendants before continuing."""
@@ -2677,143 +2699,6 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         )
 
 
-@pytest.mark.parametrize("os_id", ["nixos", "ubuntu", "unknown"])
-def test_system_inspection_checks_os_before_preservation(
-    os_id: str,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Only inspect conventional system storage on a detected NixOS system."""
-    subject = import_module("packages.afairesi.main")
-    calls: list[Path] = []
-
-    def check_storage(root: Path) -> dict[str, str]:
-        calls.append(root)
-        return {"path": str(root), "status": "missing", "message": "Storage missing"}
-
-    monkeypatch.setattr(
-        subject.platform,
-        "freedesktop_os_release",
-        lambda: {
-            "ID": os_id,
-            "PRETTY_NAME": "Example OS",
-        },
-    )
-    monkeypatch.setattr(subject, "_preservation_status", check_storage)
-    details = subject.system_summary()
-    _expect(
-        details["os"]
-        == {
-            "id": os_id,
-            "name": "Example OS",
-            "status": "detected",
-        },
-        details,
-    )
-    _expect(calls == ([Path("/persistent")] if os_id == "nixos" else []), calls)
-    status = "missing" if os_id == "nixos" else "not_applicable"
-    _expect(details["preservation"]["status"] == status, details)
-
-
-@pytest.mark.parametrize("storage_state", ["missing", "file", "directory"])
-def test_system_preservation_reports_storage_state(
-    tmp_path: Path,
-    storage_state: str,
-) -> None:
-    """Distinguish missing storage from an available directory or invalid file."""
-    subject = import_module("packages.afairesi.main")
-    storage = tmp_path / "persistent"
-    if storage_state == "file":
-        storage.touch()
-    elif storage_state == "directory":
-        storage.mkdir()
-    expected = {"missing": "missing", "file": "not_directory", "directory": "available"}
-    details = subject._preservation_status(storage)  # noqa: SLF001 - status contract
-    _expect(details["status"] == expected[storage_state], details)
-    _expect(details["path"] == str(storage), details)
-    _expect(("message" in details) == (storage_state != "directory"), details)
-
-
-def test_system_inspection_reports_unavailable_os(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Do not inspect storage when the OS cannot be identified."""
-    subject = import_module("packages.afairesi.main")
-
-    def unavailable_release() -> dict[str, str]:
-        message = "os-release is missing"
-        raise FileNotFoundError(message)
-
-    def unexpected_storage(_root: Path) -> dict[str, str]:
-        message = "storage inspected before OS identification"
-        raise AssertionError(message)
-
-    monkeypatch.setattr(subject.platform, "freedesktop_os_release", unavailable_release)
-    monkeypatch.setattr(subject, "_preservation_status", unexpected_storage)
-    details = subject.system_summary()
-    _expect(details["os"]["status"] == "unavailable", details)
-    _expect(details["preservation"]["status"] == "not_applicable", details)
-    _expect("OS detection failed" in details["preservation"]["message"], details)
-
-
-@pytest.mark.parametrize("status", ["missing", "not_applicable", "available"])
-def test_machine_storage_status_matches_text_and_json(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    status: str,
-) -> None:
-    """Report skipped or failed inspection while still showing parsed home paths."""
-    subject = import_module("packages.afairesi.main")
-    (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n!/.ssh/key\n")
-    system = {"os": {"id": "nixos"}, "preservation": {"status": status}}
-    monkeypatch.setattr(subject, "system_summary", lambda: system)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    calls: list[Path] = []
-
-    def inspect_storage(root: Path) -> dict[str, Any]:
-        calls.append(root)
-        return {"diagnostics": ["Permission denied"]}
-
-    monkeypatch.setattr(subject, "persistent_summary", inspect_storage)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "--json"])
-    subject.main()
-    tree = json.loads(capsys.readouterr().out)
-    machine = tree[socket.gethostname()]
-    observed_status = "unavailable" if status == "available" else status
-    _expect(machine["system"]["preservation"]["status"] == observed_status, machine)
-    _expect(calls == ([Path("/persistent")] if status == "available" else []), calls)
-    monkeypatch.setattr(sys, "argv", ["afairesi"])
-    subject.main()
-    output = capsys.readouterr().out
-    _expect(output == subject.render_overview(tree) + "\n", output)
-    _expect(
-        "status: " + observed_status in output and "preserved:" not in output,
-        output,
-    )
-
-
-def test_home_whitelist_merges_paths_and_rejects_escaping_entries(
-    tmp_path: Path,
-) -> None:
-    """Merge shared parents without scanning or reading whitelisted files."""
-    subject = import_module("packages.afairesi.main")
-    ignore = tmp_path / ".gitignore"
-    ignore.write_text(
-        "*\n# comment\n!/.ssh/\n!/.ssh/key\n!/.ssh/public\n!/assets/*.png\n",
-    )
-    _expect(
-        subject.home_preservation(tmp_path)
-        == {
-            ".ssh": {"key": {}, "public": {}},
-            "assets": {"*.png": {}},
-        },
-        tmp_path,
-    )
-    ignore.write_text("*\n!/../outside\n")
-    with pytest.raises(subject.CommandError, match="invalid whitelist path"):
-        subject.home_preservation(tmp_path)
-
-
 def test_machine_home_whitelist_replaces_stored_home_contents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2905,6 +2790,43 @@ def test_machine_overview_defaults_ignore_working_directory(
                 _expect(json.loads(output) == expected, output)
             else:
                 _expect(output == subject.render_overview(expected) + "\n", output)
+
+
+@pytest.mark.parametrize("status", ["missing", "not_applicable", "available"])
+def test_machine_storage_status_matches_text_and_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+) -> None:
+    """Report skipped or failed inspection while still showing parsed home paths."""
+    subject = import_module("packages.afairesi.main")
+    (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n!/.ssh/key\n")
+    system = {"os": {"id": "nixos"}, "preservation": {"status": status}}
+    monkeypatch.setattr(subject, "system_summary", lambda: system)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls: list[Path] = []
+
+    def inspect_storage(root: Path) -> dict[str, Any]:
+        calls.append(root)
+        return {"diagnostics": ["Permission denied"]}
+
+    monkeypatch.setattr(subject, "persistent_summary", inspect_storage)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "--json"])
+    subject.main()
+    tree = json.loads(capsys.readouterr().out)
+    machine = tree[socket.gethostname()]
+    observed_status = "unavailable" if status == "available" else status
+    _expect(machine["system"]["preservation"]["status"] == observed_status, machine)
+    _expect(calls == ([Path("/persistent")] if status == "available" else []), calls)
+    monkeypatch.setattr(sys, "argv", ["afairesi"])
+    subject.main()
+    output = capsys.readouterr().out
+    _expect(output == subject.render_overview(tree) + "\n", output)
+    _expect(
+        "status: " + observed_status in output and "preserved:" not in output,
+        output,
+    )
 
 
 def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
@@ -3712,3 +3634,81 @@ def test_static_test_sentences_follow_public_definitions_without_execution(
         subject.source_test_names(changed.encode(), "test_main.py") == expected,
         changed,
     )
+
+
+@pytest.mark.parametrize("os_id", ["nixos", "ubuntu", "unknown"])
+def test_system_inspection_checks_os_before_preservation(
+    os_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only inspect conventional system storage on a detected NixOS system."""
+    subject = import_module("packages.afairesi.main")
+    calls: list[Path] = []
+
+    def check_storage(root: Path) -> dict[str, str]:
+        calls.append(root)
+        return {"path": str(root), "status": "missing", "message": "Storage missing"}
+
+    monkeypatch.setattr(
+        subject.platform,
+        "freedesktop_os_release",
+        lambda: {
+            "ID": os_id,
+            "PRETTY_NAME": "Example OS",
+        },
+    )
+    monkeypatch.setattr(subject, "_preservation_status", check_storage)
+    details = subject.system_summary()
+    _expect(
+        details["os"]
+        == {
+            "id": os_id,
+            "name": "Example OS",
+            "status": "detected",
+        },
+        details,
+    )
+    _expect(calls == ([Path("/persistent")] if os_id == "nixos" else []), calls)
+    status = "missing" if os_id == "nixos" else "not_applicable"
+    _expect(details["preservation"]["status"] == status, details)
+
+
+def test_system_inspection_reports_unavailable_os(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not inspect storage when the OS cannot be identified."""
+    subject = import_module("packages.afairesi.main")
+
+    def unavailable_release() -> dict[str, str]:
+        message = "os-release is missing"
+        raise FileNotFoundError(message)
+
+    def unexpected_storage(_root: Path) -> dict[str, str]:
+        message = "storage inspected before OS identification"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(subject.platform, "freedesktop_os_release", unavailable_release)
+    monkeypatch.setattr(subject, "_preservation_status", unexpected_storage)
+    details = subject.system_summary()
+    _expect(details["os"]["status"] == "unavailable", details)
+    _expect(details["preservation"]["status"] == "not_applicable", details)
+    _expect("OS detection failed" in details["preservation"]["message"], details)
+
+
+@pytest.mark.parametrize("storage_state", ["missing", "file", "directory"])
+def test_system_preservation_reports_storage_state(
+    tmp_path: Path,
+    storage_state: str,
+) -> None:
+    """Distinguish missing storage from an available directory or invalid file."""
+    subject = import_module("packages.afairesi.main")
+    storage = tmp_path / "persistent"
+    if storage_state == "file":
+        storage.touch()
+    elif storage_state == "directory":
+        storage.mkdir()
+    expected = {"missing": "missing", "file": "not_directory", "directory": "available"}
+    details = subject._preservation_status(storage)  # noqa: SLF001 - status contract
+    _expect(details["status"] == expected[storage_state], details)
+    _expect(details["path"] == str(storage), details)
+    _expect(("message" in details) == (storage_state != "directory"), details)
