@@ -8,7 +8,7 @@ Afairesi uses shared Git repository and Nix flake conventions to describe a mach
 - A Git-tracked `$HOME` with a whitelisted `.gitignore`.
 - Nix flake Git submodules under `$HOME` at `<hostname>/<repository-path>`, each with conventional `packages/`, `hosts/`, and `checks/` directories.
 - Package directories with conventional places for source, tests, tracked resources (`prm/`), and runtime output (`tmp/`) where applicable.
-- Package names and descriptions show what is available.
+- `afairesi` provides progressive context: package names → descriptions → CLI arguments → test names.
 - `afairesi` shows OS and preservation status plus a filesystem tree of system paths, home whitelist paths, and repository summaries. JSON uses `system` and `filesystem` fields.
 - Pass a path to narrow inspection: `afairesi .` for a repository or `afairesi packages/NAME` for a package's interfaces and expected behavior.
 - `afairesi diff [PATH]` compares overview facts with Git's index; `--cached` compares with `HEAD`. System state has no Git baseline.
