@@ -3,9 +3,11 @@
 
 from __future__ import annotations
 
+import getpass
 import json
 import os
 import shutil
+import socket
 import stat
 import subprocess
 import sys
@@ -13,6 +15,7 @@ from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from textwrap import dedent
 from typing import TYPE_CHECKING, cast
 
 import coverage
@@ -756,7 +759,6 @@ def _check_overview_details(
         {"default.nix": "{}\n", "test_main.py": ""},
     ):
         details = subject.source_resource_data("empty", files)
-        _expect(subject.render_resource_overview(details) == "Name: empty", details)
         _expect(subject.resource_summary(details) == {}, details)
     package = repository / "packages/example"
     package.mkdir(parents=True)
@@ -814,12 +816,11 @@ def _check_overview_details(
         msg = "Asset line counts and suppressions must be structured source facts"
         raise AssertionError(msg)
     expected = (
-        "Name: example\nDescription: Example\n"
-        "Arguments:\n  build: command\n  build: --jobs  optional; default=2\n"
-        "Tests:\n  test result\n"
-        "Suppressions:\n  prm/nested/script.js: eslint-disable (global): 1"
+        "arguments:\n  - build: command\n  - build: --jobs  optional; default=2\n"
+        "description: Example\n"
+        "suppressions:\n  - prm/nested/script.js: eslint-disable (global): 1\n"
+        "tests:\n  - test result\n"
     )
-    _expect(subject.render_resource_overview(details) == expected, details)
     _expect(
         data
         == {
@@ -840,6 +841,14 @@ def _check_overview_details(
         data,
     )
     _expect(_overview(package) == data, data)
+    tree = _overview_tree(repository)
+    _expect(
+        tree[socket.gethostname()][getpass.getuser()]["local"][getpass.getuser()][
+            repository.name
+        ]
+        == data,
+        tree,
+    )
     (package / "test_main.py").write_text("def invalid(")
     unavailable = _overview(package)["packages"]["example"]
     _expect(
@@ -848,7 +857,8 @@ def _check_overview_details(
     )
     (package / "test_main.py").write_text("def test_result(): pass\n")
     _expect(
-        _run(repository, "packages/example").stdout == expected + "\n",
+        _resource_output(_run(repository, "packages/example").stdout, "example")
+        == expected,
         expected,
     )
 
@@ -874,12 +884,23 @@ def _check_home_summaries(home_repository: Path) -> None:
     with (home_repository / ".gitmodules").open("a", encoding="utf-8") as stream:
         stream.write('[submodule "second"]\npath = forge.example/owner/second\n')
     before = _snapshot(home_repository)
-    data = _overview(home_repository)
+    data = _overview_tree(home_repository)
     _expect(
         data
         == {
-            "packages": {f"{scope}/same": {"description": "Same"} for scope in scopes},
-            "hosts": {f"{scope}/same": {} for scope in scopes},
+            socket.gethostname(): {
+                getpass.getuser(): {
+                    "forge.example": {
+                        "owner": {
+                            name: {
+                                "packages": {"same": {"description": "Same"}},
+                                "hosts": {"same": {}},
+                            }
+                            for name in ("demo", "second")
+                        },
+                    },
+                },
+            },
         },
         data,
     )
@@ -913,6 +934,7 @@ def _check_host_summaries(repository: Path) -> None:
     before = _snapshot(repository)
     _expect(_overview(repository) == expected, expected)
     _expect(_overview(host) == expected, expected)
+    _expect(_run(host).stdout == _run(repository).stdout, expected)
     _expect(_snapshot(repository) == before, "host inspection changed source")
     configuration.write_text("{ invalid =")
     broken = _overview(host)["hosts"]["laptop"]
@@ -1229,9 +1251,39 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
     _expect(_snapshot(root) == before, arguments)
 
 
+def _overview_tree(root: Path) -> dict[str, Any]:
+    """Read the complete hierarchy from the CLI."""
+    return cast("dict[str, Any]", json.loads(_run(root, "--json", str(root)).stdout))
+
+
 def _overview(root: Path) -> dict[str, Any]:
-    """Read the selected package summaries from the CLI."""
-    return cast("dict[str, Any]", json.loads(_run(root, "--json").stdout))
+    """Read one repository's resource groups after validating machine and user."""
+    tree = _overview_tree(root)
+    _expect(set(tree) == {socket.gethostname()}, tree)
+    machine = tree[socket.gethostname()]
+    _expect(set(machine) == {getpass.getuser()}, machine)
+    branch = machine[getpass.getuser()]
+    while not set(branch).issubset({"hosts", "packages"}):
+        _expect(len(branch) == 1, branch)
+        branch = next(iter(branch.values()))
+    return cast("dict[str, Any]", branch)
+
+
+def _resource_output(output: str, name: str) -> str:
+    """Extract a resource's indented fields for declaration assertions."""
+    lines = iter(output.splitlines())
+    for line in lines:
+        if line.strip() == f"{name}:":
+            indentation = len(line) - len(line.lstrip())
+            break
+    else:
+        raise AssertionError(output)
+    fields = []
+    for line in lines:
+        if len(line) - len(line.lstrip()) <= indentation:
+            break
+        fields.append(line)
+    return dedent("\n".join(fields)) + ("\n" if fields else "")
 
 
 PACKAGE_NAMES = st.from_regex(
@@ -1450,9 +1502,9 @@ def _check_discovery_boundaries() -> None:
             before = _snapshot(root)
             inspected = _run(package, ".")
             _expect(
-                "Tests:\n  (unavailable:" in inspected.stdout
+                "tests: " in inspected.stdout
                 if layout in {"syntax", "encoding"}
-                else "Tests:\n" not in inspected.stdout,
+                else "tests:" not in inspected.stdout,
                 inspected,
             )
             _expect(_snapshot(root) == before, "malformed test source changed state")
@@ -1687,10 +1739,8 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
     nested.mkdir(parents=True)
     catalog = _run(root).stdout
     _expect(
-        "packages/alpha:\nName: alpha\n" in catalog
-        and "packages/beta:\nName: beta\n" in catalog
-        and "Tests:\n  test alpha\n" in catalog
-        and "Tests:\n  test beta\n" in catalog,
+        _resource_output(catalog, "alpha") == "tests:\n  - test alpha\n"
+        and _resource_output(catalog, "beta") == "tests:\n  - test beta\n",
         catalog,
     )
     summaries = _run(root, "--json").stdout
@@ -1699,30 +1749,24 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
         _expect(_run(cwd, "--json").stdout == summaries, cwd)
     focused_output = _run(package, ".", "--json").stdout
     _expect(_run(package, "--json", ".").stdout == focused_output, package)
-    focused = json.loads(focused_output)
+    focused = _overview(package)
     _run(root, "overview", code=2)
     _run(root, "unknown-command", code=2)
     _expect(
         focused == {"packages": {"alpha": {"tests": ["test alpha"]}}},
         focused,
     )
-    _expect("Name: alpha\n" in _run(package, ".").stdout, package)
+    _expect(
+        _resource_output(_run(package, ".").stdout, "alpha")
+        == "tests:\n  - test alpha\n",
+        package,
+    )
     _run(nested, ".", code=1)
     _run(home, "--json", code=1)
     (home / ".gitmodules").write_text(
         '[submodule "demo"]\npath = forge.example/team/demo\n',
     )
-    _expect(
-        _overview(home)
-        == {
-            collection: {
-                f"forge.example/team/demo/{name}": summary
-                for name, summary in resources.items()
-            }
-            for collection, resources in json.loads(summaries).items()
-        },
-        home,
-    )
+    _expect(_overview_tree(home) == json.loads(summaries), home)
     _run(nested, ".", "--json", code=1)
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
@@ -2101,7 +2145,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
                 _expect(imported.stdout == "1\n", imported)
                 _expect(
-                    "Arguments:\n" not in _run(package, ".").stdout,
+                    "arguments:\n" not in _run(package, ".").stdout,
                     "library contract",
                 )
                 (package / "main.py").write_text(
@@ -2138,7 +2182,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     code=2,
                 )
                 _expect(
-                    "Arguments:\n" not in _run(package, ".").stdout,
+                    "arguments:\n" not in _run(package, ".").stdout,
                     "scaffold must declare an empty CLI",
                 )
         else:
@@ -2602,6 +2646,67 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         )
 
 
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "git@forge.example:owner/demo.git",
+        "https://forge.example/owner/demo.git",
+        "ssh://git@forge.example/owner/demo.git",
+    ],
+)
+def test_overview_formats_share_machine_user_repository_hierarchy(
+    tmp_path: Path,
+    remote: str,
+) -> None:
+    """Use one full tree for hosted clones, packages, hosts, and both formats."""
+    _repository(tmp_path)
+    _git(tmp_path, "remote", "add", "origin", remote)
+    package = tmp_path / "packages/shared"
+    package.mkdir(parents=True)
+    (package / "default.nix").write_text('{ meta.description = "Shared"; }\n')
+    host = tmp_path / "hosts/shared"
+    host.mkdir(parents=True)
+    (host / "configuration.nix").write_text(
+        "{ inputs, system, ... }: { environment.systemPackages = "
+        "[ inputs.self.packages.${system}.shared ]; }\n",
+    )
+    groups = {
+        "hosts": {"shared": {"dependencies": ["runtime: packages/shared"]}},
+        "packages": {"shared": {"description": "Shared"}},
+    }
+    machine, user = socket.gethostname(), getpass.getuser()
+    expected = {machine: {user: {"forge.example": {"owner": {"demo": groups}}}}}
+    before = _snapshot(tmp_path)
+    _expect(_overview_tree(tmp_path) == expected, expected)
+    terminal = _run(tmp_path).stdout
+    _expect(
+        terminal
+        == (
+            f"{machine}:\n  {user}:\n    forge.example:\n"
+            "      owner:\n        demo:\n          hosts:\n            shared:\n"
+            "              dependencies:\n                - runtime: packages/shared\n"
+            "          packages:\n            shared:\n"
+            "              description: Shared\n"
+        ),
+        terminal,
+    )
+    for collection, selected in (("packages", package), ("hosts", host)):
+        focused = {
+            machine: {
+                user: {
+                    "forge.example": {
+                        "owner": {"demo": {collection: groups[collection]}},
+                    },
+                },
+            },
+        }
+        _expect(_overview_tree(selected) == focused, focused)
+        output = _run(selected).stdout
+        _expect(f"{machine}:\n  {user}:\n    forge.example:\n" in output, output)
+        _expect(f"          {collection}:\n            shared:\n" in output, output)
+    _expect(_snapshot(tmp_path) == before, "inspection changed Git or source state")
+
+
 def test_python_packages_require_the_shared_constructor() -> None:
     """Reject unsupported builders before convergence changes repository state."""
     with _fresh_repository() as root:
@@ -2952,16 +3057,16 @@ def test_source_overviews_preserve_declarations_and_source_facts(
             details["tests"] == ["test result"],
             details,
         )
-        focus = json.loads(_run(root, "packages/consumer", "--json").stdout)
+        focus = _overview(consumer)
         _expect(
             focus == {"packages": {"consumer": summaries["packages"]["consumer"]}},
             focus,
         )
         terminal = _run(root).stdout
         _expect(
-            "packages/consumer:\n" in terminal
+            "consumer:\n" in terminal
             and "runtime: packages/" + provider in terminal
-            and "  test result\n" in terminal,
+            and "- test result\n" in terminal,
             terminal,
         )
         _git(root, "add", "--force", ".")
@@ -3066,27 +3171,28 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
             + source,
         )
         expected_names = "".join(
-            "  test " + label.replace("_", " ") + "\n" for label in labels
+            "  - test " + label.replace("_", " ") + "\n" for label in labels
         )
         cwd = root if explicit else package
         target = (str(package),) if explicit else (".",)
         before = _snapshot(root)
         inspected = _run(cwd, *target)
+        overview = _resource_output(inspected.stdout, "my-package")
         expected_arguments = "".join(
-            "  " + line + "\n" for line in expected_args.splitlines()
+            "  - " + line + "\n" for line in expected_args.splitlines()
         )
         _expect(
-            "Arguments:\n" + expected_arguments in inspected.stdout
+            "arguments:\n" + expected_arguments in overview
             if expected_arguments
-            else "Arguments:\n" not in inspected.stdout,
+            else "arguments:\n" not in overview,
             contract,
         )
-        _expect("Dependencies:\n" not in inspected.stdout, inspected)
-        _expect("Suppressions:\n" not in inspected.stdout, inspected)
+        _expect("dependencies:\n" not in overview, inspected)
+        _expect("suppressions:\n" not in overview, inspected)
         _expect(
-            "Tests:\n" + expected_names in inspected.stdout
+            "tests:\n" + expected_names in overview
             if expected_names
-            else "Tests:\n" not in inspected.stdout,
+            else "tests:\n" not in overview,
             tests,
         )
         details = import_module("packages.afairesi.main").resource_data(package)
@@ -3105,9 +3211,11 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
             tests.replace("assert False", "raise RuntimeError('changed body')"),
         )
         _expect(
-            "Tests:\n" + expected_names in _run(package, ".").stdout
+            "tests:\n" + expected_names
+            in _resource_output(_run(package, ".").stdout, "my-package")
             if expected_names
-            else "Tests:\n" not in _run(package, ".").stdout,
+            else "tests:\n"
+            not in _resource_output(_run(package, ".").stdout, "my-package"),
             "body edits changed sentences",
         )
         (package / "test_main.py").unlink(missing_ok=True)
@@ -3119,22 +3227,19 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
         (missing / "test_main.py").unlink()
         (root / "packages/linked").symlink_to(package, target_is_directory=True)
         listed = _run(root)
-        package_summary = listed.stdout.split("packages/my-package:\n", 1)[1].split(
-            "\n\npackages/",
-            1,
-        )[0]
+        package_summary = _resource_output(listed.stdout, "my-package")
         _expect(
-            "Tests:\n" + expected_names.rstrip("\n") in package_summary
+            "tests:\n" + expected_names.rstrip("\n") in package_summary
             if expected_names
-            else "Tests:\n" not in package_summary,
+            else "tests:\n" not in package_summary,
             listed,
         )
         _expect(
-            "packages/my-package:\n" in listed.stdout
-            and "Tests:\n  (unavailable:" in listed.stdout
+            "my-package:\n" in listed.stdout
+            and "diagnostics:\n" in listed.stdout
             and "unsupported CLI interface" in listed.stdout
-            and "packages/untested:\n" in listed.stdout
-            and "packages/untested:\nName: untested\n\n" in listed.stdout
-            and "packages/linked:" not in listed.stdout,
+            and "untested:\n" in listed.stdout
+            and _resource_output(listed.stdout, "untested") == ""
+            and "linked:" not in listed.stdout,
             listed,
         )

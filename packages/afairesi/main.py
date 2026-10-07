@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import getpass
 import hashlib
 import io
 import json
@@ -17,6 +18,7 @@ import re
 import shlex
 import shutil
 import signal
+import socket
 import stat
 import subprocess
 import sys
@@ -2884,7 +2886,6 @@ class SourceRecord(TypedDict):
 class ResourceData(TypedDict):
     """Source facts used to build terminal and JSON summaries."""
 
-    name: str
     description: str | None
     cli: list[CliRecord]
     tests: list[str]
@@ -2959,7 +2960,6 @@ def source_resource_data(
             diagnostics["tests"] = str(error)
     sources = _source_observations(files, errors or {})
     return {
-        "name": name,
         "description": source_package_description(files.get(nix_filename, "")),
         "cli": cli,
         "tests": tests,
@@ -3032,52 +3032,20 @@ def resource_summary(data: ResourceData) -> dict[str, Any]:
     return {name: value for name, value in fields.items() if value}
 
 
-def render_resource_overview(data: ResourceData) -> str:
-    """Render the terminal overview from the same facts used by other clients."""
-    summary = resource_summary(data)
-
-    def group(name: str) -> list[str]:
-        diagnostic = "cli" if name == "arguments" else name
-        if error := data["diagnostics"].get(diagnostic):
-            return [f"(unavailable: {error})"]
-        return cast("list[str]", summary.get(name, []))
-
-    lines = [f"Name: {data['name']}"]
-    if data["description"]:
-        lines.append(f"Description: {data['description']}")
-    for title in ("Arguments", "Dependencies", "Tests", "Suppressions"):
-        entries = group(title.lower())
-        if entries:
-            lines.extend([f"{title}:", *(f"  {item}" for item in entries)])
-    return "\n".join(lines)
+def _repository_identity(root: Path) -> tuple[str, ...]:
+    """Use a hosted origin or canonical checkout path, with a local fallback."""
+    origin = git(root, ["remote", "get-url", "origin"], check=False)
+    if origin.returncode == 0:
+        with contextlib.suppress(CommandError):
+            return canonical_remote_path(origin.stdout.strip()).parts
+    domain = root.parent.parent.name
+    if "." in domain and not domain.startswith("."):
+        return domain, root.parent.name, root.name
+    return "local", getpass.getuser(), root.name
 
 
-def package_overview(package: Path) -> str:
-    """Read and summarize one package's conventional source inventory."""
-    data = resource_data(package)
-    return render_resource_overview(data) if data["sources"] else ""
-
-
-def overview_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
-    """Group selected resource summaries by collection, using keys as names."""
-    if (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
-        summaries: dict[str, dict[str, dict[str, Any]]] = {}
-        for repository in home_submodules(target, require_url=False):
-            relative = repository["path"]
-            checkout = (target / relative).resolve()
-            if not checkout.is_relative_to(target.resolve()):
-                msg = f"submodule path escapes the home repository: {relative}"
-                raise CommandError(msg)
-            if (checkout / "flake.nix").is_file():
-                for collection, resources in overview_summary(checkout).items():
-                    summaries.setdefault(collection, {}).update(
-                        (f"{relative}/{name}", summary)
-                        for name, summary in resources.items()
-                    )
-        if not summaries:
-            msg = f"no checked-out flake submodules found under {target}"
-            raise ValueError(msg)
-        return summaries
+def _repository_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
+    """Read the selected package and host collections within one repository."""
     if (target / "flake.nix").is_file():
         groups = {
             "packages": {
@@ -3122,41 +3090,66 @@ def overview_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
     }
 
 
-def _run_overview(target: Path) -> None:
-    """Show complete summaries for every selected package."""
-    if (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
-        found = False
+def overview_summary(target: Path) -> dict[str, Any]:
+    """Build the machine, user, domain, owner, repository, and resource tree."""
+    target = target.resolve()
+    repositories = [(target, target)]
+    if (
+        target.parent.name in {"packages", "hosts"}
+        and not (target / "flake.nix").is_file()
+    ):
+        repositories = [(target.parent.parent, target)]
+    elif (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
+        repositories = []
         for repository in home_submodules(target, require_url=False):
             relative = repository["path"]
-            checkout = target / relative
-            if not (checkout / "flake.nix").is_file():
-                continue
-            found = True
-            sys.stdout.write(f"{relative}:\n")
-            _run_overview(checkout)
-        if not found:
+            checkout = (target / relative).resolve()
+            if not checkout.is_relative_to(target):
+                msg = f"submodule path escapes the home repository: {relative}"
+                raise CommandError(msg)
+            if (checkout / "flake.nix").is_file():
+                repositories.append((checkout, checkout))
+        if not repositories:
             msg = f"no checked-out flake submodules found under {target}"
             raise ValueError(msg)
-        return
-    if (target / "flake.nix").is_file():
-        packages = detect_packages(target)
-        if not packages:
-            msg = f"no packages found under {target / 'packages'}"
-            raise ValueError(msg)
-        for package in packages:
-            sys.stdout.write(
-                f"packages/{package.name}:\n{package_overview(package.root)}\n\n",
-            )
-        return
-    validate_name(target.name)
-    if (
-        target.parent.name != "packages"
-        or not (target.parent.parent / "flake.nix").is_file()
-        or not (target / "default.nix").is_file()
-    ):
-        msg = "expected a canonical packages/NAME inside a flake"
-        raise ValueError(msg)
-    sys.stdout.write(package_overview(target) + "\n")
+    tree: dict[str, Any] = {}
+    user = tree.setdefault(socket.gethostname(), {}).setdefault(getpass.getuser(), {})
+    for root, selected in repositories:
+        groups = _repository_summary(selected)
+        branch = user
+        for component in _repository_identity(root):
+            branch = branch.setdefault(component, {})
+        for collection, resources in groups.items():
+            branch.setdefault(collection, {}).update(resources)
+    return tree
+
+
+def render_overview(tree: dict[str, Any]) -> str:
+    """Render the same nested facts as JSON, with indentation for every level."""
+    lines: list[str] = []
+
+    def visit(branch: dict[str, Any], depth: int) -> None:
+        prefix = "  " * depth
+        for name, value in sorted(branch.items()):
+            if isinstance(value, dict):
+                lines.append(f"{prefix}{name}:")
+                visit(value, depth + 1)
+            elif isinstance(value, list):
+                lines.append(f"{prefix}{name}:")
+                for item in value:
+                    content = str(item).splitlines() or [""]
+                    lines.append(f"{prefix}  - {content[0]}")
+                    lines.extend(f"{prefix}    {line}" for line in content[1:])
+            else:
+                content = str(value).splitlines()
+                if len(content) > 1:
+                    lines.append(f"{prefix}{name}:")
+                    lines.extend(f"{prefix}  {line}" for line in content)
+                else:
+                    lines.append(f"{prefix}{name}: {value}")
+
+    visit(tree, 0)
+    return "\n".join(lines)
 
 
 def _test_target_root(package: Path) -> Path:
@@ -3921,13 +3914,13 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         prog="afairesi",
         description=(
             "Create, inspect, and converge Git and Nix repositories "
-            "describing machines. Without a command, show package descriptions, "
-            "arguments, dependencies, and tests."
+            "describing machines. Without a command, show host and package "
+            "descriptions, arguments, dependencies, and tests."
         ),
         usage="%(prog)s [-h] [--json] [PATH]\n       %(prog)s COMMAND ...",
         epilog=(
-            "PATH selects a home, flake root, or package; "
-            "default: current repository root. JSON also accepts hosts/NAME."
+            "PATH selects a home, flake root, package, or host; "
+            "default: current repository root."
         ),
     )
     result.set_defaults(target=None)
@@ -3938,7 +3931,8 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
             type=_inspection_path,
             metavar="PATH",
             help=(
-                "home, flake root, or packages/NAME (default: current repository root)"
+                "home, flake root, packages/NAME, or hosts/NAME "
+                "(default: current repository root)"
             ),
         )
     result.add_argument(
@@ -4229,19 +4223,19 @@ def _dispatch_test_command(
 
 
 def _dispatch_overview(options: argparse.Namespace) -> None:
-    """Render current summaries or emit a selected source snapshot."""
-    target = _command_target(options.target)
+    """Render the selected hierarchy as indented text or JSON."""
+    tree = overview_summary(_command_target(options.target))
     if options.json:
         sys.stdout.write(
             json.dumps(
-                overview_summary(target),
+                tree,
                 indent=2,
                 sort_keys=True,
             )
             + "\n",
         )
     else:
-        _run_overview(target)
+        sys.stdout.write(render_overview(tree) + "\n")
 
 
 def _dispatch_standalone_command(
