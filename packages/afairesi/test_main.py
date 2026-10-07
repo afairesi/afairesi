@@ -811,7 +811,8 @@ def _check_overview_details(
         msg = "Asset line counts and suppressions must be structured source facts"
         raise AssertionError(msg)
     expected = (
-        "arguments:\n  - build: command\n  - build: --jobs  optional; default=2\n"
+        "cli:\n  commands:\n    build:\n      arguments:\n"
+        "        - --jobs  optional; default=2\n"
         "description: Example\n"
         "suppressions:\n  - prm/nested/script.js: eslint-disable (global): 1\n"
         "tests:\n  - result\n"
@@ -822,10 +823,13 @@ def _check_overview_details(
             "packages": {
                 "example": {
                     "description": "Example",
-                    "arguments": [
-                        "build: command",
-                        "build: --jobs  optional; default=2",
-                    ],
+                    "cli": {
+                        "commands": {
+                            "build": {
+                                "arguments": ["--jobs  optional; default=2"],
+                            },
+                        },
+                    },
                     "tests": ["result"],
                     "suppressions": [
                         "prm/nested/script.js: eslint-disable (global): 1",
@@ -943,9 +947,9 @@ def _check_host_summaries(repository: Path) -> None:
     _run(repository, "--json", str(repository), code=1)
 
 
-CLI_CONTRACTS = (
-    ("import argparse\ndef parser():\n    return argparse.ArgumentParser()\n", ""),
-    ("VALUE = 1\n", ""),
+CLI_CONTRACTS: tuple[tuple[str, dict[str, Any]], ...] = (
+    ("import argparse\ndef parser():\n    return argparse.ArgumentParser()\n", {}),
+    ("VALUE = 1\n", {}),
     (
         (
             "import argparse\n"
@@ -957,7 +961,7 @@ CLI_CONTRACTS = (
             ' p.add_argument("--public")\n'
             " return p\n"
         ),
-        "--public  optional\n",
+        {"arguments": ["--public  optional"]},
     ),
     (
         (
@@ -968,11 +972,12 @@ CLI_CONTRACTS = (
             'run = commands.add_parser("run")\n'
             'run.add_argument("mode", choices=["fast", "slow"])\n'
         ),
-        (
-            "-o, --output  optional; default='out'\n"
-            "run: command\n"
-            "run: mode  required; choices=['fast', 'slow']\n"
-        ),
+        {
+            "arguments": ["-o, --output  optional; default='out'"],
+            "commands": {
+                "run": {"arguments": ["mode  required; choices=['fast', 'slow']"]},
+            },
+        },
     ),
     (
         (
@@ -983,11 +988,12 @@ CLI_CONTRACTS = (
             'run = commands.add_parser("run")\n'
             'run.add_argument("mode", choices=["fast", "slow"])\n'
         ),
-        (
-            "-o, --output  optional; default='out'\n"
-            "run: command\n"
-            "run: mode  required; choices=['fast', 'slow']\n"
-        ),
+        {
+            "arguments": ["-o, --output  optional; default='out'"],
+            "commands": {
+                "run": {"arguments": ["mode  required; choices=['fast', 'slow']"]},
+            },
+        },
     ),
     (
         (
@@ -998,11 +1004,12 @@ CLI_CONTRACTS = (
             'run = commands.add_parser("run")\n'
             'run.add_argument("mode", choices=["fast", "slow"])\n'
         ),
-        (
-            "-o, --output  optional; default='out'\n"
-            "run: command\n"
-            "run: mode  required; choices=['fast', 'slow']\n"
-        ),
+        {
+            "arguments": ["-o, --output  optional; default='out'"],
+            "commands": {
+                "run": {"arguments": ["mode  required; choices=['fast', 'slow']"]},
+            },
+        },
     ),
 )
 NESTED_CONTRACTS = (
@@ -1532,6 +1539,80 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             _expect(_snapshot(root) == before, "nonrunnable target created state")
 
 
+def test_cli_summaries_nest_subcommands_and_preserve_argument_ownership(
+    tmp_path: Path,
+) -> None:
+    """Keep root, parent, child, sibling, and empty command interfaces distinct."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "")
+    source = (
+        "import argparse\n"
+        "p = argparse.ArgumentParser()\n"
+        "p.add_argument('--verbose')\n"
+        "commands = p.add_subparsers()\n"
+        "init = commands.add_parser('init')\n"
+        "test = commands.add_parser('test')\n"
+        "test.add_argument('--timeout')\n"
+        "children = test.add_subparsers()\n"
+        "coverage = children.add_parser('coverage')\n"
+        "coverage.add_argument('--jobs', default=2)\n"
+        "hypothesis = children.add_parser('hypothesis')\n"
+        "hypothesis.add_argument('--jobs', default=4)\n"
+    )
+    (package / "main.py").write_text(source)
+    expected = {
+        "arguments": ["--verbose  optional"],
+        "commands": {
+            "init": {},
+            "test": {
+                "arguments": ["--timeout  optional"],
+                "commands": {
+                    "coverage": {"arguments": ["--jobs  optional; default=2"]},
+                    "hypothesis": {"arguments": ["--jobs  optional; default=4"]},
+                },
+            },
+        },
+    }
+    _expect(_overview(package)["packages"]["example"]["cli"] == expected, package)
+    output = _resource_output(_run(package, ".").stdout, "example")
+    _expect(
+        output
+        == (
+            "cli:\n  arguments:\n    - --verbose  optional\n  commands:\n    init:\n"
+            "    test:\n      arguments:\n        - --timeout  optional\n"
+            "      commands:\n        coverage:\n          arguments:\n"
+            "            - --jobs  optional; default=2\n"
+            "        hypothesis:\n          arguments:\n"
+            "            - --jobs  optional; default=4\n"
+        ),
+        output,
+    )
+    _git(tmp_path, "add", ".")
+    (package / "main.py").write_text(source.replace("default=2", "default=3"))
+    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        data["repositories"][0]["changes"]
+        == [
+            {
+                "path": [
+                    "packages",
+                    "example",
+                    "cli",
+                    "commands",
+                    "test",
+                    "commands",
+                    "coverage",
+                    "arguments",
+                ],
+                "operation": "changed",
+                "before": ["--jobs  optional; default=2"],
+                "after": ["--jobs  optional; default=3"],
+            },
+        ],
+        data,
+    )
+
+
 @pytest.mark.parametrize("failure", [None, "coverage", "hypothesis", "mutation"])
 def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
     tmp_path: Path,
@@ -1979,9 +2060,9 @@ def test_diff_does_not_follow_source_symlinks_and_reports_parse_errors(
         details["repositories"][0]["changes"]
         == [
             {
-                "path": ["packages", "example", "arguments"],
+                "path": ["packages", "example", "cli"],
                 "operation": "removed",
-                "before": ["--old  optional"],
+                "before": {"arguments": ["--old  optional"]},
             },
         ],
         details,
@@ -2017,9 +2098,9 @@ def test_diff_handles_a_tracked_symlink_replaced_with_a_regular_source(
         data["repositories"][0]["changes"]
         == [
             {
-                "path": ["packages", "example", "arguments"],
+                "path": ["packages", "example", "cli"],
                 "operation": "added",
-                "after": ["--new  optional"],
+                "after": {"arguments": ["--new  optional"]},
             },
         ],
         data,
@@ -3260,13 +3341,12 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
         before = _snapshot(root)
         inspected = _run(root, str(package))
         overview = _resource_output(inspected.stdout, "my-package")
-        expected_arguments = "".join(
-            "  - " + line + "\n" for line in expected_args.splitlines()
-        )
+        subject = import_module("packages.afairesi.main")
+        expected_arguments = subject.render_overview({"cli": expected_args}) + "\n"
         _expect(
-            "arguments:\n" + expected_arguments in overview
-            if expected_arguments
-            else "arguments:\n" not in overview,
+            expected_arguments in overview
+            if expected_args
+            else "cli:\n" not in overview,
             contract,
         )
         _expect("dependencies:\n" not in overview, inspected)
@@ -3730,14 +3810,14 @@ def test_static_cli_declares_commands_and_campaign_filters() -> None:
 
 @pytest.mark.parametrize("contract", CLI_CONTRACTS)
 def test_static_cli_interfaces_match_declared_commands_and_arguments(
-    contract: tuple[str, str],
+    contract: tuple[str, dict[str, Any]],
 ) -> None:
     """Parse each supported CLI declaration without executing its source."""
     subject = import_module("packages.afairesi.main")
     source, expected = contract
     details = subject.source_resource_data("example", {"main.py": source})
     summary = subject.resource_summary(details)
-    _expect(summary.get("arguments", []) == expected.splitlines(), details)
+    _expect(summary.get("cli", {}) == expected, details)
     _expect(not details["diagnostics"], details)
 
 

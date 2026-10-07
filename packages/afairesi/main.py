@@ -2025,11 +2025,6 @@ class CliEntry:
     text: str
     command: bool = False
 
-    def render(self) -> str:
-        """Render a declaration for terminal overviews."""
-        prefix = " ".join(self.path)
-        return (prefix + ": " if prefix else "") + self.text
-
 
 def _argparse_cli(module: ast.Module, filename: str) -> list[CliEntry]:  # noqa: C901, PLR0915
     """Describe the supported static argparse declarations."""
@@ -2713,14 +2708,23 @@ def resource_data(directory: Path, *, path: str | None = None) -> ResourceData:
     return source_resource_data(directory.name, files, path=path, errors=errors)
 
 
+def cli_summary(entries: list[CliRecord]) -> dict[str, Any]:
+    """Preserve command nesting and attach arguments to their owning command."""
+    tree: dict[str, Any] = {}
+    for entry in entries:
+        branch = tree
+        for name in entry["path"]:
+            branch = branch.setdefault("commands", {}).setdefault(name, {})
+        if not entry["command"]:
+            branch.setdefault("arguments", []).append(entry["text"])
+    return tree
+
+
 def resource_summary(data: ResourceData) -> dict[str, Any]:
     """Keep populated fields for terminal and JSON summaries."""
     fields = {
         "description": data["description"],
-        "arguments": [
-            CliEntry(tuple(row["path"]), row["text"], row["command"]).render()
-            for row in data["cli"]
-        ],
+        "cli": cli_summary(data["cli"]),
         "dependencies": [
             _dependency_description(item) for item in data["dependencies"]
         ],
