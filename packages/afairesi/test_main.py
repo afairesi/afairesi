@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import shutil
@@ -750,6 +749,15 @@ def _check_overview_details(
     repository: Path,
 ) -> None:
     """Expose structured declarations independently of terminal labels and layout."""
+    subject = import_module("packages.afairesi.main")
+    for files in (
+        {},
+        {"main.py": "VALUE = 1\n"},
+        {"default.nix": "{}\n", "test_main.py": ""},
+    ):
+        details = subject.source_resource_data("empty", files)
+        _expect(subject.render_resource_overview(details) == "Name: empty", details)
+        _expect(subject.resource_summary(details) == {}, details)
     package = repository / "packages/example"
     package.mkdir(parents=True)
     help_text = (
@@ -778,10 +786,9 @@ def _check_overview_details(
     (package / "tmp").mkdir()
     (package / "tmp/generated.py").write_text("runtime\n")
     data = _overview(repository)
-    record = next(node for node in data["nodes"] if node["kind"] == "package")
-    details = record["details"]
-    if details["help"] != help_text or details["tests"] != ["test result"]:
-        msg = "Documentation and test sentences must be preserved as separate facts"
+    details = subject.resource_data(package)
+    if details["description"] != "Example" or details["tests"] != ["test result"]:
+        msg = "Descriptions and test sentences must be preserved as separate facts"
         raise AssertionError(msg)
     if details["cli"] != [
         {"path": ["build"], "text": "command", "command": True},
@@ -807,129 +814,49 @@ def _check_overview_details(
         msg = "Asset line counts and suppressions must be structured source facts"
         raise AssertionError(msg)
     expected = (
-        f"Name: example\nDescription: Example\nHelp: {help_text}\n"
+        "Name: example\nDescription: Example\n"
         "Arguments:\n  build: command\n  build: --jobs  optional; default=2\n"
-        "Dependencies:\n  (none)\nTests:\n  test result\n"
+        "Tests:\n  test result\n"
         "Suppressions:\n  prm/nested/script.js: eslint-disable (global): 1"
     )
-    _expect(record["overview"] == expected, record)
+    _expect(subject.render_resource_overview(details) == expected, details)
+    _expect(
+        data
+        == {
+            "packages": {
+                "example": {
+                    "description": "Example",
+                    "arguments": [
+                        "build: command",
+                        "build: --jobs  optional; default=2",
+                    ],
+                    "tests": ["test result"],
+                    "suppressions": [
+                        "prm/nested/script.js: eslint-disable (global): 1",
+                    ],
+                },
+            },
+        },
+        data,
+    )
+    _expect(_overview(package) == data, data)
+    (package / "test_main.py").write_text("def invalid(")
+    unavailable = _overview(package)["packages"]["example"]
+    _expect(
+        "tests" not in unavailable and "tests" in unavailable["diagnostics"],
+        unavailable,
+    )
+    (package / "test_main.py").write_text("def test_result(): pass\n")
     _expect(
         _run(repository, "packages/example").stdout == expected + "\n",
         expected,
     )
 
 
-def _check_overview_history(
-    repository: Path,
-) -> None:
-    """Read historical regular blobs with the same inventory as current sources."""
-    subject = import_module("packages.afairesi.main")
-    for relative, content in (
-        ("packages/tool/default.nix", "{}\n"),
-        ("packages/tool/main.py", '"""Original help."""\n'),
-        ("packages/tool/prm/nested/script.js", "/* eslint-disable */\n"),
-        (
-            "hosts/laptop/configuration.nix",
-            (
-                "{ inputs, system, ... }: { environment.systemPackages = [ "
-                "inputs.self.packages.${system}.tool ]; }\n"
-            ),
-        ),
-        ("checks/laptopVmWithDisko/default.nix", "{}\n"),
-    ):
-        path = repository / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
-    (repository / "packages/tool/prm/linked.py").symlink_to("../main.py")
-    _git(repository, "add", ".")
-    _git(
-        repository,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.com",
-        "commit",
-        "-qm",
-        "baseline",
-    )
-    baseline = subject.overview_data(repository)
-    historical = subject.overview_data(repository, revision="HEAD")
-    for before, after in zip(baseline["nodes"], historical["nodes"], strict=True):
-        if before.get("details") != after.get("details"):
-            msg = "Historical and current inventories must agree for identical sources"
-            raise AssertionError(msg)
-    (repository / "packages/tool/main.py").write_text('"""Changed help."""\n')
-    (repository / "packages/tool/prm/nested/script.js").unlink()
-    (repository / "hosts/laptop/configuration.nix").unlink()
-    (repository / "checks/laptopVmWithDisko/default.nix").unlink()
-    status = _git(repository, "status", "--porcelain=v1", "--untracked-files=all")
-    head = _git(repository, "rev-parse", "HEAD")
-    if subject.overview_data(repository, revision="HEAD") != historical:
-        msg = "Historical snapshots must retain removed resources and source assets"
-        raise AssertionError(msg)
-    current = subject.overview_data(repository)
-    if any(node["kind"] in {"host", "check"} for node in current["nodes"]):
-        msg = "Current snapshots must reflect removed resource sources"
-        raise AssertionError(msg)
-    with pytest.raises(subject.CommandError, match="could not read revision"):
-        subject.overview_data(repository, revision="does-not-exist")
-    with pytest.raises(subject.CommandError, match="could not read revision"):
-        subject.overview_data(repository, revision="--help")
-    if (
-        _git(repository, "status", "--porcelain=v1", "--untracked-files=all") != status
-        or _git(repository, "rev-parse", "HEAD") != head
-    ):
-        msg = "Source inspection must preserve the index, working tree, and refs"
-        raise AssertionError(msg)
-    output = _run(repository, "--json")
-    if json.loads(output.stdout) != current:
-        msg = "Python and CLI current snapshots must share their public contract"
-        raise AssertionError(msg)
-    (repository / "packages/tool/default.nix").unlink()
-    focused = subject.overview_data(repository / "packages/tool", revision="HEAD")
-    if focused["focus"] != ".:packages/tool" or focused["nodes"] != historical["nodes"]:
-        msg = "Historical focus must work when current package markers are removed"
-        raise AssertionError(msg)
-
-
-def _check_missing_history(
-    tmp_path: Path,
-) -> None:
-    """Recognize initialized home policy and distinguish absent HEAD from errors."""
-    subject = import_module("packages.afairesi.main")
-    (tmp_path / ".gitignore").write_text("/*\n!/.gitignore\n!/.gitmodules\n")
-    child = tmp_path / "forge.example"
-    child.mkdir()
-    if (
-        subject.canonical_root(child) != tmp_path
-        or subject.overview_data(tmp_path)["profile"] != "home"
-    ):
-        msg = "Root discovery must recognize home policy before any submodules exist"
-        raise AssertionError(msg)
-    (tmp_path / ".gitignore").unlink()
-    (tmp_path / "flake.nix").write_text("{}\n")
-    historical = subject.overview_data(tmp_path, revision="HEAD")
-    if historical["nodes"] != [
-        {
-            "id": ".:repository",
-            "kind": "repository",
-            "name": ".",
-            "repository": ".",
-            "path": ".",
-            "profile": "flake",
-            "available": False,
-            "revision_available": False,
-        },
-    ]:
-        msg = "Missing history must remain explicit without inventing resources"
-        raise AssertionError(msg)
-
-
-def _check_home_graph(
-    home_repository: Path,
-) -> None:
-    """Keep same-named packages distinct and expose Afairesi check relationships."""
-    for relative in ("forge.example/owner/demo", "forge.example/owner/second"):
+def _check_home_summaries(home_repository: Path) -> None:
+    """Group same-named packages and hosts by repository without including checks."""
+    scopes = ("forge.example/owner/demo", "forge.example/owner/second")
+    for relative in scopes:
         root = home_repository / relative
         root.mkdir(parents=True, exist_ok=True)
         (root / "flake.nix").write_text("", encoding="utf-8")
@@ -938,89 +865,71 @@ def _check_home_graph(
             '{ meta.description = "Same"; }',
             encoding="utf-8",
         )
-        (root / "checks/same").mkdir(parents=True)
-        (root / "checks/same/default.nix").write_text("{}", encoding="utf-8")
+        for collection, filename in (
+            ("checks", "default.nix"),
+            ("hosts", "configuration.nix"),
+        ):
+            (root / collection / "same").mkdir(parents=True)
+            (root / collection / "same" / filename).write_text("{}")
     with (home_repository / ".gitmodules").open("a", encoding="utf-8") as stream:
         stream.write('[submodule "second"]\npath = forge.example/owner/second\n')
-    data = json.loads(_run(home_repository, "--json").stdout)
-    ids = {node["id"] for node in data["nodes"]}
-    for scope in ("forge.example/owner/demo", "forge.example/owner/second"):
-        if f"{scope}:packages/same" not in ids:
-            raise AssertionError(data)
-        if not any(
-            edge["source"] == f"{scope}:packages/same"
-            and edge["target"] == f"{scope}:checks/same"
-            and edge["kind"] == "checked-by"
-            for edge in data["edges"]
-        ):
-            raise AssertionError(data)
-    if len(ids) != len(data["nodes"]):
-        raise AssertionError(data)
+    before = _snapshot(home_repository)
+    data = _overview(home_repository)
+    _expect(
+        data
+        == {
+            "packages": {f"{scope}/same": {"description": "Same"} for scope in scopes},
+            "hosts": {f"{scope}/same": {} for scope in scopes},
+        },
+        data,
+    )
+    _expect(_snapshot(home_repository) == before, "JSON inspection changed the home")
+    _git(home_repository, "config", "-f", ".gitmodules", "submodule.second.path", "..")
+    rejected = _run(home_repository, "--json", code=1)
+    _expect("submodule path escapes" in rejected.stderr, rejected)
 
 
-def _check_host_graph(
-    home_repository: Path,
-) -> None:
-    """Link host package usage without confusing repositories or external inputs."""
-    scope = "forge.example/owner/demo"
-    root = home_repository / scope
-    root.mkdir(parents=True, exist_ok=True)
-    (root / "flake.nix").write_text("", encoding="utf-8")
-    package = root / "packages/same"
-    package.mkdir(parents=True)
-    (package / "default.nix").write_text("{}", encoding="utf-8")
-    host = root / "hosts/same"
+def _check_host_summaries(repository: Path) -> None:
+    """Summarize host-only flakes and preserve diagnostics and explicit scope."""
+    host = repository / "hosts/laptop"
     host.mkdir(parents=True)
-    (host / "configuration.nix").write_text(
-        "{ inputs, pkgs, ... }: let local = inputs.self.packages.${pkgs.system}; in {\n"
-        "  environment.systemPackages = [ local.same pkgs.git local.missing ];\n"
-        "  service.package = local.same;\n"
-        "  module = ../../packages/same;\n"
-        "  external = inputs.other.packages.${pkgs.system}.same;\n"
-        "}\n",
-        encoding="utf-8",
+    configuration = host / "configuration.nix"
+    configuration.write_text(
+        '{ inputs, system, ... }: { meta.description = "Laptop"; '
+        "environment.systemPackages = [ inputs.self.packages.${system}.tool ]; }\n",
     )
-    data = json.loads(_run(home_repository, "--json").stdout)
-    nodes = {node["id"]: node for node in data["nodes"]}
-    host_id = f"{scope}:hosts/same"
-    edges = [
-        edge
-        for edge in data["edges"]
-        if edge["target"] == host_id and edge["kind"] != "contains"
-    ]
-    if {(edge["source"], edge["kind"]) for edge in edges} != {
-        (f"{scope}:packages/same", "runtime"),
-        (f"{scope}:packages/same", "source"),
-        (f"{scope}:packages/missing", "runtime"),
-    }:
-        raise AssertionError(edges)
-    if nodes[f"{scope}:packages/missing"]["kind"] != "package-reference":
-        raise AssertionError(nodes)
-    if not nodes[host_id]["dependencies"]:
-        raise AssertionError(nodes[host_id])
-    if any(
-        edge["declaration"]["path"] != "hosts/same/configuration.nix"
-        or edge["declaration"]["line"] not in {2, 4}
-        for edge in edges
-    ):
-        raise AssertionError(edges)
+    (repository / "hosts/linked").symlink_to(host, target_is_directory=True)
+    linked_source = repository / "hosts/linked-source"
+    linked_source.mkdir()
+    (linked_source / "configuration.nix").symlink_to(configuration)
+    expected = {
+        "hosts": {
+            "laptop": {
+                "description": "Laptop",
+                "dependencies": ["runtime: packages/tool"],
+            },
+        },
+    }
+    before = _snapshot(repository)
+    _expect(_overview(repository) == expected, expected)
+    _expect(_overview(host) == expected, expected)
+    _expect(_snapshot(repository) == before, "host inspection changed source")
+    configuration.write_text("{ invalid =")
+    broken = _overview(host)["hosts"]["laptop"]
+    _expect("dependencies" in broken["diagnostics"] and "name" not in broken, broken)
+    configuration.unlink()
+    _run(repository, "--json", code=1)
 
 
-def _check_command_catalog(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Keep client command menus synchronized when CLI commands are added."""
+def _check_static_cli() -> None:
+    """Discover public CLI commands and campaign filters from source."""
     subject = import_module("packages.afairesi.main")
-    source = Path(__file__).with_name("main.py").read_bytes()
-    entries = subject.source_package_cli(source, "main.py")
-    discovered = {" ".join(entry.path) for entry in entries if entry.command}
+    source = Path(__file__).with_name("main.py").read_text()
+    entries = subject.source_resource_data("afairesi", {"main.py": source})["cli"]
+    discovered = {" ".join(entry["path"]) for entry in entries if entry["command"]}
     _expect(
-        discovered == {entry["command"] for entry in subject.command_catalog()},
-        "Afairesi must discover its own complete command interface",
-    )
-    _expect(
-        [entry["command"] for entry in subject.command_catalog()]
-        == [
+        discovered
+        == {
             "init",
             "add",
             "mv",
@@ -1030,15 +939,16 @@ def _check_command_catalog(
             "test hypothesis",
             "test mutation",
             "converge",
-        ],
-        "Commands must follow lifecycle, inspection, validation, and convergence order",
+        },
+        "Afairesi must discover its own complete command interface",
     )
     for campaign in ("hypothesis", "mutation"):
         path = ("test", campaign)
         for flag in ("-k", "-m"):
             _expect(
                 any(
-                    entry.path == path and entry.text.startswith(flag + "  ")
+                    entry["path"] == list(path)
+                    and entry["text"].startswith(flag + "  ")
                     for entry in entries
                 ),
                 f"Static discovery must include {flag} for {campaign}",
@@ -1050,21 +960,6 @@ def _check_command_catalog(
             options.keywords == "keyword" and options.markers == "marker",
             "Campaign filter arguments must retain their runtime behavior",
         )
-    cli = argparse.ArgumentParser(prog="afairesi")
-    commands = cli.add_subparsers()
-    added = commands.add_parser("future")
-    added.add_argument("--visible", help="Public option")
-    added.add_argument("--internal", help=argparse.SUPPRESS)
-    children = added.add_subparsers()
-    children.add_parser("nested").add_argument("target")
-    monkeypatch.setattr(subject, "parser", lambda: cli)
-    catalog = subject.command_catalog()
-    if [entry["command"] for entry in catalog] != ["future", "future nested"]:
-        msg = "Catalog must include new commands and their nested commands"
-        raise AssertionError(msg)
-    if "--visible" not in catalog[0]["help"] or "--internal" in catalog[0]["help"]:
-        msg = "Catalog must publish public parser help without hidden options"
-        raise AssertionError(msg)
 
 
 CLI_CONTRACTS = (
@@ -1149,7 +1044,7 @@ CLI_CONTRACTS = (
         ),
     ),
     ("import argparse\ndef parser():\n    return argparse.ArgumentParser()\n", ""),
-    ("VALUE = 1\n", "(not applicable)\n"),
+    ("VALUE = 1\n", ""),
     (
         (
             "import argparse\n"
@@ -1335,7 +1230,7 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
 
 
 def _overview(root: Path) -> dict[str, Any]:
-    """Read the public structured source contract."""
+    """Read the selected package summaries from the CLI."""
     return cast("dict[str, Any]", json.loads(_run(root, "--json").stdout))
 
 
@@ -1507,11 +1402,7 @@ def _check_discovery_boundaries() -> None:
         for nested, path, parameter in NESTED_CONTRACTS:
             (package / "main.py").write_text(sentinel + nested)
             before = _snapshot(root)
-            data = next(
-                node["details"]
-                for node in _overview(root)["nodes"]
-                if node["kind"] == "package"
-            )
+            data = import_module("packages.afairesi.main").resource_data(package)
             _expect(
                 _snapshot(root) == before,
                 "nested discovery executed code or changed state",
@@ -1561,7 +1452,7 @@ def _check_discovery_boundaries() -> None:
             _expect(
                 "Tests:\n  (unavailable:" in inspected.stdout
                 if layout in {"syntax", "encoding"}
-                else "Tests:\n  (not declared)" in inspected.stdout,
+                else "Tests:\n" not in inspected.stdout,
                 inspected,
             )
             _expect(_snapshot(root) == before, "malformed test source changed state")
@@ -1723,8 +1614,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
                     "coverage",
                 )
             _expect(_snapshot(root) == before, "nonrunnable target created state")
-    with pytest.MonkeyPatch.context() as monkeypatch:
-        _check_command_catalog(monkeypatch)
+    _check_static_cli()
     _check_discovery_boundaries()
 
 
@@ -1803,22 +1693,37 @@ def test_command_defaults_select_repository_and_explicit_targets_preserve_scope(
         and "Tests:\n  test beta\n" in catalog,
         catalog,
     )
-    graph = _run(root, "--json").stdout
+    summaries = _run(root, "--json").stdout
     for cwd in (package, nested):
         _expect(_run(cwd).stdout == catalog, cwd)
-        _expect(_run(cwd, "--json").stdout == graph, cwd)
+        _expect(_run(cwd, "--json").stdout == summaries, cwd)
     focused_output = _run(package, ".", "--json").stdout
     _expect(_run(package, "--json", ".").stdout == focused_output, package)
     focused = json.loads(focused_output)
     _run(root, "overview", code=2)
     _run(root, "unknown-command", code=2)
-    _expect(focused["focus"] == ".:packages/alpha", focused)
+    _expect(
+        focused == {"packages": {"alpha": {"tests": ["test alpha"]}}},
+        focused,
+    )
     _expect("Name: alpha\n" in _run(package, ".").stdout, package)
     _run(nested, ".", code=1)
+    _run(home, "--json", code=1)
+    (home / ".gitmodules").write_text(
+        '[submodule "demo"]\npath = forge.example/team/demo\n',
+    )
     _expect(
-        json.loads(_run(home, "--json").stdout)["profile"] == "home",
+        _overview(home)
+        == {
+            collection: {
+                f"forge.example/team/demo/{name}": summary
+                for name, summary in resources.items()
+            }
+            for collection, resources in json.loads(summaries).items()
+        },
         home,
     )
+    _run(nested, ".", "--json", code=1)
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
         (),
@@ -2149,10 +2054,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
         )
         _expect(actual["name"] == name.replace("-", "_"), actual)
         _expect(actual["meta"]["description"] == description, actual)
-        graph = _overview(root)
-        details = next(
-            node["details"] for node in graph["nodes"] if node["kind"] == "package"
-        )
+        details = _overview(root)["packages"][name]
         _expect(details["description"] == description, details)
         if kind == "latex":
             _expect(actual["dependencies"] == ["git", "curl", "tex"], actual)
@@ -2199,7 +2101,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
                 _expect(imported.stdout == "1\n", imported)
                 _expect(
-                    "Arguments:\n  (not applicable)\n" in _run(package, ".").stdout,
+                    "Arguments:\n" not in _run(package, ".").stdout,
                     "library contract",
                 )
                 (package / "main.py").write_text(
@@ -2236,7 +2138,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     code=2,
                 )
                 _expect(
-                    "Arguments:\n  (none)\n" in _run(package, ".").stdout,
+                    "Arguments:\n" not in _run(package, ".").stdout,
                     "scaffold must declare an empty CLI",
                 )
         else:
@@ -2916,11 +2818,11 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
 @given(name=PACKAGE_NAMES, object_format=st.sampled_from(("sha1", "sha256")))
 @example(name="core", object_format="sha1")
 @example(name="dash-case", object_format="sha256")
-def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  # noqa: PLR0915
+def test_source_overviews_preserve_declarations_and_source_facts(
     name: str,
     object_format: str,
 ) -> None:
-    """Model declarations and compare current and historical source views."""
+    """Model declarations and compare source facts with concise CLI summaries."""
     with _fresh_repository(object_format=object_format) as root:
         provider = "p" + name
         _run(root, "add", f"packages/{provider}", "nix", "Provider")
@@ -2930,7 +2832,7 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         (consumer / "default.nix").write_text(
             "{ inputs, pkgs, system, ... }: "
             "let local = inputs.self.packages.${system}; in {\n"
-            f"  propagatedBuildInputs = [ local.{provider} "
+            f'  propagatedBuildInputs = [ local.{provider} local."{provider}" '
             'local."\\missing" local."literal \\${name}" pkgs.git ];\n'
             f'  installPhase = "cp ${{../{provider}/main.py}} result";\n'
             "  # propagatedBuildInputs = [ local.fake ];\n"
@@ -3001,35 +2903,35 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
                 "pkgs.git ] else []; }"
             ),
         )
-        graph = _overview(root)
-        nodes = {node["id"]: node for node in graph["nodes"]}
+        summaries = _overview(root)
+        subject = import_module("packages.afairesi.main")
+        details = subject.resource_data(consumer)
         _expect(
-            graph["schema"] == "afairesi.overview"
-            and graph["analysis"] == "source-declarations",
-            graph,
-        )
-        _expect(
-            len(nodes) == len(graph["nodes"])
-            and nodes[".:packages/missing"]["kind"] == "package-reference",
-            graph,
-        )
-        edges = {
-            (edge["source"], edge["target"], edge["kind"])
-            for edge in graph["edges"]
-            if edge["target"] == ".:packages/consumer" and edge["kind"] != "contains"
-        }
-        _expect(
-            edges
+            {(item["target"], item["kind"]) for item in details["dependencies"]}
             == {
-                (f".:packages/{provider}", ".:packages/consumer", "runtime"),
-                (f".:packages/{provider}", ".:packages/consumer", "source"),
-                (".:packages/missing", ".:packages/consumer", "runtime"),
-                (".:packages/literal ${name}", ".:packages/consumer", "runtime"),
+                (f"packages/{provider}", "runtime"),
+                (f"packages/{provider}", "source"),
+                ("packages/missing", "runtime"),
+                ("packages/literal ${name}", "runtime"),
             },
-            edges,
+            details,
         )
-        _expect(not nodes[".:packages/computed"]["dependencies"], nodes)
-        details = nodes[".:packages/consumer"]["details"]
+        _expect("dependencies" not in summaries["packages"]["computed"], summaries)
+        summary_dependencies = summaries["packages"]["consumer"]["dependencies"]
+        _expect(
+            set(summary_dependencies)
+            == {
+                f"runtime: packages/{provider}",
+                f"source: packages/{provider}",
+                "runtime: packages/missing",
+                "runtime: packages/literal ${name}",
+            },
+            summaries,
+        )
+        _expect(
+            len(summary_dependencies) == len(set(summary_dependencies)),
+            "Repeated references must appear once per dependency kind and target",
+        )
         sources = {source["path"]: source for source in details["sources"]}
         _expect(
             set(sources)
@@ -3047,16 +2949,14 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
                 sources,
             )
         _expect(
-            details["source_metrics"]["suppressions"]
-            == {"noqa (global)": 1, "noqa (local)": 2, "type: ignore (local)": 1},
-            details,
-        )
-        _expect(
-            details["tests"] == ["test result"] and details["help"] == "Consumer help.",
+            details["tests"] == ["test result"],
             details,
         )
         focus = json.loads(_run(root, "packages/consumer", "--json").stdout)
-        _expect(focus["focus"] == ".:packages/consumer", focus)
+        _expect(
+            focus == {"packages": {"consumer": summaries["packages"]["consumer"]}},
+            focus,
+        )
         terminal = _run(root).stdout
         _expect(
             "packages/consumer:\n" in terminal
@@ -3067,27 +2967,16 @@ def test_source_overviews_preserve_dependency_graphs_source_facts_and_history(  
         _git(root, "add", "--force", ".")
         _fixture_git(root, "commit", "-qm", "Source snapshot")
         before = _snapshot(root)
-        subject = import_module("packages.afairesi.main")
-        historical = subject.overview_data(root, revision="HEAD")
         _expect(
-            [node.get("details") for node in historical["nodes"]]
-            == [node.get("details") for node in graph["nodes"]],
-            historical,
-        )
-        _expect(
-            _snapshot(root) == before and _overview(root) == graph,
+            _snapshot(root) == before and _overview(root) == summaries,
             "overview changed its repository",
         )
     with _fresh_repository() as root:
         _check_overview_details(root)
     with _fresh_repository() as root:
-        _check_overview_history(root)
-    with TemporaryDirectory(prefix="afairesi-history-") as directory:
-        _check_missing_history(Path(directory))
-    with TemporaryDirectory(prefix="afairesi-graph-") as directory:
-        _check_home_graph(_home_repository(Path(directory)))
-    with TemporaryDirectory(prefix="afairesi-host-graph-") as directory:
-        _check_host_graph(_home_repository(Path(directory)))
+        _check_host_summaries(root)
+    with TemporaryDirectory(prefix="afairesi-summaries-") as directory:
+        _check_home_summaries(_home_repository(Path(directory)))
 
 
 @settings(deadline=None)
@@ -3183,34 +3072,29 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
         target = (str(package),) if explicit else (".",)
         before = _snapshot(root)
         inspected = _run(cwd, *target)
+        expected_arguments = "".join(
+            "  " + line + "\n" for line in expected_args.splitlines()
+        )
         _expect(
-            "Arguments:\n"
-            + (
-                "".join("  " + line + "\n" for line in expected_args.splitlines())
-                or "  (none)\n"
-            )
-            + "Dependencies:\n"
-            in inspected.stdout,
+            "Arguments:\n" + expected_arguments in inspected.stdout
+            if expected_arguments
+            else "Arguments:\n" not in inspected.stdout,
             contract,
         )
+        _expect("Dependencies:\n" not in inspected.stdout, inspected)
+        _expect("Suppressions:\n" not in inspected.stdout, inspected)
         _expect(
-            "Tests:\n" + (expected_names or "  (none)\n") + "Suppressions:\n"
-            in inspected.stdout,
+            "Tests:\n" + expected_names in inspected.stdout
+            if expected_names
+            else "Tests:\n" not in inspected.stdout,
             tests,
         )
-        details = next(
-            node["details"]
-            for node in _overview(root)["nodes"]
-            if node["kind"] == "package"
-        )
+        details = import_module("packages.afairesi.main").resource_data(package)
         _expect(
             details["tests"] == ["test " + label.replace("_", " ") for label in labels],
             details,
         )
-        _expect(
-            details["help"] == "First paragraph.\n\nArguments:\n  Documentation text.",
-            details,
-        )
+        _expect("help" not in details and "Help:" not in inspected.stdout, details)
         _expect(
             _snapshot(root) == before
             and not (root / "SENTINEL").exists()
@@ -3221,8 +3105,9 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
             tests.replace("assert False", "raise RuntimeError('changed body')"),
         )
         _expect(
-            "Tests:\n" + (expected_names or "  (none)\n") + "Suppressions:\n"
-            in _run(package, ".").stdout,
+            "Tests:\n" + expected_names in _run(package, ".").stdout
+            if expected_names
+            else "Tests:\n" not in _run(package, ".").stdout,
             "body edits changed sentences",
         )
         (package / "test_main.py").unlink(missing_ok=True)
@@ -3234,13 +3119,22 @@ def test_static_interfaces_and_test_sentences_match_declarations_without_executi
         (missing / "test_main.py").unlink()
         (root / "packages/linked").symlink_to(package, target_is_directory=True)
         listed = _run(root)
+        package_summary = listed.stdout.split("packages/my-package:\n", 1)[1].split(
+            "\n\npackages/",
+            1,
+        )[0]
+        _expect(
+            "Tests:\n" + expected_names.rstrip("\n") in package_summary
+            if expected_names
+            else "Tests:\n" not in package_summary,
+            listed,
+        )
         _expect(
             "packages/my-package:\n" in listed.stdout
-            and "Tests:\n" + (expected_names or "  (none)\n") in listed.stdout
             and "Tests:\n  (unavailable:" in listed.stdout
             and "unsupported CLI interface" in listed.stdout
             and "packages/untested:\n" in listed.stdout
-            and "Tests:\n  (not declared)" in listed.stdout
+            and "packages/untested:\nName: untested\n\n" in listed.stdout
             and "packages/linked:" not in listed.stdout,
             listed,
         )

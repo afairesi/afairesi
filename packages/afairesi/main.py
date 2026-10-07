@@ -51,7 +51,6 @@ ROOT_FILES = {
 }
 PRM_NAME = "prm"
 TMP_NAME = "tmp"
-RESOURCE_SOURCE_DEPTH = 3
 SOURCE_SUFFIXES = {
     ".nix",
     ".py",
@@ -165,16 +164,6 @@ def _repository_type_markers(root: Path) -> tuple[bool, bool]:
     gitignore = _read_regular(root / ".gitignore") or ""
     home = (root / ".gitmodules").exists() or "!/.gitmodules" in gitignore.splitlines()
     return flake, home
-
-
-def canonical_root(directory: Path) -> Path:
-    """Find the nearest Afairesi layout, or retain an ordinary directory."""
-    directory = directory.resolve()
-    for candidate in (directory, *directory.parents):
-        if any(_repository_type_markers(candidate)):
-            repository_type(candidate)
-            return candidate
-    return directory
 
 
 def _read_regular(path: Path) -> str | None:
@@ -2172,22 +2161,11 @@ def _argparse_cli(module: ast.Module, filename: str) -> list[CliEntry]:  # noqa:
     return lines
 
 
-def source_package_cli(source: bytes, filename: str) -> list[CliEntry]:
-    """Describe conventional CLI declarations without importing package code."""
-    return _module_cli(
-        ast.parse(source, filename=filename),
-        filename,
-        empty_source=not source,
-    )
-
-
 def _module_cli(  # noqa: C901, PLR0912, PLR0915
     module: ast.Module,
     filename: str,
-    *,
-    empty_source: bool = False,
 ) -> list[CliEntry]:
-    """Read CLI declarations from the same AST used for module documentation."""
+    """Read conventional CLI declarations without executing package code."""
     imports: set[str] = set()
     for node in ast.walk(module):
         if isinstance(node, ast.Import):
@@ -2547,17 +2525,13 @@ def _module_cli(  # noqa: C901, PLR0912, PLR0915
     )
     if library:
         raise unsupported(module, library)
-    if (
-        not empty_source
-        and not _module_has_main(module)
-        and not any(
-            (isinstance(node, ast.Attribute) and node.attr == "argv")
-            or (isinstance(node, ast.Name) and node.id == "argv")
-            or (isinstance(node, ast.Constant) and node.value == "__main__")
-            for node in ast.walk(module)
-        )
+    if not _module_has_main(module) and not any(
+        (isinstance(node, ast.Attribute) and node.attr == "argv")
+        or (isinstance(node, ast.Name) and node.id == "argv")
+        or (isinstance(node, ast.Constant) and node.value == "__main__")
+        for node in ast.walk(module)
     ):
-        return [CliEntry((), "(not applicable)")]
+        return []
     msg = (
         f"unsupported CLI interface in {filename}: no supported static parser found; "
         "declare parser() for executable packages"
@@ -2646,9 +2620,6 @@ class DeclaredDependency(TypedDict):
 
     kind: str
     target: str
-    expression: str
-    line: int
-    resolved: bool
 
 
 _DEPENDENCY_FIELDS = {
@@ -2839,9 +2810,6 @@ def source_package_dependencies(
                 {
                     "kind": _DEPENDENCY_FIELDS[parts[-1]] if resolved else "unresolved",
                     "target": target,
-                    "expression": text,
-                    "line": node.start_point.row + 1,
-                    "resolved": resolved,
                 },
             )
     known = {record["target"] for record in records}
@@ -2854,9 +2822,6 @@ def source_package_dependencies(
                     {
                         "kind": "reference",
                         "target": target,
-                        "expression": text,
-                        "line": node.start_point.row + 1,
-                        "resolved": True,
                     },
                 )
                 known.add(target)
@@ -2874,14 +2839,10 @@ def source_package_dependencies(
                         {
                             "kind": "source",
                             "target": package,
-                            "expression": text,
-                            "line": node.start_point.row + 1,
-                            "resolved": True,
                         },
                     )
     unique = {
-        (record["kind"], record["target"], record["expression"]): record
-        for record in reversed(records)
+        (record["kind"], record["target"]): record for record in reversed(records)
     }
     return [
         unique[key]
@@ -2921,25 +2882,22 @@ class SourceRecord(TypedDict):
 
 
 class ResourceData(TypedDict):
-    """Source facts shared by terminal summaries and visualization clients."""
+    """Source facts used to build terminal and JSON summaries."""
 
     name: str
     description: str | None
-    help: str | None
     cli: list[CliRecord]
     tests: list[str]
     dependencies: list[DeclaredDependency]
-    dependency_source: str
     sources: list[SourceRecord]
     diagnostics: dict[str, str]
-    source_metrics: dict[str, dict[str, int]]
 
 
 def _source_observations(
     files: dict[str, str],
     errors: dict[str, str],
-) -> tuple[list[SourceRecord], dict[str, dict[str, int]]]:
-    """Keep per-file observations and aggregate source totals together."""
+) -> list[SourceRecord]:
+    """Keep per-file observations for the source inventory."""
     sources: list[SourceRecord] = [
         {
             "path": filename,
@@ -2959,16 +2917,7 @@ def _source_observations(
         for filename, message in sorted(errors.items())
     )
     sources.sort(key=lambda source: source["path"])
-    lines = {}
-    suppressions: Counter[str] = Counter()
-    for source in sources:
-        if source["path"].startswith("prm/"):
-            continue
-        if source["lines"] is not None:
-            lines[source["path"]] = source["lines"]
-        for item in source["suppressions"]:
-            suppressions[f"{item['kind']} ({item['scope']})"] += item["count"]
-    return sources, {"lines": lines, "suppressions": dict(suppressions)}
+    return sources
 
 
 def source_resource_data(
@@ -2992,12 +2941,10 @@ def source_resource_data(
             )
         except nix_syntax.NixSyntaxError as error:
             diagnostics["dependencies"] = str(error)
-    help_text = None
     cli: list[CliRecord] = []
     if main_source := files.get("main.py"):
         try:
             module = ast.parse(main_source, filename="main.py")
-            help_text = ast.get_docstring(module)
             cli = [
                 {"path": list(entry.path), "text": entry.text, "command": entry.command}
                 for entry in _module_cli(module, "main.py")
@@ -3010,18 +2957,15 @@ def source_resource_data(
             tests = source_test_names(test_source.encode(), "test_main.py")
         except SyntaxError as error:
             diagnostics["tests"] = str(error)
-    sources, metrics = _source_observations(files, errors or {})
+    sources = _source_observations(files, errors or {})
     return {
         "name": name,
         "description": source_package_description(files.get(nix_filename, "")),
-        "help": help_text,
         "cli": cli,
         "tests": tests,
         "dependencies": dependencies,
-        "dependency_source": nix_filename,
         "sources": sources,
         "diagnostics": diagnostics,
-        "source_metrics": metrics,
     }
 
 
@@ -3066,53 +3010,46 @@ def resource_data(directory: Path, *, path: str | None = None) -> ResourceData:
     return source_resource_data(directory.name, files, path=path, errors=errors)
 
 
-def render_resource_overview(data: ResourceData) -> str:
-    """Render the terminal overview from the same facts used by other clients."""
-    filenames = {source["path"] for source in data["sources"]}
-
-    def group(name: str, entries: list[str], absent: str) -> list[str]:
-        if error := data["diagnostics"].get(name):
-            return [f"(unavailable: {error})"]
-        return entries or [absent]
-
-    arguments = group(
-        "cli",
-        [
+def resource_summary(data: ResourceData) -> dict[str, Any]:
+    """Keep populated fields for terminal and JSON summaries."""
+    fields = {
+        "description": data["description"],
+        "arguments": [
             CliEntry(tuple(row["path"]), row["text"], row["command"]).render()
             for row in data["cli"]
         ],
-        "(none)" if "main.py" in filenames else "(not applicable)",
-    )
-    dependencies = group(
-        "dependencies",
-        [_dependency_description(item) for item in data["dependencies"]],
-        "(none)" if "default.nix" in filenames else "(not declared)",
-    )
-    tests = group(
-        "tests",
-        data["tests"],
-        "(none)" if "test_main.py" in filenames else "(not declared)",
-    )
-    suppressions = [
-        f"{source['path']}: {item['kind']} ({item['scope']}): {item['count']}"
-        for source in data["sources"]
-        for item in source["suppressions"]
-    ]
-    return "\n".join(
-        [
-            f"Name: {data['name']}",
-            f"Description: {data['description'] or '(not declared)'}",
-            f"Help: {data['help'] or '(module docstring not declared)'}",
-            "Arguments:",
-            *(f"  {item}" for item in arguments),
-            "Dependencies:",
-            *(f"  {item}" for item in dependencies),
-            "Tests:",
-            *(f"  {item}" for item in tests),
-            "Suppressions:",
-            *(f"  {item}" for item in (suppressions or ["(none)"])),
+        "dependencies": [
+            _dependency_description(item) for item in data["dependencies"]
         ],
-    )
+        "tests": data["tests"],
+        "suppressions": [
+            f"{source['path']}: {item['kind']} ({item['scope']}): {item['count']}"
+            for source in data["sources"]
+            for item in source["suppressions"]
+        ],
+        "diagnostics": data["diagnostics"],
+    }
+    return {name: value for name, value in fields.items() if value}
+
+
+def render_resource_overview(data: ResourceData) -> str:
+    """Render the terminal overview from the same facts used by other clients."""
+    summary = resource_summary(data)
+
+    def group(name: str) -> list[str]:
+        diagnostic = "cli" if name == "arguments" else name
+        if error := data["diagnostics"].get(diagnostic):
+            return [f"(unavailable: {error})"]
+        return cast("list[str]", summary.get(name, []))
+
+    lines = [f"Name: {data['name']}"]
+    if data["description"]:
+        lines.append(f"Description: {data['description']}")
+    for title in ("Arguments", "Dependencies", "Tests", "Suppressions"):
+        entries = group(title.lower())
+        if entries:
+            lines.extend([f"{title}:", *(f"  {item}" for item in entries)])
+    return "\n".join(lines)
 
 
 def package_overview(package: Path) -> str:
@@ -3121,350 +3058,67 @@ def package_overview(package: Path) -> str:
     return render_resource_overview(data) if data["sources"] else ""
 
 
-def _overview_graph_package(
-    scope: str,
-    package: Package,
-    nodes: dict[str, dict[str, Any]],
-    edges: list[dict[str, Any]],
-    *,
-    details: ResourceData | None = None,
-) -> None:
-    path = f"packages/{package.name}"
-    identifier = f"{scope}:{path}"
-    details = details if details is not None else resource_data(package.root)
-    dependencies = details["dependencies"]
-    nodes[identifier] = {
-        "id": identifier,
-        "kind": "package",
-        "name": package.name,
-        "repository": scope,
-        "path": path,
-        "package_type": package.kind,
-        "description": details["description"],
-        "overview": render_resource_overview(details),
-        "dependencies": dependencies,
-        "details": details,
-    }
-    edges.append(
-        {"source": f"{scope}:repository", "target": identifier, "kind": "contains"},
-    )
-    _overview_graph_dependencies(
-        scope,
-        path + "/default.nix",
-        dependencies,
-        nodes,
-        edges,
-    )
-
-
-def _overview_graph_dependencies(
-    scope: str,
-    path: str,
-    dependencies: list[DeclaredDependency],
-    nodes: dict[str, dict[str, Any]],
-    edges: list[dict[str, Any]],
-) -> None:
-    """Connect declared local packages to their package or host consumer."""
-    identifier = f"{scope}:{posixpath.dirname(path)}"
-    for dependency in dependencies:
-        target = dependency["target"]
-        target_id = f"{scope}:{target}"
-        nodes.setdefault(
-            target_id,
-            {
-                "id": target_id,
-                "kind": "package-reference",
-                "name": target,
-                "repository": scope,
-                "path": target,
-                "expression": dependency["expression"],
-                "resolved": dependency["resolved"],
-            },
-        )
-        edges.append(
-            {
-                "source": target_id,
-                "target": identifier,
-                "kind": dependency["kind"],
-                "declaration": {
-                    "repository": scope,
-                    "path": path,
-                    "line": dependency["line"],
-                    "expression": dependency["expression"],
-                },
-            },
-        )
-
-
-def _revision_tree(root: Path, revision: str) -> str | None:
-    """Resolve revisions within this worktree without treating names as options."""
-    location = git(root, ["rev-parse", "--show-toplevel"], check=False)
-    if (
-        location.returncode != 0
-        or Path(location.stdout.strip()).resolve() != root.resolve()
-    ):
-        if revision == "HEAD":
-            return None
-        msg = f"could not read revision {revision}: expected a Git worktree at {root}"
-        raise CommandError(msg)
-    resolved = git(
-        root,
-        ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{tree}}"],
-        check=False,
-    )
-    if resolved.returncode != 0:
-        if (
-            revision == "HEAD"
-            and git(root, ["rev-parse", "--verify", "HEAD"], check=False).returncode
-            != 0
-        ):
-            return None
-        msg = f"could not read revision {revision}: {resolved.stderr.strip()}"
-        raise CommandError(msg)
-    return resolved.stdout.strip()
-
-
-def _revision_sources(root: Path, revision: str) -> dict[str, str] | None:
-    """Read regular source blobs without checking out a revision or following links."""
-    identifier = _revision_tree(root, revision)
-    if identifier is None:
-        return None
-    tree = git(root, ["ls-tree", "-rz", "--full-tree", identifier, "--"], check=False)
-    if tree.returncode != 0:
-        msg = f"could not read revision {revision}: {tree.stderr.strip()}"
-        raise CommandError(msg)
-    blobs = []
-    for entry in tree.stdout.split("\0"):
-        if not entry:
-            continue
-        metadata, _, filename = entry.partition("\t")
-        mode, kind, identifier = metadata.split()
-        parts = Path(filename).parts
-        if mode not in {"100644", "100755"} or kind != "blob":
-            continue
-        if filename == "flake.nix" or (
-            len(parts) >= RESOURCE_SOURCE_DEPTH
-            and parts[0] in {"packages", "hosts", "checks"}
-            and _resource_source_path(str(Path(*parts[2:])))
-        ):
-            blobs.append((filename, identifier))
-    if not blobs:
-        return {}
-    completed = subprocess.run(  # noqa: S603
-        ["git", "-C", str(root), "cat-file", "--batch"],  # noqa: S607
-        input="".join(f"{identifier}\n" for _, identifier in blobs).encode(),
-        capture_output=True,
-        check=False,
-    )
-    if completed.returncode != 0:
-        diagnostic = completed.stderr.decode(errors="replace").strip()
-        msg = f"could not read revision {revision}: {diagnostic}"
-        raise CommandError(msg)
-    result = {}
-    position = 0
-    for filename, _ in blobs:
-        end = completed.stdout.index(b"\n", position)
-        size = int(completed.stdout[position:end].rsplit(b" ", 1)[1])
-        position = end + 1
-        result[filename] = completed.stdout[position : position + size].decode(
-            errors="replace",
-        )
-        position += size + 1
-    return result
-
-
-def _revision_resources(
-    files: dict[str, str],
-    collection: str,
-) -> dict[str, dict[str, str]]:
-    """Group the same conventional source inventory used by working-tree reads."""
-    result: dict[str, dict[str, str]] = {}
-    for filename, source in files.items():
-        parts = Path(filename).parts
-        if len(parts) >= RESOURCE_SOURCE_DEPTH and parts[0] == collection:
-            result.setdefault(parts[1], {})[str(Path(*parts[2:]))] = source
-    return result
-
-
-def _revision_package(root: Path, name: str, files: dict[str, str]) -> Package:
-    """Recognize historical package markers with the current detection rules."""
-    return Package(name, _package_kind(name, set(files)), root / "packages" / name)
-
-
-def _collection_data(
-    root: Path,
-    collection: str,
-    filename: str,
-    sources: dict[str, str] | None,
-) -> dict[str, ResourceData]:
-    """Read host and check facts from a working tree or historical source map."""
-    if sources is not None:
-        return {
-            name: source_resource_data(name, files, path=f"{collection}/{name}")
-            for name, files in _revision_resources(sources, collection).items()
-            if filename in files
-        }
-    return {
-        source.parent.name: resource_data(
-            source.parent,
-            path=f"{collection}/{source.parent.name}",
-        )
-        for source in (root / collection).glob(f"*/{filename}")
-        if not source.parent.is_symlink() and not source.is_symlink()
-    }
-
-
-def overview_data(target: Path, *, revision: str | None = None) -> dict[str, Any]:  # noqa: C901, PLR0912 - traverse canonical collections
-    """Return a versioned, source-based graph for other Afairesi clients."""
-    target = target.resolve()
-    focus = None
-    if target.parent.name == "packages" and (
-        (target / "default.nix").is_file() or revision is not None
-    ):
-        focus = f".:packages/{target.name}"
-        target = target.parent.parent
-    current_type = repository_type(target)
-    repositories = [(".", target)]
-    if current_type == "home":
-        repositories = []
+def overview_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
+    """Group selected resource summaries by collection, using keys as names."""
+    if (target / ".gitmodules").is_file() and not (target / "flake.nix").exists():
+        summaries: dict[str, dict[str, dict[str, Any]]] = {}
         for repository in home_submodules(target, require_url=False):
-            scope = repository["path"]
-            checkout = (target / scope).resolve()
-            if not checkout.is_relative_to(target):
-                msg = f"submodule path escapes the home repository: {scope}"
+            relative = repository["path"]
+            checkout = (target / relative).resolve()
+            if not checkout.is_relative_to(target.resolve()):
+                msg = f"submodule path escapes the home repository: {relative}"
                 raise CommandError(msg)
-            repositories.append((scope, checkout))
-    nodes: dict[str, dict[str, Any]] = {}
-    edges: list[dict[str, Any]] = []
-    if current_type == "home":
-        nodes[".:repository"] = {
-            "id": ".:repository",
-            "kind": "repository",
-            "name": ".",
-            "repository": ".",
-            "path": ".",
-            "profile": "home",
-        }
-    for scope, root in sorted(repositories):
-        historical = _revision_sources(root, revision) if revision is not None else None
-        available = (
-            "flake.nix" in (historical or {})
-            if revision is not None
-            else (root / "flake.nix").is_file()
-        )
-        nodes[f"{scope}:repository"] = {
-            "id": f"{scope}:repository",
-            "kind": "repository",
-            "name": scope,
-            "repository": scope,
-            "path": ".",
-            "profile": "flake",
-            "available": available,
-        }
-        if revision is not None:
-            nodes[f"{scope}:repository"]["revision_available"] = historical is not None
-        if current_type == "home":
-            edges.append(
-                {
-                    "source": ".:repository",
-                    "target": f"{scope}:repository",
-                    "kind": "submodule",
-                },
-            )
-        if not available:
-            continue
-        previous_packages = _revision_resources(historical or {}, "packages")
-        packages = (
-            [
-                _revision_package(root, name, files)
-                for name, files in sorted(previous_packages.items())
-            ]
-            if revision is not None
-            else detect_packages(root)
-        )
-        for package in packages:
-            _overview_graph_package(
-                scope,
-                package,
-                nodes,
-                edges,
-                details=source_resource_data(
-                    package.name,
-                    previous_packages[package.name],
-                )
-                if revision is not None
-                else None,
-            )
-        for collection, filename, kind in (
-            ("hosts", "configuration.nix", "host"),
-            ("checks", "default.nix", "check"),
-        ):
-            resources = _collection_data(root, collection, filename, historical)
-            for name, details in sorted(resources.items()):
-                path = f"{collection}/{name}"
-                identifier = f"{scope}:{path}"
-                nodes[identifier] = {
-                    "id": identifier,
-                    "kind": kind,
-                    "name": name,
-                    "repository": scope,
-                    "path": path,
-                    "details": details,
-                }
-                edges.append(
-                    {
-                        "source": f"{scope}:repository",
-                        "target": identifier,
-                        "kind": "contains",
-                    },
-                )
-                if kind == "host":
-                    source_path = f"{path}/{filename}"
-                    dependencies = details["dependencies"]
-                    nodes[identifier]["dependencies"] = dependencies
-                    _overview_graph_dependencies(
-                        scope,
-                        source_path,
-                        dependencies,
-                        nodes,
-                        edges,
+            if (checkout / "flake.nix").is_file():
+                for collection, resources in overview_summary(checkout).items():
+                    summaries.setdefault(collection, {}).update(
+                        (f"{relative}/{name}", summary)
+                        for name, summary in resources.items()
                     )
-                if kind == "check":
-                    package_id = f"{scope}:packages/{name}"
-                    host_id = f"{scope}:hosts/{name.removesuffix('VmWithDisko')}"
-                    if package_id in nodes:
-                        edges.append(
-                            {
-                                "source": package_id,
-                                "target": identifier,
-                                "kind": "checked-by",
-                            },
-                        )
-                    elif host_id in nodes:
-                        edges.append(
-                            {
-                                "source": host_id,
-                                "target": identifier,
-                                "kind": "checked-by",
-                            },
-                        )
+        if not summaries:
+            msg = f"no checked-out flake submodules found under {target}"
+            raise ValueError(msg)
+        return summaries
+    if (target / "flake.nix").is_file():
+        groups = {
+            "packages": {
+                package.name: resource_summary(resource_data(package.root))
+                for package in detect_packages(target)
+            },
+            "hosts": {
+                source.parent.name: resource_summary(
+                    resource_data(source.parent, path=f"hosts/{source.parent.name}"),
+                )
+                for source in sorted((target / "hosts").glob("*/configuration.nix"))
+                if source.is_file()
+                and not source.is_symlink()
+                and not source.parent.is_symlink()
+            },
+        }
+        if not any(groups.values()):
+            msg = f"no packages or hosts found under {target}"
+            raise ValueError(msg)
+        return {
+            collection: resources
+            for collection, resources in groups.items()
+            if resources
+        }
+    collection = target.parent.name
+    validate = validate_host_name if collection == "hosts" else validate_name
+    validate(target.name)
+    marker = "configuration.nix" if collection == "hosts" else "default.nix"
+    if (
+        collection not in {"packages", "hosts"}
+        or not (target.parent.parent / "flake.nix").is_file()
+        or not (target / marker).is_file()
+    ):
+        msg = "expected a canonical packages/NAME or hosts/NAME inside a flake"
+        raise ValueError(msg)
     return {
-        "schema": "afairesi.overview",
-        "schema_version": 1,
-        "analysis": "source-declarations",
-        "profile": current_type,
-        "focus": focus,
-        "revision": revision,
-        "nodes": [nodes[key] for key in sorted(nodes)],
-        "edges": sorted(
-            edges,
-            key=lambda edge: (
-                edge["source"],
-                edge["target"],
-                edge["kind"],
-                json.dumps(edge, sort_keys=True),
+        collection: {
+            target.name: resource_summary(
+                resource_data(target, path=f"{collection}/{target.name}"),
             ),
-        ),
+        },
     }
 
 
@@ -4273,7 +3927,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         usage="%(prog)s [-h] [--json] [PATH]\n       %(prog)s COMMAND ...",
         epilog=(
             "PATH selects a home, flake root, or package; "
-            "default: current repository root."
+            "default: current repository root. JSON also accepts hosts/NAME."
         ),
     )
     result.set_defaults(target=None)
@@ -4290,7 +3944,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     result.add_argument(
         "--json",
         action="store_true",
-        help="emit package details as JSON",
+        help="emit package and host summaries as JSON, omitting empty fields",
     )
     if include_target:
         result.set_defaults(command=None)
@@ -4535,22 +4189,6 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     return result
 
 
-def command_catalog() -> list[dict[str, str]]:
-    """Describe public CLI commands for clients using the same parser as the CLI."""
-    entries: list[dict[str, str]] = []
-
-    def visit(command: argparse.ArgumentParser, path: tuple[str, ...]) -> None:
-        if path:
-            entries.append({"command": " ".join(path), "help": command.format_help()})
-        for action in command._actions:  # noqa: SLF001 - argparse exposes no public traversal API
-            if isinstance(action, argparse._SubParsersAction):  # noqa: SLF001
-                for name, child in action.choices.items():
-                    visit(child, (*path, name))
-
-    visit(parser(), ())
-    return entries
-
-
 def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
@@ -4596,7 +4234,7 @@ def _dispatch_overview(options: argparse.Namespace) -> None:
     if options.json:
         sys.stdout.write(
             json.dumps(
-                overview_data(target),
+                overview_summary(target),
                 indent=2,
                 sort_keys=True,
             )
