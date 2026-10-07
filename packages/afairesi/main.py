@@ -2219,11 +2219,8 @@ def _argparse_cli(module: ast.Module, filename: str) -> list[CliEntry]:  # noqa:
     return lines
 
 
-def _module_cli(  # noqa: C901, PLR0912, PLR0915
-    module: ast.Module,
-    filename: str,
-) -> list[CliEntry]:
-    """Read conventional CLI declarations without executing package code."""
+def _module_cli(module: ast.Module, filename: str) -> list[CliEntry]:
+    """Read static argparse declarations without executing package code."""
     imports: set[str] = set()
     for node in ast.walk(module):
         if isinstance(node, ast.Import):
@@ -2232,358 +2229,8 @@ def _module_cli(  # noqa: C901, PLR0912, PLR0915
             imports.add(node.module.split(".", 1)[0])
     if "argparse" in imports:
         return _argparse_cli(module, filename)
-
-    def unsupported(node: ast.AST, library: str) -> ValueError:
-        return ValueError(
-            f"unsupported CLI interface at {filename}:{getattr(node, 'lineno', 0)}: "
-            f"expected conventional static {library} declarations",
-        )
-
-    def labels(call: ast.Call) -> list[str]:
-        values = [*call.args]
-        values.extend(
-            keyword.value
-            for keyword in call.keywords
-            if keyword.arg in {"param_decls", "name", "help", "default", "required"}
-        )
-        result = []
-        for value in values:
-            try:
-                rendered = ast.literal_eval(value)
-            except (ValueError, TypeError):
-                continue
-            if isinstance(rendered, str) and rendered.startswith(("-", "<")):
-                result.append(rendered)
-        return result
-
-    def parameters(arguments: ast.arguments) -> list[tuple[ast.arg, ast.expr | None]]:
-        positional = [*arguments.posonlyargs, *arguments.args]
-        defaults: list[ast.expr | None] = [None] * (
-            len(positional) - len(arguments.defaults)
-        )
-        defaults.extend(arguments.defaults)
-        return [
-            *zip(positional, defaults, strict=True),
-            *zip(arguments.kwonlyargs, arguments.kw_defaults, strict=True),
-        ]
-
-    lines: list[CliEntry] = []
-    found = False
-    if "click" in imports:
-        command_paths: dict[str, tuple[str, ...]] = {}
-        command_functions = {
-            node.name: node
-            for node in ast.walk(module)
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-
-        def click_path(
-            name: str,
-            visiting: frozenset[str] = frozenset(),
-        ) -> tuple[str, ...]:
-            if name in command_paths:
-                return command_paths[name]
-            if name in visiting:
-                raise unsupported(command_functions[name], "Click")
-            function = command_functions[name]
-            for decorator in function.decorator_list:
-                if not isinstance(decorator, ast.Call) or not isinstance(
-                    decorator.func,
-                    ast.Attribute,
-                ):
-                    continue
-                if decorator.func.attr not in {"command", "group"}:
-                    continue
-                label = next(
-                    (
-                        str(ast.literal_eval(value))
-                        for value in [
-                            *decorator.args[:1],
-                            *(
-                                keyword.value
-                                for keyword in decorator.keywords
-                                if keyword.arg == "name"
-                            ),
-                        ]
-                    ),
-                    name,
-                )
-                owner = ast.unparse(decorator.func.value)
-                parent = (
-                    click_path(owner, visiting | {name})
-                    if owner in command_functions
-                    else ()
-                )
-                command_paths[name] = (*parent, label)
-                return command_paths[name]
-            return (name,)
-
-        for node in ast.walk(module):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            command = any(
-                isinstance(decorator, ast.Call)
-                and isinstance(decorator.func, ast.Attribute)
-                and decorator.func.attr in {"command", "group"}
-                for decorator in node.decorator_list
-            )
-            if command:
-                found = True
-                lines.append(CliEntry(click_path(node.name), "command", command=True))
-            for decorator in node.decorator_list:
-                if not isinstance(decorator, ast.Call) or not isinstance(
-                    decorator.func,
-                    ast.Attribute,
-                ):
-                    continue
-                if decorator.func.attr not in {"option", "argument"}:
-                    continue
-                names = labels(decorator)
-                if not names:
-                    raise unsupported(decorator, "Click")
-                found = True
-                help_text = next(
-                    (
-                        ast.literal_eval(item.value)
-                        for item in decorator.keywords
-                        if item.arg == "help"
-                        and isinstance(item.value, ast.Constant)
-                        and isinstance(item.value.value, str)
-                    ),
-                    "",
-                )
-                suffix = f"  help={help_text}" if help_text else ""
-                lines.append(
-                    CliEntry(click_path(node.name), f"{', '.join(names)}{suffix}"),
-                )
-        if found:
-            return lines
-    if "typer" in imports:
-        applications: dict[str, tuple[str, str]] = {}
-        for call in ast.walk(module):
-            if (
-                isinstance(call, ast.Call)
-                and isinstance(call.func, ast.Attribute)
-                and call.func.attr == "add_typer"
-                and call.args
-                and isinstance(call.args[0], ast.Name)
-            ):
-                label = next(
-                    (item.value for item in call.keywords if item.arg == "name"),
-                    None,
-                )
-                if not isinstance(label, ast.Constant) or not isinstance(
-                    label.value,
-                    str,
-                ):
-                    raise unsupported(call, "Typer")
-                applications[call.args[0].id] = (
-                    ast.unparse(call.func.value),
-                    label.value,
-                )
-
-        def typer_path(
-            owner: str,
-            visiting: frozenset[str] = frozenset(),
-        ) -> tuple[str, ...]:
-            if owner not in applications:
-                return ()
-            if owner in visiting:
-                raise unsupported(module, "Typer")
-            parent, name = applications[owner]
-            return (*typer_path(parent, visiting | {owner}), name)
-
-        lines.extend(
-            CliEntry(typer_path(owner), "command", command=True)
-            for owner in applications
-        )
-        functions = {
-            node.name: node
-            for node in module.body
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        }
-
-        def typer_function(  # noqa: C901, PLR0912
-            node: ast.FunctionDef | ast.AsyncFunctionDef,
-            path: tuple[str, ...],
-        ) -> None:
-            for argument, parameter_default in parameters(node.args):
-                if argument.arg in {"self", "cls"}:
-                    continue
-                annotation = argument.annotation
-                if isinstance(annotation, ast.Subscript) and ast.unparse(
-                    annotation.value,
-                ).endswith("Annotated"):
-                    annotation_parts = (
-                        annotation.slice.elts
-                        if isinstance(annotation.slice, ast.Tuple)
-                        else [annotation.slice]
-                    )
-                    annotation = annotation_parts[0]
-                    for metadata_part in annotation_parts[1:]:
-                        if isinstance(metadata_part, ast.Call) and isinstance(
-                            metadata_part.func,
-                            ast.Attribute,
-                        ):
-                            parameter_default = metadata_part  # noqa: PLW2901
-                annotation_text = ast.unparse(annotation) if annotation else "str"
-                parameter_kind = (
-                    "Option" if parameter_default is not None else "Argument"
-                )
-                help_text = ""
-                option_names: list[str] = []
-                if isinstance(parameter_default, ast.Call):
-                    parameter_kind = (
-                        parameter_default.func.attr
-                        if isinstance(parameter_default.func, ast.Attribute)
-                        else ast.unparse(parameter_default.func)
-                    )
-                    if parameter_kind not in {"Option", "Argument"}:
-                        raise unsupported(parameter_default, "Typer")
-                    option_names.extend(
-                        item.value
-                        for item in parameter_default.args
-                        if isinstance(item, ast.Constant)
-                        and isinstance(item.value, str)
-                        and item.value.startswith("-")
-                    )
-                    for keyword in parameter_default.keywords:
-                        if keyword.arg == "help" and isinstance(
-                            keyword.value,
-                            ast.Constant,
-                        ):
-                            help_text = str(keyword.value.value)
-                optional = parameter_default is not None
-                name = ", ".join(option_names) if option_names else argument.arg
-                if parameter_kind == "Option" and not option_names:
-                    name = f"--{argument.arg.replace('_', '-')}"
-                if parameter_kind == "Argument" and optional:
-                    name = f"[{argument.arg}]"
-                if parameter_default is not None and not isinstance(
-                    parameter_default,
-                    ast.Call,
-                ):
-                    try:
-                        default_text = repr(ast.literal_eval(parameter_default))
-                    except (ValueError, TypeError):
-                        raise unsupported(parameter_default, "Typer") from None
-                else:
-                    default_text = "required" if not optional else "optional"
-                parameter_detail = (
-                    default_text
-                    if parameter_default is None
-                    else f"default={default_text}"
-                )
-                suffix = f"; {parameter_detail}; type={annotation_text}"
-                if help_text:
-                    suffix += f"; help={help_text}"
-                lines.append(CliEntry(path, f"{name}  {suffix.lstrip('; ')}"))
-
-        run_targets = {
-            call.args[0].id
-            for call in ast.walk(module)
-            if isinstance(call, ast.Call)
-            and isinstance(call.func, (ast.Name, ast.Attribute))
-            and ast.unparse(call.func).endswith("run")
-            and call.args
-            and isinstance(call.args[0], ast.Name)
-        }
-        for name in sorted(run_targets):
-            if name not in functions:
-                continue
-            found = True
-            typer_function(functions[name], ())
-        for node in ast.walk(module):
-            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                continue
-            decorators = [
-                item
-                for item in node.decorator_list
-                if isinstance(item, ast.Call)
-                and isinstance(item.func, ast.Attribute)
-                and item.func.attr in {"command", "callback"}
-            ]
-            if not decorators:
-                continue
-            found = True
-            command_name = node.name
-            for decorator in decorators:
-                if decorator.args and isinstance(decorator.args[0], ast.Constant):
-                    command_name = str(decorator.args[0].value)
-                for keyword in decorator.keywords:
-                    if keyword.arg == "name" and isinstance(
-                        keyword.value,
-                        ast.Constant,
-                    ):
-                        command_name = str(keyword.value.value)
-            decorator = decorators[0]
-            typer_method = cast("ast.Attribute", decorator.func)
-            owner = ast.unparse(typer_method.value)
-            path = typer_path(owner)
-            if typer_method.attr == "command":
-                path = (*path, command_name)
-                lines.append(CliEntry(path, "command", command=True))
-            typer_function(node, path)
-        if found:
-            return lines
-    if "fire" in imports:
-        fire_calls = [
-            node
-            for node in ast.walk(module)
-            if isinstance(node, ast.Call)
-            and isinstance(node.func, (ast.Name, ast.Attribute))
-            and ast.unparse(node.func).endswith("Fire")
-        ]
-        if fire_calls:
-            found = True
-            targets = {
-                node.name: node
-                for node in module.body
-                if isinstance(
-                    node,
-                    (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef),
-                )
-            }
-            target = fire_calls[-1].args[0] if fire_calls[-1].args else None
-            target_name = target.id if isinstance(target, ast.Name) else None
-            for name, node in targets.items():
-                if target_name is not None and name != target_name:
-                    continue
-                callables = (
-                    [
-                        method
-                        for method in node.body
-                        if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef))
-                        and not method.name.startswith("_")
-                    ]
-                    if isinstance(node, ast.ClassDef)
-                    else [node]
-                )
-                for callable_node in callables:
-                    path = (callable_node.name,)
-                    lines.append(CliEntry(path, "command", command=True))
-                    for parameter, default in parameters(callable_node.args):
-                        if isinstance(node, ast.ClassDef) and parameter.arg in {
-                            "self",
-                            "cls",
-                        }:
-                            continue
-                        value = (
-                            "required"
-                            if default is None
-                            else repr(ast.literal_eval(default))
-                        )
-                        lines.append(
-                            CliEntry(path, f"{parameter.arg}  default={value}"),
-                        )
-            return lines
-    library = next(
-        (name for name in ("click", "typer", "fire") if name in imports),
-        None,
-    )
-    if library:
-        raise unsupported(module, library)
-    if not _module_has_main(module) and not any(
+    executable = _module_has_main(module) or bool(imports & {"click", "typer", "fire"})
+    if not executable and not any(
         (isinstance(node, ast.Attribute) and node.attr == "argv")
         or (isinstance(node, ast.Name) and node.id == "argv")
         or (isinstance(node, ast.Constant) and node.value == "__main__")
@@ -2591,8 +2238,8 @@ def _module_cli(  # noqa: C901, PLR0912, PLR0915
     ):
         return []
     msg = (
-        f"unsupported CLI interface in {filename}: no supported static parser found; "
-        "declare parser() for executable packages"
+        f"unsupported CLI interface in {filename}: no static argparse parser found; "
+        "declare an argparse parser() for executable packages"
     )
     raise ValueError(msg)
 
@@ -3149,13 +2796,18 @@ def _repository_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
 def home_preservation(root: Path) -> dict[str, Any]:
     """Parse anchored whitelist paths into a tree without expanding patterns."""
     source = _read_regular(root / ".gitignore") or ""
+    return _home_whitelist(source, root / ".gitignore")
+
+
+def _home_whitelist(source: str, path: Path) -> dict[str, Any]:
+    """Share whitelist interpretation between live and Git-backed overviews."""
     tree: dict[str, Any] = {}
     for line in source.splitlines():
         if not line.startswith("!/"):
             continue
         components = line[2:].rstrip("/").split("/")
         if any(component in {"", ".", ".."} for component in components):
-            msg = f"{root / '.gitignore'}: invalid whitelist path: {line}"
+            msg = f"{path}: invalid whitelist path: {line}"
             raise CommandError(msg)
         branch = tree
         for component in components:
@@ -3338,6 +2990,289 @@ def render_overview(tree: dict[str, Any]) -> str:
                     lines.append(f"{prefix}{name}: {value}")
 
     visit(tree, 0)
+    return "\n".join(lines)
+
+
+def _diff_entries(root: Path, version: str) -> dict[str, tuple[str, str]]:
+    """Read stage-zero index entries or HEAD, treating unborn HEAD as empty."""
+    if version == "HEAD":
+        if git(
+            root,
+            ["rev-parse", "--verify", "--quiet", "HEAD"],
+            check=False,
+        ).returncode:
+            return {}
+        output = git(root, ["ls-tree", "-r", "-z", "HEAD"]).stdout
+    else:
+        output = git(root, ["ls-files", "--stage", "-z"]).stdout
+    entries = {}
+    for record in output.split("\0"):
+        if not record:
+            continue
+        metadata, name = record.split("\t", 1)
+        mode, middle, last = metadata.split()
+        if version == "HEAD":
+            oid = last
+        else:
+            oid = middle
+            if last != "0":
+                message = f"{root}: unresolved index conflict at {name}"
+                raise CommandError(message)
+        entries[name] = (mode, oid)
+    return entries
+
+
+def _diff_source_path(name: str) -> bool:
+    """Select only files contributing to the semantic overview."""
+    parts = Path(name).parts
+    return (
+        name in {".gitignore", ".gitmodules"}
+        or (
+            len(parts) >= 3  # noqa: PLR2004 - collection/resource/file
+            and parts[0] in {"packages", "hosts"}
+            and _resource_source_path(Path(*parts[2:]).as_posix())
+        )
+    )
+
+
+def _diff_blobs(root: Path, oids: list[str]) -> dict[str, str]:
+    """Read source blobs in one binary-safe Git request without checking them out."""
+    if not oids:
+        return {}
+    completed = subprocess.run(  # noqa: S603
+        ["git", "-C", str(root), "cat-file", "--batch"],  # noqa: S607
+        input=("\n".join(oids) + "\n").encode(),
+        capture_output=True,
+        check=False,
+    )
+    if completed.returncode:
+        message = f"{root}: could not read Git source blobs"
+        raise CommandError(message)
+    stream = io.BytesIO(completed.stdout)
+    result = {}
+    for oid in oids:
+        header = stream.readline().split()
+        if len(header) != 3 or header[1] != b"blob":  # noqa: PLR2004 - Git batch header
+            message = f"{root}: unavailable Git blob {oid}"
+            raise CommandError(message)
+        result[oid] = stream.read(int(header[2])).decode(errors="replace")
+        stream.read(1)
+    return result
+
+
+def _diff_sources(
+    root: Path,
+    version: str,
+    entries: dict[str, tuple[str, str]],
+) -> dict[str, str]:
+    """Read tracked working sources or regular files from a Git snapshot."""
+    modes = {"100644", "100755"}
+    if version == "working_tree":
+        modes.add("120000")
+    selected = {
+        name: oid
+        for name, (mode, oid) in entries.items()
+        if mode in modes and _diff_source_path(name)
+    }
+    if version != "working_tree":
+        blobs = _diff_blobs(root, sorted(set(selected.values())))
+        return {name: blobs[oid] for name, oid in selected.items()}
+    sources = {}
+    for name in selected:
+        path = root / name
+        if path.is_symlink() or any(
+            parent.is_symlink() for parent in path.parents if parent != root
+        ):
+            continue
+        try:
+            if stat.S_ISREG(path.lstat().st_mode):
+                sources[name] = path.read_bytes().decode(errors="replace")
+        except FileNotFoundError:
+            continue
+    return sources
+
+
+def _diff_submodules(
+    root: Path,
+    version: str,
+    entries: dict[str, tuple[str, str]],
+    sources: dict[str, str],
+) -> list[str]:
+    """Read configured checkout paths from the matching working or Git policy."""
+    if ".gitmodules" not in sources:
+        return []
+    selector = (
+        ["--file", str(root / ".gitmodules")]
+        if version == "working_tree"
+        else ["--blob", entries[".gitmodules"][1]]
+    )
+    completed = git(
+        root,
+        ["config", *selector, "--null", "--get-regexp", r"^submodule\..*\.path$"],
+        check=False,
+    )
+    if completed.returncode not in {0, 1}:
+        message = f"{root}: could not read {version} submodule paths"
+        raise CommandError(message)
+    paths = sorted(
+        {record.split("\n", 1)[1] for record in completed.stdout.split("\0") if record},
+    )
+    for relative in paths:
+        if not (root / relative).resolve().is_relative_to(root):
+            message = f"submodule path escapes the home repository: {relative}"
+            raise CommandError(message)
+    return paths
+
+
+def _diff_snapshot(root: Path, version: str, scope: Path | None) -> dict[str, Any]:
+    """Apply the overview's source analysis to a working, index, or HEAD snapshot."""
+    entries = _diff_entries(root, version)
+    sources = _diff_sources(root, version, entries)
+    if scope is None:
+        return {
+            "paths": _home_whitelist(
+                sources.get(".gitignore", ""),
+                root / ".gitignore",
+            ),
+            "repositories": _diff_submodules(root, version, entries, sources),
+        }
+    resources: dict[tuple[str, str], dict[str, str]] = {}
+    for name, source in sources.items():
+        path = Path(name)
+        if len(path.parts) < 3 or path.parts[0] not in {"packages", "hosts"}:  # noqa: PLR2004
+            continue
+        if scope != Path() and not path.is_relative_to(scope):
+            continue
+        collection, resource = path.parts[:2]
+        resources.setdefault((collection, resource), {})[
+            Path(*path.parts[2:]).as_posix()
+        ] = source
+    result: dict[str, Any] = {}
+    for (collection, name), files in sorted(resources.items()):
+        if collection == "hosts" and "configuration.nix" not in files:
+            continue
+        result.setdefault(collection, {})[name] = resource_summary(
+            source_resource_data(name, files, path=f"{collection}/{name}"),
+        )
+    return result
+
+
+def _overview_changes(
+    before: object,
+    after: object,
+    path: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    """Represent semantic changes with structured paths and explicit operations."""
+    if before == after:
+        return []
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return [
+            {
+                "path": list(path),
+                "operation": "changed",
+                "before": before,
+                "after": after,
+            },
+        ]
+    changes = []
+    for key in sorted(before.keys() | after.keys()):
+        child_path = (*path, key)
+        if key not in before:
+            changes.append(
+                {"path": list(child_path), "operation": "added", "after": after[key]},
+            )
+        elif key not in after:
+            changes.append(
+                {
+                    "path": list(child_path),
+                    "operation": "removed",
+                    "before": before[key],
+                },
+            )
+        else:
+            changes.extend(_overview_changes(before[key], after[key], child_path))
+    return changes
+
+
+def diff_summary(target: Path | None, *, cached: bool = False) -> dict[str, Any]:
+    """Compare each selected repository against its own Git baseline."""
+    before, after = ("HEAD", "index") if cached else ("index", "working_tree")
+    selected = Path.home().resolve() if target is None else target.resolve()
+    root = repository_root(selected)
+    is_home = (
+        target is None
+        or (root / ".gitmodules").is_file()
+        or "!/.gitmodules" in (_read_regular(root / ".gitignore") or "").splitlines()
+    )
+    scope = None if is_home else selected.relative_to(root)
+    targets = [(root, scope)]
+    if is_home:
+        paths: set[str] = set()
+        for version in (before, after):
+            paths.update(_diff_snapshot(root, version, scope)["repositories"])
+        targets.extend((root / relative, Path()) for relative in sorted(paths))
+    repositories = []
+    for checkout, resource_scope in targets:
+        record: dict[str, Any] = {"path": str(checkout), "changes": []}
+        try:
+            if repository_root(checkout) != checkout:
+                message = f"{checkout}: repository is not checked out"
+                raise CommandError(message)  # noqa: TRY301 - report per-checkout failures
+            record["changes"] = _overview_changes(
+                _diff_snapshot(checkout, before, resource_scope),
+                _diff_snapshot(checkout, after, resource_scope),
+            )
+        except (CommandError, OSError) as error:
+            record["diagnostics"] = [str(error)]
+        repositories.append(record)
+    result: dict[str, Any] = {
+        "comparison": {"before": before, "after": after},
+        "repositories": repositories,
+        "uncompared": [],
+    }
+    if target is None:
+        result["uncompared"] = [
+            {
+                "sections": [
+                    "system.os",
+                    "system.preservation",
+                    "filesystem.system_paths",
+                ],
+                "reason": "OS metadata and stored system paths have no Git baseline.",
+            },
+        ]
+    return result
+
+
+def render_diff(data: dict[str, Any]) -> str:
+    """Render the same structured change records and baseline exclusions as JSON."""
+    comparison = data["comparison"]
+    lines = [f"Overview diff: {comparison['before']} -> {comparison['after']}"]
+    changed = False
+    for repository in data["repositories"]:
+        if not repository["changes"] and not repository.get("diagnostics"):
+            continue
+        changed = True
+        lines.append(repository["path"] + ":")
+        for change in repository["changes"]:
+            lines.append("  " + "/".join(change["path"]) + ":")
+            for field, prefix in (("before", "-"), ("after", "+")):
+                if field in change:
+                    value = json.dumps(
+                        change[field],
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                    lines.append(f"    {prefix} {value}")
+        lines.extend(
+            "  " + diagnostic for diagnostic in repository.get("diagnostics", [])
+        )
+    if not changed:
+        lines.append("No overview changes.")
+    lines.extend(
+        "Not compared: " + ", ".join(exclusion["sections"]) + ". " + exclusion["reason"]
+        for exclusion in data["uncompared"]
+    )
     return "\n".join(lines)
 
 
@@ -4137,6 +4072,29 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         title="commands",
         metavar="COMMAND",
     )
+    diff = commands.add_parser(
+        "diff",
+        help="compare overview facts with the Git index or HEAD",
+        description="Compare tracked overview facts in each selected repository.",
+    )
+    diff.add_argument(
+        "target",
+        nargs="?",
+        type=_inspection_path,
+        metavar="PATH",
+        help="home, repository, package, or host (default: whole machine)",
+    )
+    diff.add_argument(
+        "--cached",
+        "--staged",
+        action="store_true",
+        help="compare the index with HEAD instead of working files with the index",
+    )
+    diff.add_argument(
+        "--json",
+        action="store_true",
+        help="emit structured semantic changes and baseline exclusions",
+    )
     init = commands.add_parser(
         "init",
         help="initialize HOME, create a flake, or add a remote submodule",
@@ -4431,6 +4389,21 @@ def _dispatch_overview(options: argparse.Namespace) -> None:
         sys.stdout.write(render_overview(tree) + "\n")
 
 
+def _dispatch_diff(options: argparse.Namespace) -> None:
+    """Emit a semantic diff and signal incomplete repository comparisons."""
+    data = diff_summary(options.target, cached=options.cached)
+    sys.stdout.write(
+        (
+            json.dumps(data, indent=2, sort_keys=True)
+            if options.json
+            else render_diff(data)
+        )
+        + "\n",
+    )
+    if any(repository.get("diagnostics") for repository in data["repositories"]):
+        raise SystemExit(1)
+
+
 def _dispatch_standalone_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
@@ -4438,6 +4411,9 @@ def _dispatch_standalone_command(
     """Dispatch inspection, testing, and initialization commands."""
     if options.command == "test":
         return _dispatch_test_command(options, cli)
+    if options.command == "diff":
+        _dispatch_diff(options)
+        return True
     if options.command is None:
         _dispatch_overview(options)
         return True

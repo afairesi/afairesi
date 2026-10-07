@@ -11,6 +11,7 @@ Afairesi uses shared Git repository and Nix flake conventions to describe a mach
 - Package names and descriptions show what is available.
 - `afairesi` shows OS and preservation status plus a filesystem tree of system paths, home whitelist paths, and repository summaries. JSON uses `system` and `filesystem` fields.
 - Pass a path to narrow inspection: `afairesi .` for a repository or `afairesi packages/NAME` for a package's interfaces and expected behavior.
+- `afairesi diff [PATH]` compares overview facts with Git's index; `--cached` compares with `HEAD`. System state has no Git baseline.
 - Read tests or source code when more detail is needed.
 
 ## Runtime constraints

@@ -944,86 +944,6 @@ def _check_host_summaries(repository: Path) -> None:
 
 
 CLI_CONTRACTS = (
-    (
-        (
-            "import click\n"
-            "@click.command()\n"
-            "@click.option('--count', default=1, help='Number')\n"
-            "def cli(count): pass\n"
-        ),
-        "cli: command\ncli: --count  help=Number\n",
-    ),
-    (
-        (
-            "import typer\n"
-            "app = typer.Typer()\n"
-            "@app.command()\n"
-            "def greet(name: str, formal: bool = False): pass\n"
-        ),
-        (
-            "greet: command\n"
-            "greet: name  required; type=str\n"
-            "greet: --formal  default=False; type=bool\n"
-        ),
-    ),
-    (
-        "import fire\ndef greet(name='world'): pass\nfire.Fire(greet)\n",
-        "greet: command\ngreet: name  default='world'\n",
-    ),
-    (
-        (
-            "import typer\n"
-            "raise RuntimeError('must not execute')\n"
-            "app = typer.Typer()\n"
-            "@app.command()\n"
-            "def greet(name: str, suffix: str = '!', *, language: str, "
-            "formal: bool = False, note: str | None = None): pass\n"
-        ),
-        (
-            "greet: command\n"
-            "greet: name  required; type=str\n"
-            "greet: --suffix  default='!'; type=str\n"
-            "greet: language  required; type=str\n"
-            "greet: --formal  default=False; type=bool\n"
-            "greet: --note  default=None; type=str | None\n"
-        ),
-    ),
-    (
-        (
-            "import fire\n"
-            "raise RuntimeError('must not execute')\n"
-            "def greet(name, /, suffix='!', *, language, count=2, "
-            "note=None): pass\n"
-            "fire.Fire(greet)\n"
-        ),
-        (
-            "greet: command\n"
-            "greet: name  default=required\n"
-            "greet: suffix  default='!'\n"
-            "greet: language  default=required\n"
-            "greet: count  default=2\n"
-            "greet: note  default=None\n"
-        ),
-    ),
-    (
-        (
-            "import fire\n"
-            "raise RuntimeError('must not execute')\n"
-            "class Tools:\n"
-            " def greet(self, name, /, suffix='!', *, language, count=2, "
-            "note=None): pass\n"
-            " def _hidden(self): pass\n"
-            "fire.Fire(Tools)\n"
-        ),
-        (
-            "greet: command\n"
-            "greet: name  default=required\n"
-            "greet: suffix  default='!'\n"
-            "greet: language  default=required\n"
-            "greet: count  default=2\n"
-            "greet: note  default=None\n"
-        ),
-    ),
     ("import argparse\ndef parser():\n    return argparse.ArgumentParser()\n", ""),
     ("VALUE = 1\n", ""),
     (
@@ -1100,46 +1020,11 @@ NESTED_CONTRACTS = (
         ("test", "coverage"),
         "--jobs  optional; default=2; type=int",
     ),
-    (
-        (
-            "import click\n"
-            "@click.group()\n"
-            "def cli(): pass\n"
-            "@cli.group(name='test')\n"
-            "def tests(): pass\n"
-            "@tests.command('coverage')\n"
-            "@click.option('--jobs')\n"
-            "def coverage(jobs): pass\n"
-        ),
-        ("cli", "test", "coverage"),
-        "--jobs",
-    ),
-    (
-        (
-            "import typer\n"
-            "app = typer.Typer()\n"
-            "tests = typer.Typer()\n"
-            "app.add_typer(tests, name='test')\n"
-            "@tests.callback()\n"
-            "def settings(verbose: bool = False): pass\n"
-            "@tests.command(name='coverage')\n"
-            "def coverage(jobs: int = 2): pass\n"
-        ),
-        ("test", "coverage"),
-        "--jobs  default=2; type=int",
-    ),
-    (
-        (
-            "import fire\n"
-            "class Tools:\n"
-            " def coverage(self, jobs=2): pass\n"
-            "fire.Fire(Tools)\n"
-        ),
-        ("coverage",),
-        "jobs  default=2",
-    ),
 )
 UNSUPPORTED_INTERFACES = (
+    "import click\n@click.command()\ndef cli(): pass\n",
+    "import typer\napp = typer.Typer()\n@app.command()\ndef cli(): pass\n",
+    "import fire\ndef cli(): pass\nfire.Fire(cli)\n",
     "def main():\n    pass\n",
     "async def main():\n    pass\n",
     "from example import main\n",
@@ -2076,6 +1961,200 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
     _expect(_snapshot(tmp_path) == before, "coverage eligibility modified sources")
 
 
+def test_diff_does_not_follow_source_symlinks_and_reports_parse_errors(
+    tmp_path: Path,
+) -> None:
+    """Do not execute sources or read link targets while comparing interface changes."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "def test_baseline(): pass\n")
+    source = package / "main.py"
+    source.write_text(
+        "import argparse\np = argparse.ArgumentParser()\np.add_argument('--old')\n",
+    )
+    _git(tmp_path, "add", ".")
+    source.unlink()
+    source.symlink_to(tmp_path / "not-present")
+    details = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        details["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages", "example", "arguments"],
+                "operation": "removed",
+                "before": ["--old  optional"],
+            },
+        ],
+        details,
+    )
+    source.unlink()
+    source.write_text("def invalid(")
+    details = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        any(
+            change["path"] == ["packages", "example", "diagnostics"]
+            for change in details["repositories"][0]["changes"]
+        ),
+        details,
+    )
+
+
+def test_diff_handles_a_tracked_symlink_replaced_with_a_regular_source(
+    tmp_path: Path,
+) -> None:
+    """Discover a working interface that replaces an excluded index symlink."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "def test_result(): pass\n")
+    source = package / "main.py"
+    source.unlink()
+    source.symlink_to(tmp_path / "not-present")
+    _git(tmp_path, "add", ".")
+    source.unlink()
+    source.write_text(
+        "import argparse\np = argparse.ArgumentParser()\np.add_argument('--new')\n",
+    )
+    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        data["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages", "example", "arguments"],
+                "operation": "added",
+                "after": ["--new  optional"],
+            },
+        ],
+        data,
+    )
+
+
+def test_diff_handles_unborn_head_removed_packages_and_semantically_equal_edits(
+    tmp_path: Path,
+) -> None:
+    """Support Git's empty initial baseline and semantic additions and removals."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "def test_result(): pass\n")
+    _git(tmp_path, "add", ".")
+    staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
+    _expect(
+        staged["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages"],
+                "operation": "added",
+                "after": {"example": {"tests": ["result"]}},
+            },
+        ],
+        staged,
+    )
+    (package / "test_main.py").write_text(
+        "# comment\ndef test_result():\n    raise RuntimeError('new body')\n",
+    )
+    _expect("No overview changes." in _run(tmp_path, "diff", ".").stdout, package)
+    for path in package.iterdir():
+        path.unlink()
+    removed = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        removed["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages"],
+                "operation": "removed",
+                "before": {"example": {"tests": ["result"]}},
+            },
+        ],
+        removed,
+    )
+
+
+def test_diff_reports_unresolved_index_conflicts_without_modifying_state(
+    tmp_path: Path,
+) -> None:
+    """Reject ambiguous staged sources instead of silently choosing a conflict side."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "def test_result(): pass\n")
+    _git(tmp_path, "add", ".")
+    source = package / "test_main.py"
+    oid = _git(tmp_path, "hash-object", str(source)).strip()
+    relative = source.relative_to(tmp_path).as_posix()
+    subprocess.run(
+        ["git", "update-index", "--index-info"],  # noqa: S607
+        cwd=tmp_path,
+        input=(
+            f"0 {'0' * len(oid)}\t{relative}\n"
+            f"100644 {oid} 1\t{relative}\n"
+            f"100644 {oid} 2\t{relative}\n"
+        ),
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    before = _snapshot(tmp_path)
+    data = json.loads(_run(tmp_path, "diff", ".", "--json", code=1).stdout)
+    _expect(
+        "unresolved index conflict" in data["repositories"][0]["diagnostics"][0],
+        data,
+    )
+    _expect(_snapshot(tmp_path) == before, "diff changed conflicted index state")
+
+
+def test_diff_separates_working_index_and_head_without_modifying_state(
+    tmp_path: Path,
+) -> None:
+    """Compare staged and unstaged semantic facts while ignoring untracked sources."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "def test_baseline(): pass\n")
+    (package / "default.nix").write_text('{ meta.description = "Baseline"; }')
+    _git(tmp_path, "add", ".")
+    _fixture_git(tmp_path, "commit", "-qm", "Baseline")
+    (package / "test_main.py").write_text("def test_staged(): pass\n")
+    _git(tmp_path, "add", ".")
+    (package / "test_main.py").write_text("def test_working(): pass\n")
+    _make_source_package(tmp_path, "untracked", "def test_ignored(): pass\n")
+    before = _snapshot(tmp_path)
+    working = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
+    _expect(
+        working["comparison"] == {"before": "index", "after": "working_tree"},
+        working,
+    )
+    _expect(staged["comparison"] == {"before": "HEAD", "after": "index"}, staged)
+    for data, old, new in (
+        (working, "staged", "working"),
+        (staged, "baseline", "staged"),
+    ):
+        _expect(
+            data["repositories"]
+            == [
+                {
+                    "path": str(tmp_path),
+                    "changes": [
+                        {
+                            "path": ["packages", "example", "tests"],
+                            "operation": "changed",
+                            "before": [old],
+                            "after": [new],
+                        },
+                    ],
+                },
+            ],
+            data,
+        )
+        _expect(data["uncompared"] == [], data)
+    output = _run(tmp_path, "diff", ".").stdout
+    _expect(
+        "packages/example/tests:" in output
+        and '- ["staged"]' in output
+        and '+ ["working"]' in output,
+        output,
+    )
+    _expect(json.loads(_run(package, "diff", ".", "--json").stdout) == working, working)
+    _expect(
+        _run(tmp_path, "diff", ".", "--staged", "--json").stdout
+        == _run(tmp_path, "diff", ".", "--cached", "--json").stdout,
+        staged,
+    )
+    _expect(_snapshot(tmp_path) == before, "diff modified repository or working files")
+
+
 def test_discovery_handles_nested_interfaces_and_malformed_sources() -> None:
     """Validate nested declarations and malformed inputs once per suite."""
     with _fresh_repository() as root:
@@ -2105,22 +2184,6 @@ def test_discovery_handles_nested_interfaces_and_malformed_sources() -> None:
                 in data["cli"],
                 data,
             )
-            if nested.startswith("import typer"):
-                _expect(
-                    {
-                        "path": ["test"],
-                        "text": "--verbose  default=False; type=bool",
-                        "command": False,
-                    }
-                    in data["cli"],
-                    data,
-                )
-                _expect(
-                    not any(
-                        entry["path"][-1:] == ["settings"] for entry in data["cli"]
-                    ),
-                    data,
-                )
         for unsupported in UNSUPPORTED_INTERFACES:
             (package / "main.py").write_text(unsupported)
             before = _snapshot(root)
@@ -2699,6 +2762,74 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         )
 
 
+def test_machine_diff_uses_independent_repository_baselines_and_reports_exclusions(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Compare home policy and child sources without reading OS or system storage."""
+    home = _home_repository(tmp_path)
+    child = home / "forge.example/owner/demo"
+    package = _make_source_package(child, "example", "def test_baseline(): pass\n")
+    _git(child, "add", ".")
+    _fixture_git(child, "commit", "-qm", "Child baseline")
+    _fixture_git(home, "commit", "-qm", "Home baseline")
+    (package / "test_main.py").write_text("def test_working(): pass\n")
+    ignore = home / ".gitignore"
+    ignore.write_text(ignore.read_text() + "!/.ssh/\n!/.ssh/key\n")
+    subject = import_module("packages.afairesi.main")
+    monkeypatch.setattr(Path, "home", lambda: home)
+    before = (_snapshot(home), _snapshot(child))
+    data = subject.diff_summary(None)
+    repositories = {record["path"]: record for record in data["repositories"]}
+    _expect(
+        repositories[str(home)]["changes"]
+        == [
+            {
+                "path": ["paths", ".ssh"],
+                "operation": "added",
+                "after": {"key": {}},
+            },
+        ],
+        repositories,
+    )
+    _expect(
+        repositories[str(child)]["changes"]
+        == [
+            {
+                "path": ["packages", "example", "tests"],
+                "operation": "changed",
+                "before": ["baseline"],
+                "after": ["working"],
+            },
+        ],
+        repositories,
+    )
+    _expect(
+        data["uncompared"][0]["sections"]
+        == [
+            "system.os",
+            "system.preservation",
+            "filesystem.system_paths",
+        ],
+        data,
+    )
+    _expect("no Git baseline" in subject.render_diff(data), data)
+    _expect((_snapshot(home), _snapshot(child)) == before, "machine diff changed state")
+    _git(
+        home,
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.missing.path",
+        "forge.example/owner/missing",
+    )
+    missing = subject.diff_summary(None)
+    _expect(
+        any(record.get("diagnostics") for record in missing["repositories"]),
+        missing,
+    )
+
+
 def test_machine_home_whitelist_replaces_stored_home_contents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3107,7 +3238,7 @@ def test_overview_preserves_structured_details_and_omits_empty_fields() -> None:
 
 def test_overview_renders_declarations_without_executing_sources() -> None:
     """Exercise installed rendering without executing inspected package sources."""
-    contract = CLI_CONTRACTS[0]
+    contract = next(contract for contract in CLI_CONTRACTS if contract[1])
     labels = ["double__underscore", "async_behavior"]
     with _fresh_repository() as root:
         sentinel = (
@@ -3564,6 +3695,7 @@ def test_static_cli_declares_commands_and_campaign_filters() -> None:
     _expect(
         discovered
         == {
+            "diff",
             "init",
             "add",
             "mv",
