@@ -811,8 +811,8 @@ def _check_overview_details(
         msg = "Asset line counts and suppressions must be structured source facts"
         raise AssertionError(msg)
     expected = (
-        "cli:\n  commands:\n    build:\n      arguments:\n"
-        "        - --jobs  optional; default=2\n"
+        "commands:\n  build:\n    arguments:\n"
+        "      - --jobs  optional; default=2\n"
         "description: Example\n"
         "suppressions:\n  - prm/nested/script.js: eslint-disable (global): 1\n"
         "tests:\n  - result\n"
@@ -823,11 +823,9 @@ def _check_overview_details(
             "packages": {
                 "example": {
                     "description": "Example",
-                    "cli": {
-                        "commands": {
-                            "build": {
-                                "arguments": ["--jobs  optional; default=2"],
-                            },
+                    "commands": {
+                        "build": {
+                            "arguments": ["--jobs  optional; default=2"],
                         },
                     },
                     "tests": ["result"],
@@ -1573,17 +1571,17 @@ def test_cli_summaries_nest_subcommands_and_preserve_argument_ownership(
             },
         },
     }
-    _expect(_overview(package)["packages"]["example"]["cli"] == expected, package)
+    _expect(_overview(package)["packages"]["example"] == expected, package)
     output = _resource_output(_run(package, ".").stdout, "example")
     _expect(
         output
         == (
-            "cli:\n  arguments:\n    - --verbose  optional\n  commands:\n    init:\n"
-            "    test:\n      arguments:\n        - --timeout  optional\n"
-            "      commands:\n        coverage:\n          arguments:\n"
-            "            - --jobs  optional; default=2\n"
-            "        hypothesis:\n          arguments:\n"
-            "            - --jobs  optional; default=4\n"
+            "arguments:\n  - --verbose  optional\ncommands:\n  init:\n"
+            "  test:\n    arguments:\n      - --timeout  optional\n"
+            "    commands:\n      coverage:\n        arguments:\n"
+            "          - --jobs  optional; default=2\n"
+            "      hypothesis:\n        arguments:\n"
+            "          - --jobs  optional; default=4\n"
         ),
         output,
     )
@@ -1597,7 +1595,6 @@ def test_cli_summaries_nest_subcommands_and_preserve_argument_ownership(
                 "path": [
                     "packages",
                     "example",
-                    "cli",
                     "commands",
                     "test",
                     "commands",
@@ -2060,9 +2057,9 @@ def test_diff_does_not_follow_source_symlinks_and_reports_parse_errors(
         details["repositories"][0]["changes"]
         == [
             {
-                "path": ["packages", "example", "cli"],
+                "path": ["packages", "example", "arguments"],
                 "operation": "removed",
-                "before": {"arguments": ["--old  optional"]},
+                "before": ["--old  optional"],
             },
         ],
         details,
@@ -2098,9 +2095,9 @@ def test_diff_handles_a_tracked_symlink_replaced_with_a_regular_source(
         data["repositories"][0]["changes"]
         == [
             {
-                "path": ["packages", "example", "cli"],
+                "path": ["packages", "example", "arguments"],
                 "operation": "added",
-                "after": {"arguments": ["--new  optional"]},
+                "after": ["--new  optional"],
             },
         ],
         data,
@@ -3342,11 +3339,11 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
         inspected = _run(root, str(package))
         overview = _resource_output(inspected.stdout, "my-package")
         subject = import_module("packages.afairesi.main")
-        expected_arguments = subject.render_overview({"cli": expected_args}) + "\n"
+        expected_arguments = subject.render_overview(expected_args) + "\n"
         _expect(
             expected_arguments in overview
             if expected_args
-            else "cli:\n" not in overview,
+            else "arguments:\n" not in overview and "commands:\n" not in overview,
             contract,
         )
         _expect("dependencies:\n" not in overview, inspected)
@@ -3817,7 +3814,7 @@ def test_static_cli_interfaces_match_declared_commands_and_arguments(
     source, expected = contract
     details = subject.source_resource_data("example", {"main.py": source})
     summary = subject.resource_summary(details)
-    _expect(summary.get("cli", {}) == expected, details)
+    _expect(summary == expected, details)
     _expect(not details["diagnostics"], details)
 
 

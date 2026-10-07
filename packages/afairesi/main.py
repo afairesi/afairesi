@@ -2724,7 +2724,7 @@ def resource_summary(data: ResourceData) -> dict[str, Any]:
     """Keep populated fields for terminal and JSON summaries."""
     fields = {
         "description": data["description"],
-        "cli": cli_summary(data["cli"]),
+        **cli_summary(data["cli"]),
         "dependencies": [
             _dependency_description(item) for item in data["dependencies"]
         ],
