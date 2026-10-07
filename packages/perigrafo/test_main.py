@@ -2481,13 +2481,81 @@ def test_hypothesis_campaigns_generate_cases_and_isolate_failures(
             )
 
 
+def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
+    """Check fixed baseline failures once, independently of generated values."""
+    with TemporaryDirectory(prefix="perigrafo-baselines-") as directory:
+        root = Path(directory) / "source with spaces"
+        environment = _prepare_runner_flake(
+            root,
+            "def test_ready(): pass\n",
+            name="git-example",
+        )
+        baselines = {
+            "alpha": "def test_failure():\n    assert False\n",
+            "beta": "",
+            "gamma": "raise ImportError('missing dependency')\n",
+            "delta": (
+                "import pytest\n@pytest.mark.skip(reason='disabled')\n"
+                "def test_skipped():\n    assert False\n"
+            ),
+        }
+        for name, baseline in baselines.items():
+            _runner_package(root, name, baseline)
+        _runner_package(root, "untested", "")
+        (root / "packages/untested/test_main.py").unlink()
+        result = _campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "--max-mutations",
+            "1",
+        )
+        _expect(
+            result.returncode == 1
+            and "1 passed, 4 failed, 1 skipped" in result.stdout
+            and "baseline.log" in result.stderr,
+            result,
+        )
+        for name in baselines:
+            (failed,) = (root / "tmp").glob(f"python-mutation-{name}-*")
+            _expect(
+                (failed / "baseline.log").is_file()
+                and not (failed / "summary.json").exists(),
+                failed,
+            )
+
+
+def test_mutation_campaigns_report_empty_plans() -> None:
+    """Accept an empty mutation plan when explicit baseline examples pass."""
+    with TemporaryDirectory(prefix="perigrafo-empty-mutations-") as directory:
+        root = Path(directory) / "source"
+        tests = (
+            "from packages.example import main\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "@given(st.just(1))\n"
+            "@example(0)\n"
+            "def test_explicit(value):\n"
+            "    assert value == 0 and main is not None\n"
+        )
+        environment = _prepare_runner_flake(root, tests, "")
+        result = _campaign(root, environment, "mutation")
+        (workspace,) = (root / "tmp").glob("python-mutation-example-*")
+        _expect(
+            not result.returncode
+            and json.loads((workspace / "summary.json").read_text()) == {},
+            result,
+        )
+
+
 @settings(deadline=None)
 @given(value=st.integers(min_value=1, max_value=9))
 @example(value=1)
-def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
+def test_mutation_campaigns_report_outcomes_and_replay_plans(
     value: int,
 ) -> None:
-    """Report killed/surviving mutations and keep invalid baselines out of scores."""
+    """Report killed/surviving mutations and replay plans across generated values."""
     with TemporaryDirectory(prefix="perigrafo-mutations-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
@@ -2613,52 +2681,6 @@ def test_mutation_campaigns_report_outcomes_and_reject_invalid_baselines(
         _expect(
             mismatch.returncode == 1 and "does not match" in mismatch.stderr,
             mismatch,
-        )
-        package_source.write_text(source)
-        baselines = {
-            "alpha": "def test_failure():\n    assert False\n",
-            "beta": "",
-            "gamma": "raise ImportError('missing dependency')\n",
-            "delta": (
-                "import pytest\n@pytest.mark.skip(reason='disabled')\n"
-                "def test_skipped():\n    assert False\n"
-            ),
-        }
-        for name, baseline in baselines.items():
-            _runner_package(root, name, baseline)
-        _runner_package(root, "untested", "")
-        (root / "packages/untested/test_main.py").unlink()
-        result = _campaign(root, environment, "mutation", "--timeout", "10")
-        _expect(
-            result.returncode == 1
-            and "1 passed, 4 failed, 1 skipped" in result.stdout
-            and "baseline.log" in result.stderr,
-            result,
-        )
-        for name in baselines:
-            (failed,) = (root / "tmp").glob(f"python-mutation-{name}-*")
-            _expect(
-                (failed / "baseline.log").is_file()
-                and not (failed / "summary.json").exists(),
-                failed,
-            )
-    with TemporaryDirectory(prefix="perigrafo-empty-mutations-") as directory:
-        root = Path(directory) / "source"
-        tests = (
-            "from packages.example import main\n"
-            "from hypothesis import given, example, strategies as st\n"
-            "@given(st.just(1))\n"
-            "@example(0)\n"
-            "def test_explicit(value):\n"
-            "    assert value == 0 and main is not None\n"
-        )
-        environment = _prepare_runner_flake(root, tests, "")
-        result = _campaign(root, environment, "mutation")
-        (workspace,) = (root / "tmp").glob("python-mutation-example-*")
-        _expect(
-            not result.returncode
-            and json.loads((workspace / "summary.json").read_text()) == {},
-            result,
         )
 
 
