@@ -12,7 +12,7 @@ let
           pkgs = inputs.nixpkgs.legacyPackages.${system};
         }
       );
-    mkFlake =
+    blueprint =
       arguments:
       let
         repositoryInputs = arguments.inputs;

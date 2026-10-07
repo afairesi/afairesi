@@ -13,11 +13,13 @@
   outputs =
     inputs:
     let
-      lib = import ./packages/perigrafo/prm/flake.nix { inherit inputs; };
+      lib = builtins.removeAttrs shared [ "blueprint" ];
+      shared = import ./packages/perigrafo/prm/flake.nix { inherit inputs; };
     in
-    lib.mkFlake { inherit inputs; }
+    shared.blueprint { inherit inputs; }
     // {
       inherit lib;
+      inherit (shared) blueprint;
       formatter = lib.mkFormatter { inherit (inputs) self; };
     };
 }

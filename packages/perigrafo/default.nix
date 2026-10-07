@@ -46,14 +46,17 @@ in
   inherit pkgs;
   executable = true;
   meta.description = "Create, inspect, and converge Git and Nix repositories describing machines";
-  passthru.checkInputs = [
-    (import ../../formatter.nix {
-      inherit inputs pkgs;
-      enableMypy = false;
-      flake = inputs.self.outPath;
-    }).passthru.raw
-    python.pkgs.coverage
-  ];
+  passthru = {
+    checkInputs = [
+      (import ../../formatter.nix {
+        inherit inputs pkgs;
+        enableMypy = false;
+        flake = inputs.self.outPath;
+      }).passthru.raw
+      python.pkgs.coverage
+    ];
+    tests.consumer-contract = import ./prm/consumer-contract.nix { inherit inputs pkgs; };
+  };
   postFixup = ''
     touch "$out/${python.sitePackages}/$pname/py.typed"
   '';

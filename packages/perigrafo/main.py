@@ -1876,7 +1876,7 @@ def initialize_flake(remote: str) -> None:
     try:
         flake = directory / "flake.nix"
         flake.write_text(
-            '{ inputs.perigrafo.url = "github:perigrafo/perigrafo"; outputs = inputs: inputs.perigrafo.lib.mkFlake { inherit inputs; }; }\n',  # noqa: E501
+            '{ inputs.perigrafo.url = "github:perigrafo/perigrafo"; outputs = inputs: inputs.perigrafo.blueprint { inherit inputs; }; }\n',  # noqa: E501
             encoding="utf-8",
         )
         (directory / "README").write_text(readme, encoding="utf-8")
