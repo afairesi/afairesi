@@ -30,6 +30,8 @@ python.pkgs.buildPythonPackage (
       if [ -d prm ]; then
         cp -R prm/ "$out/${python.sitePackages}/$pname/"
       fi
+      ${python.interpreter} -m compileall -q --invalidation-mode unchecked-hash \
+        "$out/${python.sitePackages}/$pname/__init__.py"
     '';
     meta =
       builtins.removeAttrs (arguments.meta or { }) [ "mainProgram" ]
