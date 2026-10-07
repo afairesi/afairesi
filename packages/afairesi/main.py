@@ -729,8 +729,7 @@ def inspect_structure(root: Path) -> tuple[list[Package], list[str]]:
     issues: list[str] = []
     for package in packages:
         validate_name(package.name)
-        if issue := _python_test_placement_issue(package):
-            issues.append(issue)
+        issues.extend(_python_source_issues(package))
         for relative in sorted(required_package_files(package)):
             if not (root / relative).is_file():
                 issues.extend([f"{relative}: missing required regular file"])
@@ -768,6 +767,44 @@ def has_python_tests(path: Path) -> bool:
         raise CommandError(
             msg,
         ) from error
+
+
+def _python_source_issues(package: Package) -> list[str]:
+    """Check source contracts without importing or executing package code."""
+    if package.kind != "python":
+        return []
+    issues = []
+    if issue := _python_test_placement_issue(package):
+        issues.append(issue)
+    source = _read_regular(package.root / "main.py")
+    if source is not None:
+        module = ast.parse(source, filename=str(package.root / "main.py"))
+        binding = _module_main_binding(module)
+        entrypoint = (
+            binding.value
+            if isinstance(binding, (ast.Assign, ast.AnnAssign))
+            else binding
+        )
+        prefix = f"packages/{package.name}/main.py: "
+        if isinstance(entrypoint, ast.AsyncFunctionDef):
+            issues.append(
+                prefix + "main must be synchronous; the executable calls main()",
+            )
+        elif isinstance(entrypoint, (ast.FunctionDef, ast.Lambda)) and (
+            len(entrypoint.args.posonlyargs) + len(entrypoint.args.args)
+            > len(entrypoint.args.defaults)
+            or any(default is None for default in entrypoint.args.kw_defaults)
+        ):
+            issues.append(prefix + "main must accept a call without arguments")
+        elif isinstance(binding, (ast.Assign, ast.AnnAssign)) and isinstance(
+            binding.value,
+            (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict),
+        ):
+            issues.append(prefix + "main must be callable; the executable calls main()")
+    tests = package.root / "test_main.py"
+    if tests.is_file():
+        has_python_tests(tests)
+    return issues
 
 
 def package_description(package: Package) -> str | None:
@@ -997,33 +1034,41 @@ def _nix_binding_edits(
 
 def source_python_has_main(source: str | None) -> bool:
     """Recognize the module-level main binding used by canonical wrappers."""
-    if not source:
+    if source is None:
         return True
     return _module_has_main(ast.parse(source, filename="main.py"))
 
 
 def _module_has_main(module: ast.Module) -> bool:
     """Recognize function, import, and assignment bindings for a module's main."""
-    return any(
-        (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and node.name == "main"
-        )
-        or (
-            isinstance(node, (ast.Import, ast.ImportFrom))
-            and any((alias.asname or alias.name) == "main" for alias in node.names)
-        )
-        or (
-            isinstance(node, (ast.Assign, ast.AnnAssign))
-            and any(
-                isinstance(target, ast.Name) and target.id == "main"
-                for target in (
-                    node.targets if isinstance(node, ast.Assign) else [node.target]
+    return _module_main_binding(module) is not None
+
+
+def _module_main_binding(module: ast.Module) -> ast.stmt | None:
+    """Find the last explicit module-level binding used by the executable."""
+    for node in reversed(module.body):
+        if (
+            (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "main"
+            )
+            or (
+                isinstance(node, (ast.Import, ast.ImportFrom))
+                and any((alias.asname or alias.name) == "main" for alias in node.names)
+            )
+            or (
+                isinstance(node, (ast.Assign, ast.AnnAssign))
+                and node.value is not None
+                and any(
+                    isinstance(target, ast.Name) and target.id == "main"
+                    for target in (
+                        node.targets if isinstance(node, ast.Assign) else [node.target]
+                    )
                 )
             )
-        )
-        for node in module.body
-    )
+        ):
+            return node
+    return None
 
 
 def _package_body(document: nix_syntax.Document) -> tuple[Node | None, Node]:
@@ -1086,14 +1131,20 @@ def _python_required_edits(
     if formals is None:
         msg = "Python package must accept inputs and pkgs arguments"
         raise CommandError(msg)
-    if not any(
-        child.type == "formal"
-        and (name := child.child_by_field_name("name")) is not None
-        and document.text(name) == "inputs"
+    names = {
+        document.text(name)
         for child in formals.named_children
-    ):
-        edits["inputs argument"] = [
-            (formals.start_byte + 1, formals.start_byte + 1, b" inputs,"),
+        if child.type == "formal"
+        and (name := child.child_by_field_name("name")) is not None
+    }
+    missing = [name for name in ("inputs", "pkgs") if name not in names]
+    if missing:
+        edits["function arguments"] = [
+            (
+                formals.start_byte + 1,
+                formals.start_byte + 1,
+                (" " + ", ".join(missing) + ",").encode(),
+            ),
         ]
     return edits
 
@@ -1396,9 +1447,13 @@ def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
     if missing:
         raise CommandError("missing required file: " + missing[0])
     packages = detect_packages(root)
+    issues = []
     for package in packages:
-        if issue := _python_test_placement_issue(package):
-            raise CommandError(issue)
+        validate_name(package.name)
+        issues.extend(_python_source_issues(package))
+        canonical_package_default(package)
+    if issues:
+        raise CommandError("\n".join(issues))
     changed = _converge_packages(root, packages, dry_run)
     expected = render_gitignore(allowed_paths(root, packages), prm_directories(root))
     actual = _read_regular(root / ".gitignore")

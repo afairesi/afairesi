@@ -1836,10 +1836,110 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
         )
 
 
+@pytest.mark.parametrize(
+    ("source", "message"),
+    [
+        ("async def main(): pass\n", "main must be synchronous"),
+        ("def main(value): pass\n", "main must accept a call without arguments"),
+        ("def main(value, /): pass\n", "main must accept a call without arguments"),
+        ("def main(*, value): pass\n", "main must accept a call without arguments"),
+        ("main = 42\n", "main must be callable"),
+        ("main = lambda value: None\n", "main must accept a call without arguments"),
+        ("main: object = None\n", "main must be callable"),
+        ("def main(): pass\nmain = []\n", "main must be callable"),
+    ],
+)
+def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
+    source: str,
+    message: str,
+) -> None:
+    """Preserve files and Git state when an executable cannot call its entrypoint."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/a", "python")
+        _run(root, "add", "packages/z", "python")
+        (root / "packages/a/default.nix").write_text(
+            "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
+        )
+        (root / "packages/z/main.py").write_text(source)
+        (root / "unsupported").write_text("preserve until source errors are fixed")
+        before = _snapshot(root)
+        for arguments in (
+            ("converge",),
+            ("converge", "--dry-run"),
+            ("converge", "--source", str(root)),
+        ):
+            result = _run(root, *arguments, code=1)
+            _expect(message in result.stderr, result)
+            _expect(_snapshot(root) == before, "invalid entrypoint changed state")
+
+
+@pytest.mark.parametrize("invalid", ["def broken(:", "\xff"])
+def test_convergence_rejects_invalid_test_sources_before_repairs(invalid: str) -> None:
+    """Parse tests before repairing earlier packages or cleaning unsupported files."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/a", "python")
+        _run(root, "add", "packages/z", "python")
+        (root / "packages/a/default.nix").write_text(
+            "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
+        )
+        (root / "packages/z/test_main.py").write_bytes(invalid.encode("latin-1"))
+        before = _snapshot(root)
+        result = _run(root, "converge", code=1)
+        _expect("Python source could not be parsed" in result.stderr, result)
+        _expect(_snapshot(root) == before, "invalid tests changed state")
+
+
 def test_convergence_repairs_host_checks() -> None:
     """Repair generated host checks without rewriting host sources."""
     with _fresh_repository() as root:
         _check_host_repair(root)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def main(value=None, /, *, other=None): pass\n",
+        "def main(*args, **kwargs): pass\n",
+        "main = lambda: None\n",
+        "main = lambda value=None: None\n",
+        "def main(): pass\nmain: object\n",
+        "main = 42\ndef main(): pass\n",
+        "from example import main\n",
+        "VALUE = 42\n",
+        "",
+    ],
+)
+def test_convergence_repairs_python_arguments_and_preserves_supported_entrypoints(
+    source: str,
+) -> None:
+    """Repair missing constructor arguments while retaining library and CLI sources."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        package = root / "packages/example"
+        (package / "main.py").write_text(source)
+        definition = package / "default.nix"
+        definition.write_text(
+            "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {\n"
+            '  meta.description = "Preserved";\n'
+            '  passthru.custom = "Preserved too";\n'
+            "}\n",
+        )
+        _preview(root, "converge", code=1)
+        _run(root, "converge")
+        evaluated = _evaluated_template(root, "example", _nix_environment(root))
+        _expect(evaluated["meta"]["description"] == "Preserved", evaluated)
+        _expect(evaluated["name"] == "example", evaluated)
+        _expect(
+            ("mainProgram" in evaluated["meta"])
+            == (source not in {"", "VALUE = 42\n"}),
+            evaluated,
+        )
+        _expect((package / "main.py").read_text() == source, source)
+        _expect(
+            'passthru.custom = "Preserved too"' in definition.read_text(),
+            definition,
+        )
+        _preview(root, "converge")
 
 
 def test_convergence_respects_excluded_trees() -> None:
