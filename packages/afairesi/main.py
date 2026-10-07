@@ -13,6 +13,7 @@ import io
 import json
 import math
 import os
+import platform
 import posixpath
 import re
 import shlex
@@ -3146,12 +3147,69 @@ def _repository_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
 
 
 def home_preservation(root: Path) -> dict[str, Any]:
-    """List the home whitelist without expanding patterns or reading file contents."""
+    """Parse anchored whitelist paths into a tree without expanding patterns."""
     source = _read_regular(root / ".gitignore") or ""
-    return {
-        "path": str(root),
-        "preserved": [line for line in source.splitlines() if line.startswith("!/")],
-    }
+    tree: dict[str, Any] = {}
+    for line in source.splitlines():
+        if not line.startswith("!/"):
+            continue
+        components = line[2:].rstrip("/").split("/")
+        if any(component in {"", ".", ".."} for component in components):
+            msg = f"{root / '.gitignore'}: invalid whitelist path: {line}"
+            raise CommandError(msg)
+        branch = tree
+        for component in components:
+            branch = branch.setdefault(component, {})
+    return tree
+
+
+def system_summary() -> dict[str, Any]:
+    """Identify the OS before checking the NixOS preservation convention."""
+    try:
+        release = platform.freedesktop_os_release()
+        operating_system = {
+            "status": "detected",
+            "id": release.get("ID", "unknown"),
+            "name": release.get("PRETTY_NAME", release.get("NAME", "unknown")),
+        }
+    except OSError as error:
+        operating_system = {
+            "status": "unavailable",
+            "id": "unknown",
+            "name": platform.system(),
+            "message": str(error),
+        }
+    preservation = {"status": "not_applicable"}
+    if operating_system["status"] == "unavailable":
+        preservation["message"] = (
+            "OS detection failed; system preservation was not inspected."
+        )
+    elif operating_system["id"] != "nixos":
+        preservation["message"] = "System preservation inspection requires NixOS."
+    else:
+        preservation = _preservation_status(Path("/persistent"))
+    return {"os": operating_system, "preservation": preservation}
+
+
+def _preservation_status(root: Path) -> dict[str, str]:
+    """Distinguish absent, inaccessible, and non-directory preservation storage."""
+    result = {"path": str(root), "status": "available"}
+    try:
+        mode = root.stat().st_mode
+    except FileNotFoundError:
+        result.update(
+            status="missing",
+            message="System preservation directory is missing.",
+        )
+    except OSError as error:
+        result.update(status="unavailable", message=str(error))
+    else:
+        if not stat.S_ISDIR(mode):
+            result.update(
+                status="not_directory",
+                message="System preservation path is not a directory.",
+            )
+    return result
 
 
 def persistent_summary(root: Path) -> dict[str, Any]:
@@ -3183,21 +3241,25 @@ def persistent_summary(root: Path) -> dict[str, Any]:
 def machine_summary() -> dict[str, Any]:
     """Inspect preservation conventions independently of the working directory."""
     home = Path.home()
-    machine = persistent_summary(Path("/persistent"))
-    branch = machine
+    system = system_summary()
+    filesystem: dict[str, Any] = {}
+    if system["preservation"]["status"] == "available":
+        filesystem = persistent_summary(Path("/persistent"))
+        if "diagnostics" in filesystem:
+            system["preservation"].update(
+                status="unavailable",
+                message="; ".join(filesystem.pop("diagnostics")),
+            )
+    branch = filesystem
     for index, component in enumerate(home.parts[1:]):
         name = "/" + component if index == 0 else component
         branch = branch.setdefault(name, {})
     branch.clear()
     if (home / ".gitmodules").is_file() and not (home / "flake.nix").exists():
-        user = overview_summary(home)[socket.gethostname()][getpass.getuser()]
-        preservation = user.pop("home")
-        branch.update(preservation)
-        branch.update(user)
+        branch.update(overview_summary(home)[socket.gethostname()][str(home.resolve())])
     else:
         branch.update(home_preservation(home))
-    branch.pop("path", None)
-    return {socket.gethostname(): machine}
+    return {socket.gethostname(): {"system": system, "filesystem": filesystem}}
 
 
 def _overview_repositories(target: Path) -> list[tuple[Path, Path]]:
@@ -3227,12 +3289,17 @@ def overview_summary(target: Path) -> dict[str, Any]:
     target = target.resolve()
     is_home = (target / ".gitmodules").is_file() and not (target / "flake.nix").exists()
     tree: dict[str, Any] = {}
-    user = tree.setdefault(socket.gethostname(), {}).setdefault(getpass.getuser(), {})
+    machine = tree.setdefault(socket.gethostname(), {})
     if is_home:
-        user["home"] = home_preservation(target)
+        user = machine.setdefault(str(target), home_preservation(target))
+    else:
+        user = machine.setdefault(getpass.getuser(), {})
     for root, selected in _overview_repositories(target):
         branch = user
-        for component in _repository_identity(root):
+        components = (
+            root.relative_to(target).parts if is_home else _repository_identity(root)
+        )
+        for component in components:
             branch = branch.setdefault(component, {})
         try:
             groups = _repository_summary(selected)

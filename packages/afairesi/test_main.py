@@ -884,17 +884,9 @@ def _check_home_summaries(home_repository: Path) -> None:
         data
         == {
             socket.gethostname(): {
-                getpass.getuser(): {
-                    "home": {
-                        "path": str(home_repository),
-                        "preserved": [
-                            line
-                            for line in (home_repository / ".gitignore")
-                            .read_text()
-                            .splitlines()
-                            if line.startswith("!/")
-                        ],
-                    },
+                str(home_repository): {
+                    ".gitignore": {},
+                    ".gitmodules": {},
                     "forge.example": {
                         "owner": {
                             name: {
@@ -1574,7 +1566,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
                 name.startswith("/")
                 for name in json.loads(_run(root, "--json").stdout)[
                     socket.gethostname()
-                ]
+                ]["filesystem"]
             ),
             "bare afairesi must show machine preservation outside repositories",
         )
@@ -2199,10 +2191,14 @@ def test_explicit_targets_preserve_repository_scope(
     (home / ".gitmodules").write_text(
         '[submodule "demo"]\npath = forge.example/team/demo\n',
     )
-    expected = json.loads(summaries)
-    expected[socket.gethostname()][getpass.getuser()]["home"] = {
-        "path": str(home),
-        "preserved": ["!/.gitmodules"],
+    repository_tree = json.loads(summaries)[socket.gethostname()][getpass.getuser()]
+    expected = {
+        socket.gethostname(): {
+            str(home): {
+                ".gitmodules": {},
+                **repository_tree,
+            },
+        },
     }
     _expect(_overview_tree(home) == expected, home)
     _run(nested, ".", "--json", code=1)
@@ -2507,12 +2503,7 @@ def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> N
         subject.overview_summary(tmp_path)
         == {
             socket.gethostname(): {
-                getpass.getuser(): {
-                    "home": {
-                        "path": str(tmp_path),
-                        "preserved": ["!/.ssh/", "!/.ssh/key"],
-                    },
-                },
+                str(tmp_path): {".ssh": {"key": {}}},
             },
         },
         tmp_path,
@@ -2686,6 +2677,143 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         )
 
 
+@pytest.mark.parametrize("os_id", ["nixos", "ubuntu", "unknown"])
+def test_system_inspection_checks_os_before_preservation(
+    os_id: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only inspect conventional system storage on a detected NixOS system."""
+    subject = import_module("packages.afairesi.main")
+    calls: list[Path] = []
+
+    def check_storage(root: Path) -> dict[str, str]:
+        calls.append(root)
+        return {"path": str(root), "status": "missing", "message": "Storage missing"}
+
+    monkeypatch.setattr(
+        subject.platform,
+        "freedesktop_os_release",
+        lambda: {
+            "ID": os_id,
+            "PRETTY_NAME": "Example OS",
+        },
+    )
+    monkeypatch.setattr(subject, "_preservation_status", check_storage)
+    details = subject.system_summary()
+    _expect(
+        details["os"]
+        == {
+            "id": os_id,
+            "name": "Example OS",
+            "status": "detected",
+        },
+        details,
+    )
+    _expect(calls == ([Path("/persistent")] if os_id == "nixos" else []), calls)
+    status = "missing" if os_id == "nixos" else "not_applicable"
+    _expect(details["preservation"]["status"] == status, details)
+
+
+@pytest.mark.parametrize("storage_state", ["missing", "file", "directory"])
+def test_system_preservation_reports_storage_state(
+    tmp_path: Path,
+    storage_state: str,
+) -> None:
+    """Distinguish missing storage from an available directory or invalid file."""
+    subject = import_module("packages.afairesi.main")
+    storage = tmp_path / "persistent"
+    if storage_state == "file":
+        storage.touch()
+    elif storage_state == "directory":
+        storage.mkdir()
+    expected = {"missing": "missing", "file": "not_directory", "directory": "available"}
+    details = subject._preservation_status(storage)  # noqa: SLF001 - status contract
+    _expect(details["status"] == expected[storage_state], details)
+    _expect(details["path"] == str(storage), details)
+    _expect(("message" in details) == (storage_state != "directory"), details)
+
+
+def test_system_inspection_reports_unavailable_os(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Do not inspect storage when the OS cannot be identified."""
+    subject = import_module("packages.afairesi.main")
+
+    def unavailable_release() -> dict[str, str]:
+        message = "os-release is missing"
+        raise FileNotFoundError(message)
+
+    def unexpected_storage(_root: Path) -> dict[str, str]:
+        message = "storage inspected before OS identification"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(subject.platform, "freedesktop_os_release", unavailable_release)
+    monkeypatch.setattr(subject, "_preservation_status", unexpected_storage)
+    details = subject.system_summary()
+    _expect(details["os"]["status"] == "unavailable", details)
+    _expect(details["preservation"]["status"] == "not_applicable", details)
+    _expect("OS detection failed" in details["preservation"]["message"], details)
+
+
+@pytest.mark.parametrize("status", ["missing", "not_applicable", "available"])
+def test_machine_storage_status_matches_text_and_json(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    status: str,
+) -> None:
+    """Report skipped or failed inspection while still showing parsed home paths."""
+    subject = import_module("packages.afairesi.main")
+    (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n!/.ssh/key\n")
+    system = {"os": {"id": "nixos"}, "preservation": {"status": status}}
+    monkeypatch.setattr(subject, "system_summary", lambda: system)
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    calls: list[Path] = []
+
+    def inspect_storage(root: Path) -> dict[str, Any]:
+        calls.append(root)
+        return {"diagnostics": ["Permission denied"]}
+
+    monkeypatch.setattr(subject, "persistent_summary", inspect_storage)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "--json"])
+    subject.main()
+    tree = json.loads(capsys.readouterr().out)
+    machine = tree[socket.gethostname()]
+    observed_status = "unavailable" if status == "available" else status
+    _expect(machine["system"]["preservation"]["status"] == observed_status, machine)
+    _expect(calls == ([Path("/persistent")] if status == "available" else []), calls)
+    monkeypatch.setattr(sys, "argv", ["afairesi"])
+    subject.main()
+    output = capsys.readouterr().out
+    _expect(output == subject.render_overview(tree) + "\n", output)
+    _expect(
+        "status: " + observed_status in output and "preserved:" not in output,
+        output,
+    )
+
+
+def test_home_whitelist_merges_paths_and_rejects_escaping_entries(
+    tmp_path: Path,
+) -> None:
+    """Merge shared parents without scanning or reading whitelisted files."""
+    subject = import_module("packages.afairesi.main")
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text(
+        "*\n# comment\n!/.ssh/\n!/.ssh/key\n!/.ssh/public\n!/assets/*.png\n",
+    )
+    _expect(
+        subject.home_preservation(tmp_path)
+        == {
+            ".ssh": {"key": {}, "public": {}},
+            "assets": {"*.png": {}},
+        },
+        tmp_path,
+    )
+    ignore.write_text("*\n!/../outside\n")
+    with pytest.raises(subject.CommandError, match="invalid whitelist path"):
+        subject.home_preservation(tmp_path)
+
+
 def test_machine_home_whitelist_replaces_stored_home_contents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2699,11 +2827,19 @@ def test_machine_home_whitelist_replaces_stored_home_contents(
     stored_tree = {"/" + tmp_path.parts[1]: home_tree, "/etc": {"machine-id": {}}}
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(subject, "persistent_summary", lambda _root: stored_tree)
-    machine = subject.machine_summary()[socket.gethostname()]
+    monkeypatch.setattr(
+        subject,
+        "system_summary",
+        lambda: {
+            "os": {"id": "nixos"},
+            "preservation": {"status": "available"},
+        },
+    )
+    machine = subject.machine_summary()[socket.gethostname()]["filesystem"]
     branch = machine["/" + tmp_path.parts[1]]
     for component in tmp_path.parts[2:]:
         branch = branch[component]
-    _expect(branch == {"preserved": ["!/.ssh/"]}, branch)
+    _expect(branch == {".ssh": {}}, branch)
     _expect(machine["/etc"] == {"machine-id": {}}, machine)
 
 
@@ -2730,8 +2866,11 @@ def test_machine_overview_defaults_ignore_working_directory(
     monkeypatch.setattr(Path, "home", lambda: home)
     inventory = subject.persistent_summary
     monkeypatch.setattr(subject, "persistent_summary", lambda _root: inventory(storage))
+    system = {"os": {"id": "nixos"}, "preservation": {"status": "available"}}
+    monkeypatch.setattr(subject, "system_summary", lambda: system)
     expected_home = {
-        "preserved": ["!/.gitmodules", "!/.ssh/", "!/.ssh/key"],
+        ".gitmodules": {},
+        ".ssh": {"key": {}},
         "forge.example": {
             "team": {
                 "demo": {
@@ -2745,8 +2884,11 @@ def test_machine_overview_defaults_ignore_working_directory(
         expected_paths = {component: expected_paths}
     expected = {
         socket.gethostname(): {
-            "/etc": {"machine-id": {}},
-            "/" + home.parts[1]: expected_paths,
+            "system": system,
+            "filesystem": {
+                "/etc": {"machine-id": {}},
+                "/" + home.parts[1]: expected_paths,
+            },
         },
     }
     for cwd in (tmp_path, repository, repository / "packages/example"):
