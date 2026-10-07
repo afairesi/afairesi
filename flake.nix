@@ -12,21 +12,12 @@
   };
   outputs =
     inputs:
-    inputs.blueprint {
-      inherit inputs;
-    }
+    let
+      lib = import ./packages/perigrafo/prm/flake.nix { inherit inputs; };
+    in
+    lib.mkFlake { inherit inputs; }
     // {
-      inherit (inputs) blueprint;
-      formatter = inputs.self.lib.mkFormatter { inherit (inputs) self; };
-      lib.mkFormatter =
-        { self }:
-        inputs.nixpkgs.lib.genAttrs (builtins.attrNames inputs.self.packages) (
-          system:
-          import ./formatter.nix {
-            inherit inputs self;
-            flake = self.outPath;
-            pkgs = inputs.nixpkgs.legacyPackages.${system};
-          }
-        );
+      inherit lib;
+      formatter = lib.mkFormatter { inherit (inputs) self; };
     };
 }

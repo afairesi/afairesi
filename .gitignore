@@ -39,6 +39,8 @@
 !/packages/perigrafo/
 !/packages/perigrafo/default.nix
 !/packages/perigrafo/main.py
+!/packages/perigrafo/prm/
+!/packages/perigrafo/prm/**
 !/packages/perigrafo/test_main.py
 !/packages/python_test_alphabetize/
 !/packages/python_test_alphabetize/default.nix

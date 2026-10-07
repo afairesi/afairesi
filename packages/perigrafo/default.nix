@@ -40,35 +40,20 @@ let
     };
     version = "1.3.0";
   };
-  pname = baseNameOf ./.;
   python = pkgs.python3;
 in
-python.pkgs.buildPythonPackage {
-  inherit pname;
-  installPhase = ''
-    install -Dm644 main.py "$out/${python.sitePackages}/$pname/__init__.py"
-    mkdir -p "$out/bin"
-    printf '%s\n' '#!${python.interpreter}' "from $pname import main" 'main()' > "$out/bin/$pname"
-    chmod 755 "$out/bin/$pname"
-    if [ -d prm ]; then
-      cp -R prm/ "$out/${python.sitePackages}/$pname/"
-    fi
-  '';
-  meta = {
-    description = "Create, inspect, and converge Git and Nix repositories describing machines";
-    mainProgram = pname;
-  };
-  passthru = {
-    checkInputs = [
-      (import ../../formatter.nix {
-        inherit inputs pkgs;
-        enableMypy = false;
-        flake = inputs.self.outPath;
-      }).passthru.raw
-      python.pkgs.coverage
-    ];
-    python = python;
-  };
+(inputs.perigrafo or inputs.self).lib.mkPythonPackage {
+  inherit pkgs;
+  executable = true;
+  meta.description = "Create, inspect, and converge Git and Nix repositories describing machines";
+  passthru.checkInputs = [
+    (import ../../formatter.nix {
+      inherit inputs pkgs;
+      enableMypy = false;
+      flake = inputs.self.outPath;
+    }).passthru.raw
+    python.pkgs.coverage
+  ];
   postFixup = ''
     touch "$out/${python.sitePackages}/$pname/py.typed"
   '';
@@ -79,8 +64,6 @@ python.pkgs.buildPythonPackage {
     pkgs.nix
     python.pkgs.tree-sitter-language-pack
   ];
-  pyproject = false;
   src = ./.;
-  strictDeps = true;
   version = "0.0.0";
 }

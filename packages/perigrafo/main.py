@@ -547,8 +547,6 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
 def _package_kind(name: str, markers: set[str]) -> str:
     """Classify regular package markers consistently across source snapshots."""
     matches = [kind for kind, marker in KIND_MARKERS.items() if marker in markers]
-    if "main.py" in markers:
-        matches = [kind for kind in matches if kind != "latex"]
     if len(matches) > 1:
         msg = f"packages/{name}: has ambiguous project markers: {', '.join(matches)}"
         raise CommandError(msg)
@@ -872,414 +870,24 @@ def _check_test_default(root: Path, package: Package) -> None:
 
 
 def _current_python_test_source() -> str:
-    """Render the ordinary check that runs explicit examples."""
+    """Render a check using the repository's pinned shared builder."""
     return """{ inputs, pkgs, ... }:
-let
-  packageDrv = inputs.self.packages.${pkgs.stdenv.system}.${packageName};
+(inputs.perigrafo or inputs.self).lib.mkPythonCheck {
+  inherit pkgs;
+  packageDrv = inputs.self.packages.${pkgs.stdenv.system}.${baseNameOf ./.};
   packageName = baseNameOf ./.;
-  pythonEnv = packageDrv.python.withPackages (
-    ps:
-    packageDrv.propagatedBuildInputs
-    ++ (packageDrv.buildInputs or [ ])
-    ++ (packageDrv.checkInputs or [ ])
-    ++ (packageDrv.nativeCheckInputs or [ ])
-    ++ [
-      ps.hypothesis
-      ps.pytest
-    ]
-  );
-in
-pkgs.runCommand packageName
-  (
-    {
-      inherit (packageDrv) src;
-      nativeBuildInputs =
-        (packageDrv.nativeBuildInputs or [ ])
-        ++ (packageDrv.checkInputs or [ ])
-        ++ (packageDrv.nativeCheckInputs or [ ])
-        ++ packageDrv.propagatedBuildInputs
-        ++ [ pythonEnv ];
-    }
-    // pkgs.lib.optionalAttrs (packageDrv.meta ? mainProgram) {
-      PACKAGE_E2E_EXECUTABLE = pkgs.lib.getExe packageDrv;
-    }
-  )
-  ''
-    export src PACKAGE_E2E_EXECUTABLE
-    export HOME="$(mktemp -d)"
-    mkdir -p "$out" packages
-    ln -s "$src" "packages/${packageName}"
-    export PYTHONPATH="$PWD:$PYTHONPATH"
-    cd "$out"
-    "${pythonEnv}/bin/python" - <<'PYTHON'
-    import os
-    import sys
-    from hypothesis import Phase, settings
-    settings.register_profile("explicit", phases=[Phase.explicit])
-    settings.load_profile("explicit")
-    import pytest
-    sys.exit(pytest.main([
-        "-p", "no:cacheprovider",
-        "--import-mode=importlib",
-        os.environ["src"] + "/test_main.py",
-    ]))
-    PYTHON
-  ''
+}
 """
 
 
 def _current_host_check_source() -> str:
-    """Render the canonical host boot, persistence, and bootstrap check."""
-    return r"""{ inputs, pkgs, ... }:
-let
-  inherit (pkgs) lib;
-  bootstrapNode =
-    seeded: _:
-    {
-      boot.initrd.systemd = {
-        inherit (hostConfig.boot.initrd.systemd) enable;
-        storePaths = [ fixture ];
-      };
-      imports = [
-        inputs.preservation.nixosModules.default
-      ]
-      ++ lib.optional hasAge inputs.agenix.nixosModules.default;
-      preservation = {
-        enable = true;
-        preserveAt = lib.mapAttrs (path: state: {
-          directories =
-            map
-              (directory: {
-                inherit (directory)
-                  configureParent
-                  createLinkTarget
-                  directory
-                  group
-                  how
-                  inInitrd
-                  mode
-                  mountOptions
-                  parent
-                  user
-                  ;
-              })
-              (
-                builtins.filter (
-                  directory: lib.any (key: lib.hasPrefix (path + directory.directory + "/") key.preserved) keys
-                ) state.directories
-              );
-          files =
-            map
-              (file: {
-                inherit (file)
-                  configureParent
-                  createLinkTarget
-                  file
-                  group
-                  how
-                  inInitrd
-                  mode
-                  mountOptions
-                  parent
-                  user
-                  ;
-              })
-              (
-                builtins.filter (
-                  file:
-                  lib.any (key: path + file.file == key.preserved || path + file.file == key.preserved + ".pub") keys
-                ) state.files
-              );
-        }) hostConfig.preservation.preserveAt;
-      };
-      services.openssh = {
-        inherit (hostConfig.services.openssh) enable hostKeys;
-      };
-      system.stateVersion = hostConfig.system.stateVersion;
-      systemd.services.sshd.preStart = lib.optionalString (hasAge && seeded) ''
-        ${pkgs.gnugrep}/bin/grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe
-      '';
-      testing.initrdBackdoor = true;
-      virtualisation = {
-        diskImage = null;
-        emptyDiskImages = lib.imap0 (index: _: {
-          driveConfig.deviceExtraOpts.serial = "preserved-${toString index}";
-          size = 64;
-        }) storage;
-        fileSystems = builtins.listToAttrs (
-          lib.imap0 (index: state: {
-            name = state.path;
-            value = {
-              autoFormat = true;
-              device = "/dev/disk/by-id/virtio-preserved-${toString index}";
-              fsType = "ext4";
-              neededForBoot = hostConfig.fileSystems.${state.path}.neededForBoot or false;
-            };
-          }) storage
-        );
-        memorySize = 1024;
-      };
-    }
-    // lib.optionalAttrs hasAge {
-      age = {
-        inherit (hostConfig.age) identityPaths;
-        secrets = lib.optionalAttrs seeded {
-          perigrafo-probe.file = "${fixture}/probe.age";
-        };
-      };
-    };
-  configuration = inputs.self.nixosConfigurations.${host};
-  fixture =
-    pkgs.runCommand "${host}-disposable-bootstrap-identities"
-      {
-        nativeBuildInputs = [ pkgs.openssh ] ++ lib.optional hasAge pkgs.age;
-      }
-      ''
-        mkdir -p "$out"
-        ${lib.concatMapStrings (key: ''
-          ssh-keygen -q -t ${lib.escapeShellArg key.type} \
-            ${lib.optionalString (key ? bits) "-b ${toString key.bits}"} \
-            -N "" -C disposable-perigrafo-test -f "$out/key-${toString key.index}"
-        '') keys}
-        ${lib.optionalString hasAge ''
-          ${
-            assert lib.assertMsg (
-              identityKeys != [ ]
-            ) "Perigrafo bootstrap check: agenix needs a preserved SSH host identity";
-            ""
-          }
-          printf 'perigrafo-bootstrap-ok\n' | age \
-            ${lib.concatMapStringsSep " " (key: "-R \"$out/key-${toString key.index}.pub\"") identityKeys} \
-            -o "$out/probe.age"
-        ''}
-      '';
-  hasAge = hasBootstrap && builtins.attrNames (hostConfig.age.secrets or { }) != [ ];
-  hasBootstrap = hasPreservation && hostConfig.services.openssh.enable;
-  hasDisko = builtins.attrNames (configuration.config.disko.devices or { }) != [ ];
-  hasPreservation = hostConfig.preservation.enable or false;
-  host = lib.removeSuffix "VmWithDisko" (baseNameOf ./.);
-  hostConfig = configuration.config;
-  identityKeys = builtins.filter (
-    key:
-    builtins.elem key.type [
-      "rsa"
-      "ed25519"
-    ]
-    && (
-      builtins.elem key.path hostConfig.age.identityPaths
-      || builtins.elem key.preserved hostConfig.age.identityPaths
-    )
-  ) keys;
-  instrumented = configuration.extendModules {
-    modules = [
-      (
-        if hasDisko then
-          {
-            virtualisation.vmVariantWithDisko.virtualisation.graphics = lib.mkForce false;
-          }
-        else
-          {
-            virtualisation.vmVariant.virtualisation.graphics = lib.mkForce false;
-          }
-      )
-      ({ modulesPath, ... }: {
-        imports = [ (modulesPath + "/testing/test-instrumentation.nix") ];
-        users.users.root.initialHashedPassword = lib.mkForce null;
-      })
-    ];
-  };
-  keys = lib.imap0 (
-    index: key:
-    let
-      directories =
-        lib.sort (a: b: builtins.stringLength a.directory > builtins.stringLength b.directory)
-          (
-            builtins.filter (
-              directory:
-              lib.hasPrefix (directory.directory + "/") key.path
-              || lib.hasPrefix (directory.persistent + "/") key.path
-            ) preservedDirectories
-          );
-      files = builtins.filter (file: key.path == file.file || key.path == file.persistent) preservedFiles;
-      preserved =
-        if files != [ ] then
-          (builtins.head files).persistent
-        else if directories != [ ] then
-          let
-            directory = builtins.head directories;
-          in
-          if lib.hasPrefix (directory.persistent + "/") key.path then
-            key.path
-          else
-            directory.persistent + lib.removePrefix directory.directory key.path
-        else
-          throw "Perigrafo bootstrap check: SSH host key ${key.path} is not preserved";
-    in
-    key // { inherit index preserved; }
-  ) hostConfig.services.openssh.hostKeys;
-  name = "${host}VmWithDisko";
-  preservedDirectories = lib.concatMap (
-    state:
-    map (directory: {
-      inherit (directory) directory how;
-      persistent = state.path + directory.directory;
-    }) state.directories
-  ) storage;
-  preservedFiles = lib.concatMap (
-    state:
-    map (file: {
-      inherit (file) file how;
-      persistent = state.path + file.file;
-    }) state.files
-  ) storage;
-  preservedPaths = lib.concatLists (
-    lib.mapAttrsToList (
-      path: state:
-      let
-        directories = state.directories ++ lib.concatMap (user: user.directories) users;
-        files = state.files ++ lib.concatMap (user: user.files) users;
-        users = builtins.attrValues state.users;
-      in
-      map (file: {
-        inherit (file) how;
-        directory = false;
-        path = file.file;
-        persistent = path + file.file;
-      }) files
-      ++ map (directory: {
-        inherit (directory) how;
-        directory = true;
-        path = directory.directory;
-        persistent = path + directory.directory;
-      }) (builtins.filter (directory: directory.how != "_intermediate") directories)
-    ) (vmConfig.preservation.preserveAt or { })
-  );
-  startScript = pkgs.writeShellScript "start-${name}" (
-    if hasDisko then
-      ''
-        set -e
-        ${pkgs.util-linux}/bin/setsid ${vm}/bin/disko-vm "$@" &
-        vm_pid=$!
-        trap 'kill -- -"$vm_pid" 2>/dev/null || true; wait "$vm_pid" 2>/dev/null || true' EXIT
-        trap 'exit 130' INT
-        trap 'exit 143' TERM
-        wait "$vm_pid"
-      ''
-    else
-      ''
-        exec ${vm}/bin/run-*-vm "$@"
-      ''
-  );
-  storage = lib.mapAttrsToList (path: state: {
-    inherit path;
-    inherit (state) files;
-    inherit (state) directories;
-  }) (hostConfig.preservation.preserveAt or { });
-  vm = if hasDisko then vmConfig.system.build.vmWithDisko else vmConfig.system.build.vm;
-  vmConfig =
-    if hasDisko then
-      instrumented.config.virtualisation.vmVariantWithDisko
-    else
-      instrumented.config.virtualisation.vmVariant;
-in
-pkgs.testers.runNixOSTest {
-  inherit name;
-  globalTimeout = 600;
-  nodes = lib.optionalAttrs hasBootstrap {
-    fresh = bootstrapNode false;
-    seeded = bootstrapNode true;
-  };
-  requiredFeatures.kvm = pkgs.stdenv.hostPlatform.isLinux;
-  testScript = ''
-    import json
-    import shlex
-    ${lib.optionalString hasBootstrap ''
-      keys = json.loads(${builtins.toJSON (builtins.toJSON keys)})
-      fixture = ${builtins.toJSON (toString fixture)}
-      def check_host_keys(node):
-          node.wait_for_unit("sshd.service")
-          checksums = []
-          for key in keys:
-              path = shlex.quote(key["path"])
-              preserved = shlex.quote(key["preserved"])
-              node.succeed(f"test -s {preserved}")
-              assert node.succeed(f"stat -Lc '%a %U %G' {path}").strip() == "600 root root"
-              node.succeed(f"cmp {path} {preserved}")
-              public = node.succeed(f"ssh-keygen -y -f {path}").split()
-              saved = node.succeed("cat " + shlex.quote(key["path"] + ".pub")).split()
-              assert public[:2] == saved[:2]
-              checksums.append(node.succeed(f"sha256sum {preserved}"))
-          return checksums
-      for node in [seeded, fresh]:
-          node.start(allow_reboot=True)
-          node.wait_for_unit("default.target")
-      with subtest("Bootstrap with provisioned SSH identities"):
-          for key in keys:
-              source = shlex.quote(fixture + "/key-" + str(key["index"]))
-              destination = shlex.quote("/sysroot" + key["preserved"])
-              seeded.succeed(f"install -D -m 0600 {source} {destination}")
-              source_public = shlex.quote(fixture + "/key-" + str(key["index"]) + ".pub")
-              destination_public = shlex.quote("/sysroot" + key["preserved"] + ".pub")
-              seeded.succeed(f"install -D -m 0644 {source_public} {destination_public}")
-          seeded.switch_root()
-          check_host_keys(seeded)
-          for key in keys:
-              source = shlex.quote(fixture + "/key-" + str(key["index"]))
-              destination = shlex.quote(key["preserved"])
-              seeded.succeed(f"cmp {source} {destination}")
-          ${lib.optionalString hasAge ''seeded.succeed("grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe")''}
-      with subtest("Generate SSH identities on empty persistent storage"):
-          for key in keys:
-              fresh.fail("test -e " + shlex.quote("/sysroot" + key["preserved"]))
-          fresh.switch_root()
-          check_host_keys(fresh)
-      for node in [seeded, fresh]:
-          with subtest(f"{node.name}: SSH identities survive a clean-root reboot"):
-              original = check_host_keys(node)
-              node.succeed("touch /perigrafo-unpreserved-marker")
-              node.reboot()
-              node.wait_for_unit("default.target")
-              node.fail("test -e /sysroot/perigrafo-unpreserved-marker")
-              node.switch_root()
-              assert check_host_keys(node) == original
-      ${lib.optionalString hasAge ''
-        with subtest("Decrypt again after reboot without reprovisioning"):
-            seeded.succeed("grep -qx perigrafo-bootstrap-ok /run/agenix/perigrafo-probe")
-      ''}
-      for node in [seeded, fresh]:
-          node.shutdown()
-    ''}
-    machine = create_machine(start_command="${startScript}", name="machine")
-    driver.machines_qemu.append(machine)
-    machine.start(allow_reboot=True)
-    for phase in ["boot", "reboot"]:
-        with subtest(phase):
-            machine.wait_for_unit("local-fs.target")
-            machine.wait_for_unit("multi-user.target")
-            ${lib.optionalString vmConfig.services.openssh.enable ''
-              machine.wait_for_unit("sshd.service")
-            ''}
-            for entry in json.loads(${builtins.toJSON (builtins.toJSON preservedPaths)}):
-                path = shlex.quote(entry["path"])
-                persistent = shlex.quote(entry["persistent"])
-                kind = "d" if entry["directory"] else "f"
-                machine.succeed(f"test -{kind} {path}; test -{kind} {persistent}")
-                if entry["how"] == "symlink":
-                    assert machine.succeed(f"readlink -f {path}").strip() == machine.succeed(f"readlink -f {persistent}").strip()
-                else:
-                    assert machine.succeed(f"stat -Lc '%d:%i' {path}").strip() == machine.succeed(f"stat -Lc '%d:%i' {persistent}").strip()
-                if entry["directory"]:
-                    marker = shlex.quote(entry["path"] + "/.perigrafo-preservation-probe")
-                    if phase == "boot":
-                        machine.succeed(f"printf perigrafo-preserved > {marker}")
-                    else:
-                        assert machine.succeed(f"cat {marker}") == "perigrafo-preserved"
-        if phase == "boot":
-            machine.reboot()
-    machine.shutdown()
-  '';
+    """Render a host check using the repository's pinned shared builder."""
+    return """{ inputs, pkgs, ... }:
+(inputs.perigrafo or inputs.self).lib.mkHostCheck {
+  inherit inputs pkgs;
+  host = pkgs.lib.removeSuffix "VmWithDisko" (baseNameOf ./.);
 }
-"""  # noqa: E501
+"""
 
 
 def _python_static_template_issues(package: Package, source: str) -> list[str]:
@@ -1396,47 +1004,6 @@ def _nix_binding_edits(
     return edits
 
 
-def _nix_remove_binding_edits(
-    document: nix_syntax.Document,
-    container: Node,
-    path: tuple[str, ...],
-) -> list[tuple[int, int, bytes]]:
-    """Remove a scoped metadata binding while retaining neighboring fields."""
-    if container.type == "parenthesized_expression":
-        return _nix_remove_binding_edits(
-            document,
-            cast("Node", container.child_by_field_name("expression")),
-            path,
-        )
-    bindings = next(
-        (node for node in container.named_children if node.type == "binding_set"),
-        None,
-    )
-    edits = []
-    for binding in [] if bindings is None else bindings.named_children:
-        attrpath = binding.child_by_field_name("attrpath")
-        expression = binding.child_by_field_name("expression")
-        if attrpath is not None and expression is not None:
-            names = nix_syntax.static_attrpath(document, attrpath)
-            if names == path:
-                edits.append((binding.start_byte, binding.end_byte, b""))
-            elif names and path[: len(names)] == names:
-                edits.extend(
-                    _nix_remove_binding_edits(
-                        document,
-                        expression,
-                        path[len(names) :],
-                    ),
-                )
-        elif len(path) == 1 and (attrs := binding.child_by_field_name("attrs")):
-            edits.extend(
-                (attr.start_byte, attr.end_byte, b"")
-                for attr in attrs.named_children
-                if document.text(attr) == path[0]
-            )
-    return edits
-
-
 def source_python_has_main(source: str | None) -> bool:
     """Recognize the module-level main binding used by canonical wrappers."""
     if not source:
@@ -1493,112 +1060,50 @@ def _python_required_edits(
     package: Package,
     source: str,
 ) -> dict[str, list[tuple[int, int, bytes]]]:
-    """Derive validation and repair from the same scoped Python requirements."""
+    """Enforce the shared Python constructor's source interface."""
     document = nix_syntax.parse(source)
-    scope, body = _package_body(document)
+    _scope, body = _package_body(document)
     argument = body.child_by_field_name("argument")
     function = body.child_by_field_name("function")
+    constructor = "(inputs.perigrafo or inputs.self).lib.mkPythonPackage"
     if (
         body.type != "apply_expression"
         or function is None
         or nix_syntax.compact(document.text(function))
-        != "python.pkgs.buildPythonPackage"
+        != nix_syntax.compact(constructor)
         or argument is None
         or argument.type not in {"attrset_expression", "rec_attrset_expression"}
     ):
-        msg = (
-            "Python package must call python.pkgs.buildPythonPackage "
-            "with an attribute set"
-        )
+        msg = "Python package must call the shared mkPythonPackage constructor"
         raise CommandError(msg)
-    template = scaffold("python", package.name, None)[
-        Path("packages") / package.name / "default.nix"
-    ]
-    template_document, install_expression = _metadata_expression(
-        template,
-        "installPhase",
-        (),
-    )
-    if install_expression is None:
-        msg = "Python scaffold omitted its install phase"
-        raise AssertionError(msg)
-    install_phase = template_document.text(install_expression)
-    executable = source_python_has_main(_read_regular(package.root / "main.py"))
-    if not executable:
-        install_phase = "\n".join(
-            line
-            for line in install_phase.split("\n")
-            if not any(
-                marker in line
-                for marker in ('mkdir -p "$out/bin"', "printf '%s", "chmod 755")
-            )
-        )
-    required = {
-        "pname": "pname",
-        "installPhase": install_phase,
-        "passthru.python": "python",
-        "pyproject": "false",
-        "src": "./.",
-        "strictDeps": "true",
-    }
-    if executable:
-        required["meta.mainProgram"] = (
-            "baseNameOf ./." if "-" in package.name else "pname"
-        )
     edits = {
-        name: _nix_binding_edits(document, argument, tuple(name.split(".")), value)
-        for name, value in required.items()
-    }
-    if not executable:
-        edits["library metadata"] = _nix_remove_binding_edits(
+        "pkgs": _nix_binding_edits(document, argument, ("pkgs",), "pkgs"),
+        "src": _nix_binding_edits(document, argument, ("src",), "./."),
+        "executable": _nix_binding_edits(
             document,
             argument,
-            ("meta", "mainProgram"),
-        )
-    pname = (
-        'builtins.replaceStrings [ "-" ] [ "_" ] (baseNameOf ./.)'
-        if "-" in package.name
-        else "baseNameOf ./."
-    )
-    if scope is None:
-        edits["Python let bindings"] = [
-            (
-                body.start_byte,
-                body.start_byte,
-                f"let pname = {pname}; python = pkgs.python3; in ".encode(),
-            ),
+            ("executable",),
+            "true"
+            if source_python_has_main(_read_regular(package.root / "main.py"))
+            else "false",
+        ),
+    }
+    outer = document.root
+    while outer.type == "parenthesized_expression":
+        outer = cast("Node", outer.child_by_field_name("expression"))
+    formals = outer.child_by_field_name("formals")
+    if formals is None:
+        msg = "Python package must accept inputs and pkgs arguments"
+        raise CommandError(msg)
+    if not any(
+        child.type == "formal"
+        and (name := child.child_by_field_name("name")) is not None
+        and document.text(name) == "inputs"
+        for child in formals.named_children
+    ):
+        edits["inputs argument"] = [
+            (formals.start_byte + 1, formals.start_byte + 1, b" inputs,"),
         ]
-    else:
-        edits["local pname"] = _nix_binding_edits(
-            document,
-            scope,
-            ("pname",),
-            pname,
-        )
-        bindings = next(
-            (node for node in scope.named_children if node.type == "binding_set"),
-            None,
-        )
-        has_python = any(
-            (
-                (path := binding.child_by_field_name("attrpath")) is not None
-                and nix_syntax.static_attrpath(document, path) == ("python",)
-            )
-            or (
-                (attrs := binding.child_by_field_name("attrs")) is not None
-                and any(
-                    document.text(attr) == "python" for attr in attrs.named_children
-                )
-            )
-            for binding in ([] if bindings is None else bindings.named_children)
-        )
-        if not has_python:
-            edits["local python"] = _nix_binding_edits(
-                document,
-                scope,
-                ("python",),
-                "pkgs.python3",
-            )
     return edits
 
 
@@ -2005,34 +1510,15 @@ def scaffold(
     description_literal = nix_syntax.quote_string(description)
     root = Path("packages") / name
     defaults = {
-        "python": """{ pkgs, ... }:
-let
-  pname = baseNameOf ./.;
-  python = pkgs.python3;
-in
-python.pkgs.buildPythonPackage {
-  inherit pname;
-  installPhase = ''
-    install -Dm644 main.py "$out/${python.sitePackages}/$pname/__init__.py"
-    mkdir -p "$out/bin"
-    printf '%s\\n' '#!${python.interpreter}' "from $pname import main" 'main()' > "$out/bin/$pname"
-    chmod 755 "$out/bin/$pname"
-    if [ -d prm ]; then
-      cp -R prm/ "$out/${python.sitePackages}/$pname/"
-    fi
-  '';
-  meta = {
-    description = __DESCRIPTION__;
-    mainProgram = pname;
-  };
-  passthru.python = python;
+        "python": """{ inputs, pkgs, ... }:
+(inputs.perigrafo or inputs.self).lib.mkPythonPackage {
+  inherit pkgs;
+  executable = true;
+  meta.description = __DESCRIPTION__;
   propagatedBuildInputs = [ ];
-  pyproject = false;
   src = ./.;
-  strictDeps = true;
-  version = "0.0.0";
 }
-""",  # noqa: E501
+""",
         "html": """{ pkgs, ... }:
 let
   pname = baseNameOf ./.;
@@ -2117,12 +1603,6 @@ pkgs.writeTextFile {
             "baseNameOf ./.",
             'builtins.replaceStrings [ "-" ] [ "_" ] (baseNameOf ./.)',
         )
-        if kind == "python":
-            default = default.replace("$out/bin/$pname", "$out/bin/${baseNameOf ./.}")
-            default = default.replace(
-                "mainProgram = pname;",
-                "mainProgram = baseNameOf ./.;",
-            )
     files: dict[Path, str] = {root / "default.nix": default}
     if kind == "python":
         files[root / "main.py"] = (
@@ -2396,7 +1876,7 @@ def initialize_flake(remote: str) -> None:
     try:
         flake = directory / "flake.nix"
         flake.write_text(
-            '{ inputs.perigrafo.url = "github:perigrafo/perigrafo"; outputs = inputs: inputs.perigrafo.blueprint { inherit inputs; }; }\n',  # noqa: E501
+            '{ inputs.perigrafo.url = "github:perigrafo/perigrafo"; outputs = inputs: inputs.perigrafo.lib.mkFlake { inherit inputs; }; }\n',  # noqa: E501
             encoding="utf-8",
         )
         (directory / "README").write_text(readme, encoding="utf-8")
@@ -4114,38 +3594,16 @@ class TestEnvironment:
 
 
 def _build_test_environment(root: Path, name: str, workspace: Path) -> TestEnvironment:
-    """Build a target-specific interpreter and resolve its external tools."""
-    expression = workspace / "environment.nix"
-    expression.write_text(
-        "let\n"
-        "  flake = builtins.getFlake "
-        f"{nix_syntax.quote_string('git+' + root.as_uri())};\n"
-        "  system = builtins.currentSystem;\n"
-        "  pkgs = import flake.inputs.nixpkgs { inherit system; };\n"
-        "  package = flake.packages.${system}."
-        f"${{{nix_syntax.quote_string(name)}}};\n"
-        "  dependencies = pkgs.lib.concatMap (name: package.${name} or []) [\n"
-        '    "buildInputs" "checkInputs" "nativeBuildInputs" "nativeCheckInputs"\n'
-        '    "propagatedBuildInputs" "propagatedNativeBuildInputs"\n'
-        "  ];\n"
-        "  python = package.python.withPackages (ps:\n"
-        "    dependencies ++ [ps.hypothesis ps.pytest]);\n"
-        'in pkgs.writeText "test-environment.json" (builtins.toJSON {\n'
-        '  python = "${python}/bin/python";\n'
-        "  path = pkgs.lib.makeBinPath dependencies;\n"
-        "})\n",
-        encoding="utf-8",
-    )
+    """Build the target's declared test environment through its flake output."""
     log = workspace / "environment.log"
     _run_test_command(
         [
             "nix",
             "build",
-            "--impure",
+            "--no-update-lock-file",
             "--no-link",
             "--print-out-paths",
-            "--file",
-            str(expression),
+            _flake_installable(root, f"{name}-test-environment"),
         ],
         workspace,
         log,
@@ -4183,151 +3641,10 @@ class TestSelection:
 
 
 def _test_report_source() -> str:
-    """Render a pytest plugin shared by coverage and on-demand campaigns."""
-    return r"""import functools
-import json
-import os
-import sys
-from collections import Counter
-from pathlib import Path
-import pytest
-from hypothesis import Phase, is_hypothesis_test, settings
-tests = {}
-collection_errors = []
-owner = os.environ.setdefault("PERIGRAFO_TEST_REPORT_OWNER", str(os.getpid()))
-def node_id(item):
-    path, separator, name = item.nodeid.partition("::")
-    return Path(path).name + separator + name
-def record(item):
-    key = node_id(item)
-    if key not in tests:
-        function = getattr(item, "obj", None)
-        property_test = is_hypothesis_test(function)
-        instance = getattr(function, "__self__", None)
-        profile = getattr(
-            function, "_hypothesis_internal_use_settings",
-            getattr(instance, "settings", settings.default),
-        )
-        examples = getattr(function, "hypothesis_explicit_examples", ())
-        handle = getattr(function, "hypothesis", None)
-        measured = not property_test or hasattr(handle, "inner_test")
-        tests[key] = {
-            "nodeid": key,
-            "function": key.split("[", 1)[0],
-            "outcome": "not_run",
-            "duration": 0.0,
-            "body_calls": 0 if measured else None,
-            "is_property": property_test,
-            "explicit_examples": len(examples),
-            "generation_enabled": property_test and Phase.generate in profile.phases,
-        }
-    return tests[key]
-def pytest_collection_finish(session):
-    for item in session.items:
-        record(item)
-def pytest_deselected(items):
-    for item in items:
-        record(item)["outcome"] = "deselected"
-def pytest_collectreport(report):
-    if report.failed:
-        collection_errors.append(str(report.longrepr))
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_protocol(item, nextitem):
-    previous = os.environ.get("PERIGRAFO_TEST_CONTEXT", "")
-    context = node_id(item) if owner == str(os.getpid()) else previous
-    os.environ["PERIGRAFO_TEST_CONTEXT"] = context
-    try:
-        import coverage
-        tracer = coverage.Coverage.current()
-    except ImportError:
-        tracer = None
-    if tracer is not None:
-        tracer.switch_context(context)
-    try:
-        return (yield)
-    finally:
-        os.environ["PERIGRAFO_TEST_CONTEXT"] = previous
-        if tracer is not None:
-            tracer.switch_context(previous)
-@pytest.hookimpl(wrapper=True)
-def pytest_runtest_call(item):
-    row = record(item)
-    handle = getattr(getattr(item, "obj", None), "hypothesis", None)
-    original = getattr(handle, "inner_test", None)
-    if original is None:
-        if not row["is_property"]:
-            row["body_calls"] += 1
-    else:
-        @functools.wraps(original)
-        def counted(*args, **kwargs):
-            row["body_calls"] += 1
-            return original(*args, **kwargs)
-        handle.inner_test = counted
-    try:
-        return (yield)
-    finally:
-        if original is not None:
-            handle.inner_test = original
-@pytest.hookimpl(wrapper=True, tryfirst=True)
-def pytest_runtest_makereport(item, call):
-    report = yield
-    row = record(item)
-    row["duration"] += report.duration
-    if report.failed or row["outcome"] != "failed":
-        if report.failed or report.skipped or report.when == "call":
-            row["outcome"] = report.outcome
-    if report.skipped:
-        reason = report.longrepr
-        reason = str(reason[-1] if isinstance(reason, tuple) else reason)
-        row["skip_reason"] = reason.removeprefix("Skipped: ")
-    if hasattr(report, "wasxfail"):
-        row["xfail_reason"] = report.wasxfail
-    statistics = getattr(item, "hypothesis_statistics", None)
-    if statistics:
-        row["hypothesis_statistics"] = statistics
-    return report
-def pytest_sessionfinish(session, exitstatus):
-    if owner != str(os.getpid()):
-        return
-    rows = sorted(tests.values(), key=lambda row: row["nodeid"])
-    selected = [row for row in rows if row["outcome"] != "deselected"]
-    unexecuted = [
-        row["nodeid"] for row in selected
-        if row["is_property"] and row["body_calls"] == 0
-    ]
-    summary = dict(Counter(row["outcome"] for row in rows))
-    summary.update({
-        "collected_cases": len(rows),
-        "selected_cases": len(selected),
-        "functions": len({row["function"] for row in rows}),
-        "properties": sum(row["is_property"] for row in selected),
-        "unexecuted_properties": unexecuted,
-        "unmeasured_properties": [
-            row["nodeid"] for row in selected if row["body_calls"] is None
-        ],
-        "body_calls": sum(row["body_calls"] or 0 for row in selected),
-        "duration": sum(row["duration"] for row in selected),
-    })
-    document = {
-        "schema": "perigrafo.tests",
-        "schema_version": 1,
-        "package": os.environ.get("PERIGRAFO_TEST_PACKAGE"),
-        "exit_code": int(exitstatus),
-        "summary": summary,
-        "tests": rows,
-        "collection_errors": collection_errors,
-    }
-    report = Path(os.environ["PERIGRAFO_TEST_REPORT"])
-    report.write_text(json.dumps(document, indent=2) + "\n")
-    if os.environ.get("PERIGRAFO_MUTATION_REPORT") == "1":
-        attribution = {
-            "failed_tests": [
-                row["nodeid"] for row in rows if row["outcome"] == "failed"
-            ],
-            "collection_errors": collection_errors,
-        }
-        sys.stdout.write("\nPERIGRAFO_TEST_REPORT " + json.dumps(attribution) + "\n")
-"""
+    """Read the pytest plugin shared by coverage and on-demand campaigns."""
+    return (Path(__file__).with_name("prm") / "test_report.py").read_text(
+        encoding="utf-8",
+    )
 
 
 def _prepare_package_tests(
@@ -4812,75 +4129,12 @@ def _dispatch_test_runner(
     )
 
 
-def _coverage_expression(root: Path, name: str, system: str) -> str:
-    """Instrument the ordinary check while reusing its environment and test command."""
-    expression = """let
-  flake = builtins.getFlake FLAKE;
-  system = SYSTEM;
-  packageName = PACKAGE;
-  packageDrv = flake.packages.${system}.${packageName};
-  check = flake.checks.${system}.${packageName};
-  reportPlugin = builtins.toFile "_perigrafo_test_report.py" REPORT_PLUGIN;
-in
-check.overrideAttrs (previous: {
-  name = "${previous.name}-coverage";
-  buildCommand = ''
-    mkdir -p "$out/html" "$TMPDIR/coverage-startup"
-    export COVERAGE_FILE="$out/.coverage"
-    export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
-    export PERIGRAFO_TEST_REPORT="$out/tests.json"
-    export PERIGRAFO_TEST_PACKAGE=${packageName}
-    unset PERIGRAFO_TEST_REPORT_OWNER PERIGRAFO_MUTATION_REPORT PERIGRAFO_TEST_CONTEXT
-    cp "${reportPlugin}" "$TMPDIR/coverage-startup/_perigrafo_test_report.py"
-    export PYTEST_PLUGINS="_perigrafo_test_report''${PYTEST_PLUGINS:+,$PYTEST_PLUGINS}"
-    cat > "$COVERAGE_PROCESS_START" <<EOF
-    [run]
-    core = ctrace
-    parallel = true
-    branch = true
-    data_file = $out/.coverage
-    source =
-        $src
-        ${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}
-    omit =
-        */test_main.py
-        */prm/*
-    EOF
-    printf '%s\\n' 'import os, coverage' 'tracer = coverage.Coverage.current() or coverage.process_startup()' 'if tracer is not None: tracer.switch_context(os.environ.get("PERIGRAFO_TEST_CONTEXT", ""))' > "$TMPDIR/coverage-startup/sitecustomize.py"
-    export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
-  '' + previous.buildCommand + ''
-    unset COVERAGE_PROCESS_START
-    python -m coverage combine --rcfile="$TMPDIR/coverage.ini"
-    python - <<'PYTHON'
-    import os
-    import coverage
-    data = coverage.CoverageData()
-    data.read()
-    mapped = coverage.CoverageData(basename=".coverage-mapped")
-    installed = "${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}/__init__.py"
-    mapped.update(data, map_path=lambda path: os.environ["src"] + "/main.py" if path == installed else path)
-    mapped.write()
-    os.replace(mapped.data_filename(), data.data_filename())
-    PYTHON
-    python -m coverage html --show-contexts --rcfile="$TMPDIR/coverage.ini" -d "$out/html"
-    python -m coverage json --show-contexts --rcfile="$TMPDIR/coverage.ini" -o "$out/coverage.json"
-  '';
-})
-"""  # noqa: E501
-    substitutions = {
-        "FLAKE": nix_syntax.quote_string("git+" + root.as_uri()),
-        "SYSTEM": nix_syntax.quote_string(system),
-        "PACKAGE": nix_syntax.quote_string(name),
-        "REPORT_PLUGIN": nix_syntax.quote_string(_test_report_source()),
-    }
-    return re.sub(
-        r"\b(?:FLAKE|SYSTEM|PACKAGE|REPORT_PLUGIN)\b",
-        lambda match: substitutions[match[0]],
-        expression,
-    )
+def _flake_installable(root: Path, attribute: str) -> str:
+    """Select a named output while retaining Git's tracked-source filtering."""
+    return f"git+{root.as_uri()}#{attribute}"
 
 
-def _build_package_coverage(package: Path, system: str) -> None:
+def _build_package_coverage(package: Path) -> None:
     """Build an instrumented variant of the test check and print its report path."""
     root = _test_target_root(package)
     check = root / "checks" / package.name / "default.nix"
@@ -4894,11 +4148,9 @@ def _build_package_coverage(package: Path, system: str) -> None:
             "nix",
             "build",
             "--no-link",
-            "--no-write-lock-file",
+            "--no-update-lock-file",
             "--print-out-paths",
-            "--impure",
-            "--expr",
-            _coverage_expression(root, package.name, system),
+            _flake_installable(root, f"{package.name}-coverage"),
         ],
         stdout=subprocess.PIPE,
         text=True,
@@ -4958,9 +4210,6 @@ def _run_coverage(target: Path) -> bool:
     else:
         _test_target_root(target)
         packages = [target]
-    system = _run(
-        ["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],
-    ).stdout.strip()
     outcomes: dict[str, str] = {}
     for package in packages:
         try:
@@ -4971,7 +4220,7 @@ def _run_coverage(target: Path) -> bool:
                 outcomes[package.name] = "skipped"
                 sys.stdout.write(f"Skipping {package.name}: no Python tests\n")
                 continue
-            _build_package_coverage(package, system)
+            _build_package_coverage(package)
             outcomes[package.name] = "passed"
         except (CommandError, OSError) as error:
             outcomes[package.name] = "failed"
@@ -5386,13 +4635,6 @@ def _dispatch_standalone_command(
     return True
 
 
-def _normalize_help_arguments(arguments: list[str]) -> list[str]:
-    """Translate the help convenience command to argparse's help option."""
-    if arguments[:1] == ["help"]:
-        return [*arguments[1:], "--help"]
-    return arguments
-
-
 def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
     """Create the selected package or host resource."""
     kind, name, _relative = _parse_resource_path(options.resource)
@@ -5411,7 +4653,7 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
 
 def main() -> None:
     """Dispatch the Perigrafo CLI."""
-    arguments = _normalize_help_arguments(sys.argv[1:])
+    arguments = sys.argv[1:]
     try:
         cli = parser()
         commands = next(

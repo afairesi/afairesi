@@ -1,0 +1,81 @@
+{ inputs }:
+let
+  builders = import ./builders.nix;
+  lib = builders // {
+    mkFormatter =
+      { self }:
+      inputs.nixpkgs.lib.genAttrs (builtins.attrNames self.packages) (
+        system:
+        import ../../../formatter.nix {
+          inherit inputs self;
+          flake = self.outPath;
+          pkgs = inputs.nixpkgs.legacyPackages.${system};
+        }
+      );
+    mkFlake =
+      arguments:
+      let
+        repositoryInputs = arguments.inputs;
+        base = inputs.blueprint arguments;
+        nixlib = inputs.nixpkgs.lib;
+        source = repositoryInputs.self.outPath;
+        packagePath = source + "/packages";
+        names = builtins.attrNames (
+          nixlib.filterAttrs (
+            name: type: type == "directory" && builtins.pathExists (packagePath + "/${name}/main.py")
+          ) (if builtins.pathExists packagePath then builtins.readDir packagePath else { })
+        );
+        systems = builtins.attrNames base.packages;
+        environments = nixlib.genAttrs systems (
+          system:
+          nixlib.genAttrs names (
+            name:
+            builders.mkTestEnvironment {
+              pkgs = (repositoryInputs.nixpkgs or inputs.nixpkgs).legacyPackages.${system};
+              packageDrv = repositoryInputs.self.packages.${system}.${name};
+            }
+          )
+        );
+      in
+      (builtins.removeAttrs base [ "__functor" ])
+      // {
+        legacyPackages = nixlib.genAttrs systems (
+          system:
+          let
+            generated = nixlib.listToAttrs (
+              nixlib.concatMap (
+                name:
+                [
+                  {
+                    name = "${name}-test-environment";
+                    value = environments.${system}.${name}.manifest;
+                  }
+                ]
+                ++ nixlib.optional (builtins.pathExists (source + "/checks/${name}/default.nix")) {
+                  name = "${name}-coverage";
+                  value = builders.mkCoverage {
+                    packageName = name;
+                    packageDrv = repositoryInputs.self.packages.${system}.${name};
+                    check = repositoryInputs.self.checks.${system}.${name};
+                  };
+                }
+              ) names
+            );
+          in
+          assert nixlib.assertMsg (
+            builtins.intersectAttrs (base.legacyPackages.${system} or { }) generated == { }
+          ) "Perigrafo generated test outputs collide with package names";
+          (base.legacyPackages.${system} or { }) // generated
+        );
+        devShells = nixlib.genAttrs systems (
+          system:
+          (base.devShells.${system} or { })
+          // nixlib.mapAttrs' (name: environment: {
+            name = "${name}-test";
+            value = environment.shell;
+          }) environments.${system}
+        );
+      };
+  };
+in
+lib

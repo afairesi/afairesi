@@ -117,20 +117,34 @@ def _prepare_runner_flake(
     """Provide an offline flake backed by this check's real Python environment."""
     package = _make_runner_target(root, source, tests, name=name)
     (package / "main.py").write_text(source, encoding="utf-8")
-    dependency = root / "prm/nixpkgs"
-    dependency.mkdir(parents=True)
-    (dependency / "flake.nix").write_text("{ outputs = _: {}; }", encoding="utf-8")
-    (dependency / "default.nix").write_text(
-        "_: { lib = { concatMap = f: xs: builtins.concatLists (map f xs); "
-        'makeBinPath = _: ""; }; writeText = builtins.toFile; }',
-        encoding="utf-8",
+    builders = root / "prm/builders"
+    shutil.copytree(Path(__file__).with_name("prm"), builders)
+    environment = dict(os.environ)
+    store = root.parent / "nix"
+    environment["NIX_REMOTE"] = (
+        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
     )
+    environment["NIX_CONFIG"] = (
+        "experimental-features = nix-command flakes\nbuild-users-group =\n"
+    )
+    system = subprocess.run(
+        ["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
     (root / "flake.nix").write_text(
-        '{ inputs.nixpkgs.url = "path:./prm/nixpkgs"; '
-        "outputs = _: { packages.${builtins.currentSystem} = { "
-        f"{json.dumps(name)}.python"
-        ".withPackages = "
-        f"_ : {json.dumps(sys.prefix)}; }}; }}; }}",
+        "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
+        "pkgs = { lib = { concatMap = f: xs: builtins.concatLists (map f xs); "
+        'makeBinPath = _: ""; }; writeText = builtins.toFile; }; '
+        f"packageDrv.python.withPackages = _ : {json.dumps(sys.prefix)}; "
+        "in { "
+        f"packages.{json.dumps(system)} = builtins.listToAttrs (map (name: {{ "
+        'name = "${name}-test-environment"; '
+        "value = (lib.mkTestEnvironment { inherit pkgs packageDrv; }).manifest; "
+        "}) (builtins.attrNames (builtins.readDir ./packages))); }; }",
         encoding="utf-8",
     )
     for args in (["init", "--quiet"], ["add", "."]):
@@ -140,14 +154,6 @@ def _prepare_runner_flake(
             capture_output=True,
             timeout=10,
         )
-    environment = dict(os.environ)
-    store = root.parent / "nix"
-    environment["NIX_REMOTE"] = (
-        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
-    )
-    environment["NIX_CONFIG"] = (
-        "experimental-features = nix-command flakes\nbuild-users-group =\n"
-    )
     return environment
 
 
@@ -217,6 +223,8 @@ def _prepare_coverage_flake(
         raise AssertionError(message)
     packages = []
     checks = []
+    reports = []
+    shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
     for name in ("example", "z-last"):
         _run(root, "add", f"packages/{name}", "python")
         package = root / "packages" / name
@@ -283,7 +291,7 @@ def _prepare_coverage_flake(
         )
         expression = (
             f"import ./checks/{name}/default.nix {{ inherit pkgs; "
-            "inputs.self.packages.${system} = packages; }"
+            "inputs.self = { inherit lib; packages.${system} = packages; }; }"
         )
         if name == "example" and failure == "report":
             expression = (
@@ -291,9 +299,15 @@ def _prepare_coverage_flake(
                 '(_: { buildCommand = "mkdir -p $out\\n"; })'
             )
         checks.append(f"{json.dumps(name)} = {expression};")
+        reports.append(
+            f"{json.dumps(name + '-coverage')} = lib.mkCoverage {{ "
+            f"packageName = {json.dumps(name)}; "
+            f"packageDrv = packages.{json.dumps(name)}; "
+            f"check = checks.{json.dumps(name)}; }};",
+        )
     _run(root, "converge")
     (root / "flake.nix").write_text(
-        "{ outputs = _: let "
+        "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
         f"system = {json.dumps(system)}; "
         "mkCheck = name: attrs: script: let build = current: (builtins.derivation { "
         "inherit system; inherit (current) name src PACKAGE_E2E_EXECUTABLE; "
@@ -310,8 +324,11 @@ def _prepare_coverage_flake(
         'getExe = p: "${p}/bin/${p.cliName}"; }; }; '
         "packages = { "
         + " ".join(packages)
-        + " }; in { packages.${system} = packages; "
-        "checks.${system} = { " + " ".join(checks) + " }; }; }\n",
+        + " }; checks = { "
+        + " ".join(checks)
+        + " }; "
+        "in { packages.${system} = packages // { " + " ".join(reports) + " }; "
+        "checks.${system} = checks; }; }\n",
     )
     _git(root, "add", ".")
     return environment
@@ -390,29 +407,35 @@ def _check_excluded_trees(
         raise AssertionError(issues)
 
 
-def _check_formatted_host(
+def _check_formatted_checks(
     repository: Path,
 ) -> None:
     """Preserve formatted generated checks through the full formatting pipeline."""
     _run(repository, "add", "hosts/laptop")
-    relative = "checks/laptopVmWithDisko/default.nix"
-    check = repository / relative
-    _run(repository, "--no-cache", relative, executable="treefmt")
-    formatted = check.read_text(encoding="utf-8")
-    _git(repository, "add", "--", relative)
-    index = _git(repository, "ls-files", "--stage")
-    result = _run(repository, "converge")
-    if (
-        check.read_text(encoding="utf-8") != formatted
-        or _git(repository, "ls-files", "--stage") != index
-        or f"write '{relative}'" in result.stdout
+    (repository / "packages/example/test_main.py").write_text(
+        "def test_result(): pass\n",
+    )
+    _run(repository, "converge")
+    for relative in (
+        "checks/laptopVmWithDisko/default.nix",
+        "checks/example/default.nix",
     ):
-        message = "convergence regenerated a formatted host check"
-        raise AssertionError(message)
+        check = repository / relative
+        _run(repository, "--no-cache", relative, executable="treefmt")
+        formatted = check.read_text(encoding="utf-8")
+        _git(repository, "add", "--", relative)
+        index = _git(repository, "ls-files", "--stage")
+        result = _run(repository, "converge")
+        _expect(
+            check.read_text(encoding="utf-8") == formatted
+            and _git(repository, "ls-files", "--stage") == index
+            and f"write '{relative}'" not in result.stdout,
+            f"convergence regenerated formatted {relative}",
+        )
 
 
-def _check_host_upgrade(repository: Path) -> None:
-    """Upgrade a generated check without changing its host or adding resources."""
+def _check_host_repair(repository: Path) -> None:
+    """Repair a changed check while preserving its host and resource inventory."""
     _run(repository, "add", "hosts/laptop")
     host = repository / "hosts/laptop/configuration.nix"
     original_host = host.read_bytes()
@@ -420,25 +443,25 @@ def _check_host_upgrade(repository: Path) -> None:
     relative = "checks/laptopVmWithDisko/default.nix"
     check = repository / relative
     current = check.read_bytes()
-    legacy = b'{ pkgs, ... }: pkgs.runCommand "legacy-host-check" {} "mkdir $out"\n'
-    check.write_bytes(legacy)
+    changed = current.replace(b'"VmWithDisko"', b'"Changed"')
+    check.write_bytes(changed)
     _git(repository, "add", "--", relative)
     _run(repository, "converge", "--dry-run", code=1)
-    if check.read_bytes() != legacy:
+    if check.read_bytes() != changed:
         message = "dry-run changed the generated check"
         raise AssertionError(message)
     _run(repository, "converge")
     if check.read_bytes() != current:
-        message = "convergence did not upgrade the generated check"
+        message = "convergence did not repair the generated check"
         raise AssertionError(message)
     if host.read_bytes() != original_host:
-        message = "check upgrade changed the host configuration"
+        message = "check repair changed the host configuration"
         raise AssertionError(message)
     if _git(repository, "ls-files").splitlines() != original_paths:
-        message = "check upgrade added consumer files"
+        message = "check repair added consumer files"
         raise AssertionError(message)
     if _run(repository, "converge", "--dry-run").stdout:
-        message = "check upgrade did not converge"
+        message = "check repair did not converge"
         raise AssertionError(message)
 
 
@@ -1373,7 +1396,9 @@ def _template_expression(root: Path, name: str) -> str:
         'http-server = "server"; texliveFull = "tex"; '
         "stdenv.hostPlatform.isLinux = false; "
         "stdenv.mkDerivation = attrs: attrs; writeTextFile = attrs: attrs; "
-        "lib.optionals = condition: values: if condition then values else []; "
+        "lib = { optionals = condition: values: if condition then values else []; "
+        'optionalString = condition: value: if condition then value else ""; '
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; }; "
         "runCommand = name: attrs: script: mk name "
         '("runHook() {\\n" + (attrs.postInstall or ":") + "\\n}\\n" + script); '
         "writeShellApplication = attrs: (mk attrs.name "
@@ -1386,7 +1411,10 @@ def _template_expression(root: Path, name: str) -> str:
         + json.dumps('\nPERIGRAFO_SCRIPT\nchmod 755 "$out/bin/${attrs.name}"\n')
         + ")) // attrs; }; "
         + f"package = import {root / 'packages' / name / 'default.nix'} "
-        + "{ inherit pkgs; }; in "
+        + "{ inherit pkgs; "
+        + "inputs.self.lib = import "
+        + f"{Path(__file__).with_name('prm') / 'builders.nix'}; "
+        + "}; in "
     )
 
 
@@ -1428,6 +1456,7 @@ def _check_launcher_environment(
     expression = _template_expression(root, name) + (
         "let checkPkgs = pkgs // { stdenv.system = builtins.currentSystem; "
         "runCommand = _: attrs: _: attrs; lib = pkgs.lib // { "
+        "concatMap = f: xs: builtins.concatLists (map f xs); "
         "optionalAttrs = condition: attrs: if condition then attrs else {}; "
         'getExe = p: if p.meta ? mainProgram then "/package/bin/${p.meta.mainProgram}" '
         'else abort "library check requested an executable"; }; }; '
@@ -1437,8 +1466,10 @@ def _check_launcher_environment(
         'hypothesis = "hypothesis"; pytest = "pytest"; }; }; }; '
         f"meta = {metadata}; }}; "
         f"in import {root / 'checks' / name / 'default.nix'} {{ pkgs = checkPkgs; "
-        "inputs.self.packages.${builtins.currentSystem}."
-        f"{json.dumps(name)} = packageDrv; }}"
+        "inputs.self = { "
+        f"lib = import {Path(__file__).with_name('prm') / 'builders.nix'}; "
+        "packages.${builtins.currentSystem}."
+        f"{json.dumps(name)} = packageDrv; }}; }}"
     )
     result = _run(
         root,
@@ -1540,15 +1571,8 @@ def _runner_package(root: Path, name: str, tests: str, source: str = "") -> None
     """Add another offline runnable package without replacing the fixture flake."""
     flake = (root / "flake.nix").read_text()
     _make_runner_target(root, source, tests, name=name)
-    prefix, ending = flake.rsplit("}; }; }", 1)
-    (root / "flake.nix").write_text(
-        prefix
-        + f" {json.dumps(name)}.python.withPackages = "
-        + f"_: {json.dumps(sys.prefix)}; "
-        + "}; }; }"
-        + ending,
-    )
-    _git(root, "add", "flake.nix", f"packages/{name}")
+    (root / "flake.nix").write_text(flake)
+    _git(root, "add", ".")
 
 
 def _campaign(
@@ -1595,7 +1619,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         for path in commands:
             option = _run(root, *path, "--help").stdout
             _expect(
-                option == _run(root, "help", *path).stdout and "usage:" in option,
+                "usage:" in option,
                 path,
             )
         environment = dict(os.environ)
@@ -1605,11 +1629,12 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             + environment["PATH"]
         )
         _expect(
-            _run(root, "help", executable="perigrafo", environment=environment).stdout
+            _run(root, "--help", executable="perigrafo", environment=environment).stdout
             == _run(root, "--help").stdout,
             "standalone command unavailable through PATH",
         )
         for retired in (
+            "help",
             "status",
             "check",
             "overview",
@@ -1893,9 +1918,9 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
         _run(root, "converge")
         _expect(_snapshot(root) == stable, "convergence is not idempotent")
         _preview(root, "converge")
-        _check_formatted_host(root)
-        with _fresh_repository() as upgrade:
-            _check_host_upgrade(upgrade)
+        _check_formatted_checks(root)
+        with _fresh_repository() as repair:
+            _check_host_repair(repair)
         with (
             _fresh_repository() as validation,
             pytest.MonkeyPatch.context() as patch,
@@ -2049,7 +2074,7 @@ def test_coverage_checks_measure_subprocesses_and_continue_after_failures() -> N
 @example(kind="html", name="web-site", description="Δ report", library=False)
 @example(kind="latex", name="document", description="LaTeX\tresources", library=False)
 @example(kind="nix", name="my-package", description="é", library=False)
-def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(  # noqa: C901, PLR0912, PLR0915
+def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(  # noqa: PLR0915
     kind: str,
     name: str,
     description: str,
@@ -2069,15 +2094,6 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
             (package / "test_main.py").write_text("def test_result(): pass\n")
             if library:
                 (package / "main.py").write_text("VALUE = 1\n")
-            if library and "_" in name:
-                source = (
-                    source.replace("    mainProgram = pname;", "")
-                    .replace("    mainProgram = baseNameOf ./.;", "")
-                    .replace(
-                        "  passthru.python",
-                        "  meta.mainProgram = pname;\n  passthru.python",
-                    )
-                )
         elif kind in {"html", "latex"}:
             binding = "runtimeInputs" if kind == "html" else "nativeBuildInputs"
             expression = (
@@ -2682,6 +2698,26 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
             mismatch.returncode == 1 and "does not match" in mismatch.stderr,
             mismatch,
         )
+
+
+def test_python_packages_require_the_shared_constructor() -> None:
+    """Reject unsupported builders before convergence changes repository state."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        definition = root / "packages/example/default.nix"
+        definition.write_text(
+            "{ pkgs, ... }: pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
+        )
+        _git(root, "add", ".")
+        before = _snapshot(root)
+        result = _run(root, "converge", code=1)
+        _expect("shared mkPythonPackage constructor" in result.stderr, result)
+        _expect(_snapshot(root) == before, "unsupported builder changed repository")
+        (root / "packages/example/ms.tex").touch()
+        before = _snapshot(root)
+        result = _run(root, "converge", code=1)
+        _expect("ambiguous project markers" in result.stderr, result)
+        _expect(_snapshot(root) == before, "ambiguous markers changed repository")
 
 
 @settings(deadline=None)
