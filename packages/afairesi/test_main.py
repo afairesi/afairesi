@@ -15,13 +15,14 @@ from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from textwrap import dedent
 from typing import TYPE_CHECKING, cast
 
 import coverage
+import jsonpatch
 import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
+from jsonpointer import JsonPointer
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -749,7 +750,7 @@ def _check_home_move(
 def _check_overview_details(
     repository: Path,
 ) -> None:
-    """Expose structured declarations independently of terminal labels and layout."""
+    """Expose structured declarations while preserving source facts."""
     subject = import_module("packages.afairesi.main")
     for files in (
         {},
@@ -809,29 +810,12 @@ def _check_overview_details(
     if sources["prm/nested/script.js"]["lines"] != expected_lines:
         msg = "Asset line counts must be structured source facts"
         raise AssertionError(msg)
-    expected = (
-        "commands:\n  build:\n    arguments:\n"
-        "      - --jobs  optional; default=2\n"
-        "description: Example\n"
-        "tests:\n  - result\n"
-    )
-    _expect(
-        data
-        == {
-            "packages": {
-                "example": {
-                    "description": "Example",
-                    "commands": {
-                        "build": {
-                            "arguments": ["--jobs  optional; default=2"],
-                        },
-                    },
-                    "tests": ["result"],
-                },
-            },
-        },
-        data,
-    )
+    expected = {
+        "commands": {"build": {"arguments": ["--jobs  optional; default=2"]}},
+        "description": "Example",
+        "tests": ["result"],
+    }
+    _expect(data == {"packages": {"example": expected}}, data)
     _expect(_overview(package) == data, data)
     tree = _overview_tree(repository)
     _expect(
@@ -849,7 +833,9 @@ def _check_overview_details(
     )
     (package / "test_main.py").write_text("def test_result(): pass\n")
     _expect(
-        _resource_output(_run(repository, "packages/example").stdout, "example")
+        _overview_resources(_run(repository, "packages/example").stdout)["packages"][
+            "example"
+        ]
         == expected,
         expected,
     )
@@ -882,11 +868,11 @@ def _check_home_summaries(home_repository: Path) -> None:
         == {
             socket.gethostname(): {
                 str(home_repository): {
-                    ".gitignore": {},
-                    ".gitmodules": {},
-                    "forge.example": {
-                        "owner": {
-                            name: {
+                    ".gitignore": None,
+                    ".gitmodules": None,
+                    "forge.example/": {
+                        "owner/": {
+                            name + "/": {
                                 "packages": {"same": {"description": "Same"}},
                                 "hosts": {"same": {}},
                             }
@@ -900,7 +886,7 @@ def _check_home_summaries(home_repository: Path) -> None:
     )
     _expect(_snapshot(home_repository) == before, "JSON inspection changed the home")
     _git(home_repository, "config", "-f", ".gitmodules", "submodule.second.path", "..")
-    rejected = _run(home_repository, "--json", str(home_repository), code=1)
+    rejected = _run(home_repository, str(home_repository), code=1)
     _expect("submodule path escapes" in rejected.stderr, rejected)
 
 
@@ -937,7 +923,7 @@ def _check_host_summaries(repository: Path) -> None:
     broken = _overview(host)["hosts"]["laptop"]
     _expect("dependencies" in broken["diagnostics"] and "name" not in broken, broken)
     configuration.unlink()
-    _run(repository, "--json", str(repository), code=1)
+    _run(repository, str(repository), code=1)
 
 
 CLI_CONTRACTS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -1097,12 +1083,17 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
 
 def _overview_tree(root: Path) -> dict[str, Any]:
     """Read the complete hierarchy from the CLI."""
-    return cast("dict[str, Any]", json.loads(_run(root, "--json", str(root)).stdout))
+    return cast("dict[str, Any]", json.loads(_run(root, str(root)).stdout))
 
 
 def _overview(root: Path) -> dict[str, Any]:
-    """Read one repository's resource groups after validating machine and user."""
-    tree = _overview_tree(root)
+    """Read one repository's resource groups from the CLI."""
+    return _overview_resources(_run(root, str(root)).stdout)
+
+
+def _overview_resources(output: str) -> dict[str, Any]:
+    """Extract resource groups after validating the machine and user hierarchy."""
+    tree = json.loads(output)
     _expect(set(tree) == {socket.gethostname()}, tree)
     machine = tree[socket.gethostname()]
     _expect(set(machine) == {getpass.getuser()}, machine)
@@ -1113,21 +1104,19 @@ def _overview(root: Path) -> dict[str, Any]:
     return cast("dict[str, Any]", branch)
 
 
-def _resource_output(output: str, name: str) -> str:
-    """Extract a resource's indented fields for declaration assertions."""
-    lines = iter(output.splitlines())
-    for line in lines:
-        if line.strip() == f"{name}:":
-            indentation = len(line) - len(line.lstrip())
-            break
-    else:
-        raise AssertionError(output)
-    fields = []
-    for line in lines:
-        if len(line) - len(line.lstrip()) <= indentation:
-            break
-        fields.append(line)
-    return dedent("\n".join(fields)) + ("\n" if fields else "")
+def _patch_values(patch: list[dict[str, Any]], action: str, *path: str) -> list[Any]:
+    """Read changed values at a semantic field from standard JSON Pointer paths."""
+    values = []
+    for operation in patch:
+        parts = JsonPointer(operation["path"]).parts[1:]
+        if operation["op"] != action or parts[: len(path)] != list(path):
+            continue
+        value = operation["value"]
+        if len(parts) == len(path) and isinstance(value, list):
+            values.extend(value)
+        else:
+            values.append(value)
+    return values
 
 
 PACKAGE_NAMES = st.from_regex(
@@ -1449,9 +1438,9 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         _expect(
             any(
                 name.startswith("/")
-                for name in json.loads(_run(root, "--json").stdout)[
-                    socket.gethostname()
-                ]["filesystem"]
+                for name in json.loads(_run(root).stdout)[socket.gethostname()][
+                    "filesystem"
+                ]
             ),
             "bare afairesi must show machine preservation outside repositories",
         )
@@ -1461,7 +1450,8 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         )
         overview_help = _run(root, "--help").stdout
         _expect(
-            "--json" in overview_help
+            "formatted JSON" in overview_help
+            and "--json" not in overview_help
             and "--full" not in overview_help
             and "--revision" not in overview_help,
             overview_help,
@@ -1566,43 +1556,25 @@ def test_cli_summaries_nest_subcommands_and_preserve_argument_ownership(
             },
         },
     }
-    _expect(_overview(package)["packages"]["example"] == expected, package)
-    output = _resource_output(_run(package, ".").stdout, "example")
-    _expect(
-        output
-        == (
-            "arguments:\n  - --verbose  optional\ncommands:\n  init:\n"
-            "  test:\n    arguments:\n      - --timeout  optional\n"
-            "    commands:\n      coverage:\n        arguments:\n"
-            "          - --jobs  optional; default=2\n"
-            "      hypothesis:\n        arguments:\n"
-            "          - --jobs  optional; default=4\n"
-        ),
-        output,
-    )
+    output = _overview_resources(_run(package, ".").stdout)["packages"]["example"]
+    _expect(output == expected, output)
     _git(tmp_path, "add", ".")
     (package / "main.py").write_text(source.replace("default=2", "default=3"))
-    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    data = json.loads(_run(tmp_path, "diff", ".").stdout)
+    path = (
+        "packages",
+        "example",
+        "commands",
+        "test",
+        "commands",
+        "coverage",
+        "arguments",
+    )
     _expect(
-        data["repositories"][0]["changes"]
-        == [
-            {
-                "path": [
-                    "packages",
-                    "example",
-                    "commands",
-                    "test",
-                    "commands",
-                    "coverage",
-                    "arguments",
-                ],
-                "operation": "changed",
-                "before": ["--jobs  optional; default=2"],
-                "after": ["--jobs  optional; default=3"],
-            },
-        ],
+        _patch_values(data, "remove", *path) == ["--jobs  optional; default=2"],
         data,
     )
+    _expect(_patch_values(data, "add", *path) == ["--jobs  optional; default=3"], data)
 
 
 @pytest.mark.parametrize("failure", [None, "coverage", "hypothesis", "mutation"])
@@ -2047,26 +2019,17 @@ def test_diff_does_not_follow_source_symlinks_and_reports_parse_errors(
     _git(tmp_path, "add", ".")
     source.unlink()
     source.symlink_to(tmp_path / "not-present")
-    details = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    details = json.loads(_run(tmp_path, "diff", ".").stdout)
     _expect(
-        details["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example", "arguments"],
-                "operation": "removed",
-                "before": ["--old  optional"],
-            },
-        ],
+        _patch_values(details, "remove", "packages", "example", "arguments")
+        == ["--old  optional"],
         details,
     )
     source.unlink()
     source.write_text("def invalid(")
-    details = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    details = json.loads(_run(tmp_path, "diff", ".").stdout)
     _expect(
-        any(
-            change["path"] == ["packages", "example", "diagnostics"]
-            for change in details["repositories"][0]["changes"]
-        ),
+        bool(_patch_values(details, "add", "packages", "example", "diagnostics")),
         details,
     )
 
@@ -2085,16 +2048,10 @@ def test_diff_handles_a_tracked_symlink_replaced_with_a_regular_source(
     source.write_text(
         "import argparse\np = argparse.ArgumentParser()\np.add_argument('--new')\n",
     )
-    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    data = json.loads(_run(tmp_path, "diff", ".").stdout)
     _expect(
-        data["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example", "arguments"],
-                "operation": "added",
-                "after": ["--new  optional"],
-            },
-        ],
+        _patch_values(data, "add", "packages", "example", "arguments")
+        == ["--new  optional"],
         data,
     )
 
@@ -2106,34 +2063,21 @@ def test_diff_handles_unborn_head_removed_packages_and_semantically_equal_edits(
     _repository(tmp_path)
     package = _make_source_package(tmp_path, "example", "def test_result(): pass\n")
     _git(tmp_path, "add", ".")
-    staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
+    staged = json.loads(_run(tmp_path, "diff", ".", "--cached").stdout)
     _expect(
-        staged["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example"],
-                "operation": "added",
-                "after": {"tests": ["result"]},
-            },
-        ],
+        _patch_values(staged, "add", "packages", "example") == [{"tests": ["result"]}],
         staged,
     )
     (package / "test_main.py").write_text(
         "# comment\ndef test_result():\n    raise RuntimeError('new body')\n",
     )
-    _expect("No overview changes." in _run(tmp_path, "diff", ".").stdout, package)
+    _expect(json.loads(_run(tmp_path, "diff", ".").stdout) == [], package)
     for path in package.iterdir():
         path.unlink()
-    removed = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    removed = json.loads(_run(tmp_path, "diff", ".").stdout)
     _expect(
-        removed["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example"],
-                "operation": "removed",
-                "before": {"tests": ["result"]},
-            },
-        ],
+        _patch_values(removed, "remove", "packages", "example")
+        == [{"tests": ["result"]}],
         removed,
     )
 
@@ -2163,13 +2107,12 @@ def test_diff_ignores_reordered_tests_and_named_options(
         "def test_second(): pass\ndef test_first():\n    assert True\n",
     )
     before = _snapshot(tmp_path)
-    working = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
-    _expect(working["repositories"][0]["changes"] == [], working)
-    _expect("No overview changes." in _run(tmp_path, "diff", ".").stdout, working)
+    working = json.loads(_run(tmp_path, "diff", ".").stdout)
+    _expect(working == [], working)
     _expect(_snapshot(tmp_path) == before, "semantic inspection changed source state")
     _git(tmp_path, "add", ".")
-    staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
-    _expect(staged["repositories"][0]["changes"] == [], staged)
+    staged = json.loads(_run(tmp_path, "diff", ".", "--cached").stdout)
+    _expect(staged == [], staged)
 
 
 def test_diff_preserves_positional_argument_order(
@@ -2189,17 +2132,29 @@ def test_diff_preserves_positional_argument_order(
         prefix + "p.add_argument('--verbose')\np.add_argument('destination')\n"
         "p.add_argument('source')\n",
     )
-    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
-    _expect(
-        data["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example", "arguments"],
-                "operation": "changed",
-                "before": ["source  required", "destination  required"],
-                "after": ["destination  required", "source  required"],
+    data = json.loads(_run(tmp_path, "diff", ".").stdout)
+    document = {
+        str(tmp_path): {
+            "packages": {
+                "example": {
+                    "arguments": [
+                        "source  required",
+                        "destination  required",
+                        "--verbose  optional",
+                    ],
+                },
             },
-        ],
+            "hosts": {},
+        },
+    }
+    patched = jsonpatch.apply_patch(document, data)
+    _expect(
+        patched[str(tmp_path)]["packages"]["example"]["arguments"]
+        == ["destination  required", "source  required", "--verbose  optional"],
+        data,
+    )
+    _expect(
+        all(operation.get("value") != "--verbose  optional" for operation in data),
         data,
     )
 
@@ -2256,16 +2211,22 @@ def test_diff_reports_list_membership_changes_and_preserves_duplicate_counts(
     source.write_text(before)
     _git(tmp_path, "add", ".")
     source.write_text(after)
-    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    data = json.loads(_run(tmp_path, "diff", ".").stdout)
+    action = "add" if operation == "added" else "remove"
     _expect(
-        data["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example", field],
-                "operation": operation,
-                "after" if operation == "added" else "before": entries,
-            },
-        ],
+        sorted(_patch_values(data, action, "packages", "example", field))
+        == sorted(entries),
+        data,
+    )
+    _expect(
+        _patch_values(
+            data,
+            "remove" if action == "add" else "add",
+            "packages",
+            "example",
+            field,
+        )
+        == [],
         data,
     )
 
@@ -2299,57 +2260,30 @@ def test_diff_reports_only_changed_list_entries(
     (package / "test_main.py").write_text(
         "def test_new(): pass\ndef test_kept(): pass\n",
     )
-    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
-    _expect(
-        data["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example", "arguments"],
-                "operation": "changed",
-                "before": ["--jobs  optional; default=2"],
-                "after": ["--jobs  optional; default=3"],
-            },
-            {
-                "path": ["packages", "example", "dependencies"],
-                "operation": "changed",
-                "before": ["runtime: packages/old"],
-                "after": ["runtime: packages/new"],
-            },
-            {
-                "path": ["packages", "example", "description"],
-                "operation": "changed",
-                "before": "Before",
-                "after": "After",
-            },
-            {
-                "path": ["packages", "example", "tests"],
-                "operation": "changed",
-                "before": ["old"],
-                "after": ["new"],
-            },
-        ],
-        data,
+    data = json.loads(_run(tmp_path, "diff", ".").stdout)
+    for field, old, new in (
+        ("arguments", "--jobs  optional; default=2", "--jobs  optional; default=3"),
+        ("dependencies", "runtime: packages/old", "runtime: packages/new"),
+        ("description", "Before", "After"),
+        ("tests", "old", "new"),
+    ):
+        _expect(
+            _patch_values(data, "remove", "packages", "example", field) == [old],
+            data,
+        )
+        _expect(_patch_values(data, "add", "packages", "example", field) == [new], data)
+    rendered = subprocess.run(
+        ["jd", "-t", "patch2jd"],  # noqa: S607
+        input=json.dumps(data),
+        capture_output=True,
+        text=True,
+        check=True,
     )
-    output = _run(tmp_path, "diff", ".").stdout
     _expect(
-        output
-        == (
-            "Overview diff: index -> working_tree\n"
-            f"{tmp_path}:\n"
-            "  packages/example/arguments:\n"
-            "    - --jobs  optional; default=2\n"
-            "    + --jobs  optional; default=3\n"
-            "  packages/example/dependencies:\n"
-            "    - runtime: packages/old\n"
-            "    + runtime: packages/new\n"
-            "  packages/example/description:\n"
-            "    - Before\n"
-            "    + After\n"
-            "  packages/example/tests:\n"
-            "    - old\n"
-            "    + new\n"
-        ),
-        output,
+        '- "Before"' in rendered.stdout
+        and '+ "After"' in rendered.stdout
+        and "kept" not in rendered.stdout,
+        rendered,
     )
 
 
@@ -2376,11 +2310,9 @@ def test_diff_reports_unresolved_index_conflicts_without_modifying_state(
         capture_output=True,
     )
     before = _snapshot(tmp_path)
-    data = json.loads(_run(tmp_path, "diff", ".", "--json", code=1).stdout)
-    _expect(
-        "unresolved index conflict" in data["repositories"][0]["diagnostics"][0],
-        data,
-    )
+    result = _run(tmp_path, "diff", ".", code=1)
+    _expect(json.loads(result.stdout) == [], result)
+    _expect("unresolved index conflict" in result.stderr, result)
     _expect(_snapshot(tmp_path) == before, "diff changed conflicted index state")
 
 
@@ -2398,46 +2330,25 @@ def test_diff_separates_working_index_and_head_without_modifying_state(
     (package / "test_main.py").write_text("def test_working(): pass\n")
     _make_source_package(tmp_path, "untracked", "def test_ignored(): pass\n")
     before = _snapshot(tmp_path)
-    working = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
-    staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
-    _expect(
-        working["comparison"] == {"before": "index", "after": "working_tree"},
-        working,
-    )
-    _expect(staged["comparison"] == {"before": "HEAD", "after": "index"}, staged)
+    working = json.loads(_run(tmp_path, "diff", ".").stdout)
+    staged = json.loads(_run(tmp_path, "diff", ".", "--cached").stdout)
     for data, old, new in (
         (working, "staged", "working"),
         (staged, "baseline", "staged"),
     ):
         _expect(
-            data["repositories"]
-            == [
-                {
-                    "path": str(tmp_path),
-                    "changes": [
-                        {
-                            "path": ["packages", "example", "tests"],
-                            "operation": "changed",
-                            "before": [old],
-                            "after": [new],
-                        },
-                    ],
-                },
-            ],
+            _patch_values(data, "remove", "packages", "example", "tests") == [old],
             data,
         )
-        _expect(data["uncompared"] == [], data)
-    output = _run(tmp_path, "diff", ".").stdout
+        _expect(
+            _patch_values(data, "add", "packages", "example", "tests") == [new],
+            data,
+        )
+        _expect("untracked" not in json.dumps(data), data)
+    _expect(json.loads(_run(package, "diff", ".").stdout) == working, working)
     _expect(
-        "packages/example/tests:" in output
-        and "- staged\n" in output
-        and "+ working\n" in output,
-        output,
-    )
-    _expect(json.loads(_run(package, "diff", ".", "--json").stdout) == working, working)
-    _expect(
-        _run(tmp_path, "diff", ".", "--staged", "--json").stdout
-        == _run(tmp_path, "diff", ".", "--cached", "--json").stdout,
+        _run(tmp_path, "diff", ".", "--staged").stdout
+        == _run(tmp_path, "diff", ".", "--cached").stdout,
         staged,
     )
     _expect(_snapshot(tmp_path) == before, "diff modified repository or working files")
@@ -2490,9 +2401,14 @@ def test_discovery_handles_nested_interfaces_and_malformed_sources() -> None:
             before = _snapshot(root)
             inspected = _run(package, ".")
             _expect(
-                "tests: " in inspected.stdout
+                "tests"
+                in _overview_resources(inspected.stdout)["packages"]["example"].get(
+                    "diagnostics",
+                    {},
+                )
                 if layout in {"syntax", "encoding"}
-                else "tests:" not in inspected.stdout,
+                else "tests"
+                not in _overview_resources(inspected.stdout)["packages"]["example"],
                 inspected,
             )
             _expect(_snapshot(root) == before, "malformed test source changed state")
@@ -2516,16 +2432,13 @@ def test_explicit_targets_preserve_repository_scope(
     nested.mkdir(parents=True)
     catalog = _run(root, str(root)).stdout
     _expect(
-        _resource_output(catalog, "alpha") == "tests:\n  - alpha\n"
-        and _resource_output(catalog, "beta") == "tests:\n  - beta\n",
+        _overview_resources(catalog)
+        == {"packages": {"alpha": {"tests": ["alpha"]}, "beta": {"tests": ["beta"]}}},
         catalog,
     )
-    summaries = _run(root, "--json", str(root)).stdout
     for cwd in (package, nested):
         _expect(_run(cwd, str(root)).stdout == catalog, cwd)
-        _expect(_run(cwd, "--json", str(root)).stdout == summaries, cwd)
-    focused_output = _run(package, ".", "--json").stdout
-    _expect(_run(package, "--json", ".").stdout == focused_output, package)
+    _run(root, "--json", code=2)
     focused = _overview(package)
     _run(root, "overview", code=2)
     _run(root, "unknown-command", code=2)
@@ -2534,25 +2447,34 @@ def test_explicit_targets_preserve_repository_scope(
         focused,
     )
     _expect(
-        _resource_output(_run(package, ".").stdout, "alpha") == "tests:\n  - alpha\n",
+        _overview_resources(_run(package, ".").stdout)["packages"]["alpha"]
+        == {"tests": ["alpha"]},
         package,
     )
     _run(nested, ".", code=1)
-    _run(home, "--json", str(home))
+    _run(home, str(home))
     (home / ".gitmodules").write_text(
         '[submodule "demo"]\npath = forge.example/team/demo\n',
     )
-    repository_tree = json.loads(summaries)[socket.gethostname()][getpass.getuser()]
+    repository_tree = json.loads(catalog)[socket.gethostname()][getpass.getuser()]
     expected = {
         socket.gethostname(): {
             str(home): {
-                ".gitmodules": {},
-                **repository_tree,
+                ".gitmodules": None,
+                **{
+                    domain + "/": {
+                        owner + "/": {
+                            name + "/": facts for name, facts in repositories.items()
+                        }
+                        for owner, repositories in owners.items()
+                    }
+                    for domain, owners in repository_tree.items()
+                },
             },
         },
     }
     _expect(_overview_tree(home) == expected, home)
-    _run(nested, ".", "--json", code=1)
+    _run(nested, ".", code=1)
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
         ("test",),
@@ -2717,7 +2639,10 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
                 _expect(imported.stdout == "1\n", imported)
                 _expect(
-                    "arguments:\n" not in _run(package, ".").stdout,
+                    "arguments"
+                    not in _overview_resources(_run(package, ".").stdout)["packages"][
+                        name
+                    ],
                     "library contract",
                 )
                 (package / "main.py").write_text(
@@ -2754,7 +2679,10 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                     code=2,
                 )
                 _expect(
-                    "arguments:\n" not in _run(package, ".").stdout,
+                    "arguments"
+                    not in _overview_resources(_run(package, ".").stdout)["packages"][
+                        name
+                    ],
                     "scaffold must declare an empty CLI",
                 )
         else:
@@ -2854,7 +2782,7 @@ def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> N
         subject.overview_summary(tmp_path)
         == {
             socket.gethostname(): {
-                str(tmp_path): {".ssh": {"key": {}}},
+                str(tmp_path): {".ssh/": {"key": None}},
             },
         },
         tmp_path,
@@ -2885,7 +2813,7 @@ def test_home_policy_diagnostics_preserve_git_and_whitelist_state(
     }
     tree = subject.overview_summary(tmp_path)[socket.gethostname()][str(tmp_path)]
     _expect(tree["diagnostics"] == expected, tree)
-    _expect("private contents" not in subject.render_overview(tree), tree)
+    _expect("private contents" not in json.dumps(tree), tree)
     _expect(
         before == (ignore.read_text(), _git(tmp_path, "ls-files", "--stage")),
         before,
@@ -2938,13 +2866,15 @@ def test_home_whitelist_merges_paths_and_rejects_escaping_entries(
     subject = import_module("packages.afairesi.main")
     ignore = tmp_path / ".gitignore"
     ignore.write_text(
-        "*\n# comment\n!/.ssh/\n!/.ssh/key\n!/.ssh/public\n!/assets/*.png\n",
+        "*\n# comment\n!/.ssh\n!/.ssh/key\n!/.ssh/\n!/.ssh/public\n"
+        "!/assets/*.png\n!/empty/\n",
     )
     _expect(
         subject.home_preservation(tmp_path)
         == {
-            ".ssh": {"key": {}, "public": {}},
-            "assets": {"*.png": {}},
+            ".ssh/": {"key": None, "public": None},
+            "assets/": {"*.png": None},
+            "empty/": {},
         },
         tmp_path,
     )
@@ -3120,9 +3050,43 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         )
 
 
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        ({}, {"new": {"value": None}}),
+        ({"removed": {"value": None}}, {}),
+        ({"value": None}, {"value": "replacement"}),
+        ({"values": ["a", "b"]}, {"values": ["b", "a"]}),
+        ({"values": ["a", "a", "b"]}, {"values": ["a", "b", "c"]}),
+        ({"old": "moved"}, {"new": "moved"}),
+        ({"a/b~": {"key": "old"}}, {"a/b~": {"key": "new"}}),
+    ],
+)
+def test_json_diff_patch_applies_and_renders_with_jd(
+    tmp_path: Path,
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> None:
+    """Check standard patch application and jd rendering across JSON edge cases."""
+    subject = import_module("packages.afairesi.main")
+    original = json.dumps(before, sort_keys=True)
+    patch = subject._json_diff_patch(before, after)  # noqa: SLF001 - renderer contract
+    _expect(jsonpatch.apply_patch(before, patch) == after, patch)
+    _expect(json.dumps(before, sort_keys=True) == original, before)
+    _expect(
+        {operation["op"] for operation in patch} <= {"test", "remove", "add"},
+        patch,
+    )
+    patch_file = tmp_path / "patch.json"
+    patch_file.write_text(json.dumps(patch))
+    rendered = _run(tmp_path, "-t", "patch2jd", str(patch_file), executable="jd")
+    _expect("@ [" in rendered.stdout, rendered)
+
+
 def test_machine_diff_uses_independent_repository_baselines_and_reports_exclusions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Compare home policy and child sources without reading OS or system storage."""
     home = _home_repository(tmp_path)
@@ -3138,41 +3102,27 @@ def test_machine_diff_uses_independent_repository_baselines_and_reports_exclusio
     monkeypatch.setattr(Path, "home", lambda: home)
     before = (_snapshot(home), _snapshot(child))
     data = subject.diff_summary(None)
-    repositories = {record["path"]: record for record in data["repositories"]}
     _expect(
-        repositories[str(home)]["changes"]
-        == [
-            {
-                "path": ["paths", ".ssh"],
-                "operation": "added",
-                "after": {"key": {}},
-            },
-        ],
-        repositories,
-    )
-    _expect(
-        repositories[str(child)]["changes"]
-        == [
-            {
-                "path": ["packages", "example", "tests"],
-                "operation": "changed",
-                "before": ["baseline"],
-                "after": ["working"],
-            },
-        ],
-        repositories,
-    )
-    _expect(
-        data["uncompared"][0]["sections"]
-        == [
-            "system.os",
-            "system.preservation",
-            "filesystem.system_paths",
-        ],
+        _patch_values(data["patch"], "add", "paths", ".ssh/") == [{"key": None}],
         data,
     )
-    _expect("no Git baseline" in subject.render_diff(data), data)
+    _expect(
+        _patch_values(data["patch"], "remove", "packages", "example", "tests")
+        == ["baseline"],
+        data,
+    )
+    _expect(
+        _patch_values(data["patch"], "add", "packages", "example", "tests")
+        == ["working"],
+        data,
+    )
     _expect((_snapshot(home), _snapshot(child)) == before, "machine diff changed state")
+    _git(home, "add", ".gitignore")
+    changed = subject.diff_summary(None)
+    _expect(
+        {JsonPointer(op["path"]).parts[0] for op in changed["patch"]} == {str(child)},
+        changed,
+    )
     _git(
         home,
         "config",
@@ -3183,9 +3133,16 @@ def test_machine_diff_uses_independent_repository_baselines_and_reports_exclusio
     )
     missing = subject.diff_summary(None)
     _expect(
-        any(record.get("diagnostics") for record in missing["repositories"]),
+        bool(missing["diagnostics"]),
         missing,
     )
+    monkeypatch.setattr(sys, "argv", ["afairesi", "diff"])
+    with pytest.raises(SystemExit) as exit_status:
+        subject.main()
+    output = capsys.readouterr()
+    _expect(exit_status.value.code == 1, exit_status)
+    _expect(isinstance(json.loads(output.out), list), output)
+    _expect("no Git baseline" in output.err and "error:" in output.err, output)
 
 
 def test_machine_home_whitelist_replaces_stored_home_contents(
@@ -3195,10 +3152,13 @@ def test_machine_home_whitelist_replaces_stored_home_contents(
     """Represent a stored home once through its policy even without submodules."""
     subject = import_module("packages.afairesi.main")
     (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n")
-    home_tree: dict[str, Any] = {"untracked-file": {}}
+    home_tree: dict[str, Any] = {"untracked-file": None}
     for component in reversed(tmp_path.parts[2:]):
-        home_tree = {component: home_tree}
-    stored_tree = {"/" + tmp_path.parts[1]: home_tree, "/etc": {"machine-id": {}}}
+        home_tree = {component + "/": home_tree}
+    stored_tree = {
+        "/" + tmp_path.parts[1] + "/": home_tree,
+        "/etc/": {"machine-id": None},
+    }
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(subject, "persistent_summary", lambda _root: stored_tree)
     monkeypatch.setattr(
@@ -3210,11 +3170,11 @@ def test_machine_home_whitelist_replaces_stored_home_contents(
         },
     )
     machine = subject.machine_summary()[socket.gethostname()]["filesystem"]
-    branch = machine["/" + tmp_path.parts[1]]
+    branch = machine["/" + tmp_path.parts[1] + "/"]
     for component in tmp_path.parts[2:]:
-        branch = branch[component]
-    _expect(branch == {".ssh": {}}, branch)
-    _expect(machine["/etc"] == {"machine-id": {}}, machine)
+        branch = branch[component + "/"]
+    _expect(branch == {".ssh/": {}}, branch)
+    _expect(machine["/etc/"] == {"machine-id": None}, machine)
 
 
 def test_machine_overview_defaults_ignore_working_directory(
@@ -3242,12 +3202,12 @@ def test_machine_overview_defaults_ignore_working_directory(
     monkeypatch.setattr(subject, "persistent_summary", lambda _root: inventory(storage))
     system = {"os": {"id": "nixos"}, "preservation": {"status": "available"}}
     monkeypatch.setattr(subject, "system_summary", lambda: system)
-    expected_home = {
-        ".gitmodules": {},
-        ".ssh": {"key": {}},
-        "forge.example": {
-            "team": {
-                "demo": {
+    expected_home: dict[str, Any] = {
+        ".gitmodules": None,
+        ".ssh/": {"key": None},
+        "forge.example/": {
+            "team/": {
+                "demo/": {
                     "packages": {"example": {"tests": ["example"]}},
                 },
             },
@@ -3255,34 +3215,30 @@ def test_machine_overview_defaults_ignore_working_directory(
     }
     expected_paths = expected_home
     for component in reversed(home.parts[2:]):
-        expected_paths = {component: expected_paths}
+        expected_paths = {component + "/": expected_paths}
     expected = {
         socket.gethostname(): {
             "system": system,
             "filesystem": {
-                "/etc": {"machine-id": {}},
-                "/" + home.parts[1]: expected_paths,
+                "/etc/": {"machine-id": None},
+                "/" + home.parts[1] + "/": expected_paths,
             },
         },
     }
     for cwd in (tmp_path, repository, repository / "packages/example"):
         monkeypatch.chdir(cwd)
-        for arguments in ([], ["--json"]):
-            monkeypatch.setattr(sys, "argv", ["afairesi", *arguments])
-            subject.main()
-            output = capsys.readouterr().out
-            _expect(
-                "persistent" not in output and "secret contents" not in output,
-                output,
-            )
-            if arguments:
-                _expect(json.loads(output) == expected, output)
-            else:
-                _expect(output == subject.render_overview(expected) + "\n", output)
+        monkeypatch.setattr(sys, "argv", ["afairesi"])
+        subject.main()
+        output = capsys.readouterr().out
+        _expect(
+            "persistent" not in output and "secret contents" not in output,
+            output,
+        )
+        _expect(output == json.dumps(expected, indent=2, sort_keys=True) + "\n", output)
 
 
 @pytest.mark.parametrize("status", ["missing", "not_applicable", "available"])
-def test_machine_storage_status_matches_text_and_json(
+def test_machine_storage_status_is_reported_in_json(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -3301,21 +3257,13 @@ def test_machine_storage_status_matches_text_and_json(
         return {"diagnostics": ["Permission denied"]}
 
     monkeypatch.setattr(subject, "persistent_summary", inspect_storage)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "--json"])
+    monkeypatch.setattr(sys, "argv", ["afairesi"])
     subject.main()
     tree = json.loads(capsys.readouterr().out)
     machine = tree[socket.gethostname()]
     observed_status = "unavailable" if status == "available" else status
     _expect(machine["system"]["preservation"]["status"] == observed_status, machine)
     _expect(calls == ([Path("/persistent")] if status == "available" else []), calls)
-    monkeypatch.setattr(sys, "argv", ["afairesi"])
-    subject.main()
-    output = capsys.readouterr().out
-    _expect(output == subject.render_overview(tree) + "\n", output)
-    _expect(
-        "status: " + observed_status in output and "preserved:" not in output,
-        output,
-    )
 
 
 def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
@@ -3521,6 +3469,12 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         )
 
 
+def test_overview_groups_home_repositories_and_rejects_escaping_submodules() -> None:
+    """Keep same-named resources separate across repositories."""
+    with TemporaryDirectory(prefix="afairesi-summaries-") as directory:
+        _check_home_summaries(_home_repository(Path(directory)))
+
+
 @pytest.mark.parametrize(
     "remote",
     [
@@ -3529,11 +3483,11 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         "ssh://git@forge.example/owner/demo.git",
     ],
 )
-def test_overview_formats_share_machine_user_repository_hierarchy(
+def test_overview_json_preserves_machine_user_repository_hierarchy(
     tmp_path: Path,
     remote: str,
 ) -> None:
-    """Use one full tree for hosted clones, packages, hosts, and both formats."""
+    """Preserve hosted clones, packages, hosts, and formatted JSON output."""
     _repository(tmp_path)
     _git(tmp_path, "remote", "add", "origin", remote)
     package = tmp_path / "packages/shared"
@@ -3552,19 +3506,8 @@ def test_overview_formats_share_machine_user_repository_hierarchy(
     machine, user = socket.gethostname(), getpass.getuser()
     expected = {machine: {user: {"forge.example": {"owner": {"demo": groups}}}}}
     before = _snapshot(tmp_path)
-    _expect(_overview_tree(tmp_path) == expected, expected)
     terminal = _run(tmp_path, str(tmp_path)).stdout
-    _expect(
-        terminal
-        == (
-            f"{machine}:\n  {user}:\n    forge.example:\n"
-            "      owner:\n        demo:\n          hosts:\n            shared:\n"
-            "              dependencies:\n                - runtime: packages/shared\n"
-            "          packages:\n            shared:\n"
-            "              description: Shared\n"
-        ),
-        terminal,
-    )
+    _expect(terminal == json.dumps(expected, indent=2, sort_keys=True) + "\n", terminal)
     for collection, selected in (("packages", package), ("hosts", host)):
         focused = {
             machine: {
@@ -3577,15 +3520,8 @@ def test_overview_formats_share_machine_user_repository_hierarchy(
         }
         _expect(_overview_tree(selected) == focused, focused)
         output = _run(selected, str(tmp_path)).stdout
-        _expect(f"{machine}:\n  {user}:\n    forge.example:\n" in output, output)
-        _expect(f"          {collection}:\n            shared:\n" in output, output)
+        _expect(json.loads(output) == expected, output)
     _expect(_snapshot(tmp_path) == before, "inspection changed Git or source state")
-
-
-def test_overview_groups_home_repositories_and_rejects_escaping_submodules() -> None:
-    """Keep same-named resources separate across repositories."""
-    with TemporaryDirectory(prefix="afairesi-summaries-") as directory:
-        _check_home_summaries(_home_repository(Path(directory)))
 
 
 def test_overview_preserves_structured_details_and_omits_empty_fields() -> None:
@@ -3612,27 +3548,14 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
             + sentinel
             + source,
         )
-        expected_names = "".join(
-            "  - " + label.replace("_", " ") + "\n" for label in labels
-        )
+        expected_names = [label.replace("_", " ") for label in labels]
         before = _snapshot(root)
         inspected = _run(root, str(package))
-        overview = _resource_output(inspected.stdout, "my-package")
-        subject = import_module("packages.afairesi.main")
-        expected_arguments = subject.render_overview(expected_args) + "\n"
-        _expect(
-            expected_arguments in overview
-            if expected_args
-            else "arguments:\n" not in overview and "commands:\n" not in overview,
-            contract,
-        )
-        _expect("dependencies:\n" not in overview, inspected)
-        _expect(
-            "tests:\n" + expected_names in overview
-            if expected_names
-            else "tests:\n" not in overview,
-            tests,
-        )
+        overview = _overview_resources(inspected.stdout)["packages"]["my-package"]
+        expected_overview = dict(expected_args)
+        if expected_names:
+            expected_overview["tests"] = expected_names
+        _expect(overview == expected_overview, contract)
         details = import_module("packages.afairesi.main").resource_data(package)
         _expect(
             details["tests"] == [label.replace("_", " ") for label in labels],
@@ -3652,20 +3575,13 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
         (missing / "test_main.py").unlink()
         (root / "packages/linked").symlink_to(package, target_is_directory=True)
         listed = _run(root, str(root))
-        package_summary = _resource_output(listed.stdout, "my-package")
+        listed_packages = _overview_resources(listed.stdout)["packages"]
+        _expect(listed_packages["my-package"] == expected_overview, listed)
         _expect(
-            "tests:\n" + expected_names.rstrip("\n") in package_summary
-            if expected_names
-            else "tests:\n" not in package_summary,
-            listed,
-        )
-        _expect(
-            "my-package:\n" in listed.stdout
-            and "diagnostics:\n" in listed.stdout
+            "diagnostics" in listed_packages["alpha"]
             and "unsupported CLI interface" in listed.stdout
-            and "untested:\n" in listed.stdout
-            and _resource_output(listed.stdout, "untested") == ""
-            and "linked:" not in listed.stdout,
+            and listed_packages["untested"] == {}
+            and "linked" not in listed_packages,
             listed,
         )
 
@@ -3685,6 +3601,8 @@ def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
     storage = tmp_path / "persistent"
     (storage / "var/lib/service").mkdir(parents=True)
     (storage / "var/lib/service/hidden").write_text("runtime")
+    (storage / "file").write_text("private contents")
+    (storage / "empty").mkdir()
     (storage / "link").symlink_to(storage, target_is_directory=True)
     blocked = storage / "private"
     blocked.mkdir()
@@ -3700,9 +3618,11 @@ def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
     _expect(
         details
         == {
-            "/link": {},
-            "/private": {"diagnostics": ["Permission denied"]},
-            "/var": {"lib": {"service": {}}},
+            "/empty/": {},
+            "/file": None,
+            "/link": None,
+            "/private/": {"diagnostics": ["Permission denied"]},
+            "/var/": {"lib/": {"service/": {}}},
         },
         details,
     )
@@ -3987,13 +3907,6 @@ def test_source_overviews_preserve_declarations_and_source_facts(
         _expect(
             focus == {"packages": {"consumer": summaries["packages"]["consumer"]}},
             focus,
-        )
-        terminal = _run(root, str(root)).stdout
-        _expect(
-            "consumer:\n" in terminal
-            and "runtime: packages/" + provider in terminal
-            and "- result\n" in terminal,
-            terminal,
         )
         _git(root, "add", "--force", ".")
         _fixture_git(root, "commit", "-qm", "Source snapshot")

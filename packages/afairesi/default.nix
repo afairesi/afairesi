@@ -53,6 +53,7 @@ in
         enableMypy = false;
         flake = inputs.self.outPath;
       }).passthru.raw
+      pkgs.jd-diff-patch
       python.pkgs.coverage
     ];
     tests.consumer-contract = import ./prm/consumer-contract.nix { inherit inputs pkgs; };
@@ -65,6 +66,7 @@ in
     inputs.self.packages.${pkgs.stdenv.system}.nix_syntax
     pkgs.git
     pkgs.nix
+    python.pkgs.jsonpatch
   ];
   src = ./.;
   version = "0.0.0";

@@ -2,7 +2,7 @@
 
 Afairesi uses shared Git repository and Nix flake conventions to describe a machine and return it to its intended state. `afairesi` creates, inspects, and converges those repositories.
 
-Running `afairesi` without arguments shows the machine's current high-level state.
+Running `afairesi` without arguments shows the machine's current high-level state as formatted JSON.
 
 Use `afairesi --help` or `afairesi COMMAND --help` for command details.
 

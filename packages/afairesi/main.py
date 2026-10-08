@@ -29,7 +29,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
+import jsonpatch
 import nix_syntax
+from jsonpointer import resolve_pointer
 
 if TYPE_CHECKING:
     from tree_sitter import Node
@@ -2521,7 +2523,7 @@ class SourceRecord(TypedDict):
 
 
 class ResourceData(TypedDict):
-    """Source facts used to build terminal and JSON summaries."""
+    """Source facts used to build repository overviews."""
 
     description: str | None
     cli: list[CliRecord]
@@ -2654,7 +2656,7 @@ def cli_summary(entries: list[CliRecord]) -> dict[str, Any]:
 
 
 def resource_summary(data: ResourceData) -> dict[str, Any]:
-    """Keep populated interface and behavior facts for terminal and JSON summaries."""
+    """Keep populated interface and behavior facts for repository overviews."""
     fields = {
         "description": data["description"],
         **cli_summary(data["cli"]),
@@ -2758,7 +2760,7 @@ def _home_policy_diagnostics(root: Path, source: str) -> dict[str, list[str]]:
 
 
 def _home_whitelist(source: str, path: Path) -> dict[str, Any]:
-    """Share whitelist interpretation between live and Git-backed overviews."""
+    """Represent whitelist directories as branches and other paths as null leaves."""
     tree: dict[str, Any] = {}
     for line in source.splitlines():
         if not line.startswith("!/"):
@@ -2768,8 +2770,16 @@ def _home_whitelist(source: str, path: Path) -> dict[str, Any]:
             msg = f"{path}: invalid whitelist path: {line}"
             raise CommandError(msg)
         branch = tree
-        for component in components:
-            branch = branch.setdefault(component, {})
+        for component in components[:-1]:
+            branch.pop(component, None)
+            name = component + "/"
+            branch = branch.setdefault(name, {})
+        name = components[-1]
+        if line.endswith("/"):
+            branch.pop(name, None)
+            branch.setdefault(name + "/", {})
+        elif name + "/" not in branch:
+            branch.setdefault(name, None)
     return tree
 
 
@@ -2841,8 +2851,13 @@ def persistent_summary(root: Path) -> dict[str, Any]:
             except OSError as error:
                 child["diagnostics"] = [error.strerror]
                 continue
-            if stat.S_ISDIR(mode) and depth < 3:  # noqa: PLR2004 - compact storage inventory
-                visit(entry, child, depth + 1)
+            if stat.S_ISDIR(mode):
+                branch.pop(name)
+                branch[name + "/"] = child
+                if depth < 3:  # noqa: PLR2004 - compact storage inventory
+                    visit(entry, child, depth + 1)
+            else:
+                branch[name] = None
 
     visit(root, tree, 1)
     return tree
@@ -2863,7 +2878,7 @@ def machine_summary() -> dict[str, Any]:
     branch = filesystem
     for index, component in enumerate(home.parts[1:]):
         name = "/" + component if index == 0 else component
-        branch = branch.setdefault(name, {})
+        branch = branch.setdefault(name + "/", {})
     branch.clear()
     if (home / ".gitmodules").is_file() and not (home / "flake.nix").exists():
         branch.update(overview_summary(home)[socket.gethostname()][str(home.resolve())])
@@ -2910,7 +2925,10 @@ def overview_summary(target: Path) -> dict[str, Any]:
             root.relative_to(target).parts if is_home else _repository_identity(root)
         )
         for component in components:
-            branch = branch.setdefault(component, {})
+            if is_home:
+                branch.pop(component, None)
+            name = component + "/" if is_home else component
+            branch = branch.setdefault(name, {})
         try:
             groups = _repository_summary(selected)
         except ValueError as error:
@@ -2921,34 +2939,6 @@ def overview_summary(target: Path) -> dict[str, Any]:
         for collection, resources in groups.items():
             branch.setdefault(collection, {}).update(resources)
     return tree
-
-
-def render_overview(tree: dict[str, Any]) -> str:
-    """Render the same nested facts as JSON, with indentation for every level."""
-    lines: list[str] = []
-
-    def visit(branch: dict[str, Any], depth: int) -> None:
-        prefix = "  " * depth
-        for name, value in sorted(branch.items()):
-            if isinstance(value, dict):
-                lines.append(f"{prefix}{name}:")
-                visit(value, depth + 1)
-            elif isinstance(value, list):
-                lines.append(f"{prefix}{name}:")
-                for item in value:
-                    content = str(item).splitlines() or [""]
-                    lines.append(f"{prefix}  - {content[0]}")
-                    lines.extend(f"{prefix}    {line}" for line in content[1:])
-            else:
-                content = str(value).splitlines()
-                if len(content) > 1:
-                    lines.append(f"{prefix}{name}:")
-                    lines.extend(f"{prefix}  {line}" for line in content)
-                else:
-                    lines.append(f"{prefix}{name}: {value}")
-
-    visit(tree, 0)
-    return "\n".join(lines)
 
 
 def _diff_entries(root: Path, version: str) -> dict[str, tuple[str, str]]:
@@ -3105,7 +3095,7 @@ def _diff_snapshot(root: Path, version: str, scope: Path | None) -> dict[str, An
         resources.setdefault((collection, resource), {})[
             Path(*path.parts[2:]).as_posix()
         ] = source
-    result: dict[str, Any] = {}
+    result: dict[str, Any] = {"packages": {}, "hosts": {}}
     for (collection, name), files in sorted(resources.items()):
         if collection == "hosts" and "configuration.nix" not in files:
             continue
@@ -3115,89 +3105,56 @@ def _diff_snapshot(root: Path, version: str, scope: Path | None) -> dict[str, An
     return result
 
 
-def _overview_list_changes(
-    before: list[str],
-    after: list[str],
-    path: tuple[str, ...],
-) -> list[dict[str, Any]]:
-    """Compare memberships, retaining the order of positional CLI arguments."""
-    removed = sorted((Counter(before) - Counter(after)).elements())
-    added = sorted((Counter(after) - Counter(before)).elements())
-    if path[-1] == "arguments":
-        old_positionals = [item for item in before if not item.startswith("-")]
-        new_positionals = [item for item in after if not item.startswith("-")]
-        if old_positionals != new_positionals:
-            removed = old_positionals + [
-                item for item in removed if item.startswith("-")
-            ]
-            added = new_positionals + [item for item in added if item.startswith("-")]
-    if not removed and not added:
-        return []
-    change: dict[str, Any] = {
-        "path": list(path),
-        "operation": "changed"
-        if removed and added
-        else "removed"
-        if removed
-        else "added",
-    }
-    if removed:
-        change["before"] = removed
-    if added:
-        change["after"] = added
-    return [change]
-
-
-def _overview_changes(
-    before: object,
-    after: object,
-    path: tuple[str, ...] = (),
-) -> list[dict[str, Any]]:
-    """Represent semantic changes with structured paths and explicit operations."""
-    if before == after:
-        return []
-    if (
-        isinstance(before, list)
-        and isinstance(after, list)
-        and path
-        and path[-1] in {"arguments", "dependencies", "repositories", "tests"}
-    ):
-        return _overview_list_changes(before, after, path)
-    if not isinstance(before, dict) or not isinstance(after, dict):
-        return [
-            {
-                "path": list(path),
-                "operation": "changed",
-                "before": before,
-                "after": after,
-            },
-        ]
-    changes = []
-    for key in sorted(before.keys() | after.keys()):
-        child_path = (*path, key)
-        if not path and key in {"packages", "hosts"}:
-            changes.extend(
-                _overview_changes(before.get(key, {}), after.get(key, {}), child_path),
-            )
-        elif key not in before:
-            changes.append(
-                {"path": list(child_path), "operation": "added", "after": after[key]},
-            )
-        elif key not in after:
-            changes.append(
-                {
-                    "path": list(child_path),
-                    "operation": "removed",
-                    "before": before[key],
-                },
-            )
+def _diff_facts(facts: dict[str, Any]) -> dict[str, Any]:
+    """Canonicalize unordered declarations while retaining positional meaning."""
+    result: dict[str, Any] = {}
+    for field, value in facts.items():
+        if isinstance(value, dict):
+            result[field] = _diff_facts(value)
+        elif isinstance(value, list) and field in {
+            "tests",
+            "dependencies",
+            "repositories",
+        }:
+            result[field] = sorted(value)
+        elif isinstance(value, list) and field == "arguments":
+            result[field] = [
+                item for item in value if not item.startswith("-")
+            ] + sorted(item for item in value if item.startswith("-"))
         else:
-            changes.extend(_overview_changes(before[key], after[key], child_path))
-    return changes
+            result[field] = value
+    return result
+
+
+def _json_diff_patch(
+    before: dict[str, Any],
+    after: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Emit JSON Patch's test/remove/add subset understood by jd's renderer."""
+    document = before
+    result: list[dict[str, Any]] = []
+    for operation in jsonpatch.make_patch(before, after).patch:
+        operations: list[dict[str, Any]] = []
+        kind, path = operation["op"], operation["path"]
+        if kind in {"remove", "replace", "move"}:
+            source = operation.get("from", path)
+            old = resolve_pointer(document, source)
+            operations.extend(
+                {"op": action, "path": source, "value": old}
+                for action in ("test", "remove")
+            )
+            if kind in {"replace", "move"}:
+                value = old if kind == "move" else operation["value"]
+                operations.append({"op": "add", "path": path, "value": value})
+        elif kind == "add":
+            operations.append(operation)
+        document = jsonpatch.apply_patch(document, operations)
+        result.extend(operations)
+    return result
 
 
 def diff_summary(target: Path | None, *, cached: bool = False) -> dict[str, Any]:
-    """Compare each selected repository against its own Git baseline."""
+    """Compare repository facts and report JSON Patch plus inspection errors."""
     before, after = ("HEAD", "index") if cached else ("index", "working_tree")
     selected = Path.home().resolve() if target is None else target.resolve()
     root = repository_root(selected)
@@ -3208,78 +3165,45 @@ def diff_summary(target: Path | None, *, cached: bool = False) -> dict[str, Any]
     )
     scope = None if is_home else selected.relative_to(root)
     targets = [(root, scope)]
+    home_snapshots = (
+        {version: _diff_snapshot(root, version, None) for version in (before, after)}
+        if is_home
+        else {}
+    )
     if is_home:
-        paths: set[str] = set()
-        for version in (before, after):
-            paths.update(_diff_snapshot(root, version, scope)["repositories"])
+        paths = {
+            relative
+            for snapshot in home_snapshots.values()
+            for relative in snapshot["repositories"]
+        }
         targets.extend((root / relative, Path()) for relative in sorted(paths))
-    repositories = []
+    old: dict[str, Any] = {}
+    new: dict[str, Any] = {}
+    diagnostics = []
     for checkout, resource_scope in targets:
-        record: dict[str, Any] = {"path": str(checkout), "changes": []}
         try:
             if repository_root(checkout) != checkout:
                 message = f"{checkout}: repository is not checked out"
                 raise CommandError(message)  # noqa: TRY301 - report per-checkout failures
-            record["changes"] = _overview_changes(
-                _diff_snapshot(checkout, before, resource_scope),
-                _diff_snapshot(checkout, after, resource_scope),
+            snapshots = (
+                home_snapshots
+                if checkout == root and is_home
+                else {
+                    version: _diff_snapshot(checkout, version, resource_scope)
+                    for version in (before, after)
+                }
             )
-        except (CommandError, OSError) as error:
-            record["diagnostics"] = [str(error)]
-        repositories.append(record)
-    result: dict[str, Any] = {
-        "comparison": {"before": before, "after": after},
-        "repositories": repositories,
-        "uncompared": [],
+            left, right = (
+                _diff_facts(snapshots[version]) for version in (before, after)
+            )
+            if left != right:
+                old[str(checkout)], new[str(checkout)] = left, right
+        except (CommandError, OSError) as error:  # noqa: PERF203 - inspect remaining repositories
+            diagnostics.append(str(error))
+    return {
+        "patch": _json_diff_patch(old, new),
+        "diagnostics": diagnostics,
     }
-    if target is None:
-        result["uncompared"] = [
-            {
-                "sections": [
-                    "system.os",
-                    "system.preservation",
-                    "filesystem.system_paths",
-                ],
-                "reason": "OS metadata and stored system paths have no Git baseline.",
-            },
-        ]
-    return result
-
-
-def render_diff(data: dict[str, Any]) -> str:
-    """Render the same structured change records and baseline exclusions as JSON."""
-    comparison = data["comparison"]
-    lines = [f"Overview diff: {comparison['before']} -> {comparison['after']}"]
-    changed = False
-    for repository in data["repositories"]:
-        if not repository["changes"] and not repository.get("diagnostics"):
-            continue
-        changed = True
-        lines.append(repository["path"] + ":")
-        for change in repository["changes"]:
-            lines.append("  " + "/".join(change["path"]) + ":")
-            for field, prefix in (("before", "-"), ("after", "+")):
-                if field in change:
-                    value = change[field]
-                    if isinstance(value, dict):
-                        content = render_overview(value) or "{}"
-                    elif isinstance(value, list):
-                        content = "\n".join(str(item) for item in value)
-                    else:
-                        content = str(value)
-                    lines.extend(
-                        f"    {prefix} {line}" for line in content.splitlines() or [""]
-                    )
-        lines.extend(
-            "  " + diagnostic for diagnostic in repository.get("diagnostics", [])
-        )
-    if not changed:
-        lines.append("No overview changes.")
-    lines.extend(
-        "Not compared: " + ", ".join(exclusion["sections"]) + ". " + exclusion["reason"]
-        for exclusion in data["uncompared"]
-    )
-    return "\n".join(lines)
 
 
 def _test_target_root(package: Path) -> Path:
@@ -4047,9 +3971,9 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
             "describing machines. Without a command, show "
             "OS and preservation status, preserved system paths, the Git-governed "
             "home whitelist, and repository descriptions, CLI arguments, "
-            "dependencies, tests, and diagnostics."
+            "dependencies, tests, and diagnostics as formatted JSON."
         ),
-        usage="%(prog)s [-h] [--json] [PATH]\n       %(prog)s COMMAND ...",
+        usage="%(prog)s [-h] [PATH]\n       %(prog)s COMMAND ...",
         epilog=(
             "PATH selects a home, flake root, package, or host; default: whole "
             "machine. Use afairesi . to inspect a repository or afairesi "
@@ -4071,11 +3995,6 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
                 "(default: whole machine)"
             ),
         )
-    result.add_argument(
-        "--json",
-        action="store_true",
-        help="emit the selected overview as JSON (machine fields: system, filesystem)",
-    )
     if include_target:
         result.set_defaults(command=None)
         return result
@@ -4087,13 +4006,17 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     diff = commands.add_parser(
         "diff",
         help="compare overview facts with the Git index or HEAD",
-        description="Compare tracked overview facts in each selected repository.",
+        description="Emit JSON Patch for tracked overview facts.",
         epilog=(
             "Report descriptions, CLI arguments, dependencies, tests, and "
             "diagnostics, with packages and hosts reported individually. Lists "
             "show added and removed entries. Test, dependency, and named-option "
             "declaration order is ignored; positional argument order is preserved. "
-            "System state has no Git baseline and is excluded from comparison."
+            "System state has no Git baseline and is excluded from comparison. "
+            "Pipe the patch to jd -t patch2jd for a visual diff. "
+            "Patch paths start with the absolute repository path; unordered "
+            "declaration lists are sorted in the comparison document. "
+            "Diagnostics and exclusions are written to stderr."
         ),
     )
     diff.add_argument(
@@ -4108,11 +4031,6 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         "--staged",
         action="store_true",
         help="compare the index with HEAD instead of working files with the index",
-    )
-    diff.add_argument(
-        "--json",
-        action="store_true",
-        help="emit structured semantic changes and baseline exclusions",
     )
     init = commands.add_parser(
         "init",
@@ -4402,37 +4320,26 @@ def _dispatch_test_command(
 
 
 def _dispatch_overview(options: argparse.Namespace) -> None:
-    """Render the selected hierarchy as indented text or JSON."""
+    """Emit the selected machine or repository overview as formatted JSON."""
     tree = (
         machine_summary()
         if options.target is None
         else overview_summary(options.target)
     )
-    if options.json:
-        sys.stdout.write(
-            json.dumps(
-                tree,
-                indent=2,
-                sort_keys=True,
-            )
-            + "\n",
-        )
-    else:
-        sys.stdout.write(render_overview(tree) + "\n")
+    sys.stdout.write(json.dumps(tree, indent=2, sort_keys=True) + "\n")
 
 
 def _dispatch_diff(options: argparse.Namespace) -> None:
-    """Emit a semantic diff and signal incomplete repository comparisons."""
+    """Emit JSON Patch and report incomplete comparisons separately on stderr."""
     data = diff_summary(options.target, cached=options.cached)
-    sys.stdout.write(
-        (
-            json.dumps(data, indent=2, sort_keys=True)
-            if options.json
-            else render_diff(data)
+    sys.stdout.write(json.dumps(data["patch"], indent=2, sort_keys=True) + "\n")
+    if options.target is None:
+        sys.stderr.write(
+            "Not compared: OS metadata and stored system paths have no Git baseline.\n",
         )
-        + "\n",
-    )
-    if any(repository.get("diagnostics") for repository in data["repositories"]):
+    for message in data["diagnostics"]:
+        sys.stderr.write(f"error: {message}\n")
+    if data["diagnostics"]:
         raise SystemExit(1)
 
 
