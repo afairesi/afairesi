@@ -741,6 +741,9 @@ def _check_home_move(
         message = "home rename failed to preserve Git state or synchronize the URL"
         raise AssertionError(message)
     _run(root, "converge", "--dry-run")
+    whitelist = (root / ".gitignore").read_text().splitlines()
+    _expect(f"!/{relative}" not in whitelist, whitelist)
+    _expect(f"!/{destination}" in whitelist, whitelist)
 
 
 def _check_overview_details(
@@ -777,7 +780,7 @@ def _check_overview_details(
     )
     asset = package / "prm/nested/script.js"
     asset.parent.mkdir(parents=True)
-    asset.write_text("/* eslint-disable no-alert */\n\n")
+    asset.write_text("const value = 1;\n\n")
     (asset.parent / "picture.png").write_bytes(b"binary\n")
     (asset.parent / "linked.py").symlink_to(package / "main.py")
     (package / "tmp").mkdir()
@@ -803,12 +806,8 @@ def _check_overview_details(
         msg = "Source inventories must exclude binary assets, links, and runtime output"
         raise AssertionError(msg)
     expected_lines = 2
-    if sources["prm/nested/script.js"]["lines"] != expected_lines or sources[
-        "prm/nested/script.js"
-    ]["suppressions"] != [
-        {"kind": "eslint-disable", "scope": "global", "count": 1},
-    ]:
-        msg = "Asset line counts and suppressions must be structured source facts"
+    if sources["prm/nested/script.js"]["lines"] != expected_lines:
+        msg = "Asset line counts must be structured source facts"
         raise AssertionError(msg)
     expected = (
         "commands:\n  build:\n    arguments:\n"
@@ -2139,38 +2138,7 @@ def test_diff_handles_unborn_head_removed_packages_and_semantically_equal_edits(
     )
 
 
-def test_diff_reports_unresolved_index_conflicts_without_modifying_state(
-    tmp_path: Path,
-) -> None:
-    """Reject ambiguous staged sources instead of silently choosing a conflict side."""
-    _repository(tmp_path)
-    package = _make_source_package(tmp_path, "example", "def test_result(): pass\n")
-    _git(tmp_path, "add", ".")
-    source = package / "test_main.py"
-    oid = _git(tmp_path, "hash-object", str(source)).strip()
-    relative = source.relative_to(tmp_path).as_posix()
-    subprocess.run(
-        ["git", "update-index", "--index-info"],  # noqa: S607
-        cwd=tmp_path,
-        input=(
-            f"0 {'0' * len(oid)}\t{relative}\n"
-            f"100644 {oid} 1\t{relative}\n"
-            f"100644 {oid} 2\t{relative}\n"
-        ),
-        text=True,
-        check=True,
-        capture_output=True,
-    )
-    before = _snapshot(tmp_path)
-    data = json.loads(_run(tmp_path, "diff", ".", "--json", code=1).stdout)
-    _expect(
-        "unresolved index conflict" in data["repositories"][0]["diagnostics"][0],
-        data,
-    )
-    _expect(_snapshot(tmp_path) == before, "diff changed conflicted index state")
-
-
-def test_diff_ignores_reordered_tests_named_options_and_suppression_edits(
+def test_diff_ignores_reordered_tests_and_named_options(
     tmp_path: Path,
 ) -> None:
     """Keep implementation observations and declaration ordering out of the diff."""
@@ -2178,7 +2146,7 @@ def test_diff_ignores_reordered_tests_named_options_and_suppression_edits(
     package = _make_source_package(
         tmp_path,
         "example",
-        "def test_first(): pass  # noqa: S101\ndef test_second(): pass\n",
+        "def test_first(): pass  # comment\ndef test_second(): pass\n",
     )
     source = package / "main.py"
     source.write_text(
@@ -2198,7 +2166,6 @@ def test_diff_ignores_reordered_tests_named_options_and_suppression_edits(
     working = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
     _expect(working["repositories"][0]["changes"] == [], working)
     _expect("No overview changes." in _run(tmp_path, "diff", ".").stdout, working)
-    _expect("suppressions" not in _overview(package)["packages"]["example"], package)
     _expect(_snapshot(tmp_path) == before, "semantic inspection changed source state")
     _git(tmp_path, "add", ".")
     staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
@@ -2231,6 +2198,72 @@ def test_diff_preserves_positional_argument_order(
                 "operation": "changed",
                 "before": ["source  required", "destination  required"],
                 "after": ["destination  required", "source  required"],
+            },
+        ],
+        data,
+    )
+
+
+@pytest.mark.parametrize("field", ["tests", "dependencies", "arguments"])
+@pytest.mark.parametrize("operation", ["added", "removed"])
+def test_diff_reports_list_membership_changes_and_preserves_duplicate_counts(
+    tmp_path: Path,
+    field: str,
+    operation: str,
+) -> None:
+    """Distinguish one added or removed occurrence from a reordered retained entry."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "")
+    parser_source = "import argparse\np = argparse.ArgumentParser()\n"
+    dependency_source = (
+        "{ inputs, system, ... }: let local = inputs.self.packages.${system}; in "
+    )
+    filename, before, after, entries = {
+        "tests": (
+            "test_main.py",
+            (
+                "def test_shared(): pass\n"
+                "class TestFirst:\n    def test_repeated(self): pass\n"
+            ),
+            (
+                "class TestFirst:\n    def test_repeated(self): pass\n"
+                "def test_shared(): pass\n"
+                "class TestSecond:\n    def test_repeated(self): pass\n"
+                "def test_new(): pass\n"
+            ),
+            ["new", "repeated"],
+        ),
+        "arguments": (
+            "main.py",
+            parser_source
+            + "p.add_argument('--shared')\np.add_argument('--repeated')\n",
+            parser_source + "p.add_argument('--repeated')\np.add_argument('--shared')\n"
+            "p.add_argument('--new')\n",
+            ["--new  optional"],
+        ),
+        "dependencies": (
+            "default.nix",
+            dependency_source
+            + "{ propagatedBuildInputs = [ local.shared local.repeated ]; }",
+            dependency_source
+            + "{ propagatedBuildInputs = [ local.repeated local.shared local.new ]; }",
+            ["runtime: packages/new"],
+        ),
+    }[field]
+    if operation == "removed":
+        before, after = after, before
+    source = package / filename
+    source.write_text(before)
+    _git(tmp_path, "add", ".")
+    source.write_text(after)
+    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        data["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages", "example", field],
+                "operation": operation,
+                "after" if operation == "added" else "before": entries,
             },
         ],
         data,
@@ -2320,70 +2353,35 @@ def test_diff_reports_only_changed_list_entries(
     )
 
 
-@pytest.mark.parametrize("field", ["tests", "dependencies", "arguments"])
-@pytest.mark.parametrize("operation", ["added", "removed"])
-def test_diff_reports_list_membership_changes_and_preserves_duplicate_counts(
+def test_diff_reports_unresolved_index_conflicts_without_modifying_state(
     tmp_path: Path,
-    field: str,
-    operation: str,
 ) -> None:
-    """Distinguish one added or removed occurrence from a reordered retained entry."""
+    """Reject ambiguous staged sources instead of silently choosing a conflict side."""
     _repository(tmp_path)
-    package = _make_source_package(tmp_path, "example", "")
-    parser_source = "import argparse\np = argparse.ArgumentParser()\n"
-    dependency_source = (
-        "{ inputs, system, ... }: let local = inputs.self.packages.${system}; in "
-    )
-    filename, before, after, entries = {
-        "tests": (
-            "test_main.py",
-            (
-                "def test_shared(): pass\n"
-                "class TestFirst:\n    def test_repeated(self): pass\n"
-            ),
-            (
-                "class TestFirst:\n    def test_repeated(self): pass\n"
-                "def test_shared(): pass\n"
-                "class TestSecond:\n    def test_repeated(self): pass\n"
-                "def test_new(): pass\n"
-            ),
-            ["new", "repeated"],
-        ),
-        "arguments": (
-            "main.py",
-            parser_source
-            + "p.add_argument('--shared')\np.add_argument('--repeated')\n",
-            parser_source + "p.add_argument('--repeated')\np.add_argument('--shared')\n"
-            "p.add_argument('--new')\n",
-            ["--new  optional"],
-        ),
-        "dependencies": (
-            "default.nix",
-            dependency_source
-            + "{ propagatedBuildInputs = [ local.shared local.repeated ]; }",
-            dependency_source
-            + "{ propagatedBuildInputs = [ local.repeated local.shared local.new ]; }",
-            ["runtime: packages/new"],
-        ),
-    }[field]
-    if operation == "removed":
-        before, after = after, before
-    source = package / filename
-    source.write_text(before)
+    package = _make_source_package(tmp_path, "example", "def test_result(): pass\n")
     _git(tmp_path, "add", ".")
-    source.write_text(after)
-    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    source = package / "test_main.py"
+    oid = _git(tmp_path, "hash-object", str(source)).strip()
+    relative = source.relative_to(tmp_path).as_posix()
+    subprocess.run(
+        ["git", "update-index", "--index-info"],  # noqa: S607
+        cwd=tmp_path,
+        input=(
+            f"0 {'0' * len(oid)}\t{relative}\n"
+            f"100644 {oid} 1\t{relative}\n"
+            f"100644 {oid} 2\t{relative}\n"
+        ),
+        text=True,
+        check=True,
+        capture_output=True,
+    )
+    before = _snapshot(tmp_path)
+    data = json.loads(_run(tmp_path, "diff", ".", "--json", code=1).stdout)
     _expect(
-        data["repositories"][0]["changes"]
-        == [
-            {
-                "path": ["packages", "example", field],
-                "operation": operation,
-                "after" if operation == "added" else "before": entries,
-            },
-        ],
+        "unresolved index conflict" in data["repositories"][0]["diagnostics"][0],
         data,
     )
+    _expect(_snapshot(tmp_path) == before, "diff changed conflicted index state")
 
 
 def test_diff_separates_working_index_and_head_without_modifying_state(
@@ -2860,6 +2858,76 @@ def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> N
             },
         },
         tmp_path,
+    )
+
+
+def test_home_policy_diagnostics_preserve_git_and_whitelist_state(
+    tmp_path: Path,
+) -> None:
+    """Report missing paths and ignored tracked files without changing home policy."""
+    subject = import_module("packages.afairesi.main")
+    _git(tmp_path, "init", "--quiet")
+    (tmp_path / ".gitmodules").touch()
+    ignore = tmp_path / ".gitignore"
+    ignore.write_text(
+        "*\n!/.gitignore\n!/.gitmodules\n!/allowed\n!/future\n"
+        "!/assets/\n!/assets/*.png\n!/broken-link\n",
+    )
+    (tmp_path / "allowed").write_text("private contents")
+    (tmp_path / "excluded file").write_text("private contents")
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "broken-link").symlink_to(tmp_path / "missing-target")
+    _git(tmp_path, "add", "--force", ".gitignore", ".gitmodules", "excluded file")
+    before = ignore.read_text(), _git(tmp_path, "ls-files", "--stage")
+    expected = {
+        "missing_whitelist_paths": ["future"],
+        "tracked_outside_whitelist": ["excluded file"],
+    }
+    tree = subject.overview_summary(tmp_path)[socket.gethostname()][str(tmp_path)]
+    _expect(tree["diagnostics"] == expected, tree)
+    _expect("private contents" not in subject.render_overview(tree), tree)
+    _expect(
+        before == (ignore.read_text(), _git(tmp_path, "ls-files", "--stage")),
+        before,
+    )
+    ignore.write_text(ignore.read_text() + "!/excluded file\n")
+    (tmp_path / "future").touch()
+    _expect("diagnostics" not in subject.home_preservation(tmp_path), tmp_path)
+
+
+def test_home_submodule_whitelist_move_preserves_unrelated_entries(
+    tmp_path: Path,
+) -> None:
+    """Preview moves safely and migrate subtree rules without touching sibling paths."""
+    subject = import_module("packages.afairesi.main")
+    _git(tmp_path, "init", "--quiet")
+    ignore = tmp_path / ".gitignore"
+    source = (
+        "*\n!/.gitignore\n!/forge.example/\n!/forge.example/team/\n"
+        "!/forge.example/team/old\n!/forge.example/team/old/prm/\n"
+        "!/forge.example/team/older\n!/forge.example/team/new\n!/future\n"
+    )
+    ignore.write_text(source)
+    _git(tmp_path, "add", ".gitignore")
+    old = Path("forge.example/team/old")
+    new = Path("forge.example/team/new")
+    _expect(
+        subject._move_home_whitelist(tmp_path, old, new, dry_run=True),  # noqa: SLF001
+        tmp_path,
+    )
+    _expect(ignore.read_text() == source, ignore)
+    _expect(_git(tmp_path, "show", ":.gitignore") == source, ignore)
+    subject._move_home_whitelist(tmp_path, old, new, dry_run=False)  # noqa: SLF001
+    expected = (
+        "*\n!/.gitignore\n!/forge.example/\n!/forge.example/team/\n"
+        "!/forge.example/team/older\n!/forge.example/team/new\n!/future\n"
+        "!/forge.example/team/new/prm/\n"
+    )
+    _expect(ignore.read_text() == expected, ignore.read_text())
+    _expect(_git(tmp_path, "show", ":.gitignore") == expected, ignore)
+    _expect(
+        not subject._move_home_whitelist(tmp_path, old, new, dry_run=True),  # noqa: SLF001
+        ignore,
     )
 
 
@@ -3559,7 +3627,6 @@ def test_overview_renders_declarations_without_executing_sources() -> None:
             contract,
         )
         _expect("dependencies:\n" not in overview, inspected)
-        _expect("suppressions:\n" not in overview, inspected)
         _expect(
             "tests:\n" + expected_names in overview
             if expected_names
@@ -3847,52 +3914,19 @@ def test_source_overviews_preserve_declarations_and_source_facts(
                 'raise RuntimeError("must not run")\n'
                 "p = argparse.ArgumentParser()\n"
                 'p.add_argument("--output", help="Output path")\n'
-                "literal = '# noqa: D103 and # type: ignore are text'\n"
-                "# ruff: noqa: D\n"
-                "value = 1  # noqa: E501\n"
-                "other = 2  # type: ignore[assignment]\n"
             ),
         )
         (consumer / "test_main.py").write_text(
-            "def test_result(): pass  # noqa: D103\n",
+            "def test_result(): pass\n",
         )
         assets = consumer / "prm/assets"
         assets.mkdir(parents=True)
-        snippets: tuple[tuple[str, str, list[dict[str, str | int]]], ...] = (
-            (
-                "directives.html",
-                (
-                    "<!-- html-validate-disable -->\n"
-                    "<!-- html-validate-disable-next heading-level -->\n"
-                    "<p>eslint-disable is text</p>\n"
-                ),
-                [
-                    {"kind": "html-validate-disable", "scope": "global", "count": 1},
-                    {"kind": "html-validate-disable", "scope": "local", "count": 1},
-                ],
-            ),
-            (
-                "index.html",
-                '<script>const text = "<!-- htmlhint-disable -->";</script>',
-                [],
-            ),
-            (
-                "script.js",
-                "const value = `${(() => { /* eslint-disable */ return 1; })()}`;",
-                [{"kind": "eslint-disable", "scope": "global", "count": 1}],
-            ),
-            (
-                "string.js",
-                "const value = `/* eslint-disable */`; /* eslint-disable-next-line */",
-                [{"kind": "eslint-disable", "scope": "local", "count": 1}],
-            ),
-            (
-                "style.css",
-                'p { content: "/* stylelint-disable */"; } /* stylelint-disable */',
-                [{"kind": "stylelint-disable", "scope": "global", "count": 1}],
-            ),
-        )
-        for filename, source, _ in snippets:
+        asset_sources = {
+            "index.html": "<p>Example</p>\n",
+            "script.js": "const value = 1;\n",
+            "style.css": "p { color: red; }\n",
+        }
+        for filename, source in asset_sources.items():
             (assets / filename).write_text(source)
         (assets / "picture.png").write_bytes(b"binary")
         (assets / "linked.py").symlink_to(consumer / "main.py")
@@ -3941,15 +3975,10 @@ def test_source_overviews_preserve_declarations_and_source_facts(
                 "default.nix",
                 "main.py",
                 "test_main.py",
-                *("prm/assets/" + filename for filename, _, _ in snippets),
+                *("prm/assets/" + filename for filename in asset_sources),
             },
             sources,
         )
-        for filename, _, expected in snippets:
-            _expect(
-                sources["prm/assets/" + filename]["suppressions"] == expected,
-                sources,
-            )
         _expect(
             details["tests"] == ["result"],
             details,

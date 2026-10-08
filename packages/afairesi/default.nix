@@ -65,7 +65,6 @@ in
     inputs.self.packages.${pkgs.stdenv.system}.nix_syntax
     pkgs.git
     pkgs.nix
-    python.pkgs.tree-sitter-language-pack
   ];
   src = ./.;
   version = "0.0.0";

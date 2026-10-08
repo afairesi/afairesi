@@ -24,18 +24,15 @@ import stat
 import subprocess
 import sys
 import tempfile
-import tokenize
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import nix_syntax
-from tree_sitter_language_pack import get_parser
 
 if TYPE_CHECKING:
     from tree_sitter import Node
-    from tree_sitter_language_pack import SupportedLanguage
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 KIND_MARKERS = {
     "html": "index.html",
@@ -409,6 +406,7 @@ def _converge_home_submodule(
                     expected.as_posix(),
                 ],
             )
+        changed |= _move_home_whitelist(root, actual, expected, dry_run=dry_run)
     if repository["name"] != expected.as_posix():
         _change(
             f"rename submodule '{repository['name']}' to '{expected.as_posix()}'",
@@ -459,6 +457,32 @@ def _converge_home_submodule(
             dry_run=dry_run,
         )
     return changed
+
+
+def _move_home_whitelist(
+    root: Path,
+    actual: Path,
+    expected: Path,
+    *,
+    dry_run: bool,
+) -> bool:
+    """Move only whitelist entries owned by a relocated submodule."""
+    source = _read_regular(root / ".gitignore") or ""
+    old = f"!/{actual.as_posix()}"
+    new = f"!/{expected.as_posix()}"
+    lines = source.splitlines()
+    retained = [
+        line for line in lines if line != old and not line.startswith(old + "/")
+    ]
+    for line in lines:
+        if line == old or line.startswith(old + "/"):
+            replacement = new + line[len(old) :]
+            if replacement not in retained:
+                retained.append(replacement)
+    updated = "\n".join(retained) + "\n"
+    if updated == source:
+        return False
+    return _write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
 
 def _sync_submodule_url(
@@ -2239,82 +2263,6 @@ def _module_cli(module: ast.Module, filename: str) -> list[CliEntry]:
     raise ValueError(msg)
 
 
-def _python_suppressions(source: str) -> Counter[tuple[str, str]]:
-    """Count explicit suppressions in Python comments."""
-    counts: Counter[tuple[str, str]] = Counter()
-    try:
-        comments = (
-            (token.string[1:].strip(), token.start[1] == 0)
-            for token in tokenize.generate_tokens(io.StringIO(source).readline)
-            if token.type == tokenize.COMMENT
-        )
-        for comment, standalone in comments:
-            if re.search(r"^(?:ruff|flake8):\s*noqa\b", comment, re.IGNORECASE):
-                counts["noqa", "global"] += 1
-            elif re.search(r"^noqa\b", comment, re.IGNORECASE):
-                counts["noqa", "local"] += 1
-            for kind, pattern in (
-                ("type: ignore", r"^type:\s*ignore\b"),
-                ("pyright: ignore", r"^pyright:\s*ignore\b"),
-                ("nosec", r"^nosec\b"),
-                ("pragma: no cover", r"^pragma:\s*no cover\b"),
-            ):
-                if re.search(pattern, comment, re.IGNORECASE):
-                    counts[kind, "local"] += 1
-            if re.search(
-                r"^mypy:\s*(?:ignore-errors|disable-error-code)\b",
-                comment,
-                re.IGNORECASE,
-            ):
-                counts["mypy", "global"] += 1
-            if re.search(r"^pylint:\s*disable(?:-next)?=", comment, re.IGNORECASE):
-                scope = (
-                    "global"
-                    if standalone and "disable-next=" not in comment
-                    else "local"
-                )
-                counts["pylint: disable", scope] += 1
-    except tokenize.TokenError:
-        pass
-    return counts
-
-
-def source_suppressions(filename: str, source: str) -> Counter[tuple[str, str]]:
-    """Count explicit lint and type-check suppressions in source comments."""
-    if filename.endswith(".py"):
-        return _python_suppressions(source)
-    counts: Counter[tuple[str, str]] = Counter()
-    languages: dict[str, SupportedLanguage] = {
-        ".html": "html",
-        ".js": "javascript",
-        ".css": "css",
-    }
-    language = languages.get(Path(filename).suffix)
-    if language is None:
-        return counts
-    encoded = source.encode()
-    tree = get_parser(language).parse(encoded)
-    web_comments = [
-        encoded[node.start_byte : node.end_byte].decode()
-        for node in nix_syntax.walk(tree.root_node)
-        if node.type == "comment"
-    ]
-    for text in web_comments:
-        comment = text.removeprefix("<!--").removeprefix("/*").removeprefix("//")
-        directive = re.match(
-            r"\s*(html-validate|htmlhint|eslint|stylelint)-disable"
-            r"(-next-line|-next|-current|-line)?\b",
-            comment,
-            re.IGNORECASE,
-        )
-        if directive:
-            kind = f"{directive[1].lower()}-disable"
-            counts[kind, "local" if directive[2] else "global"] += 1
-        elif re.match(r"\s*prettier-ignore\b", comment, re.IGNORECASE):
-            counts["prettier-ignore", "local"] += 1
-    return counts
-
-
 class DeclaredDependency(TypedDict):
     """One source declaration, without claiming an evaluated dependency closure."""
 
@@ -2564,20 +2512,11 @@ class CliRecord(TypedDict):
     command: bool
 
 
-class SuppressionRecord(TypedDict):
-    """One explicit suppression count within a source file."""
-
-    kind: str
-    scope: str
-    count: int
-
-
 class SourceRecord(TypedDict):
     """Physical source observations, excluding runtime output and symbolic links."""
 
     path: str
     lines: int | None
-    suppressions: list[SuppressionRecord]
     diagnostic: str | None
 
 
@@ -2601,18 +2540,12 @@ def _source_observations(
         {
             "path": filename,
             "lines": len(source.encode().splitlines()),
-            "suppressions": [
-                {"kind": kind, "scope": scope, "count": count}
-                for (kind, scope), count in sorted(
-                    source_suppressions(filename, source).items(),
-                )
-            ],
             "diagnostic": None,
         }
         for filename, source in sorted(files.items())
     ]
     sources.extend(
-        {"path": filename, "lines": None, "suppressions": [], "diagnostic": message}
+        {"path": filename, "lines": None, "diagnostic": message}
         for filename, message in sorted(errors.items())
     )
     sources.sort(key=lambda source: source["path"])
@@ -2793,9 +2726,35 @@ def _repository_summary(target: Path) -> dict[str, dict[str, dict[str, Any]]]:
 
 
 def home_preservation(root: Path) -> dict[str, Any]:
-    """Parse anchored whitelist paths into a tree without expanding patterns."""
+    """Show Git-governed home paths and discrepancies without reading their contents."""
     source = _read_regular(root / ".gitignore") or ""
-    return _home_whitelist(source, root / ".gitignore")
+    tree = _home_whitelist(source, root / ".gitignore")
+    if (root / ".git").exists():
+        diagnostics = _home_policy_diagnostics(root, source)
+        if diagnostics:
+            tree["diagnostics"] = diagnostics
+    return tree
+
+
+def _home_policy_diagnostics(root: Path, source: str) -> dict[str, list[str]]:
+    """Report policy drift while leaving Git tracking choices to the user."""
+    missing = set()
+    for line in source.splitlines():
+        if not line.startswith("!/") or any(char in line for char in "*?[\\"):
+            continue
+        relative = line[2:].rstrip("/")
+        path = root / relative
+        if not path.exists() and not path.is_symlink():
+            missing.add(relative)
+    ignored = git(
+        root,
+        ["ls-files", "--cached", "--ignored", "--exclude-standard", "-z"],
+    ).stdout
+    diagnostics = {
+        "missing_whitelist_paths": sorted(missing),
+        "tracked_outside_whitelist": sorted(set(ignored.split("\0")) - {""}),
+    }
+    return {name: paths for name, paths in diagnostics.items() if paths}
 
 
 def _home_whitelist(source: str, path: Path) -> dict[str, Any]:
@@ -4086,12 +4045,18 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         description=(
             "Create, inspect, and converge Git and Nix repositories "
             "describing machines. Without a command, show "
-            "preserved machine paths, the home whitelist, and repository "
-            "descriptions, arguments, dependencies, and tests."
+            "OS and preservation status, preserved system paths, the Git-governed "
+            "home whitelist, and repository descriptions, CLI arguments, "
+            "dependencies, tests, and diagnostics."
         ),
         usage="%(prog)s [-h] [--json] [PATH]\n       %(prog)s COMMAND ...",
         epilog=(
-            "PATH selects a home, flake root, package, or host; default: whole machine."
+            "PATH selects a home, flake root, package, or host; default: whole "
+            "machine. Use afairesi . to inspect a repository or afairesi "
+            "packages/NAME to inspect a package. Home diagnostics report missing "
+            "literal whitelist paths and tracked files excluded by the whitelist; "
+            "patterns are not expanded and Git tracking choices remain explicit. "
+            "Read tests or source code when more detail is needed."
         ),
     )
     result.set_defaults(target=None)
@@ -4109,7 +4074,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     result.add_argument(
         "--json",
         action="store_true",
-        help="emit the selected overview as JSON",
+        help="emit the selected overview as JSON (machine fields: system, filesystem)",
     )
     if include_target:
         result.set_defaults(command=None)
@@ -4123,6 +4088,13 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         "diff",
         help="compare overview facts with the Git index or HEAD",
         description="Compare tracked overview facts in each selected repository.",
+        epilog=(
+            "Report descriptions, CLI arguments, dependencies, tests, and "
+            "diagnostics, with packages and hosts reported individually. Lists "
+            "show added and removed entries. Test, dependency, and named-option "
+            "declaration order is ignored; positional argument order is preserved. "
+            "System state has no Git baseline and is excluded from comparison."
+        ),
     )
     diff.add_argument(
         "target",
@@ -4162,6 +4134,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         "add",
         help="add a package or host",
         description="Create and stage a canonical package or host.",
+        epilog="Update and stage the repository whitelist and related checks.",
     )
     add.add_argument(
         "resource",
@@ -4184,6 +4157,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         "mv",
         help="rename a package or host",
         description="Rename a canonical package or host and stage the result.",
+        epilog="Update and stage the repository whitelist and related checks.",
     )
     move.add_argument(
         "source",
@@ -4205,6 +4179,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         "rm",
         help="remove a package or host",
         description="Remove and stage a canonical package or host.",
+        epilog="Update and stage the repository whitelist and remove related checks.",
     )
     remove.add_argument(
         "resource",
@@ -4227,8 +4202,18 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     )
     converge = commands.add_parser(
         "converge",
-        help="converge the repository to its canonical layout",
-        description="Converge the repository to its canonical layout.",
+        help="converge the home or flake repository to its target layout",
+        description=(
+            "Converge the current home or flake repository to its target layout."
+        ),
+        epilog=(
+            "Home convergence synchronizes submodule paths, URLs, and whitelist "
+            "entries, migrating entries when submodules move. Flake convergence "
+            "repairs managed files, checks, and the whitelist, and removes "
+            "undeclared files while preserving permitted tmp/ output. "
+            "Git governs home state; preservation governs system state outside "
+            "HOME. Reboot to restore impermanent NixOS system state."
+        ),
     )
     converge.add_argument(
         "-n",
