@@ -12,6 +12,8 @@ Afairesi uses shared Git repository and Nix flake conventions to describe a mach
 - `afairesi` shows OS and preservation status plus a filesystem tree of system paths, home whitelist paths, and repository summaries. JSON uses `system` and `filesystem` fields.
 - Pass a path to narrow inspection: `afairesi .` for a repository or `afairesi packages/NAME` for a package's interfaces and expected behavior.
 - `afairesi diff [PATH]` compares overview facts with Git's index; `--cached` compares with `HEAD`. System state has no Git baseline.
+- Diff lists show only added and removed entries. Test, dependency, and named-option declaration order is ignored; positional argument order is preserved. Packages and hosts are reported individually.
+- Default and diff output focus on descriptions, CLI arguments, dependencies, tests, and diagnostics. The Python source inventory (`resource_data`) retains suppression counts.
 - Read tests or source code when more detail is needed.
 
 ## Runtime constraints

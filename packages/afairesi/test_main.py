@@ -814,7 +814,6 @@ def _check_overview_details(
         "commands:\n  build:\n    arguments:\n"
         "      - --jobs  optional; default=2\n"
         "description: Example\n"
-        "suppressions:\n  - prm/nested/script.js: eslint-disable (global): 1\n"
         "tests:\n  - result\n"
     )
     _expect(
@@ -829,9 +828,6 @@ def _check_overview_details(
                         },
                     },
                     "tests": ["result"],
-                    "suppressions": [
-                        "prm/nested/script.js: eslint-disable (global): 1",
-                    ],
                 },
             },
         },
@@ -2116,9 +2112,9 @@ def test_diff_handles_unborn_head_removed_packages_and_semantically_equal_edits(
         staged["repositories"][0]["changes"]
         == [
             {
-                "path": ["packages"],
+                "path": ["packages", "example"],
                 "operation": "added",
-                "after": {"example": {"tests": ["result"]}},
+                "after": {"tests": ["result"]},
             },
         ],
         staged,
@@ -2134,9 +2130,9 @@ def test_diff_handles_unborn_head_removed_packages_and_semantically_equal_edits(
         removed["repositories"][0]["changes"]
         == [
             {
-                "path": ["packages"],
+                "path": ["packages", "example"],
                 "operation": "removed",
-                "before": {"example": {"tests": ["result"]}},
+                "before": {"tests": ["result"]},
             },
         ],
         removed,
@@ -2172,6 +2168,222 @@ def test_diff_reports_unresolved_index_conflicts_without_modifying_state(
         data,
     )
     _expect(_snapshot(tmp_path) == before, "diff changed conflicted index state")
+
+
+def test_diff_ignores_reordered_tests_named_options_and_suppression_edits(
+    tmp_path: Path,
+) -> None:
+    """Keep implementation observations and declaration ordering out of the diff."""
+    _repository(tmp_path)
+    package = _make_source_package(
+        tmp_path,
+        "example",
+        "def test_first(): pass  # noqa: S101\ndef test_second(): pass\n",
+    )
+    source = package / "main.py"
+    source.write_text(
+        "import argparse\np = argparse.ArgumentParser()\n"
+        "p.add_argument('--verbose')\np.add_argument('--jobs', default=2)\n",
+    )
+    _git(tmp_path, "add", ".")
+    _fixture_git(tmp_path, "commit", "-qm", "Baseline")
+    source.write_text(
+        "import argparse\np = argparse.ArgumentParser()\n"
+        "p.add_argument('--jobs', default=2)\np.add_argument('--verbose')\n",
+    )
+    (package / "test_main.py").write_text(
+        "def test_second(): pass\ndef test_first():\n    assert True\n",
+    )
+    before = _snapshot(tmp_path)
+    working = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(working["repositories"][0]["changes"] == [], working)
+    _expect("No overview changes." in _run(tmp_path, "diff", ".").stdout, working)
+    _expect("suppressions" not in _overview(package)["packages"]["example"], package)
+    _expect(_snapshot(tmp_path) == before, "semantic inspection changed source state")
+    _git(tmp_path, "add", ".")
+    staged = json.loads(_run(tmp_path, "diff", ".", "--cached", "--json").stdout)
+    _expect(staged["repositories"][0]["changes"] == [], staged)
+
+
+def test_diff_preserves_positional_argument_order(
+    tmp_path: Path,
+) -> None:
+    """Report changed positional meaning while omitting unchanged named options."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "")
+    source = package / "main.py"
+    prefix = "import argparse\np = argparse.ArgumentParser()\n"
+    source.write_text(
+        prefix + "p.add_argument('source')\np.add_argument('--verbose')\n"
+        "p.add_argument('destination')\n",
+    )
+    _git(tmp_path, "add", ".")
+    source.write_text(
+        prefix + "p.add_argument('--verbose')\np.add_argument('destination')\n"
+        "p.add_argument('source')\n",
+    )
+    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        data["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages", "example", "arguments"],
+                "operation": "changed",
+                "before": ["source  required", "destination  required"],
+                "after": ["destination  required", "source  required"],
+            },
+        ],
+        data,
+    )
+
+
+def test_diff_reports_only_changed_list_entries(
+    tmp_path: Path,
+) -> None:
+    """Show changed contracts without repeating retained declarations."""
+    _repository(tmp_path)
+    package = _make_source_package(
+        tmp_path,
+        "example",
+        "def test_kept(): pass\ndef test_old(): pass\n",
+    )
+    definition = package / "default.nix"
+    definition.write_text(
+        "{ inputs, system, ... }: let local = inputs.self.packages.${system}; in "
+        '{ meta.description = "Before"; '
+        "propagatedBuildInputs = [ local.kept local.old ]; }",
+    )
+    source = package / "main.py"
+    source.write_text(
+        "import argparse\np = argparse.ArgumentParser()\n"
+        "p.add_argument('--kept')\np.add_argument('--jobs', default=2)\n",
+    )
+    _git(tmp_path, "add", ".")
+    definition.write_text(
+        definition.read_text().replace("Before", "After").replace(".old", ".new"),
+    )
+    source.write_text(source.read_text().replace("default=2", "default=3"))
+    (package / "test_main.py").write_text(
+        "def test_new(): pass\ndef test_kept(): pass\n",
+    )
+    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        data["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages", "example", "arguments"],
+                "operation": "changed",
+                "before": ["--jobs  optional; default=2"],
+                "after": ["--jobs  optional; default=3"],
+            },
+            {
+                "path": ["packages", "example", "dependencies"],
+                "operation": "changed",
+                "before": ["runtime: packages/old"],
+                "after": ["runtime: packages/new"],
+            },
+            {
+                "path": ["packages", "example", "description"],
+                "operation": "changed",
+                "before": "Before",
+                "after": "After",
+            },
+            {
+                "path": ["packages", "example", "tests"],
+                "operation": "changed",
+                "before": ["old"],
+                "after": ["new"],
+            },
+        ],
+        data,
+    )
+    output = _run(tmp_path, "diff", ".").stdout
+    _expect(
+        output
+        == (
+            "Overview diff: index -> working_tree\n"
+            f"{tmp_path}:\n"
+            "  packages/example/arguments:\n"
+            "    - --jobs  optional; default=2\n"
+            "    + --jobs  optional; default=3\n"
+            "  packages/example/dependencies:\n"
+            "    - runtime: packages/old\n"
+            "    + runtime: packages/new\n"
+            "  packages/example/description:\n"
+            "    - Before\n"
+            "    + After\n"
+            "  packages/example/tests:\n"
+            "    - old\n"
+            "    + new\n"
+        ),
+        output,
+    )
+
+
+@pytest.mark.parametrize("field", ["tests", "dependencies", "arguments"])
+@pytest.mark.parametrize("operation", ["added", "removed"])
+def test_diff_reports_list_membership_changes_and_preserves_duplicate_counts(
+    tmp_path: Path,
+    field: str,
+    operation: str,
+) -> None:
+    """Distinguish one added or removed occurrence from a reordered retained entry."""
+    _repository(tmp_path)
+    package = _make_source_package(tmp_path, "example", "")
+    parser_source = "import argparse\np = argparse.ArgumentParser()\n"
+    dependency_source = (
+        "{ inputs, system, ... }: let local = inputs.self.packages.${system}; in "
+    )
+    filename, before, after, entries = {
+        "tests": (
+            "test_main.py",
+            (
+                "def test_shared(): pass\n"
+                "class TestFirst:\n    def test_repeated(self): pass\n"
+            ),
+            (
+                "class TestFirst:\n    def test_repeated(self): pass\n"
+                "def test_shared(): pass\n"
+                "class TestSecond:\n    def test_repeated(self): pass\n"
+                "def test_new(): pass\n"
+            ),
+            ["new", "repeated"],
+        ),
+        "arguments": (
+            "main.py",
+            parser_source
+            + "p.add_argument('--shared')\np.add_argument('--repeated')\n",
+            parser_source + "p.add_argument('--repeated')\np.add_argument('--shared')\n"
+            "p.add_argument('--new')\n",
+            ["--new  optional"],
+        ),
+        "dependencies": (
+            "default.nix",
+            dependency_source
+            + "{ propagatedBuildInputs = [ local.shared local.repeated ]; }",
+            dependency_source
+            + "{ propagatedBuildInputs = [ local.repeated local.shared local.new ]; }",
+            ["runtime: packages/new"],
+        ),
+    }[field]
+    if operation == "removed":
+        before, after = after, before
+    source = package / filename
+    source.write_text(before)
+    _git(tmp_path, "add", ".")
+    source.write_text(after)
+    data = json.loads(_run(tmp_path, "diff", ".", "--json").stdout)
+    _expect(
+        data["repositories"][0]["changes"]
+        == [
+            {
+                "path": ["packages", "example", field],
+                "operation": operation,
+                "after" if operation == "added" else "before": entries,
+            },
+        ],
+        data,
+    )
 
 
 def test_diff_separates_working_index_and_head_without_modifying_state(
@@ -2220,8 +2432,8 @@ def test_diff_separates_working_index_and_head_without_modifying_state(
     output = _run(tmp_path, "diff", ".").stdout
     _expect(
         "packages/example/tests:" in output
-        and '- ["staged"]' in output
-        and '+ ["working"]' in output,
+        and "- staged\n" in output
+        and "+ working\n" in output,
         output,
     )
     _expect(json.loads(_run(package, "diff", ".", "--json").stdout) == working, working)

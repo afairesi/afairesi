@@ -2721,7 +2721,7 @@ def cli_summary(entries: list[CliRecord]) -> dict[str, Any]:
 
 
 def resource_summary(data: ResourceData) -> dict[str, Any]:
-    """Keep populated fields for terminal and JSON summaries."""
+    """Keep populated interface and behavior facts for terminal and JSON summaries."""
     fields = {
         "description": data["description"],
         **cli_summary(data["cli"]),
@@ -2729,11 +2729,6 @@ def resource_summary(data: ResourceData) -> dict[str, Any]:
             _dependency_description(item) for item in data["dependencies"]
         ],
         "tests": data["tests"],
-        "suppressions": [
-            f"{source['path']}: {item['kind']} ({item['scope']}): {item['count']}"
-            for source in data["sources"]
-            for item in source["suppressions"]
-        ],
         "diagnostics": data["diagnostics"],
     }
     return {name: value for name, value in fields.items() if value}
@@ -3161,6 +3156,39 @@ def _diff_snapshot(root: Path, version: str, scope: Path | None) -> dict[str, An
     return result
 
 
+def _overview_list_changes(
+    before: list[str],
+    after: list[str],
+    path: tuple[str, ...],
+) -> list[dict[str, Any]]:
+    """Compare memberships, retaining the order of positional CLI arguments."""
+    removed = sorted((Counter(before) - Counter(after)).elements())
+    added = sorted((Counter(after) - Counter(before)).elements())
+    if path[-1] == "arguments":
+        old_positionals = [item for item in before if not item.startswith("-")]
+        new_positionals = [item for item in after if not item.startswith("-")]
+        if old_positionals != new_positionals:
+            removed = old_positionals + [
+                item for item in removed if item.startswith("-")
+            ]
+            added = new_positionals + [item for item in added if item.startswith("-")]
+    if not removed and not added:
+        return []
+    change: dict[str, Any] = {
+        "path": list(path),
+        "operation": "changed"
+        if removed and added
+        else "removed"
+        if removed
+        else "added",
+    }
+    if removed:
+        change["before"] = removed
+    if added:
+        change["after"] = added
+    return [change]
+
+
 def _overview_changes(
     before: object,
     after: object,
@@ -3169,6 +3197,13 @@ def _overview_changes(
     """Represent semantic changes with structured paths and explicit operations."""
     if before == after:
         return []
+    if (
+        isinstance(before, list)
+        and isinstance(after, list)
+        and path
+        and path[-1] in {"arguments", "dependencies", "repositories", "tests"}
+    ):
+        return _overview_list_changes(before, after, path)
     if not isinstance(before, dict) or not isinstance(after, dict):
         return [
             {
@@ -3181,7 +3216,11 @@ def _overview_changes(
     changes = []
     for key in sorted(before.keys() | after.keys()):
         child_path = (*path, key)
-        if key not in before:
+        if not path and key in {"packages", "hosts"}:
+            changes.extend(
+                _overview_changes(before.get(key, {}), after.get(key, {}), child_path),
+            )
+        elif key not in before:
             changes.append(
                 {"path": list(child_path), "operation": "added", "after": after[key]},
             )
@@ -3262,12 +3301,16 @@ def render_diff(data: dict[str, Any]) -> str:
             lines.append("  " + "/".join(change["path"]) + ":")
             for field, prefix in (("before", "-"), ("after", "+")):
                 if field in change:
-                    value = json.dumps(
-                        change[field],
-                        ensure_ascii=False,
-                        sort_keys=True,
+                    value = change[field]
+                    if isinstance(value, dict):
+                        content = render_overview(value) or "{}"
+                    elif isinstance(value, list):
+                        content = "\n".join(str(item) for item in value)
+                    else:
+                        content = str(value)
+                    lines.extend(
+                        f"    {prefix} {line}" for line in content.splitlines() or [""]
                     )
-                    lines.append(f"    {prefix} {value}")
         lines.extend(
             "  " + diagnostic for diagnostic in repository.get("diagnostics", [])
         )
