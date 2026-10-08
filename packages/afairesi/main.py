@@ -2786,8 +2786,27 @@ def _home_policy_diagnostics(root: Path, source: str) -> dict[str, list[str]]:
     return {name: paths for name, paths in diagnostics.items() if paths}
 
 
+def _compact_filesystem(tree: dict[str, Any]) -> dict[str, Any]:
+    """List file names in populated directories containing only file leaves."""
+    for name, child in tree.items():
+        if name.endswith("/") and isinstance(child, dict):
+            _compact_filesystem(child)
+            if child and all(value is None for value in child.values()):
+                tree[name] = sorted(child)
+    return tree
+
+
+def _filesystem_branch(tree: dict[str, Any], name: str) -> dict[str, Any]:
+    """Expand a file list when adding a directory or replacing home contents."""
+    child = tree.setdefault(name, {})
+    if isinstance(child, list):
+        child = dict.fromkeys(child)
+        tree[name] = child
+    return cast("dict[str, Any]", child)
+
+
 def _home_whitelist(source: str, path: Path) -> dict[str, Any]:
-    """Represent whitelist directories as branches and other paths as null leaves."""
+    """Represent whitelist directories as branches or lists of file leaves."""
     tree: dict[str, Any] = {}
     for line in source.splitlines():
         if not line.startswith("!/"):
@@ -2807,7 +2826,7 @@ def _home_whitelist(source: str, path: Path) -> dict[str, Any]:
             branch.setdefault(name + "/", {})
         elif name + "/" not in branch:
             branch.setdefault(name, None)
-    return tree
+    return _compact_filesystem(tree)
 
 
 def system_summary() -> dict[str, Any]:
@@ -2887,7 +2906,7 @@ def persistent_summary(root: Path) -> dict[str, Any]:
                 branch[name] = None
 
     visit(root, tree, 1)
-    return tree
+    return _compact_filesystem(tree)
 
 
 def machine_summary() -> dict[str, Any]:
@@ -2905,13 +2924,18 @@ def machine_summary() -> dict[str, Any]:
     branch = filesystem
     for index, component in enumerate(home.parts[1:]):
         name = "/" + component if index == 0 else component
-        branch = branch.setdefault(name + "/", {})
+        branch = _filesystem_branch(branch, name + "/")
     branch.clear()
     if (home / ".gitmodules").is_file() and not (home / "flake.nix").exists():
         branch.update(overview_summary(home)[socket.gethostname()][str(home.resolve())])
     else:
         branch.update(home_preservation(home))
-    return {socket.gethostname(): {"system": system, "filesystem": filesystem}}
+    return {
+        socket.gethostname(): {
+            "system": system,
+            "filesystem": _compact_filesystem(filesystem),
+        },
+    }
 
 
 def _overview_repositories(target: Path) -> list[tuple[Path, Path]]:
@@ -2955,7 +2979,11 @@ def overview_summary(target: Path) -> dict[str, Any]:
             if is_home:
                 branch.pop(component, None)
             name = component + "/" if is_home else component
-            branch = branch.setdefault(name, {})
+            branch = (
+                _filesystem_branch(branch, name)
+                if is_home
+                else branch.setdefault(name, {})
+            )
         try:
             groups = _repository_summary(selected)
         except ValueError as error:

@@ -2782,7 +2782,7 @@ def test_home_overview_without_repositories_lists_whitelist(tmp_path: Path) -> N
         subject.overview_summary(tmp_path)
         == {
             socket.gethostname(): {
-                str(tmp_path): {".ssh/": {"key": None}},
+                str(tmp_path): {".ssh/": ["key"]},
             },
         },
         tmp_path,
@@ -2932,8 +2932,8 @@ def test_home_whitelist_merges_paths_and_rejects_escaping_entries(
     _expect(
         subject.home_preservation(tmp_path)
         == {
-            ".ssh/": {"key": None, "public": None},
-            "assets/": {"*.png": None},
+            ".ssh/": ["key", "public"],
+            "assets/": ["*.png"],
             "empty/": {},
         },
         tmp_path,
@@ -3163,7 +3163,7 @@ def test_machine_diff_uses_independent_repository_baselines_and_reports_exclusio
     before = (_snapshot(home), _snapshot(child))
     data = subject.diff_summary(None)
     _expect(
-        _patch_values(data["patch"], "add", "paths", ".ssh/") == [{"key": None}],
+        _patch_values(data["patch"], "add", "paths", ".ssh/") == ["key"],
         data,
     )
     _expect(
@@ -3212,12 +3212,12 @@ def test_machine_home_whitelist_replaces_stored_home_contents(
     """Represent a stored home once through its policy even without submodules."""
     subject = import_module("packages.afairesi.main")
     (tmp_path / ".gitignore").write_text("*\n!/.ssh/\n")
-    home_tree: dict[str, Any] = {"untracked-file": None}
+    home_tree: dict[str, Any] | list[str] = ["untracked-file"]
     for component in reversed(tmp_path.parts[2:]):
         home_tree = {component + "/": home_tree}
     stored_tree = {
         "/" + tmp_path.parts[1] + "/": home_tree,
-        "/etc/": {"machine-id": None},
+        "/etc/": ["machine-id"],
     }
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     monkeypatch.setattr(subject, "persistent_summary", lambda _root: stored_tree)
@@ -3234,7 +3234,7 @@ def test_machine_home_whitelist_replaces_stored_home_contents(
     for component in tmp_path.parts[2:]:
         branch = branch[component + "/"]
     _expect(branch == {".ssh/": {}}, branch)
-    _expect(machine["/etc/"] == {"machine-id": None}, machine)
+    _expect(machine["/etc/"] == ["machine-id"], machine)
 
 
 def test_machine_overview_defaults_ignore_working_directory(
@@ -3264,7 +3264,7 @@ def test_machine_overview_defaults_ignore_working_directory(
     monkeypatch.setattr(subject, "system_summary", lambda: system)
     expected_home: dict[str, Any] = {
         ".gitmodules": None,
-        ".ssh/": {"key": None},
+        ".ssh/": ["key"],
         "forge.example/": {
             "team/": {
                 "demo/": {
@@ -3280,7 +3280,7 @@ def test_machine_overview_defaults_ignore_working_directory(
         socket.gethostname(): {
             "system": system,
             "filesystem": {
-                "/etc/": {"machine-id": None},
+                "/etc/": ["machine-id"],
                 "/" + home.parts[1] + "/": expected_paths,
             },
         },
@@ -3663,7 +3663,13 @@ def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
     (storage / "var/lib/service/hidden").write_text("runtime")
     (storage / "file").write_text("private contents")
     (storage / "empty").mkdir()
+    (storage / "files").mkdir()
+    (storage / "files/z-last").touch()
+    (storage / "files/a-first").touch()
+    (storage / "mixed/empty").mkdir(parents=True)
+    (storage / "mixed/file").touch()
     (storage / "link").symlink_to(storage, target_is_directory=True)
+    (storage / "files/link").symlink_to(storage, target_is_directory=True)
     blocked = storage / "private"
     blocked.mkdir()
     iterdir = Path.iterdir
@@ -3680,7 +3686,9 @@ def test_persistent_inventory_bounds_traversal_and_reports_unreadable_paths(
         == {
             "/empty/": {},
             "/file": None,
+            "/files/": ["a-first", "link", "z-last"],
             "/link": None,
+            "/mixed/": {"empty/": {}, "file": None},
             "/private/": {"diagnostics": ["Permission denied"]},
             "/var/": {"lib/": {"service/": {}}},
         },
