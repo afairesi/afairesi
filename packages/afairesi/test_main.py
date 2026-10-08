@@ -1346,6 +1346,108 @@ def _test_declarations(labels: list[str], form: str) -> str:
     return tests
 
 
+@pytest.mark.parametrize("relative", [None, "..", "."])
+def test_campaign_home_targets_reject_empty_or_escaping_submodules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    relative: str | None,
+) -> None:
+    """Reject invalid home selections before any campaign runs."""
+    subject = import_module("packages.afairesi.main")
+    _git(tmp_path, "init", "--quiet")
+    (tmp_path / ".gitmodules").write_text(
+        "" if relative is None else f'[submodule "bad"]\n\tpath = {relative}\n',
+    )
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "test"])
+    with pytest.raises(SystemExit) as completed:
+        subject.main()
+    output = capsys.readouterr()
+    _expect(completed.value.code == 1, completed)
+    _expect(
+        ("no submodules found" if relative is None else "submodule path escapes")
+        in output.err,
+        output,
+    )
+
+
+@pytest.mark.parametrize("command", [None, "coverage", "hypothesis", "mutation"])
+@pytest.mark.parametrize("failure", [None, "coverage", "hypothesis", "mutation"])
+def test_campaign_home_targets_run_all_submodules_after_failures(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    command: str | None,
+    failure: str | None,
+) -> None:
+    """Expand home scope while preserving campaign options and failure status."""
+    subject = import_module("packages.afairesi.main")
+    _git(tmp_path, "init", "--quiet")
+    roots = [tmp_path / "repos" / name for name in ("alpha", "beta")]
+    for root in roots:
+        root.mkdir(parents=True)
+        _repository(root)
+    (tmp_path / ".gitmodules").write_text(
+        "".join(
+            f'[submodule "{root.name}"]\n\tpath = repos/{root.name}\n' for root in roots
+        ),
+    )
+    nested = tmp_path / "outside"
+    nested.mkdir()
+    observed: list[tuple[str, Path]] = []
+
+    def run(target: Path, campaign: str) -> bool:
+        observed.append((campaign, target))
+        if target == roots[0] and campaign == failure:
+            message = "campaign failed"
+            raise subject.CommandError(message)
+        return True
+
+    def coverage_run(target: Path) -> bool:
+        return run(target, "coverage")
+
+    def runner(
+        target: Path,
+        campaign: str,
+        _timeout: float | None,
+        _max_examples: int | None,
+        selection: object,
+    ) -> bool:
+        if command in {"hypothesis", "mutation"}:
+            _expect(getattr(selection, "keywords", None) == "chosen", selection)
+        return run(target, campaign)
+
+    monkeypatch.setattr(subject, "_run_coverage", coverage_run)
+    monkeypatch.setattr(subject, "_run_test_repository", runner)
+    commands = [command] if command else ["coverage", "hypothesis", "mutation"]
+    arguments = ["test", command] if command else ["test"]
+    if command in {"hypothesis", "mutation"}:
+        arguments.extend(["-k", "chosen"])
+    for cwd in (tmp_path, nested):
+        monkeypatch.chdir(cwd)
+        observed.clear()
+        monkeypatch.setattr(sys, "argv", ["afairesi", *arguments])
+        with pytest.raises(SystemExit) as completed:
+            subject.main()
+        _expect(completed.value.code == int(failure in commands), completed)
+        _expect(
+            observed == [(campaign, root) for campaign in commands for root in roots],
+            observed,
+        )
+        output = capsys.readouterr()
+        _expect(
+            "Submodule summary" in output.out and "repos/beta: passed" in output.out,
+            output,
+        )
+    if command:
+        observed.clear()
+        monkeypatch.setattr(sys, "argv", ["afairesi", *arguments, str(tmp_path)])
+        with pytest.raises(SystemExit):
+            subject.main()
+        _expect(observed == [(command, root) for root in roots], observed)
+
+
 def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

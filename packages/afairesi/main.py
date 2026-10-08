@@ -4197,6 +4197,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         help="run coverage, property tests, and mutation tests",
         description=(
             "Run coverage, Hypothesis, and mutation campaigns for the current "
+            "flake repository or all registered submodules of the current home "
             "repository. Select a subcommand to run one campaign."
         ),
     )
@@ -4218,7 +4219,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="canonical packages/NAME or flake root (default: current repository root)",
+        help="package, flake, or home (default: current repository and its submodules)",
     )
     hypothesis = test_commands.add_parser(
         "hypothesis",
@@ -4236,7 +4237,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="canonical packages/NAME or flake root (default: current repository root)",
+        help="package, flake, or home (default: current repository and its submodules)",
     )
     hypothesis.add_argument(
         "--timeout",
@@ -4268,7 +4269,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="canonical packages/NAME or flake root (default: current repository root)",
+        help="package, flake, or home (default: current repository and its submodules)",
     )
     mutation.add_argument(
         "--timeout",
@@ -4340,14 +4341,52 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     return result
 
 
+def _run_test_targets(
+    campaign: argparse.Namespace,
+    cli: argparse.ArgumentParser,
+    target: Path,
+    targets: list[Path],
+) -> bool:
+    """Run one campaign across selected repositories and collect every failure."""
+    command = campaign.test_command
+    results: dict[Path, bool] = {}
+    for selected in targets:
+        selected_options = argparse.Namespace(**vars(campaign))
+        selected_options.target = selected
+        if selected != target:
+            sys.stdout.write(f"\nRunning {command} for {selected}...\n")
+            sys.stdout.flush()
+        try:
+            results[selected] = (
+                _run_coverage(selected)
+                if command == "coverage"
+                else _dispatch_test_runner(selected_options, cli)
+            )
+        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
+            results[selected] = False
+            sys.stderr.write(f"afairesi test {command}: {selected}: {error}\n")
+        except KeyboardInterrupt:
+            sys.stderr.write(f"afairesi test {command}: interrupted\n")
+            sys.exit(130)
+    if targets != [target]:
+        sys.stdout.write(f"\nSubmodule summary ({command}):\n")
+        for selected, success in results.items():
+            sys.stdout.write(
+                f"  {selected.relative_to(target)}: "
+                f"{'passed' if success else 'failed'}\n",
+            )
+    return all(results.values())
+
+
 def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
 ) -> bool:
     """Run selected campaigns, continuing after failures and returning one status."""
     combined = options.test_command is None
+    target = _command_target(options.target)
+    targets = _test_targets(target)
     if combined:
-        target = _command_target(None)
         campaigns = [
             cli.parse_args(["test", command, str(target)])
             for command in ("coverage", "hypothesis", "mutation")
@@ -4360,23 +4399,32 @@ def _dispatch_test_command(
         if combined:
             sys.stdout.write(f"\nRunning {command} campaign...\n")
             sys.stdout.flush()
-        try:
-            outcomes[command] = (
-                _run_coverage(_command_target(campaign.target))
-                if command == "coverage"
-                else _dispatch_test_runner(campaign, cli)
-            )
-        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-            outcomes[command] = False
-            sys.stderr.write(f"afairesi test {command}: {error}\n")
-        except KeyboardInterrupt:
-            sys.stderr.write(f"afairesi test {command}: interrupted\n")
-            sys.exit(130)
+        outcomes[command] = _run_test_targets(campaign, cli, target, targets)
     if combined:
         sys.stdout.write("\nCampaign summary:\n")
         for command, success in outcomes.items():
             sys.stdout.write(f"  {command}: {'passed' if success else 'failed'}\n")
     sys.exit(0 if all(outcomes.values()) else 1)
+
+
+def _test_targets(target: Path) -> list[Path]:
+    """Expand a home target into its registered submodules without changing them."""
+    flake, home = _repository_type_markers(target)
+    if not home or flake:
+        return [target]
+    targets = []
+    for repository in home_submodules(target, require_url=False):
+        checkout = (target / repository["path"]).resolve()
+        if not checkout.is_relative_to(target) or checkout == target:
+            message = (
+                f"submodule path escapes the home repository: {repository['path']}"
+            )
+            raise CommandError(message)
+        targets.append(checkout)
+    if not targets:
+        message = f"no submodules found under {target}"
+        raise CommandError(message)
+    return targets
 
 
 def _dispatch_overview(options: argparse.Namespace) -> None:
