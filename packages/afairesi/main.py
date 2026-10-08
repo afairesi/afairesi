@@ -1779,6 +1779,33 @@ def add_host(root: Path, name: str) -> None:
         raise
 
 
+def remove_home_submodule(root: Path, value: str, *, dry_run: bool) -> None:
+    """Remove a registered home submodule and its owned whitelist entries."""
+    relative = Path(value)
+    if (
+        relative.is_absolute()
+        or ".." in relative.parts
+        or relative.as_posix()
+        not in {repository["path"] for repository in home_submodules(root)}
+    ):
+        msg = f"not a registered home submodule: {value}"
+        raise CommandError(msg)
+    source = _read_regular(root / ".gitignore") or ""
+    entry = f"!/{relative.as_posix()}"
+    retained = [
+        line
+        for line in source.splitlines()
+        if line != entry and not line.startswith(entry + "/")
+    ]
+    updated = "\n".join(retained) + "\n" if retained else ""
+    arguments = ["rm", "-r", "--", f":(literal){relative.as_posix()}"]
+    if dry_run:
+        arguments.insert(2, "--dry-run")
+    git(root, arguments)
+    _change(f"remove submodule '{relative}' and update '.gitmodules'", dry_run=dry_run)
+    _write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
+
+
 def remove_resource(root: Path, value: str, dry_run: bool) -> None:  # noqa: FBT001
     """Remove a canonical package or host and stage its related metadata."""
     kind, name, relative = _parse_resource_path(value)
@@ -4003,35 +4030,6 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         title="commands",
         metavar="COMMAND",
     )
-    diff = commands.add_parser(
-        "diff",
-        help="compare overview facts with the Git index or HEAD",
-        description="Emit JSON Patch for tracked overview facts.",
-        epilog=(
-            "Report descriptions, CLI arguments, dependencies, tests, and "
-            "diagnostics, with packages and hosts reported individually. Lists "
-            "show added and removed entries. Test, dependency, and named-option "
-            "declaration order is ignored; positional argument order is preserved. "
-            "System state has no Git baseline and is excluded from comparison. "
-            "Pipe the patch to jd -t patch2jd for a visual diff. "
-            "Patch paths start with the absolute repository path; unordered "
-            "declaration lists are sorted in the comparison document. "
-            "Diagnostics and exclusions are written to stderr."
-        ),
-    )
-    diff.add_argument(
-        "target",
-        nargs="?",
-        type=_inspection_path,
-        metavar="PATH",
-        help="home, repository, package, or host (default: whole machine)",
-    )
-    diff.add_argument(
-        "--cached",
-        "--staged",
-        action="store_true",
-        help="compare the index with HEAD instead of working files with the index",
-    )
     init = commands.add_parser(
         "init",
         help="initialize HOME, create a flake, or add a remote submodule",
@@ -4095,28 +4093,25 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
     )
     remove = commands.add_parser(
         "rm",
-        help="remove a package or host",
-        description="Remove and stage a canonical package or host.",
-        epilog="Update and stage the repository whitelist and remove related checks.",
+        help="remove a home submodule, package, or host",
+        description="Remove and stage a registered home submodule or flake resource.",
+        epilog=(
+            "Home removal uses git rm and removes the submodule's whitelist "
+            "entries while preserving shared parents. Git rejects local changes "
+            "that would be lost. Flake removal updates the whitelist and removes "
+            "related checks."
+        ),
     )
     remove.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="existing packages/NAME or hosts/NAME path",
+        help="registered home submodule path, packages/NAME, or hosts/NAME",
     )
     remove.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
         help="print removals without changing the repository",
-    )
-    test = commands.add_parser(
-        "test",
-        help="run coverage, property tests, and mutation tests",
-        description=(
-            "Run coverage, Hypothesis, and mutation campaigns for the current "
-            "repository. Select a subcommand to run one campaign."
-        ),
     )
     converge = commands.add_parser(
         "converge",
@@ -4140,6 +4135,43 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         help="report required actions without changing the repository",
     )
     converge.add_argument("--source", type=Path, help=argparse.SUPPRESS)
+    diff = commands.add_parser(
+        "diff",
+        help="compare overview facts with the Git index or HEAD",
+        description="Emit JSON Patch for tracked overview facts.",
+        epilog=(
+            "Report descriptions, CLI arguments, dependencies, tests, and "
+            "diagnostics, with packages and hosts reported individually. Lists "
+            "show added and removed entries. Test, dependency, and named-option "
+            "declaration order is ignored; positional argument order is preserved. "
+            "System state has no Git baseline and is excluded from comparison. "
+            "Pipe the patch to jd -t patch2jd for a visual diff. "
+            "Patch paths start with the absolute repository path; unordered "
+            "declaration lists are sorted in the comparison document. "
+            "Diagnostics and exclusions are written to stderr."
+        ),
+    )
+    diff.add_argument(
+        "target",
+        nargs="?",
+        type=_inspection_path,
+        metavar="PATH",
+        help="home, repository, package, or host (default: whole machine)",
+    )
+    diff.add_argument(
+        "--cached",
+        "--staged",
+        action="store_true",
+        help="compare the index with HEAD instead of working files with the index",
+    )
+    test = commands.add_parser(
+        "test",
+        help="run coverage, property tests, and mutation tests",
+        description=(
+            "Run coverage, Hypothesis, and mutation campaigns for the current "
+            "repository. Select a subcommand to run one campaign."
+        ),
+    )
     test.set_defaults(test_command=None)
     test_commands = test.add_subparsers(dest="test_command", metavar="COMMAND")
     coverage = test_commands.add_parser(
@@ -4391,6 +4423,14 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
     add_package(root, options.type, name, description)
 
 
+def _dispatch_remove(root: Path, options: argparse.Namespace, kind: str) -> None:
+    """Remove a resource through its repository's lifecycle."""
+    if kind == "home":
+        remove_home_submodule(root, options.resource, dry_run=options.dry_run)
+    else:
+        remove_resource(root, options.resource, options.dry_run)
+
+
 def main() -> None:
     """Dispatch the Afairesi CLI."""
     arguments = sys.argv[1:]
@@ -4411,7 +4451,7 @@ def main() -> None:
             return
         root = repository_root()
         current_type = repository_type(root)
-        if options.command in {"add", "mv", "rm"} and current_type != "flake":
+        if options.command in {"add", "mv"} and current_type != "flake":
             msg = f"{current_type} repositories do not support flake resources"
             raise CommandError(  # noqa: TRY301
                 msg,
@@ -4427,7 +4467,7 @@ def main() -> None:
         elif options.command == "add":
             _dispatch_add(root, options)
         elif options.command == "rm":
-            remove_resource(root, options.resource, options.dry_run)
+            _dispatch_remove(root, options, current_type)
         elif options.command == "mv":
             rename_resource(
                 root,

@@ -2823,6 +2823,66 @@ def test_home_policy_diagnostics_preserve_git_and_whitelist_state(
     _expect("diagnostics" not in subject.home_preservation(tmp_path), tmp_path)
 
 
+@pytest.mark.parametrize("case", ["unknown", "parent", "dirty", "dirty-preview"])
+def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    """Reject ambiguous paths and local changes without changing home state."""
+    root = _home_repository(tmp_path)
+    relative = "forge.example/owner/demo"
+    _git(root, "submodule", "absorbgitdirs")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
+    target = {"unknown": "missing", "parent": "forge.example/owner"}.get(
+        case,
+        relative,
+    )
+    if case.startswith("dirty"):
+        (root / relative / "README").write_text("local changes")
+    before = _snapshot(root)
+    arguments = ("--dry-run",) if case == "dirty-preview" else ()
+    _run(root, "rm", target, *arguments, code=1)
+    _expect(_snapshot(root) == before, "rejected removal changed home state")
+
+
+def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
+    tmp_path: Path,
+) -> None:
+    """Preview and remove a repository together with its owned whitelist entries."""
+    root = _home_repository(tmp_path)
+    relative = "forge.example/owner/demo"
+    _git(root, "submodule", "absorbgitdirs")
+    ignore = root / ".gitignore"
+    ignore.write_text(
+        ignore.read_text()
+        + f"!/{relative}/\n!/{relative}/README\n"
+        + "!/forge.example/owner/demo-other\n!/.ssh/\n",
+    )
+    _git(root, "add", ".gitignore")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
+    before = _snapshot(root)
+    preview = _run(root, "rm", relative, "--dry-run")
+    _expect(relative in preview.stdout and ".gitignore" in preview.stdout, preview)
+    _expect(_snapshot(root) == before, "removal preview changed home state")
+    _run(root, "rm", relative)
+    _expect(not (root / relative).exists(), "submodule checkout was not removed")
+    lines = ignore.read_text().splitlines()
+    _expect(f"!/{relative}" not in lines and f"!/{relative}/README" not in lines, lines)
+    for entry in (
+        "!/forge.example/",
+        "!/forge.example/owner/",
+        "!/forge.example/owner/demo-other",
+        "!/.ssh/",
+    ):
+        _expect(entry in lines, lines)
+    subject = import_module("packages.afairesi.main")
+    _expect(subject.home_submodules(root) == [], "submodule remains registered")
+    staged = _git(root, "diff", "--cached", "--name-only").splitlines()
+    _expect(set(staged) == {".gitignore", ".gitmodules", relative}, staged)
+    _expect(not _git(root, "diff", "--name-only"), "metadata was not staged")
+    _run(root, "converge", "--dry-run")
+
+
 def test_home_submodule_whitelist_move_preserves_unrelated_entries(
     tmp_path: Path,
 ) -> None:
