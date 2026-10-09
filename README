@@ -2,9 +2,9 @@
 
 Afairesi uses shared Git repository and Nix flake conventions to describe a machine and return it to its target state. `afairesi` creates, inspects, and converges those repositories.
 
-Running `afairesi` without arguments shows the machine's current high-level state as formatted JSON.
+Run `afairesi` without arguments to inspect the machine's current high-level state as formatted JSON.
 
-Use `afairesi --help` or `afairesi COMMAND --help` for command details.
+Run `afairesi --help` or `afairesi COMMAND --help` for command details.
 
 ## Requirements
 
@@ -15,22 +15,22 @@ Use `afairesi --help` or `afairesi COMMAND --help` for command details.
 - Impermanent NixOS.
 - A Git-tracked `$HOME` with a whitelisted `.gitignore`; Git governs home state, and preservation governs system state outside `$HOME`.
 - Nix flake Git submodules under `$HOME` at `<remote-hostname>/<repository-path>`, with conventional `packages/`, `hosts/`, and `checks/` directories where applicable.
-- Package directories with conventional places for source and tests, `prm/` for tracked files that do not fit the conventional layout, and `tmp/` for runtime output where applicable.
+- Package directories with a conventional layout for source and tests, `prm/` for tracked files that do not fit that layout, and `tmp/` for runtime output where applicable.
 
 ## Runtime constraints
 
-- Use `afairesi` for persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
+- Run `afairesi` to make persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
 
 ## Convergence to target state
 
 - Reboot to restore impermanent NixOS system state; the persistent `$HOME` remains governed by Git.
 - Run `nix flake check` and `nix fmt` for flake repositories.
 - Run `afairesi converge` for `$HOME` and flake repositories.
-- Use `git clean` to remove untracked state; it is destructive.
+- Run `git clean` to remove untracked state; it is destructive.
 
 ## Migration to Afairesi
 
 - Progressively adopt the target state, choosing which repositories to migrate, whether to use impermanence, and what state to preserve.
 - Run `afairesi PATH` to inspect repository details, Git worktrees, home submodule registration, and convention gaps without changing them.
-- Use Git and Nix to prepare repositories for Afairesi conventions before running convergence.
+- Run Git and Nix commands to prepare repositories for Afairesi conventions before running `afairesi converge`.
 - Apply runtime constraints and convergence to the repositories you adopt.
