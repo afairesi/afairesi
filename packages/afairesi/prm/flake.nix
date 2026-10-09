@@ -39,6 +39,27 @@ let
       in
       (builtins.removeAttrs base [ "__functor" ])
       // {
+        apps = nixlib.genAttrs systems (
+          system:
+          let
+            pkgs = (repositoryInputs.nixpkgs or inputs.nixpkgs).legacyPackages.${system};
+            packages = nixlib.filterAttrs (
+              _: package: package ? runtimeHook && package.runtimeHook != ""
+            ) repositoryInputs.self.packages.${system};
+            generated = nixlib.mapAttrs (name: package: {
+              type = "app";
+              program = toString (pkgs.writeShellScript "${name}-run" ''
+                set -e
+                ${package.runtimeHook}
+                exec ${nixlib.getExe package} "$@"
+              '');
+            }) packages;
+          in
+          assert nixlib.assertMsg (
+            builtins.intersectAttrs (base.apps.${system} or { }) generated == { }
+          ) "Afairesi generated runtime apps collide with existing app names";
+          (base.apps.${system} or { }) // generated
+        );
         legacyPackages = nixlib.genAttrs systems (
           system:
           let

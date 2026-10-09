@@ -9,6 +9,13 @@ let
   cliName = baseNameOf src;
   pname = builtins.replaceStrings [ "-" ] [ "_" ] cliName;
 in
+assert
+  !(arguments ? shellHook)
+  || throw "mkPythonPackage does not accept shellHook; use runtimeHook for app initialization";
+assert
+  !(arguments ? runtimeHook)
+  || executable
+  || throw "runtimeHook requires an executable package";
 python.pkgs.buildPythonPackage (
   {
     version = "0.0.0";
@@ -17,6 +24,7 @@ python.pkgs.buildPythonPackage (
   // builtins.removeAttrs arguments [
     "pkgs"
     "executable"
+    "runtimeHook"
   ]
   // {
     inherit pname src;
@@ -38,7 +46,7 @@ python.pkgs.buildPythonPackage (
       // pkgs.lib.optionalAttrs executable { mainProgram = cliName; };
     passthru = (arguments.passthru or { }) // {
       inherit python;
-    };
+    } // pkgs.lib.optionalAttrs (arguments ? runtimeHook) { inherit (arguments) runtimeHook; };
     pyproject = false;
     strictDeps = true;
   }

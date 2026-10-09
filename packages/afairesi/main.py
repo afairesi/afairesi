@@ -4129,16 +4129,6 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
             "dependencies, tests, and diagnostics as formatted JSON."
         ),
         usage="%(prog)s [-h] [PATH]\n       %(prog)s COMMAND ...",
-        epilog=(
-            "PATH inspects a directory, home, flake root, package, or host; "
-            "default: whole machine. Use afairesi . to inspect a repository or "
-            "afairesi packages/NAME to inspect a package. Explicit paths also report "
-            "Git worktrees, home registration, and convention gaps recursively, "
-            "without following directory symlinks. Home diagnostics report missing "
-            "literal whitelist paths and tracked files excluded by the whitelist; "
-            "patterns are not expanded and Git tracking choices remain explicit. "
-            "Read tests or source code when more detail is needed."
-        ),
     )
     result.set_defaults(target=None)
     if include_target:
