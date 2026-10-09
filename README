@@ -16,6 +16,7 @@ Run `afairesi --help` or `afairesi COMMAND --help` for command details.
 - A Git-tracked `$HOME` with a whitelisted `.gitignore`; Git governs home state, and preservation governs system state outside `$HOME`.
 - Nix flake Git submodules under `$HOME` at `<remote-hostname>/<repository-path>`, with conventional `packages/`, `hosts/`, and `checks/` directories where applicable.
 - Package directories with a conventional layout for source and tests, `prm/` for tracked files that do not fit that layout, and `tmp/` for runtime output where applicable.
+- Packages write runtime state to their own canonical home-relative `packages/NAME/tmp/`, independently of the working directory; they may explicitly read another package's data. Python packages declare these paths as `RUNTIME_DIR` and `INPUT_DIRS` using `Path.home()` and literal relative paths.
 
 ## Runtime constraints
 

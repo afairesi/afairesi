@@ -4104,6 +4104,87 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
         _preview(root, "converge")
 
 
+@pytest.mark.parametrize(
+    ("declaration", "valid"),
+    [
+        (
+            (
+                "RUNTIME_DIR = Path.home() / "
+                '"forge.example/team/repo/packages/example/tmp"'
+            ),
+            True,
+        ),
+        (
+            (
+                'RUNTIME_DIR = Path.home() / "forge.example" '
+                '/ "team/repo/packages/example/tmp"'
+            ),
+            True,
+        ),
+        (
+            'INPUT_DIRS = (Path.home() / "forge.example/team/repo/packages/data/tmp",)',
+            True,
+        ),
+        ('RUNTIME_DIR = Path.cwd() / "tmp"', False),
+        ('RUNTIME_DIR = Path(__file__).parent / "tmp"', False),
+        (
+            'RUNTIME_DIR = Path.home() / "forge.example/team/repo/packages/other/tmp"',
+            False,
+        ),
+        ('RUNTIME_DIR = Path.home() / "/persistent/example"', False),
+        (
+            (
+                "RUNTIME_DIR = Path.home() / "
+                '"forge.example/team/repo/packages/example/../tmp"'
+            ),
+            False,
+        ),
+        ('RUNTIME_DIR = Path.home() / os.environ["OUTPUT"]', False),
+        (
+            'INPUT_DIRS = Path.home() / "forge.example/team/repo/packages/data/tmp"',
+            False,
+        ),
+    ],
+)
+def test_runtime_directory_declarations_are_checked_without_execution(
+    declaration: str,
+    tmp_path: Path,
+    *,
+    valid: bool,
+) -> None:
+    """Check owned output and explicit inputs without executing declarations."""
+    subject = import_module("packages.afairesi.main")
+    package = _make_source_package(tmp_path, "example", "")
+    source = (
+        "from pathlib import Path\n"
+        + declaration
+        + "\nraise RuntimeError('do not execute')\n"
+    )
+    (package / "main.py").write_text(source)
+    _, issues = subject.inspect_structure(tmp_path)
+    _expect(bool(issues) != valid, issues)
+    facts = subject.source_resource_data("example", {"main.py": source})
+    _expect(("runtime" in facts["diagnostics"]) != valid, facts)
+
+
+def test_runtime_directory_must_match_the_repository_origin(tmp_path: Path) -> None:
+    """Reject a valid-looking path that points to a different checkout."""
+    subject = import_module("packages.afairesi.main")
+    package = _make_source_package(tmp_path, "example", "")
+    _git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "remote", "add", "origin", "git@forge.example:team/repo.git")
+    main = package / "main.py"
+    main.write_text(
+        "from pathlib import Path\nRUNTIME_DIR = Path.home() / "
+        '"forge.example/team/wrong/packages/example/tmp"\n',
+    )
+    _, issues = subject.inspect_structure(tmp_path)
+    _expect(bool(issues), "foreign repository accepted")
+    main.write_text(main.read_text().replace("team/wrong", "team/repo"))
+    _, issues = subject.inspect_structure(tmp_path)
+    _expect(not issues, "canonical runtime directory rejected")
+
+
 @settings(deadline=None)
 @given(name=PACKAGE_NAMES, object_format=st.sampled_from(("sha1", "sha256")))
 @example(name="core", object_format="sha1")

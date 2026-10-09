@@ -796,6 +796,89 @@ def has_python_tests(path: Path) -> bool:
         ) from error
 
 
+def _runtime_path(expression: ast.expr) -> Path | None:
+    """Recognize home-relative literal paths without executing source code."""
+    parts: list[str] = []
+    while isinstance(expression, ast.BinOp) and isinstance(expression.op, ast.Div):
+        if not isinstance(expression.right, ast.Constant) or not isinstance(
+            expression.right.value,
+            str,
+        ):
+            return None
+        parts.insert(0, expression.right.value)
+        expression = expression.left
+    if ast.unparse(expression) != "Path.home()" or not parts:
+        return None
+    if any(Path(part).is_absolute() or ".." in Path(part).parts for part in parts):
+        return None
+    return Path(*parts)
+
+
+def _runtime_directory_issues(
+    package: Package,
+    module: ast.Module,
+    *,
+    check_repository: bool = True,
+) -> list[str]:
+    """Validate declared output ownership and explicit input directories."""
+    issues = []
+    bindings = [
+        statement
+        for statement in module.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        and any(
+            isinstance(target, ast.Name) and target.id in {"RUNTIME_DIR", "INPUT_DIRS"}
+            for target in (
+                statement.targets
+                if isinstance(statement, ast.Assign)
+                else [statement.target]
+            )
+        )
+    ]
+    if not bindings:
+        return []
+    repository = package.root.parent.parent
+    expected = None
+    if check_repository and (repository / ".git").exists():
+        origin = git(repository, ["remote", "get-url", "origin"], check=False)
+        if origin.returncode == 0:
+            expected = canonical_remote_path(origin.stdout.strip())
+    for statement in bindings:
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        names = {target.id for target in targets if isinstance(target, ast.Name)}
+        for name in names & {"RUNTIME_DIR", "INPUT_DIRS"}:
+            value = statement.value
+            expressions = (
+                value.elts
+                if name == "INPUT_DIRS" and isinstance(value, ast.Tuple)
+                else [value]
+            )
+            for expression in expressions:
+                path = _runtime_path(expression) if expression is not None else None
+                valid = (
+                    path is not None
+                    and len(path.parts[:-3]) >= len(("host", "repository"))
+                    and path.parts[-3] == "packages"
+                    and path.parts[-1] == "tmp"
+                    and (name != "INPUT_DIRS" or isinstance(value, ast.Tuple))
+                    and (name == "INPUT_DIRS" or path.parts[-2] == package.name)
+                    and (expected is None or Path(*path.parts[:-3]) == expected)
+                )
+                if not valid:
+                    issues.append(
+                        f"packages/{package.name}/main.py:{statement.lineno}: {name} "
+                        "must use Path.home() / "
+                        "'<host>/<repository>/packages/NAME/tmp'; "
+                        "RUNTIME_DIR must belong to this package "
+                        "and INPUT_DIRS must be a tuple",
+                    )
+    return issues
+
+
 def _python_source_issues(package: Package) -> list[str]:
     """Check source contracts without importing or executing package code."""
     if package.kind != "python":
@@ -806,6 +889,7 @@ def _python_source_issues(package: Package) -> list[str]:
     source = _read_regular(package.root / "main.py")
     if source is not None:
         module = ast.parse(source, filename=str(package.root / "main.py"))
+        issues.extend(_runtime_directory_issues(package, module))
         binding = _module_main_binding(module)
         entrypoint = (
             binding.value
@@ -2606,6 +2690,13 @@ def source_resource_data(
     if main_source := files.get("main.py"):
         try:
             module = ast.parse(main_source, filename="main.py")
+            runtime_issues = _runtime_directory_issues(
+                Package(name, "python", Path(path)),
+                module,
+                check_repository=False,
+            )
+            if runtime_issues:
+                diagnostics["runtime"] = "\n".join(runtime_issues)
             cli = [
                 {"path": list(entry.path), "text": entry.text, "command": entry.command}
                 for entry in _module_cli(module, "main.py")
