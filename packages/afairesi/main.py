@@ -2996,6 +2996,106 @@ def overview_summary(target: Path) -> dict[str, Any]:
     return tree
 
 
+def inspection_summary(target: Path) -> dict[str, Any]:
+    """Include repository discovery alongside the selected overview."""
+    target = target.resolve()
+    migration = migration_summary(target)
+    tree: dict[str, Any] = {socket.gethostname(): {}}
+    try:
+        if any(_repository_type_markers(target)) or (
+            target.parent.name in {"packages", "hosts"}
+            and (target.parent.parent / "flake.nix").is_file()
+        ):
+            tree = overview_summary(target)
+    except ValueError as error:
+        migration["diagnostics"].append(str(error))
+    tree[socket.gethostname()]["migration"] = migration
+    return tree
+
+
+def migration_summary(target: Path) -> dict[str, Any]:
+    """Find Git worktrees and assess conventions without changing their state."""
+    home = Path.home().resolve()
+    diagnostics: list[str] = []
+    registered: dict[Path, str | None] = {}
+    if (home / ".gitmodules").is_file():
+        try:
+            for repository in home_submodules(home, require_url=False):
+                checkout = (home / repository["path"]).resolve()
+                if not checkout.is_relative_to(home):
+                    diagnostics.append("submodule path escapes the home repository")
+                    continue
+                registered[checkout] = repository.get("url")
+        except (CommandError, OSError) as error:
+            diagnostics.append(str(error))
+
+    def traversal_error(error: OSError) -> None:
+        diagnostics.append(str(error))
+
+    repositories = {}
+    for directory, directories, files in os.walk(
+        target.resolve(),
+        onerror=traversal_error,
+        followlinks=False,
+    ):
+        directories[:] = sorted(
+            name
+            for name in directories
+            if name != ".git" and not (Path(directory) / name).is_symlink()
+        )
+        root = Path(directory)
+        if not (root / ".git").exists() and ".git" not in files:
+            continue
+        try:
+            if repository_root(root).resolve() != root:
+                diagnostics.append(
+                    f"{root}: Git worktree root does not match the directory",
+                )
+                continue
+            repositories[str(root)] = _migration_assessment(root, home, registered)
+        except (CommandError, OSError) as error:
+            diagnostics.append(f"{root}: {error}")
+    return {"repositories": repositories, "diagnostics": diagnostics}
+
+
+def _migration_assessment(
+    root: Path,
+    home: Path,
+    registered: dict[Path, str | None],
+) -> dict[str, Any]:
+    """Report layout and registration facts for an existing Git worktree."""
+    flake, home_layout = _repository_type_markers(root)
+    kind = "flake" if flake else "home" if home_layout else "git"
+    issues = []
+    try:
+        repository_type(root, "git")
+        if kind == "home":
+            for name, paths in _home_policy_diagnostics(
+                root,
+                _read_regular(root / ".gitignore") or "",
+            ).items():
+                issues.append(f"{name}: {', '.join(paths)}")
+        else:
+            validate_flake_source(root)
+    except (CommandError, OSError, ValueError, nix_syntax.NixSyntaxError) as error:
+        issues.append(str(error))
+    remote = registered.get(root)
+    if root in registered and remote is None:
+        issues.append("registered submodule has no URL")
+    if remote is not None:
+        try:
+            expected = home / canonical_remote_path(remote)
+            if root != expected:
+                issues.append(f"submodule path: expected {expected}")
+        except CommandError as error:
+            issues.append(str(error))
+    return {
+        "layout": kind,
+        "registered": root in registered,
+        "diagnostics": issues,
+    }
+
+
 def _diff_entries(root: Path, version: str) -> dict[str, tuple[str, str]]:
     """Read stage-zero index entries or HEAD, treating unborn HEAD as empty."""
     if version == "HEAD":
@@ -4030,9 +4130,11 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
         ),
         usage="%(prog)s [-h] [PATH]\n       %(prog)s COMMAND ...",
         epilog=(
-            "PATH selects a home, flake root, package, or host; default: whole "
-            "machine. Use afairesi . to inspect a repository or afairesi "
-            "packages/NAME to inspect a package. Home diagnostics report missing "
+            "PATH inspects a directory, home, flake root, package, or host; "
+            "default: whole machine. Use afairesi . to inspect a repository or "
+            "afairesi packages/NAME to inspect a package. Explicit paths also report "
+            "Git worktrees, home registration, and convention gaps recursively, "
+            "without following directory symlinks. Home diagnostics report missing "
             "literal whitelist paths and tracked files excluded by the whitelist; "
             "patterns are not expanded and Git tracking choices remain explicit. "
             "Read tests or source code when more detail is needed."
@@ -4046,7 +4148,7 @@ def parser(*, include_target: bool = False) -> argparse.ArgumentParser:
             type=_inspection_path,
             metavar="PATH",
             help=(
-                "home, flake root, packages/NAME, or hosts/NAME "
+                "directory, home, flake root, packages/NAME, or hosts/NAME "
                 "(default: whole machine)"
             ),
         )
@@ -4428,11 +4530,11 @@ def _test_targets(target: Path) -> list[Path]:
 
 
 def _dispatch_overview(options: argparse.Namespace) -> None:
-    """Emit the selected machine or repository overview as formatted JSON."""
+    """Emit the machine or selected inspection as formatted JSON."""
     tree = (
         machine_summary()
         if options.target is None
-        else overview_summary(options.target)
+        else inspection_summary(options.target)
     )
     sys.stdout.write(json.dumps(tree, indent=2, sort_keys=True) + "\n")
 

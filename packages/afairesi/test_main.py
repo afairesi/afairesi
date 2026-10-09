@@ -915,7 +915,7 @@ def _check_host_summaries(repository: Path) -> None:
     _expect(_overview(repository) == expected, expected)
     _expect(_overview(host) == expected, expected)
     _expect(
-        _run(host, str(host)).stdout == _run(repository, str(repository)).stdout,
+        _overview_tree(host) == _overview_tree(repository),
         expected,
     )
     _expect(_snapshot(repository) == before, "host inspection changed source")
@@ -923,7 +923,8 @@ def _check_host_summaries(repository: Path) -> None:
     broken = _overview(host)["hosts"]["laptop"]
     _expect("dependencies" in broken["diagnostics"] and "name" not in broken, broken)
     configuration.unlink()
-    _run(repository, str(repository), code=1)
+    report = json.loads(_run(repository, str(repository)).stdout)
+    _expect(report[socket.gethostname()]["migration"]["diagnostics"], report)
 
 
 CLI_CONTRACTS: tuple[tuple[str, dict[str, Any]], ...] = (
@@ -1082,8 +1083,15 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
 
 
 def _overview_tree(root: Path) -> dict[str, Any]:
-    """Read the complete hierarchy from the CLI."""
-    return cast("dict[str, Any]", json.loads(_run(root, str(root)).stdout))
+    """Read the resource hierarchy independently of migration assessment."""
+    return _overview_details(_run(root, str(root)).stdout)
+
+
+def _overview_details(output: str) -> dict[str, Any]:
+    """Separate resource details from migration facts in explicit inspection."""
+    tree = json.loads(output)
+    tree[socket.gethostname()].pop("migration")
+    return cast("dict[str, Any]", tree)
 
 
 def _overview(root: Path) -> dict[str, Any]:
@@ -1093,7 +1101,7 @@ def _overview(root: Path) -> dict[str, Any]:
 
 def _overview_resources(output: str) -> dict[str, Any]:
     """Extract resource groups after validating the machine and user hierarchy."""
-    tree = json.loads(output)
+    tree = _overview_details(output)
     _expect(set(tree) == {socket.gethostname()}, tree)
     machine = tree[socket.gethostname()]
     _expect(set(machine) == {getpass.getuser()}, machine)
@@ -2553,7 +2561,7 @@ def test_explicit_targets_preserve_repository_scope(
         == {"tests": ["alpha"]},
         package,
     )
-    _run(nested, ".", code=1)
+    _run(nested, ".")
     _run(home, str(home))
     (home / ".gitmodules").write_text(
         '[submodule "demo"]\npath = forge.example/team/demo\n',
@@ -2576,7 +2584,7 @@ def test_explicit_targets_preserve_repository_scope(
         },
     }
     _expect(_overview_tree(home) == expected, home)
-    _run(nested, ".", code=1)
+    _run(nested, ".")
     _expect(_run(tmp_path, str(root)).stdout == catalog, tmp_path)
     for path in (
         ("test",),
@@ -2589,10 +2597,10 @@ def test_explicit_targets_preserve_repository_scope(
     ordinary = tmp_path / "ordinary"
     ordinary.mkdir()
     _git(ordinary, "init", "--quiet")
+    report = json.loads(_run(ordinary, ".").stdout)
     _expect(
-        "expected a canonical packages/NAME or hosts/NAME"
-        in _run(ordinary, ".", code=1).stderr,
-        ordinary,
+        str(ordinary) in report[socket.gethostname()]["migration"]["repositories"],
+        report,
     )
 
 
@@ -3212,6 +3220,119 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         )
 
 
+def test_inspection_distinguishes_convention_gaps_from_registration(
+    tmp_path: Path,
+) -> None:
+    """Assess flake layout independently of registration and diagnose path drift."""
+    subject = import_module("packages.afairesi.main")
+    home = tmp_path / "home"
+    home.mkdir()
+    _home_repository(home)
+    checkout = home / "forge.example/owner/demo"
+    flake = home / "flake"
+    flake.mkdir()
+    _repository(flake)
+    (flake / ".gitignore").write_text(
+        subject.render_gitignore(subject.allowed_paths(flake, []), set()),
+    )
+    environment = {**os.environ, "HOME": str(home)}
+    before = _snapshot(flake)
+    report = json.loads(
+        _run(tmp_path, str(flake), environment=environment).stdout,
+    )[socket.gethostname()]["migration"]
+    _expect(
+        report["repositories"][str(flake)]
+        == {
+            "layout": "flake",
+            "registered": False,
+            "diagnostics": [],
+        },
+        report,
+    )
+    _expect(_snapshot(flake) == before, "assessment mutated flake state")
+    (flake / "README").unlink()
+    report = json.loads(
+        _run(tmp_path, str(flake), environment=environment).stdout,
+    )[socket.gethostname()]["migration"]
+    _expect("README" in str(report["repositories"][str(flake)]["diagnostics"]), report)
+    _git(
+        home,
+        "config",
+        "-f",
+        ".gitmodules",
+        "submodule.forge.example/owner/demo.url",
+        "git@forge.example:owner/other",
+    )
+    report = json.loads(
+        _run(tmp_path, str(checkout), environment=environment).stdout,
+    )[socket.gethostname()]["migration"]
+    _expect(
+        "submodule path: expected"
+        in str(report["repositories"][str(checkout)]["diagnostics"]),
+        report,
+    )
+
+
+def test_inspection_reports_worktrees_and_registration_without_mutation(
+    tmp_path: Path,
+) -> None:
+    """Discover nested worktrees, skip symlinks, and retain existing Git state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    _home_repository(home)
+    checkout = home / "forge.example/owner/demo"
+    ordinary = home / "ordinary"
+    ordinary.mkdir()
+    _git(ordinary, "init", "--quiet")
+    _fixture_git(ordinary, "commit", "--quiet", "--allow-empty", "-m", "fixture")
+    (ordinary / "untracked").write_text("keep")
+    worktree = home / "worktree"
+    _git(ordinary, "worktree", "add", "--detach", str(worktree), "HEAD")
+    _git(home, "submodule", "absorbgitdirs")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    _git(outside, "init", "--quiet")
+    (home / "link").symlink_to(outside, target_is_directory=True)
+    broken = home / "broken"
+    broken.mkdir()
+    (broken / ".git").write_text("gitdir: missing\n")
+    before = {
+        str(path): _snapshot(path) for path in (home, checkout, ordinary, worktree)
+    }
+    result = _run(
+        tmp_path,
+        str(home),
+        environment={**os.environ, "HOME": str(home)},
+    )
+    report = json.loads(result.stdout)[socket.gethostname()]["migration"]
+    repositories = report["repositories"]
+    _expect(
+        set(repositories) == {str(home), str(checkout), str(ordinary), str(worktree)},
+        report,
+    )
+    _expect(repositories[str(home)]["layout"] == "home", report)
+    _expect(repositories[str(checkout)]["registered"], report)
+    _expect(not repositories[str(worktree)]["registered"], report)
+    _expect(repositories[str(ordinary)]["diagnostics"], report)
+    _expect(any(str(broken) in issue for issue in report["diagnostics"]), report)
+    parent = json.loads(
+        _run(
+            tmp_path,
+            str(tmp_path),
+            environment={**os.environ, "HOME": str(home)},
+        ).stdout,
+    )[socket.gethostname()]["migration"]
+    _expect(set(parent["repositories"]) == {*repositories, str(outside)}, parent)
+    _expect(
+        before
+        == {
+            str(path): _snapshot(path) for path in (home, checkout, ordinary, worktree)
+        },
+        "discovery mutated repositories",
+    )
+    _run(tmp_path, str(tmp_path / "missing"), code=2)
+
+
 @pytest.mark.parametrize(
     ("before", "after"),
     [
@@ -3364,6 +3485,12 @@ def test_machine_overview_defaults_ignore_working_directory(
     monkeypatch.setattr(subject, "persistent_summary", lambda _root: inventory(storage))
     system = {"os": {"id": "nixos"}, "preservation": {"status": "available"}}
     monkeypatch.setattr(subject, "system_summary", lambda: system)
+
+    def unexpected_discovery(_target: Path) -> dict[str, Any]:
+        message = "bare inspection must not recursively discover repositories"
+        raise AssertionError(message)
+
+    monkeypatch.setattr(subject, "migration_summary", unexpected_discovery)
     expected_home: dict[str, Any] = {
         ".gitmodules": None,
         ".ssh/": ["key"],
@@ -3669,7 +3796,11 @@ def test_overview_json_preserves_machine_user_repository_hierarchy(
     expected = {machine: {user: {"forge.example": {"owner": {"demo": groups}}}}}
     before = _snapshot(tmp_path)
     terminal = _run(tmp_path, str(tmp_path)).stdout
-    _expect(terminal == json.dumps(expected, indent=2, sort_keys=True) + "\n", terminal)
+    _expect(_overview_details(terminal) == expected, terminal)
+    _expect(
+        terminal == json.dumps(json.loads(terminal), indent=2, sort_keys=True) + "\n",
+        terminal,
+    )
     for collection, selected in (("packages", package), ("hosts", host)):
         focused = {
             machine: {
@@ -3682,7 +3813,7 @@ def test_overview_json_preserves_machine_user_repository_hierarchy(
         }
         _expect(_overview_tree(selected) == focused, focused)
         output = _run(selected, str(tmp_path)).stdout
-        _expect(json.loads(output) == expected, output)
+        _expect(_overview_details(output) == expected, output)
     _expect(_snapshot(tmp_path) == before, "inspection changed Git or source state")
 
 
