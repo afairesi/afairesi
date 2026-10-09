@@ -814,6 +814,73 @@ def _runtime_path(expression: ast.expr) -> Path | None:
     return Path(*parts)
 
 
+def _implicit_runtime_paths(
+    module: ast.Module,
+    bindings: list[ast.Assign | ast.AnnAssign],
+) -> list[ast.expr]:
+    """Find cwd, home, and installed-source tmp paths, including aliases."""
+    paths: list[ast.expr] = []
+    declared_nodes = {id(node) for binding in bindings for node in ast.walk(binding)}
+    assignments = {
+        target.id: statement.value
+        for statement in module.body
+        if isinstance(statement, (ast.Assign, ast.AnnAssign))
+        for target in (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if isinstance(target, ast.Name) and statement.value is not None
+    }
+
+    def implicit_root(expression: ast.AST, seen: frozenset[str] = frozenset()) -> bool:
+        for node in ast.walk(expression):
+            if isinstance(node, ast.Name) and node.id not in seen:
+                if node.id in {"RUNTIME_DIR", "INPUT_DIRS"}:
+                    continue
+                if node.id in assignments and implicit_root(
+                    assignments[node.id],
+                    seen | {node.id},
+                ):
+                    return True
+            if isinstance(node, ast.Call) and (
+                ast.unparse(node.func) in {"Path.home", "Path.cwd"}
+                or (
+                    ast.unparse(node.func) == "Path"
+                    and any(
+                        isinstance(argument, ast.Constant)
+                        or (
+                            isinstance(argument, ast.Name) and argument.id == "__file__"
+                        )
+                        for argument in node.args
+                    )
+                )
+            ):
+                return True
+        return False
+
+    for node in ast.walk(module):
+        if not isinstance(node, (ast.BinOp, ast.Call)) or id(node) in declared_nodes:
+            continue
+        literal = (
+            node.right
+            if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
+            else node.args[0]
+            if isinstance(node, ast.Call)
+            and ast.unparse(node.func) == "Path"
+            and node.args
+            else None
+        )
+        if (
+            isinstance(literal, ast.Constant)
+            and isinstance(literal.value, str)
+            and "tmp" in Path(literal.value).parts
+            and implicit_root(node)
+        ):
+            paths.append(node)
+    return paths
+
+
 def _runtime_directory_issues(
     package: Package,
     module: ast.Module,
@@ -821,7 +888,7 @@ def _runtime_directory_issues(
     check_repository: bool = True,
 ) -> list[str]:
     """Validate declared output ownership and explicit input directories."""
-    issues = []
+    issues: list[str] = []
     bindings = [
         statement
         for statement in module.body
@@ -835,8 +902,11 @@ def _runtime_directory_issues(
             )
         )
     ]
-    if not bindings:
-        return []
+    issues.extend(
+        f"packages/{package.name}/main.py:{node.lineno}: runtime paths "
+        "must derive from declared RUNTIME_DIR or INPUT_DIRS"
+        for node in _implicit_runtime_paths(module, bindings)
+    )
     repository = package.root.parent.parent
     expected = None
     if check_repository and (repository / ".git").exists():

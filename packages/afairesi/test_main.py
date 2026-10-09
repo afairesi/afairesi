@@ -3220,6 +3220,34 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         )
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        'OUTPUT = Path.cwd() / "tmp"',
+        'OUTPUT = Path("packages/example/tmp")',
+        'ROOT = Path(__file__).parent\nOUTPUT = ROOT / "tmp"',
+        'ROOT = Path(os.environ.get("ROOT", Path.cwd()))\nOUTPUT = ROOT / "tmp"',
+        'OUTPUT = Path.home() / "forge.example/team/repo/packages/example/tmp"',
+        (
+            'RUNTIME_DIR = Path.home() / "forge.example/team/repo/packages/example/tmp"'
+            '\nOUTPUT = Path.cwd() / "tmp"'
+        ),
+    ],
+)
+def test_implicit_runtime_paths_cannot_bypass_declarations(
+    source: str,
+    tmp_path: Path,
+) -> None:
+    """Catch missing declarations and unused declarations masking cwd defaults."""
+    subject = import_module("packages.afairesi.main")
+    package = _make_source_package(tmp_path, "example", "")
+    (package / "main.py").write_text(source)
+    _, issues = subject.inspect_structure(tmp_path)
+    _expect(bool(issues), "implicit runtime output accepted")
+    facts = subject.source_resource_data("example", {"main.py": source})
+    _expect("runtime" in facts["diagnostics"], facts)
+
+
 def test_inspection_distinguishes_convention_gaps_from_registration(
     tmp_path: Path,
 ) -> None:
@@ -4183,6 +4211,19 @@ def test_runtime_directory_must_match_the_repository_origin(tmp_path: Path) -> N
     main.write_text(main.read_text().replace("team/wrong", "team/repo"))
     _, issues = subject.inspect_structure(tmp_path)
     _expect(not issues, "canonical runtime directory rejected")
+
+
+def test_runtime_paths_can_derive_from_declared_directories(tmp_path: Path) -> None:
+    """Accept owned outputs and reads through explicit shared inputs."""
+    subject = import_module("packages.afairesi.main")
+    package = _make_source_package(tmp_path, "example", "")
+    (package / "main.py").write_text(
+        'RUNTIME_DIR = Path.home() / "forge.example/team/repo/packages/example/tmp"\n'
+        'INPUT_DIRS = (Path.home() / "forge.example/team/repo/packages/data/tmp",)\n'
+        'OUTPUT = RUNTIME_DIR / "reports"\nDATA = INPUT_DIRS[0] / "data.sqlite3"\n',
+    )
+    _, issues = subject.inspect_structure(tmp_path)
+    _expect(not issues, issues)
 
 
 @settings(deadline=None)
