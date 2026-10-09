@@ -33,6 +33,8 @@ assert consumer.legacyPackages.${system} ? example-test-environment;
 assert consumer.legacyPackages.${system} ? example-coverage;
 assert consumer.devShells.${system} ? example-test;
 assert consumer.apps.${system}.example.type == "app";
+assert consumer.apps.${system}.example.meta == package.meta;
+assert consumer.apps.${system}.example.meta.description == "Afairesi consumer contract example";
 assert !(package.drvAttrs ? runtimeHook);
 assert !(accepts { shellHook = "echo obsolete"; });
 assert !(accepts { executable = false; runtimeHook = "echo invalid"; });
