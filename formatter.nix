@@ -7,6 +7,9 @@
   ...
 }:
 let
+  formatterPython = pkgs.python3.withPackages (_: [
+    inputs.self.packages.${pkgs.stdenv.system}.afairesi
+  ]);
   packagesPath = self.outPath + "/packages";
   pythonPackageNames =
     if enableMypy then
@@ -253,9 +256,12 @@ let
   };
   wrapper = pkgs.writeShellApplication {
     name = "treefmt";
-    runtimeInputs = [ inputs.self.packages.${pkgs.stdenv.system}.afairesi ];
+    runtimeInputs = [
+      pkgs.git
+      pkgs.nix
+    ];
     text = ''
-      afairesi converge
+      ${formatterPython}/bin/python -c 'from afairesi import formatter_main; formatter_main()'
       exec ${rawFormatter}/bin/treefmt "$@"
     '';
   };

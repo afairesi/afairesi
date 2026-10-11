@@ -1,8 +1,10 @@
 # Afairesi
 
-Afairesi uses shared Git repository and Nix flake conventions to describe a machine and return it to its target state. `afairesi` creates, inspects, and converges those repositories.
+Afairesi manages persistent home and repository structure through Git and Nix flake conventions.
 
-Run `afairesi` without arguments to inspect the machine's current high-level state as formatted JSON.
+Afairesi aims to minimize the description and effort required to understand, verify, and restore a practical computing environment.
+
+The description includes shared rules, machine-specific declarations, and explicit exceptions. Filesystem and code conventions reduce special cases; checks verify these conventions, and repairs restore the required structure.
 
 Run `afairesi --help` or `afairesi COMMAND --help` for command details.
 
@@ -10,28 +12,29 @@ Run `afairesi --help` or `afairesi COMMAND --help` for command details.
 
 - Nix with flakes enabled.
 
-## Target state
+## Conventions
 
 - Impermanent NixOS.
-- A Git-tracked `$HOME` with a whitelisted `.gitignore`; Git governs home state, and preservation governs system state outside `$HOME`.
+- A Git-tracked `$HOME` with a `.gitignore` whitelist. Git tracks permitted home files; preservation keeps selected system files outside `$HOME`.
 - Nix flake Git submodules under `$HOME` at `<remote-hostname>/<repository-path>`, with conventional `packages/`, `hosts/`, and `checks/` directories where applicable.
 - Package directories with a conventional layout for source and tests, `prm/` for tracked files that do not fit that layout, and `tmp/` for runtime output where applicable.
-- Packages write runtime state to their own canonical home-relative `packages/NAME/tmp/`, independently of the working directory; they may explicitly read another package's data. Python packages declare these paths as `RUNTIME_DIR` and `INPUT_DIRS` using `Path.home()` and literal relative paths.
+- Managed code follows shared formatting and lint rules, with strict type checking for Python packages.
+- Packages store runtime data in `$HOME/<remote-hostname>/<repository-path>/packages/NAME/tmp/`, independently of the working directory; they may explicitly read another package's data. Python packages declare these paths as `RUNTIME_DIR` and `INPUT_DIRS` using `Path.home()` and literal relative paths.
 
-## Runtime constraints
+## Repository management
 
-- Run `afairesi` to make persistent changes to `$HOME`'s structure, including flake submodules and package or host lifecycle.
+- Use `afairesi init` to initialize the home repository, create a flake, or register a remote as a home submodule.
+- Use `afairesi add`, `afairesi mv`, and `afairesi rm` to create, rename, and remove packages or hosts. `afairesi rm` also removes home submodules.
 
-## Convergence to target state
+## Repair and validation
 
-- Reboot to restore impermanent NixOS system state; the persistent `$HOME` remains governed by Git.
-- Run `nix flake check` and `nix fmt` for flake repositories.
-- Run `afairesi converge` for `$HOME` and flake repositories.
-- Run `git clean` to remove untracked state; it is destructive.
+- Reboot to restore impermanent NixOS; persistent files remain.
+- Run `afairesi repair-home` in the home repository to repair its whitelist and submodule paths, names, and URLs. Use `--dry-run` to preview repairs without changing files or Git tracking.
+- Run `nix fmt` in each flake repository to repair managed package definitions and checks, update its whitelist, stage permitted files, remove files outside the permitted layout, and format, lint, and type-check code.
+- Run `nix flake check` to validate flake repositories and run their checks.
+- Run `git clean` to delete untracked files; it is destructive.
 
 ## Migration to Afairesi
 
-- Progressively adopt the target state, choosing which repositories to migrate, whether to use impermanence, and what state to preserve.
-- Run `afairesi PATH` to inspect repository details, Git worktrees, home submodule registration, and convention gaps without changing them.
-- Run Git and Nix commands to prepare repositories for Afairesi conventions before running `afairesi converge`.
-- Apply runtime constraints and convergence to the repositories you adopt.
+- Adopt the conventions incrementally, choosing which repositories to migrate, whether to use impermanence, and which files to preserve.
+- Use Git and Nix to prepare existing flake repositories for these conventions before running `nix fmt`. Put tracked files that do not fit the conventional layout in `prm/`.
