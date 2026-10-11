@@ -947,7 +947,12 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
     """Preserve files and Git state when an executable cannot call its entrypoint."""
     with _fresh_repository() as root:
         before = _snapshot(root)
-        rejected = _run(root, "repair-home", code=1)
+        rejected = _run(
+            root,
+            "repair-home",
+            code=1,
+            environment={**os.environ, "HOME": str(root)},
+        )
         _expect("requires a home repository" in rejected.stderr, rejected)
         _expect(_snapshot(root) == before, "home repair changed flake state")
         _run(root, "add", "packages/a", "python")
@@ -1288,8 +1293,12 @@ def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
         pytest.MonkeyPatch.context() as patch,
     ):
         _check_flake_initialization(Path(directory), patch)
-    with TemporaryDirectory(prefix="afairesi-home-") as directory:
+    with (
+        TemporaryDirectory(prefix="afairesi-home-") as directory,
+        pytest.MonkeyPatch.context() as patch,
+    ):
         root = _home_repository(Path(directory))
+        patch.setenv("HOME", str(root))
         before = _snapshot(root)
         rejected = _repair_flake(root, code=1)
         _expect("run afairesi repair-home" in rejected.stderr, rejected)
@@ -1308,6 +1317,51 @@ def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
             "duplicate url field" in result.stderr and _snapshot(root) == before,
             result,
         )
+
+
+@pytest.mark.parametrize(
+    "location",
+    ["home", "nested", "submodule", "flake", "outside"],
+)
+def test_home_repair_targets_home_from_any_working_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    location: str,
+) -> None:
+    """Repair only HOME and preserve preview state from repositories or plain paths."""
+    home = _home_repository(tmp_path / "home")
+    monkeypatch.setenv("HOME", str(home))
+    checkout = home / "forge.example/owner/demo"
+    (checkout / "flake.nix").touch()
+    flake = tmp_path / "flake"
+    flake.mkdir()
+    _git(flake, "init", "--quiet")
+    (flake / "flake.nix").touch()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cwd = {
+        "home": home,
+        "nested": checkout.parent,
+        "submodule": checkout,
+        "flake": flake,
+        "outside": outside,
+    }[location]
+    ignore = home / ".gitignore"
+    expected = ignore.read_text()
+    ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
+    before = _snapshot(home)
+    checkout_before = _snapshot(checkout)
+    flake_before = _snapshot(flake)
+    preview = _run(cwd, "repair-home", "--dry-run", code=1)
+    _expect("would write '.gitignore'" in preview.stdout, preview)
+    _expect(_snapshot(home) == before, "home repair preview changed state")
+    _run(cwd, "repair-home")
+    _expect(ignore.read_text() == expected, "home whitelist was not repaired")
+    _expect(_git(home, "show", ":.gitignore") == expected, "repair was not staged")
+    _expect(_snapshot(checkout) == checkout_before, "home repair changed submodule")
+    _expect(_snapshot(flake) == flake_before, "home repair changed unrelated flake")
+    _expect(not list(outside.iterdir()), "home repair changed outside path")
+    _run(cwd, "repair-home", "--dry-run")
 
 
 @pytest.mark.parametrize("case", ["unknown", "parent", "dirty", "dirty-preview"])
@@ -1334,9 +1388,11 @@ def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
 
 def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Preview and remove a repository together with its owned whitelist entries."""
     root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
     _git(root, "submodule", "absorbgitdirs")
     ignore = root / ".gitignore"

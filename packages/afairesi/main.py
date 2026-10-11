@@ -2300,8 +2300,8 @@ def parser() -> argparse.ArgumentParser:
         "repair-home",
         help="repair the home repository whitelist and submodule layout",
         description=(
-            "Repair the current home repository's whitelist and registered "
-            "submodule paths, names, and URLs."
+            "Repair the repository at $HOME: its whitelist and registered "
+            "submodule paths, names, and URLs, from any working directory."
         ),
         epilog=(
             "Move submodules to <remote-hostname>/<repository-path>, migrate "
@@ -2407,7 +2407,7 @@ def main() -> None:
         options = cli.parse_args(arguments)
         if _dispatch_standalone_command(options, cli):
             return
-        root = repository_root()
+        root = Path.home() if options.command == "repair-home" else repository_root()
         current_type = repository_type(root)
         if options.command in {"add", "mv"} and current_type != "flake":
             msg = f"{current_type} repositories do not support flake resources"
