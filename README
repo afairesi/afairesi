@@ -1,40 +1,30 @@
 # Afairesi
 
-Afairesi manages persistent home and repository structure through Git and Nix flake conventions.
-
-Afairesi aims to minimize the description and effort required to understand, verify, and restore a practical computing environment.
-
-The description includes shared rules, machine-specific declarations, and explicit exceptions. Filesystem and code conventions reduce special cases; checks verify these conventions, and repairs restore the required structure.
+Afairesi manages persistent files and directory layouts in `$HOME` and its Git repositories through shared Git, Nix flake, and code conventions. These conventions reduce repository-specific configuration and, together with machine-specific declarations and explicit exceptions, describe the environment. Checks validate the conventions, and repair commands restore the required structure.
 
 Run `afairesi --help` or `afairesi COMMAND --help` for command details.
 
 ## Requirements
 
+- Git.
 - Nix with flakes enabled.
 
 ## Conventions
 
-- Impermanent NixOS.
-- A Git-tracked `$HOME` with a `.gitignore` whitelist. Git tracks permitted home files; preservation keeps selected system files outside `$HOME`.
-- Nix flake Git submodules under `$HOME` at `<remote-hostname>/<repository-path>`, with conventional `packages/`, `hosts/`, and `checks/` directories where applicable.
-- Package directories with a conventional layout for source and tests, `prm/` for tracked files that do not fit that layout, and `tmp/` for runtime output where applicable.
-- Managed code follows shared formatting and lint rules, with strict type checking for Python packages.
-- Packages store runtime data in `$HOME/<remote-hostname>/<repository-path>/packages/NAME/tmp/`, independently of the working directory; they may explicitly read another package's data. Python packages declare these paths as `RUNTIME_DIR` and `INPUT_DIRS` using `Path.home()` and literal relative paths.
+- A Git-tracked `$HOME` with a `.gitignore` whitelist.
+- Git submodules containing Nix flakes under `$HOME` at `<remote-hostname>/<repository-path>`, with `packages/`, `hosts/`, and `checks/` directories as needed.
+- Package layouts define source and test files, with `prm/` for other tracked files and `tmp/` for untracked runtime data.
+- Code follows shared formatting and strict lint rules.
+- Packages store runtime data in `$HOME/<remote-hostname>/<repository-path>/packages/NAME/tmp/`, independently of the working directory; they may explicitly read another package's data.
 
 ## Repository management
 
-- Use `afairesi init` to initialize the home repository, create a flake, or register a remote as a home submodule.
-- Use `afairesi add`, `afairesi mv`, and `afairesi rm` to create, rename, and remove packages or hosts. `afairesi rm` also removes home submodules.
+Repository operations maintain directory structure and Git tracking together. Creating, renaming, or removing packages and hosts updates the whitelist and related checks. Home repairs keep submodule paths, registration, and whitelist entries consistent with their remotes.
 
-## Repair and validation
+Flake repair is integrated into `nix fmt` through Afairesi's formatter. It repairs managed package definitions and checks, updates Git tracking, and removes files outside the permitted layout before formatting and checking code. Permitted `tmp/` directories retain their data without being tracked by Git.
 
-- Reboot to restore impermanent NixOS; persistent files remain.
-- Run `afairesi repair-home` in the home repository to repair its whitelist and submodule paths, names, and URLs. Use `--dry-run` to preview repairs without changing files or Git tracking.
-- Run `nix fmt` in each flake repository to repair managed package definitions and checks, update its whitelist, stage permitted files, remove files outside the permitted layout, and format, lint, and type-check code.
-- Run `nix flake check` to validate flake repositories and run their checks.
-- Run `git clean` to delete untracked files; it is destructive.
+Checks validate formatting, types, and package behavior. Repairs stage structural changes for review; they do not commit them.
 
 ## Migration to Afairesi
 
-- Adopt the conventions incrementally, choosing which repositories to migrate, whether to use impermanence, and which files to preserve.
-- Use Git and Nix to prepare existing flake repositories for these conventions before running `nix fmt`. Put tracked files that do not fit the conventional layout in `prm/`.
+Repositories can adopt the conventions incrementally. Before applying repairs, adapt package definitions and move files outside the permitted layout into `prm/`, since repairs can delete those files.
