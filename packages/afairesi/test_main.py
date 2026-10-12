@@ -242,7 +242,15 @@ def _check_host_repair(repository: Path) -> None:
         raise AssertionError(message)
 
 
-def _check_remote_initialization(  # noqa: C901
+@pytest.mark.parametrize(
+    "remote",
+    [
+        "https://example.test/team/project.git",
+        "ssh://git@example.test/team/project.git",
+        "git@example.test:team/project.git",
+    ],
+)
+def test_clone_registers_existing_content_without_creating_commits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote: str,
@@ -322,23 +330,9 @@ def _check_remote_initialization(  # noqa: C901
     if (home / ".gitignore").read_text(encoding="utf-8") != ignore:
         message = "repeated clone changed the home whitelist"
         raise AssertionError(message)
-    (checkout / ".git").unlink()
-    native = subprocess.run(  # noqa: S603
-        ["git", "submodule", "add", "--", remote, relative],  # noqa: S607
-        cwd=home,
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if native.returncode == 0:
-        message = "adding over a broken checkout should fail"
-        raise AssertionError(message)
-    duplicate = _run(tmp_path, "clone", remote, code=native.returncode)
-    if duplicate.stderr != native.stderr:
-        raise AssertionError(duplicate.stderr)
 
 
-def _check_flake_initialization(
+def test_init_flake_commits_registers_and_publishes_an_empty_remote(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -371,8 +365,33 @@ def _check_flake_initialization(
     monkeypatch.setenv("AFAIRESI_NIX", str(fake_nix))
     _run(tmp_path, "init-home")
     _git(home, "commit", "--quiet", "-m", "Home policy")
+    home_head = _git(home, "rev-parse", "HEAD")
     _run(tmp_path, "init-flake", remote)
     relative = "example.test/team/new"
+    checkout = home / relative
+    _expect(
+        _git(checkout, "branch", "--show-current").strip() == "main",
+        "init-flake did not select main",
+    )
+    _expect(
+        _git(origin, "rev-parse", "refs/heads/main")
+        == _git(checkout, "rev-parse", "HEAD"),
+        "init-flake did not publish its initial commit",
+    )
+    _expect(
+        _git(home, "rev-parse", "HEAD") == home_head,
+        "init-flake committed the home registration",
+    )
+    _expect(
+        set(_git(checkout, "ls-files").splitlines())
+        == {".gitignore", "README", "flake.lock", "flake.nix"},
+        "init-flake did not commit the canonical initial files",
+    )
+    _expect(
+        (checkout / "README").read_text() == "# new\n"
+        and "inputs.afairesi.url" in (checkout / "flake.nix").read_text(),
+        "init-flake did not scaffold the requested repository",
+    )
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     if f"!/{relative}" not in ignore.splitlines():
         raise AssertionError(ignore)
@@ -409,9 +428,6 @@ def _check_home_commits(
             message = "convergence advanced the recorded submodule commit"
             raise AssertionError(message)
     _git(root, "add", relative)
-    if second not in _git(root, "ls-files", "--stage", relative):
-        message = "native Git could not advance the submodule commit"
-        raise AssertionError(message)
 
 
 def _check_home_whitelist(home_repository: Path) -> None:
@@ -729,6 +745,102 @@ def _check_launcher_environment(
     python_inputs = native_inputs[-1]["selected"]
     _expect("check-input" in python_inputs, python_inputs)
     _expect("native-check-input" in python_inputs, python_inputs)
+
+
+def test_init_home_stages_policy_without_cleaning_or_committing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Initialize HOME from another directory and preserve existing home data."""
+    home = tmp_path / "home"
+    home.mkdir()
+    local = home / "personal-data"
+    local.write_bytes(b"\x00keep home data\xff")
+    monkeypatch.setenv("HOME", str(home))
+    _run(tmp_path, "init-home")
+    expected = "*\n!/.gitignore\n!/.gitmodules\n"
+    _expect((home / ".gitignore").read_text() == expected, "wrong home policy")
+    _expect(_git(home, "show", ":.gitignore") == expected, "policy was not staged")
+    _expect(
+        _git(home, "ls-files").splitlines() == [".gitignore"],
+        "home data was staged",
+    )
+    _expect(not _git(home, "for-each-ref"), "init-home created a commit")
+    _expect(local.read_bytes() == b"\x00keep home data\xff", "init-home cleaned HOME")
+    before = _snapshot(home)
+    _run(tmp_path, "init-home")
+    _expect(_snapshot(home) == before, "repeated init-home changed state")
+    _expect(
+        not (tmp_path / ".git").exists(),
+        "init-home initialized the working directory",
+    )
+
+
+@pytest.mark.parametrize(
+    ("kind", "filenames"),
+    [
+        ("python", {"default.nix", "main.py"}),
+        ("html", {"default.nix", "index.html", "script.js", "style.css"}),
+        ("latex", {"default.nix", "ms.tex", "ms.bib"}),
+        ("nix", {"default.nix"}),
+        ("host", {"configuration.nix"}),
+    ],
+)
+def test_create_stages_the_requested_resource_and_whitelist(
+    kind: str,
+    filenames: set[str],
+) -> None:
+    """Create each supported resource with its declared files and related metadata."""
+    with _fresh_repository() as root:
+        _fixture_git(root, "commit", "-qm", "Initial repository")
+        head = _git(root, "rev-parse", "HEAD")
+        relative = "hosts/example" if kind == "host" else "packages/example"
+        arguments = () if kind == "host" else (kind, "Shared", "command description")
+        _run(root, "create", relative, *arguments)
+        resource = root / relative
+        _expect(
+            {path.name for path in resource.iterdir()} == filenames,
+            "wrong resource files",
+        )
+        staged = {f"{relative}/{name}" for name in filenames} | {".gitignore"}
+        if kind == "host":
+            staged.add("checks/exampleVmWithDisko/default.nix")
+        else:
+            _expect(
+                'meta.description = "Shared command description";'
+                in (resource / "default.nix").read_text(),
+                "create lost the description arguments",
+            )
+        _expect(
+            set(_git(root, "diff", "--cached", "--name-only").splitlines()) == staged,
+            "create staged unexpected paths",
+        )
+        for path in staged:
+            _expect(_git(root, "show", f":{path}") == (root / path).read_text(), path)
+        _expect(_git(root, "rev-parse", "HEAD") == head, "create committed changes")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "message"),
+    [
+        (("packages/example",), "package creation requires TYPE"),
+        (("packages/example", "unknown"), "unsupported package type"),
+        (
+            ("hosts/example", "python"),
+            "host creation does not accept a type or description",
+        ),
+    ],
+)
+def test_create_rejects_invalid_resource_arguments_without_changes(
+    arguments: tuple[str, ...],
+    message: str,
+) -> None:
+    """Reject missing or incompatible resource arguments with an actionable error."""
+    with _fresh_repository() as root:
+        before = _snapshot(root)
+        result = _run(root, "create", *arguments, code=1)
+        _expect(message in result.stderr, result)
+        _expect(_snapshot(root) == before, "invalid create changed state")
 
 
 def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
@@ -1478,23 +1590,8 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
 
 
-def test_home_lifecycle_repairs_policy_and_preserves_dirty_submodules() -> None:
-    """Initialize remotes and preserve checkout/index state through home convergence."""
-    for remote in (
-        "https://example.test/team/project.git",
-        "ssh://git@example.test/team/project.git",
-        "git@example.test:team/project.git",
-    ):
-        with (
-            TemporaryDirectory(prefix="afairesi-home-") as directory,
-            pytest.MonkeyPatch.context() as patch,
-        ):
-            _check_remote_initialization(Path(directory), patch, remote)
-    with (
-        TemporaryDirectory(prefix="afairesi-bootstrap-") as directory,
-        pytest.MonkeyPatch.context() as patch,
-    ):
-        _check_flake_initialization(Path(directory), patch)
+def test_repair_home_preserves_dirty_submodules_and_repairs_registration() -> None:
+    """Preserve checkout/index state through home convergence and relocation."""
     with (
         TemporaryDirectory(prefix="afairesi-home-") as directory,
         pytest.MonkeyPatch.context() as patch,

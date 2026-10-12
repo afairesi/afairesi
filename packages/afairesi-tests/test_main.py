@@ -955,7 +955,7 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
             "    print('ready')\n"
         )
         tests = (
-            "import os, subprocess\n"
+            "import os, subprocess, sys\n"
             "from pathlib import Path\n"
             "from hypothesis import given, example, strategies as st\n"
             "@given(st.integers())\n"
@@ -977,6 +977,13 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
             "        assert directory == os.environ[name]\n"
             "        assert Path(directory).is_relative_to(Path.cwd())\n"
             "    assert not (Path.home() / 'sentinel').exists()\n"
+            "    child = subprocess.run([sys.executable, '-c', "
+            '"import importlib; '
+            "print(importlib.import_module('packages.git-example.main').__file__)\"], "
+            "cwd=Path.home(), capture_output=True, text=True)\n"
+            "    assert child.returncode == 0, child.stderr\n"
+            "    assert Path(child.stdout.strip()).is_relative_to("
+            "Path.cwd() / 'packages')\n"
         )
         environment = _prepare_runner_flake(root, tests, source, name="git-example")
         caller_home = Path(directory) / "caller home"

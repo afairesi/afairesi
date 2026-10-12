@@ -250,7 +250,7 @@ def _prepare_package_tests(
         "os.environ['PATH'] = tools + os.pathsep + os.environ.get('PATH', '')\n"
         "os.environ['PYTHONDONTWRITEBYTECODE'] = '1'\n"
         f"os.environ['GIT_CEILING_DIRECTORIES'] = {str(workspace.parent)!r}\n"
-        "os.environ.pop('PYTHONPATH', None)\n"
+        f"os.environ['PYTHONPATH'] = {str(workspace)!r}\n"
         "os.environ.pop('PYTEST_ADDOPTS', None)\n"
         "os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'\n"
         "os.environ.pop('PYTEST_PLUGINS', None)\n"

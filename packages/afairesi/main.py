@@ -2447,7 +2447,7 @@ def initialize_flake(remote: str) -> None:
         _converge_checks(directory, detected_packages, False)  # noqa: FBT003
         (directory / ".gitignore").write_text(
             render_gitignore(
-                allowed_paths(directory, detected_packages),
+                allowed_paths(directory, detected_packages) | {Path(".gitignore")},
                 prm_directories(directory),
             ),
             encoding="utf-8",
