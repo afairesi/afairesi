@@ -13,13 +13,12 @@
   outputs =
     inputs:
     let
-      lib = builtins.removeAttrs shared [ "blueprint" ];
-      shared = import ./packages/afairesi/prm/flake.nix { inherit inputs; };
+      lib = import ./packages/afairesi/prm/flake.nix { inherit inputs; };
     in
-    shared.blueprint { inherit inputs; }
+    lib.blueprint { inherit inputs; }
     // {
       inherit lib;
-      inherit (shared) blueprint;
+      inherit (lib) blueprint;
       formatter = lib.mkFormatter { inherit (inputs) self; };
     };
 }
