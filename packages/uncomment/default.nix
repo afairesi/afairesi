@@ -22,9 +22,9 @@ pkgs.stdenv.mkDerivation rec {
   pname = baseNameOf ./.;
   sourceRoot = ".";
   src = pkgs.fetchurl {
-    sha256 = "VOPIsOprfzF3zV83QS6aYpMnTU8vD/P2t5yeZvcD8EQ=";
+    sha256 = "UgOQd2uzEXuaDIVOu1A6E3DiIn17IsBfCgW+4P6PhhQ=";
     url = "https://github.com/Goldziher/${pname}/releases/download/v${version}/${pname}-x86_64-unknown-linux-gnu.tar.gz";
   };
   strictDeps = true;
-  version = "3.10.2";
+  version = "3.10.3";
 }

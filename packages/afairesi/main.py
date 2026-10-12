@@ -21,6 +21,9 @@ from typing import TYPE_CHECKING, cast
 import nix_syntax
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+    import libcst as cst
     from tree_sitter import Node
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 KIND_MARKERS = {
@@ -71,6 +74,7 @@ def _run(
     cwd: Path | None = None,
     *,
     check: bool = True,
+    input_source: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a process and preserve failures and captured output."""
     completed = subprocess.run(  # noqa: S603
@@ -78,6 +82,7 @@ def _run(
         cwd=cwd,
         capture_output=True,
         check=False,
+        input=input_source,
         text=True,
     )
     if check and completed.returncode != 0:
@@ -129,8 +134,8 @@ def repository_type(root: Path, default: str | None = None) -> str:
         raise CommandError(msg)
     msg = (
         "cannot determine the repository type; run "
-        "'afairesi init home' or "
-        "'afairesi init flake REMOTE'"
+        "'afairesi init-home' or "
+        "'afairesi init-flake REMOTE'"
     )
     raise CommandError(msg)
 
@@ -304,35 +309,33 @@ def home_submodules(
     return repositories
 
 
-def _converge_home_ignore(root: Path, *, dry_run: bool) -> bool:
-    """Converge the canonical home whitelist."""
-    changed = False
-    gitignore_path = root / ".gitignore"
-    source = _read_regular(gitignore_path)
+def _home_ignore_source(root: Path) -> str:
+    """Validate the home whitelist and include its required entries."""
+    path = root / ".gitignore"
     required = ["!/.gitignore", "!/.gitmodules"]
+    source = _read_regular(path)
     if source is None:
-        source = "*\n" + "\n".join(required) + "\n"
-        changed |= _write_managed(root, Path(".gitignore"), source, dry_run=dry_run)
+        return "*\n" + "\n".join(required) + "\n"
     lines = source.splitlines()
     if (
         not lines
         or lines[0] != "*"
         or any(not line.startswith("!/") for line in lines[1:])
     ):
-        msg = f"{gitignore_path}: must start with * and subsequent lines must start with !/"  # noqa: E501
-        raise CommandError(
-            msg,
-        )
+        msg = f"{path}: must start with * and subsequent lines must start with !/"
+        raise CommandError(msg)
     missing = [line for line in required if line not in lines]
-    if missing:
-        source = source.rstrip("\n") + "\n" + "\n".join(missing) + "\n"
-        changed |= _write_managed(
-            root,
-            Path(".gitignore"),
-            source,
-            dry_run=dry_run,
-        )
-    return changed
+    return source.rstrip("\n") + "\n" + "\n".join(missing) + "\n" if missing else source
+
+
+def _converge_home_ignore(root: Path, *, dry_run: bool) -> bool:
+    """Converge the canonical home whitelist."""
+    return _write_managed(
+        root,
+        Path(".gitignore"),
+        _home_ignore_source(root),
+        dry_run=dry_run,
+    )
 
 
 def _allow_home_submodule(root: Path, relative: Path, *, dry_run: bool = False) -> bool:
@@ -524,19 +527,16 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
     ):
         msg = "stage .gitmodules with git add before moving submodules"
         raise CommandError(msg)
-    changed = _converge_home_ignore(root, dry_run=dry_run)
+    _converge_home_ignore(root, dry_run=dry_run)
     for expected in expected_paths:
-        changed |= _allow_home_submodule(root, expected, dry_run=dry_run)
+        _allow_home_submodule(root, expected, dry_run=dry_run)
     for repository, expected in zip(repositories, expected_paths, strict=True):
-        changed |= _converge_home_submodule(
+        _converge_home_submodule(
             root,
             repository,
             expected,
             dry_run=dry_run,
         )
-    if dry_run and changed:
-        msg_0 = "home repository would change"
-        raise CommandError(msg_0)
     return repositories
 
 
@@ -766,7 +766,19 @@ def _python_test_placement_issue(package: Package) -> str | None:
 def has_python_tests(path: Path) -> bool:
     """Detect static Python test definitions without executing the source."""
     try:
-        return bool(source_test_names(path.read_bytes(), str(path)))
+        module = ast.parse(path.read_bytes(), filename=str(path))
+        case_classes = _unittest_classes(module)
+        return any(
+            isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and definition.name.startswith("test_")
+            for node in module.body
+            for definition in (
+                node.body
+                if isinstance(node, ast.ClassDef)
+                and (node.name.startswith("Test") or node.name in case_classes)
+                else [node]
+            )
+        )
     except (OSError, SyntaxError, UnicodeError) as error:
         msg = f"{path}: Python source could not be parsed: {error}"
         raise CommandError(
@@ -1834,6 +1846,73 @@ pkgs.writeTextFile {
     return files
 
 
+def _validate_managed_path(root: Path, relative: Path) -> None:
+    """Reject symlinks and non-directory ancestors before modifying managed paths."""
+    for component in (*reversed(relative.parents), relative):
+        path = root / component
+        if path.is_symlink() or (
+            component != relative and path.exists() and not path.is_dir()
+        ):
+            msg = (
+                f"{component}: managed paths cannot contain symlinks or file ancestors"
+            )
+            raise CommandError(msg)
+
+
+def _missing_directories(root: Path, paths: list[Path]) -> list[Path]:
+    """Remember missing directories for cleanup after a failed operation."""
+    directories = {parent for path in paths for parent in (path, *path.parents)}
+    return sorted(
+        (
+            root / path
+            for path in directories
+            if path != Path() and not (root / path).exists()
+        ),
+        key=lambda path: len(path.parts),
+        reverse=True,
+    )
+
+
+def _remove_empty_directories(directories: list[Path]) -> None:
+    """Remove only directories created by an operation that remain empty."""
+    for directory in directories:
+        with contextlib.suppress(OSError):
+            directory.rmdir()
+
+
+@contextlib.contextmanager
+def _preserve_whitelist_on_error(root: Path) -> Iterator[None]:
+    """Restore the whitelist and its staged entry if a lifecycle operation fails."""
+    path = root / ".gitignore"
+    _read_regular(path)
+    snapshot = (
+        (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
+        if path.exists()
+        else None
+    )
+    arguments = ["ls-files", "--stage", "-z", "--", ".gitignore"]
+    indexed = git(root, arguments).stdout
+    try:
+        yield
+    except BaseException:
+        if snapshot is None:
+            path.unlink(missing_ok=True)
+        else:
+            contents, mode = snapshot
+            path.write_bytes(contents)
+            path.chmod(mode)
+        if git(root, arguments).stdout != indexed:
+            if indexed:
+                _run(
+                    ["git", "update-index", "-z", "--index-info"],
+                    cwd=root,
+                    input_source=indexed,
+                )
+            else:
+                git(root, ["update-index", "--force-remove", "--", ".gitignore"])
+        raise
+
+
 def add_package(root: Path, kind: str, name: str, description: str | None) -> None:
     """Create a package transactionally and stage its managed files."""
     if kind not in PACKAGE_KINDS:
@@ -1843,27 +1922,33 @@ def add_package(root: Path, kind: str, name: str, description: str | None) -> No
         )
     validate_name(name)
     files = scaffold(kind, name, description)
-    if any((root / path).exists() for path in files):
+    relative = Path("packages") / name
+    _validate_managed_path(root, relative)
+    _validate_managed_path(root, Path("checks") / name)
+    if (root / relative).exists() or (root / "checks" / name).exists():
         msg = f"package or generated check already exists: {name}"
         raise CommandError(msg)
+    directories = _missing_directories(root, [relative])
     created: list[Path] = []
     try:
-        for relative, source in files.items():
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(source, encoding="utf-8")
-            path.chmod(0o755 if path.name == "main.py" else 0o644)
-            created.append(path)
-        _refresh_gitignore(root)
-        generated = [str(path.relative_to(root)) for path in created] + [".gitignore"]
-        completed = git(root, ["add", "--", *generated], check=False)
-        if completed.returncode != 0:
-            raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
+        with _preserve_whitelist_on_error(root):
+            for relative, source in files.items():
+                path = root / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                created.append(path)
+                path.write_text(source, encoding="utf-8")
+                path.chmod(0o755 if path.name == "main.py" else 0o644)
+            _refresh_gitignore(root)
+            generated = [str(path.relative_to(root)) for path in created] + [
+                ".gitignore",
+            ]
+            completed = git(root, ["add", "--", *generated], check=False)
+            if completed.returncode != 0:
+                raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
     except BaseException:
         for path in reversed(created):
             path.unlink(missing_ok=True)
-            with contextlib.suppress(OSError):
-                path.parent.rmdir()
+        _remove_empty_directories(directories)
         raise
 
 
@@ -1874,6 +1959,8 @@ def add_host(root: Path, name: str) -> None:
     path = root / relative
     check_relative = Path("checks") / f"{name}VmWithDisko" / "default.nix"
     check = root / check_relative
+    _validate_managed_path(root, relative)
+    _validate_managed_path(root, check_relative)
     if (
         path.parent.exists()
         or path.parent.is_symlink()
@@ -1882,36 +1969,41 @@ def add_host(root: Path, name: str) -> None:
     ):
         msg = f"host or generated check already exists: {name}"
         raise CommandError(msg)
+    directories = _missing_directories(root, [relative.parent, check_relative.parent])
     try:
-        path.parent.mkdir(parents=True)
-        path.write_text("{ ... }: { }\n", encoding="utf-8")
-        check.parent.mkdir(parents=True)
-        check.write_text(_current_host_check_source(), encoding="utf-8")
-        _refresh_gitignore(root)
-        completed = git(
-            root,
-            [
-                "add",
-                "--",
-                str(relative),
-                str(check_relative),
-                ".gitignore",
-            ],
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
+        with _preserve_whitelist_on_error(root):
+            path.parent.mkdir(parents=True)
+            path.write_text("{ ... }: { }\n", encoding="utf-8")
+            check.parent.mkdir(parents=True)
+            check.write_text(_current_host_check_source(), encoding="utf-8")
+            _refresh_gitignore(root)
+            completed = git(
+                root,
+                [
+                    "add",
+                    "--",
+                    str(relative),
+                    str(check_relative),
+                    ".gitignore",
+                ],
+                check=False,
+            )
+            if completed.returncode != 0:
+                raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
     except BaseException:
         path.unlink(missing_ok=True)
         check.unlink(missing_ok=True)
-        with contextlib.suppress(OSError):
-            path.parent.rmdir()
-        with contextlib.suppress(OSError):
-            check.parent.rmdir()
+        _remove_empty_directories(directories)
         raise
 
 
-def remove_home_submodule(root: Path, value: str, *, dry_run: bool) -> None:
+def remove_home_submodule(
+    root: Path,
+    value: str,
+    *,
+    dry_run: bool,
+    force: bool = False,
+) -> None:
     """Remove a registered home submodule and its owned whitelist entries."""
     relative = Path(value)
     if (
@@ -1922,6 +2014,18 @@ def remove_home_submodule(root: Path, value: str, *, dry_run: bool) -> None:
     ):
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
+    checkout = root / relative
+    if not force and (checkout / ".git").exists():
+        status = git(
+            checkout,
+            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
+        )
+        if status.stdout:
+            msg = (
+                "submodule contains local changes or untracked data; "
+                "commit or preserve them, or use --force to remove them"
+            )
+            raise CommandError(msg)
     source = _read_regular(root / ".gitignore") or ""
     entry = f"!/{relative.as_posix()}"
     retained = [
@@ -1931,6 +2035,8 @@ def remove_home_submodule(root: Path, value: str, *, dry_run: bool) -> None:
     ]
     updated = "\n".join(retained) + "\n" if retained else ""
     arguments = ["rm", "-r", "--", f":(literal){relative.as_posix()}"]
+    if force:
+        arguments.insert(2, "--force")
     if dry_run:
         arguments.insert(2, "--dry-run")
     git(root, arguments)
@@ -1938,7 +2044,13 @@ def remove_home_submodule(root: Path, value: str, *, dry_run: bool) -> None:
     _write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
 
-def remove_resource(root: Path, value: str, dry_run: bool) -> None:  # noqa: FBT001
+def remove_resource(
+    root: Path,
+    value: str,
+    *,
+    dry_run: bool,
+    force: bool = False,
+) -> None:
     """Remove a canonical package or host and stage its related metadata."""
     kind, name, relative = _parse_resource_path(value)
     resource_root = root / relative
@@ -1955,26 +2067,47 @@ def remove_resource(root: Path, value: str, dry_run: bool) -> None:  # noqa: FBT
         resource_root,
         *([check_root] if check_root.exists() else []),
     ]
-    target_relatives = [str(target.relative_to(root)) for target in targets]
-    if dry_run:
-        for target in targets:
-            print(f"rm '{target.relative_to(root)}'")  # noqa: T201
-        print("update '.gitignore'")  # noqa: T201
-        return
     for target in targets:
-        shutil.rmtree(target)
-    _refresh_gitignore(root)
-    git(
-        root,
-        [
-            "add",
-            "--all",
-            "--force",
-            "--",
-            *target_relatives,
-            ".gitignore",
-        ],
-    )
+        _validate_managed_path(root, target.relative_to(root))
+        if not target.is_dir():
+            msg = f"{target.relative_to(root)}: removal target must be a directory"
+            raise CommandError(msg)
+    _read_regular(root / ".gitignore")
+    target_relatives = [str(target.relative_to(root)) for target in targets]
+    if not force:
+        status = git(
+            root,
+            [
+                "status",
+                "--porcelain",
+                "--untracked-files=all",
+                "--ignored",
+                "--",
+                *target_relatives,
+            ],
+        )
+        if status.stdout:
+            msg = (
+                "resource or related checks contain local changes or untracked data; "
+                "commit or preserve them, or use --force to remove them"
+            )
+            raise CommandError(msg)
+    arguments = ["rm", "-r", "--ignore-unmatch"]
+    if force:
+        arguments.append("--force")
+    if dry_run:
+        arguments.append("--dry-run")
+    removal = git(root, [*arguments, "--", *target_relatives])
+    print(removal.stdout, end="")  # noqa: T201
+    _change("update '.gitignore'", dry_run=dry_run)
+    clean_arguments = ["clean", "-dx", "--dry-run" if dry_run else "--force"]
+    if force:
+        clean_arguments.extend(("--force", "--force"))
+    clean = git(root, [*clean_arguments, "--", *target_relatives])
+    print(clean.stdout, end="")  # noqa: T201
+    if not dry_run:
+        _refresh_gitignore(root)
+        git(root, ["add", "--", ".gitignore"])
 
 
 def _parse_resource_path(value: str) -> tuple[str, str, Path]:
@@ -1994,6 +2127,177 @@ def _parse_resource_path(value: str) -> tuple[str, str, Path]:
     raise CommandError(msg)
 
 
+def _renamed_runtime_expression(
+    expression: cst.BaseExpression,
+    old: Path,
+    new: Path,
+    repository: Path | None,
+) -> cst.BaseExpression:
+    """Change only the package component of a declared literal runtime path."""
+    import libcst as cst  # noqa: PLC0415
+
+    code = cst.Module([]).code_for_node(expression)
+    path = _runtime_path(ast.parse(code, mode="eval").body)
+    if path is None or path.parts[-3:] != (*old.parts, "tmp"):
+        return expression
+    if repository is not None and Path(*path.parts[:-3]) != repository:
+        return expression
+    literals: list[cst.SimpleString | cst.ConcatenatedString] = []
+    current = expression
+    while isinstance(current, cst.BinaryOperation) and isinstance(
+        current.operator,
+        cst.Divide,
+    ):
+        if not isinstance(current.right, (cst.SimpleString, cst.ConcatenatedString)):
+            return expression
+        literals.insert(0, current.right)
+        current = current.left
+    position = len(path.parts) - 2
+    for literal in literals:
+        components = list(Path(cast("str", literal.evaluated_value)).parts)
+        if position < len(components):
+            components[position] = new.name
+            if isinstance(literal, cst.ConcatenatedString):
+                return expression.deep_replace(
+                    literal,
+                    cst.parse_expression(repr("/".join(components))),
+                )
+            value = (
+                literal.prefix + literal.quote + "/".join(components) + literal.quote
+            )
+            return expression.with_deep_changes(literal, value=value)
+        position -= len(components)
+    return expression
+
+
+def _renamed_runtime_source(
+    source: str,
+    old: Path,
+    new: Path,
+    *,
+    own_package: bool,
+    repository: Path | None,
+) -> str:
+    """Use LibCST to edit module declarations without rewriting their formatting."""
+    import libcst as cst  # noqa: PLC0415
+
+    try:
+        module = cst.parse_module(source)
+    except cst.ParserSyntaxError as error:
+        raise CommandError(str(error)) from error
+    body: list[cst.BaseStatement] = []
+    for line in module.body:
+        if not isinstance(line, cst.SimpleStatementLine):
+            body.append(line)
+            continue
+        statements = []
+        for statement in line.body:
+            if isinstance(statement, cst.Assign):
+                targets = [target.target for target in statement.targets]
+            elif isinstance(statement, cst.AnnAssign) and statement.value is not None:
+                targets = [statement.target]
+            else:
+                statements.append(statement)
+                continue
+            names = {target.value for target in targets if isinstance(target, cst.Name)}
+            value = cast("cst.BaseExpression", statement.value)
+            if "RUNTIME_DIR" in names and own_package:
+                value = _renamed_runtime_expression(value, old, new, repository)
+            if (
+                "INPUT_DIRS" in names
+                and isinstance(value, cst.Tuple)
+                and (own_package or repository is not None)
+            ):
+                value = value.with_changes(
+                    elements=[
+                        element.with_changes(
+                            value=_renamed_runtime_expression(
+                                element.value,
+                                old,
+                                new,
+                                repository,
+                            ),
+                        )
+                        if isinstance(element, cst.Element)
+                        else element
+                        for element in value.elements
+                    ],
+                )
+            statements.append(statement.with_changes(value=value))
+        body.append(line.with_changes(body=statements))
+    return module.with_changes(body=body).code
+
+
+def _runtime_rename_updates(
+    root: Path,
+    old: Path,
+    new: Path,
+) -> list[tuple[Path, str, str | None, str | None]]:
+    """Prepare working and indexed runtime edits independently before moving files."""
+    origin = git(root, ["remote", "get-url", "origin"], check=False)
+    repository = (
+        canonical_remote_path(origin.stdout.strip()) if origin.returncode == 0 else None
+    )
+    updates = []
+    for package in detect_packages(root):
+        if package.kind != "python":
+            continue
+        relative = Path("packages") / package.name / "main.py"
+        _validate_managed_path(root, relative)
+        source = _read_regular(root / relative)
+        if source is None:
+            continue
+        own_package = relative.parent == old
+        working = _renamed_runtime_source(
+            source,
+            old,
+            new,
+            own_package=own_package,
+            repository=repository,
+        )
+        indexed = git(root, ["ls-files", "--stage", "--", str(relative)]).stdout
+        staged = None
+        mode = None
+        if indexed:
+            if len(indexed.splitlines()) != 1 or indexed.split()[2] != "0":
+                msg = f"{relative}: resolve index conflicts before renaming"
+                raise CommandError(msg)
+            mode = indexed.split()[0]
+            staged_source = git(root, ["show", f":{relative}"]).stdout
+            staged = _renamed_runtime_source(
+                staged_source,
+                old,
+                new,
+                own_package=own_package,
+                repository=repository,
+            )
+        if working != source or (staged is not None and staged != staged_source):
+            destination = new / relative.name if own_package else relative
+            updates.append((destination, working, staged, mode))
+    return updates
+
+
+def _apply_runtime_updates(
+    root: Path,
+    updates: list[tuple[Path, str, str | None, str | None]],
+    *,
+    dry_run: bool,
+) -> None:
+    """Apply prepared edits without staging unrelated working changes."""
+    for relative, working, staged, mode in updates:
+        _change(f"update runtime paths in '{relative}'", dry_run=dry_run)
+        if dry_run:
+            continue
+        (root / relative).write_text(working, encoding="utf-8")
+        if staged is not None and mode is not None:
+            blob = _run(
+                ["git", "hash-object", "-w", "--stdin"],
+                cwd=root,
+                input_source=staged,
+            ).stdout.strip()
+            git(root, ["update-index", "--cacheinfo", mode, blob, str(relative)])
+
+
 def rename_resource(root: Path, source: str, destination: str, dry_run: bool) -> None:  # noqa: FBT001
     """Rename one canonical package or host and stage its related metadata."""
     source_kind, source_name, source_relative = _parse_resource_path(source)
@@ -2001,6 +2305,8 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
     if source_kind != destination_kind:
         msg = "cannot rename a package to a host or a host to a package"
         raise CommandError(msg)
+    _validate_managed_path(root, source_relative)
+    _validate_managed_path(root, destination_relative)
     source_path = root / source_relative
     destination_path = root / destination_relative
     marker = "default.nix" if source_kind == "package" else "configuration.nix"
@@ -2024,10 +2330,18 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
             msg = f"destination already exists: {destination_check}"
             raise CommandError(msg)
         moves.append((source_check, destination_check))
+    updates = (
+        _runtime_rename_updates(root, source_relative, destination_relative)
+        if source_kind == "package"
+        else []
+    )
     for old, new in moves:
+        _validate_managed_path(root, old)
+        _validate_managed_path(root, new)
         _change(f"move '{old}' to '{new}'", dry_run=dry_run)
     _change("update '.gitignore'", dry_run=dry_run)
     if dry_run:
+        _apply_runtime_updates(root, updates, dry_run=True)
         return
     tracked = _tracked_paths(root)
     for old, new in moves:
@@ -2035,6 +2349,7 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
             git(root, ["mv", "--", str(old), str(new)])
         else:
             shutil.move(root / old, root / new)
+    _apply_runtime_updates(root, updates, dry_run=False)
     _refresh_gitignore(root)
     git(root, ["add", "--", ".gitignore"])
 
@@ -2057,24 +2372,33 @@ def initialize_submodule(remote: str) -> None:
     if repository_root(home) != home or repository_type(home) != "home":
         message = "$HOME must be an initialized canonical home repository"
         raise CommandError(message)
-    _allow_home_submodule(home, relative)
-    registered = any(
-        Path(repository["path"]) == relative and repository["url"] == remote
-        for repository in home_submodules(home)
-    )
-    indexed = git(home, ["ls-files", "--stage", "--", str(relative)]).stdout
-    if (
-        registered
-        and indexed.startswith("160000 ")
-        and (home / relative / ".git").exists()
-    ):
-        return
-    completed = subprocess.run(  # noqa: S603
-        ["git", "submodule", "add", "--", remote, relative.as_posix()],  # noqa: S607
-        cwd=home,
-        check=False,
-    )
-    raise SystemExit(completed.returncode)
+    _validate_managed_path(home, relative)
+    directories = _missing_directories(home, [relative.parent])
+    try:
+        with _preserve_whitelist_on_error(home):
+            _allow_home_submodule(home, relative)
+            registered = any(
+                Path(repository["path"]) == relative and repository["url"] == remote
+                for repository in home_submodules(home)
+            )
+            indexed = git(home, ["ls-files", "--stage", "--", str(relative)]).stdout
+            if (
+                registered
+                and indexed.startswith("160000 ")
+                and (home / relative / ".git").exists()
+            ):
+                return
+            completed = _run(
+                ["git", "submodule", "add", "--", remote, relative.as_posix()],
+                cwd=home,
+            )
+            if completed.stdout:
+                print(completed.stdout, end="")  # noqa: T201
+            if completed.stderr:
+                print(completed.stderr, end="", file=sys.stderr)  # noqa: T201
+    except BaseException:
+        _remove_empty_directories(directories)
+        raise
 
 
 def _remote_is_empty(remote: str) -> bool:
@@ -2095,8 +2419,11 @@ def initialize_flake(remote: str) -> None:
     if repository_root(home) != home or repository_type(home) != "home":
         msg = "$HOME must be an initialized canonical home repository"
         raise CommandError(msg)
+    _home_ignore_source(home)
+    home_submodules(home)
+    _validate_managed_path(home, relative)
     if not _remote_is_empty(remote):
-        msg = "init flake requires an empty remote"
+        msg = "init-flake requires an empty remote"
         raise CommandError(msg)
     readme = f"# {relative.name}\n"
     directory = home / relative
@@ -2132,7 +2459,6 @@ def initialize_flake(remote: str) -> None:
         git(directory, ["add", "--all"])
         git(directory, ["branch", "-M", "main"])
         git(directory, ["commit", "-m", "Initialize repository"])
-        git(directory, ["push", "--set-upstream", "origin", "main"])
     except BaseException:
         shutil.rmtree(directory)
         with contextlib.suppress(OSError):
@@ -2150,6 +2476,7 @@ def initialize_flake(remote: str) -> None:
             str(relative),
         ],
     )
+    git(directory, ["push", "--set-upstream", "origin", "main"])
 
 
 def _unittest_classes(module: ast.Module) -> set[str]:
@@ -2182,91 +2509,135 @@ def _unittest_classes(module: ast.Module) -> set[str]:
     return found
 
 
-def source_test_names(source: bytes, filename: str) -> list[str]:
-    """Convert Python source into sentences in definition order without executing it."""
-    module = ast.parse(source, filename=filename)
-    case_classes = _unittest_classes(module)
-    definitions = []
-    for node in module.body:
-        if isinstance(node, ast.ClassDef) and (
-            node.name.startswith("Test") or node.name in case_classes
-        ):
-            definitions.extend(node.body)
-        else:
-            definitions.append(node)
-    return [
-        node.name.removeprefix("test_").replace("_", " ")
-        for node in definitions
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-        and node.name.startswith("test_")
-    ]
-
-
 def parser() -> argparse.ArgumentParser:
     """Construct the public command-line parser."""
     result = argparse.ArgumentParser(
         prog="afairesi",
-        description="Manage persistent home and flake repository structure.",
+        description=(
+            "Manage persistent files and directory layouts in $HOME and its Git\n"
+            "repositories through shared Git, Nix flake, and code conventions.\n"
+            "These conventions reduce repository-specific configuration and,\n"
+            "together with machine-specific declarations and explicit exceptions,\n"
+            "describe the environment. Checks validate the conventions, and\n"
+            "repairs restore the required structure."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Requirements:\n"
+            "  Git and Nix with flakes enabled.\n\n"
+            "Conventions:\n"
+            "  Git tracks $HOME using a .gitignore whitelist. Submodules containing\n"
+            "  Nix flakes live at $HOME/<remote-hostname>/<repository-path>, with\n"
+            "  packages/, hosts/, and checks/ directories as needed.\n"
+            "  Package layouts define source and test files; prm/ holds other\n"
+            "  tracked files and tmp/ holds untracked runtime data. Code follows\n"
+            "  shared formatting and strict lint rules.\n"
+            "  Packages store runtime data at\n"
+            "  $HOME/<remote-hostname>/<repository-path>/packages/NAME/tmp/,\n"
+            "  independently of the working directory, and may explicitly read\n"
+            "  another package's data.\n\n"
+            "Repository management:\n"
+            "  Creating, moving, or removing resources updates the whitelist and\n"
+            "  related checks. Home repairs keep submodule paths, registration, and\n"
+            "  whitelist entries consistent with their remotes.\n"
+            "  In flake repositories, nix fmt repairs managed package definitions\n"
+            "  and checks, updates Git tracking, and removes files outside the\n"
+            "  permitted layout before formatting and checking code. Permitted\n"
+            "  tmp/ directories retain their data without being tracked by Git.\n"
+            "  Checks validate formatting, types, and package behavior. Repairs\n"
+            "  stage structural changes for review without committing them.\n\n"
+            "Migration:\n"
+            "  Adopt the conventions incrementally. Before applying repairs, adapt\n"
+            "  package definitions and move files outside the permitted layout into\n"
+            "  prm/, since repairs can delete those files.\n\n"
+            "Run afairesi COMMAND --help for command details."
+        ),
     )
     commands = result.add_subparsers(
         dest="command",
         title="commands",
         metavar="COMMAND",
     )
-    init = commands.add_parser(
-        "init",
-        help="initialize HOME, create a flake, or add a remote submodule",
-        description="Initialize HOME, create a flake, or add a remote under HOME.",
+    clone = commands.add_parser(
+        "clone",
+        help="clone and register an existing remote as a home submodule",
+        description=(
+            "Clone a hosted remote at $HOME/<remote-hostname>/<repository-path> "
+            "and register it as a submodule."
+        ),
+        epilog=(
+            "Requires an initialized home repository. Stage its whitelist and "
+            "submodule registration without creating commits or pushing. On "
+            "failure, restore the previous whitelist and its staged entry."
+        ),
     )
-    init.add_argument(
-        "repository_type",
-        metavar="home|flake|REMOTE",
-        help="home or flake repository type, or a hosted Git remote for a submodule",
-    )
-    init.add_argument(
-        "remote",
-        nargs="?",
-        metavar="REMOTE",
-        help="empty hosted Git remote required by the flake repository type",
-    )
-    add = commands.add_parser(
-        "add",
-        help="add a package or host",
+    clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
+    create = commands.add_parser(
+        "create",
+        help="create a package or host",
         description="Create and stage a canonical package or host.",
-        epilog="Update and stage the repository whitelist and related checks.",
+        epilog=(
+            "Update and stage the repository whitelist and related checks. "
+            "Reject existing resource directories and symlinks in managed paths. "
+            "On failure, restore the previous whitelist and its staged entry."
+        ),
     )
-    add.add_argument(
+    create.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="new packages/NAME or hosts/NAME path",
+        help="new repository-relative packages/NAME or hosts/NAME path",
     )
-    add.add_argument(
+    create.add_argument(
         "type",
         nargs="?",
         metavar="TYPE",
         help="package type (html, latex, nix, python)",
     )
-    add.add_argument(
+    create.add_argument(
         "description",
         nargs="*",
         metavar="DESCRIPTION",
         help="optional package description",
     )
+    init_flake = commands.add_parser(
+        "init-flake",
+        help="create, commit, and push a flake under HOME",
+        description=(
+            "Create a flake from an empty hosted remote at "
+            "$HOME/<remote-hostname>/<repository-path>."
+        ),
+        epilog=(
+            "Requires an initialized home repository. Clone the remote, scaffold "
+            "and format the flake, commit its initial main branch, register and "
+            "stage it as a home submodule, then push."
+        ),
+    )
+    init_flake.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
+    commands.add_parser(
+        "init-home",
+        help="initialize the home repository and stage its whitelist",
+        description="Initialize the repository at $HOME and stage its whitelist.",
+    )
     move = commands.add_parser(
-        "mv",
+        "move",
         help="rename a package or host",
         description="Rename a canonical package or host and stage the result.",
-        epilog="Update and stage the repository whitelist and related checks.",
+        epilog=(
+            "Update and stage the repository whitelist and related checks. Package "
+            "renames update declared runtime paths and references from other "
+            "packages in the repository, preserving unstaged edits. Runtime data "
+            "moves with the package directory."
+        ),
     )
     move.add_argument(
         "source",
         metavar="SOURCE",
-        help="existing packages/NAME or hosts/NAME path",
+        help="existing repository-relative packages/NAME or hosts/NAME path",
     )
     move.add_argument(
         "destination",
         metavar="DESTINATION",
-        help="new path in the same resource collection",
+        help="new repository-relative path in the same resource collection",
     )
     move.add_argument(
         "-n",
@@ -2275,26 +2646,34 @@ def parser() -> argparse.ArgumentParser:
         help="print moves without changing the repository",
     )
     remove = commands.add_parser(
-        "rm",
+        "remove",
         help="remove a home submodule, package, or host",
         description="Remove and stage a registered home submodule or flake resource.",
         epilog=(
             "Home removal uses git rm and removes the submodule's whitelist "
-            "entries while preserving shared parents. Git rejects local changes "
-            "that would be lost. Flake removal updates the whitelist and removes "
-            "related checks."
+            "entries while preserving shared parents. Removal rejects local changes "
+            "and untracked data unless --force is given. Flake removal updates "
+            "the whitelist and removes related checks, including runtime data "
+            "inside the removed resource. Validate every target before deleting "
+            "files. Paths are relative to the repository root."
         ),
     )
     remove.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="registered home submodule path, packages/NAME, or hosts/NAME",
+        help="repository-relative home submodule path, packages/NAME, or hosts/NAME",
     )
     remove.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
         help="print removals without changing the repository",
+    )
+    remove.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="allow deletion of local changes and untracked data",
     )
     repair_home = commands.add_parser(
         "repair-home",
@@ -2314,7 +2693,7 @@ def parser() -> argparse.ArgumentParser:
         "-n",
         "--dry-run",
         action="store_true",
-        help="report required repairs without changing the home repository",
+        help="report required repairs without changes; successful previews exit with 0",
     )
     return result
 
@@ -2327,26 +2706,18 @@ def _dispatch_standalone_command(
     if options.command is None:
         cli.print_help()
         return True
-    if options.command != "init":
-        return False
-    if options.repository_type == "home":
-        if options.remote is not None:
-            msg = "init home does not accept a remote"
-            raise CommandError(msg)
+    if options.command == "init-home":
         initialize_home()
-    elif options.repository_type == "flake":
-        if options.remote is None:
-            msg = "init flake requires REMOTE"
-            raise CommandError(msg)
+    elif options.command == "init-flake":
         initialize_flake(options.remote)
+    elif options.command == "clone":
+        initialize_submodule(options.remote)
     else:
-        if options.remote is not None:
-            cli.error("init REMOTE accepts exactly one remote")
-        initialize_submodule(options.repository_type)
+        return False
     return True
 
 
-def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
+def _dispatch_create(root: Path, options: argparse.Namespace) -> None:
     """Create the selected package or host resource."""
     kind, name, _relative = _parse_resource_path(options.resource)
     description = " ".join(options.description) or None
@@ -2365,9 +2736,19 @@ def _dispatch_add(root: Path, options: argparse.Namespace) -> None:
 def _dispatch_remove(root: Path, options: argparse.Namespace, kind: str) -> None:
     """Remove a resource through its repository's lifecycle."""
     if kind == "home":
-        remove_home_submodule(root, options.resource, dry_run=options.dry_run)
+        remove_home_submodule(
+            root,
+            options.resource,
+            dry_run=options.dry_run,
+            force=options.force,
+        )
     else:
-        remove_resource(root, options.resource, options.dry_run)
+        remove_resource(
+            root,
+            options.resource,
+            dry_run=options.dry_run,
+            force=options.force,
+        )
 
 
 def formatter_main() -> None:
@@ -2409,7 +2790,7 @@ def main() -> None:
             return
         root = Path.home() if options.command == "repair-home" else repository_root()
         current_type = repository_type(root)
-        if options.command in {"add", "mv"} and current_type != "flake":
+        if options.command in {"create", "move"} and current_type != "flake":
             msg = f"{current_type} repositories do not support flake resources"
             raise CommandError(  # noqa: TRY301
                 msg,
@@ -2419,11 +2800,11 @@ def main() -> None:
                 msg = "repair-home requires a home repository; run nix fmt for flakes"
                 raise CommandError(msg)  # noqa: TRY301
             converge_home(root, options.dry_run)
-        elif options.command == "add":
-            _dispatch_add(root, options)
-        elif options.command == "rm":
+        elif options.command == "create":
+            _dispatch_create(root, options)
+        elif options.command == "remove":
             _dispatch_remove(root, options, current_type)
-        elif options.command == "mv":
+        elif options.command == "move":
             rename_resource(
                 root,
                 options.source,

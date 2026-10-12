@@ -23,6 +23,7 @@ in
     inputs.self.packages.${pkgs.stdenv.system}.nix_syntax
     pkgs.git
     pkgs.nix
+    pkgs.python3.pkgs.libcst
   ];
   src = ./.;
   version = "0.0.0";

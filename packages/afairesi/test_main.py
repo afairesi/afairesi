@@ -147,7 +147,7 @@ def _check_excluded_trees(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Skip excluded subtrees while still rejecting unmanaged files and symlinks."""
-    _run(repository, "add", "packages/example", "python")
+    _run(repository, "create", "packages/example", "python")
     excluded = [
         repository / name
         for name in (
@@ -188,7 +188,7 @@ def _check_formatted_checks(
     repository: Path,
 ) -> None:
     """Preserve formatted generated checks through the full formatting pipeline."""
-    _run(repository, "add", "hosts/laptop")
+    _run(repository, "create", "hosts/laptop")
     (repository / "packages/example/test_main.py").write_text(
         "def test_result(): pass\n",
     )
@@ -213,7 +213,7 @@ def _check_formatted_checks(
 
 def _check_host_repair(repository: Path) -> None:
     """Repair a changed check while preserving its host and resource inventory."""
-    _run(repository, "add", "hosts/laptop")
+    _run(repository, "create", "hosts/laptop")
     host = repository / "hosts/laptop/configuration.nix"
     original_host = host.read_bytes()
     original_paths = _git(repository, "ls-files").splitlines()
@@ -271,7 +271,7 @@ def _check_remote_initialization(  # noqa: C901
     monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin.as_uri()}.insteadOf")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    _run(tmp_path, "init", "home")
+    _run(tmp_path, "init-home")
     _git(
         home,
         "-c",
@@ -285,7 +285,7 @@ def _check_remote_initialization(  # noqa: C901
     )
     head = _git(home, "rev-parse", "HEAD")
     relative = "example.test/team/project"
-    result = _run(tmp_path, "init", remote)
+    result = _run(tmp_path, "clone", remote)
     checkout = home / relative
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     for pattern in (
@@ -296,12 +296,12 @@ def _check_remote_initialization(  # noqa: C901
         if ignore.splitlines().count(pattern) != 1:
             raise AssertionError(ignore)
     if _git(home, "show", ":.gitignore") != ignore:
-        message = "init REMOTE did not stage the home whitelist"
+        message = "clone REMOTE did not stage the home whitelist"
         raise AssertionError(message)
     if (checkout / "README").read_text() != "existing repository":
         raise AssertionError(result.stdout + result.stderr)
     if _git(home, "rev-parse", "HEAD") != head:
-        message = "init REMOTE created a home commit"
+        message = "clone REMOTE created a home commit"
         raise AssertionError(message)
     if (
         _git(
@@ -313,14 +313,14 @@ def _check_remote_initialization(  # noqa: C901
         ).strip()
         != remote
     ):
-        message = "init REMOTE changed the registered remote"
+        message = "clone REMOTE changed the registered remote"
         raise AssertionError(message)
     if not _git(home, "ls-files", "--stage", "--", relative).startswith("160000 "):
-        message = "init REMOTE did not stage the submodule"
+        message = "clone REMOTE did not stage the submodule"
         raise AssertionError(message)
-    _run(tmp_path, "init", remote)
+    _run(tmp_path, "clone", remote)
     if (home / ".gitignore").read_text(encoding="utf-8") != ignore:
-        message = "repeated init changed the home whitelist"
+        message = "repeated clone changed the home whitelist"
         raise AssertionError(message)
     (checkout / ".git").unlink()
     native = subprocess.run(  # noqa: S603
@@ -333,7 +333,7 @@ def _check_remote_initialization(  # noqa: C901
     if native.returncode == 0:
         message = "adding over a broken checkout should fail"
         raise AssertionError(message)
-    duplicate = _run(tmp_path, "init", remote, code=native.returncode)
+    duplicate = _run(tmp_path, "clone", remote, code=native.returncode)
     if duplicate.stderr != native.stderr:
         raise AssertionError(duplicate.stderr)
 
@@ -360,23 +360,27 @@ def _check_flake_initialization(
     monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.test")
     fake_nix = tmp_path / "nix"
     fake_nix.write_text(
-        '#!/bin/sh\nif [ "$1" = flake ]; then printf "{}\\n" > flake.lock; fi\n',
+        '#!/bin/sh\nif [ "$1" = flake ]; then printf "{}\\n" > flake.lock; '
+        "else mkdir -p .git/hooks; cat > .git/hooks/pre-push <<'HOOK'\n"
+        '#!/bin/sh\ngit -C "$HOME" config --file .gitmodules '
+        "--get-regexp '^submodule\\..*\\.path$' >/dev/null\n"
+        "HOOK\nchmod +x .git/hooks/pre-push\nfi\n",
         encoding="utf-8",
     )
     fake_nix.chmod(0o755)
     monkeypatch.setenv("AFAIRESI_NIX", str(fake_nix))
-    _run(tmp_path, "init", "home")
+    _run(tmp_path, "init-home")
     _git(home, "commit", "--quiet", "-m", "Home policy")
-    _run(tmp_path, "init", "flake", remote)
+    _run(tmp_path, "init-flake", remote)
     relative = "example.test/team/new"
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     if f"!/{relative}" not in ignore.splitlines():
         raise AssertionError(ignore)
     if _git(home, "show", ":.gitignore") != ignore:
-        message = "init flake did not stage the home whitelist"
+        message = "init-flake did not stage the home whitelist"
         raise AssertionError(message)
     if not _git(home, "ls-files", "--stage", "--", relative).startswith("160000 "):
-        message = "init flake did not stage its submodule"
+        message = "init-flake did not stage its submodule"
         raise AssertionError(message)
 
 
@@ -417,7 +421,7 @@ def _check_home_whitelist(home_repository: Path) -> None:
     expected = ignore.read_text(encoding="utf-8")
     ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n", encoding="utf-8")
     before = _git(root, "show", ":.gitignore")
-    preview = _run(root, "repair-home", "--dry-run", code=1)
+    preview = _run(root, "repair-home", "--dry-run")
     if "would write '.gitignore'" not in preview.stdout:
         raise AssertionError(preview.stdout)
     if (
@@ -503,7 +507,7 @@ def _check_home_move(
     if "stage .gitmodules" not in rejected.stderr or not checkout.exists():
         raise AssertionError(rejected.stderr)
     _git(root, "add", ".gitmodules")
-    _run(root, "repair-home", "--dry-run", code=1)
+    _run(root, "repair-home", "--dry-run")
     if not checkout.exists() or target.exists():
         message = "dry-run moved the checkout"
         raise AssertionError(message)
@@ -587,11 +591,6 @@ DESCRIPTIONS = st.text(
     alphabet=st.characters(exclude_categories=["Cs"], exclude_characters="\x00"),
     min_size=1,
     max_size=30,
-)
-TEST_LABELS = st.lists(
-    st.from_regex(r"[a-z][a-z0-9_]{0,8}", fullmatch=True),
-    max_size=5,
-    unique=True,
 )
 
 
@@ -732,57 +731,18 @@ def _check_launcher_environment(
     _expect("native-check-input" in python_inputs, python_inputs)
 
 
-def _test_declarations(labels: list[str], form: str) -> str:
-    """Build static test definitions with hidden helpers and hostile top-level code."""
-    sentinel = (
-        "from pathlib import Path\n"
-        "Path('SENTINEL').touch()\n"
-        "raise RuntimeError('must not execute')\n"
-    )
-    tests = sentinel + (
-        "def helper():\n"
-        "    def test_hidden(): pass\n"
-        "class Helper:\n"
-        "    def test_hidden(self): pass\n"
-    )
-    if form == "functions":
-        tests += "".join(
-            f"@unknown_decorator()\nasync def test_{label}():\n    assert False\n"
-            for label in labels
-        )
-    else:
-        header = (
-            "class TestBehavior:\n"
-            if form == "classes"
-            else (
-                "import unittest as unit\n"
-                "from unittest import TestCase as Case, "
-                "IsolatedAsyncioTestCase\n"
-                "class Base(Case): pass\n"
-                "class Reports(Base):\n"
-            )
-        )
-        tests += header + (
-            "    pass\n"
-            if not labels
-            else "".join(
-                f"    async def test_{label}(self):\n        assert False\n"
-                for label in labels
-            )
-        )
-    return tests
-
-
-def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:
+def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
         commands = (
             (),
-            ("add",),
-            ("mv",),
-            ("rm",),
-            ("init",),
+            ("create",),
+            ("move",),
+            ("remove",),
+            ("init-home",),
+            ("init-flake",),
+            ("clone",),
             ("repair-home",),
         )
         for command_path in commands:
@@ -802,51 +762,293 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:
             == _run(root, "--help").stdout,
             "standalone command unavailable through PATH",
         )
-        for retired in (
-            "help",
-            "status",
-            "check",
-            "overview",
-            "converge",
-            "diff",
-            "test",
-            "test-names",
-            "coverage",
-            "hypothesis",
-            "mutation",
-        ):
+        for retired in ("init", "add"):
             _run(root, retired, code=2)
+        for invalid_arguments in (
+            ("init-home", "unexpected"),
+            ("init-flake",),
+            ("init-flake", "remote", "unexpected"),
+            ("clone",),
+            ("clone", "remote", "unexpected"),
+            ("create",),
+        ):
+            _run(root, *invalid_arguments, code=2)
         help_output = _run(root, "--help").stdout
+        command_names = sorted(path[0] for path in commands if path)
+        positions = [help_output.index(f"    {name} ") for name in command_names]
+        _expect(positions == sorted(positions), "help commands must be alphabetical")
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
-        _expect("formatted JSON" not in help_output, help_output)
-        _expect(
-            "repair-home" in help_output and "converge" not in help_output,
-            help_output,
-        )
         _run(root, "repair-home", "--source", str(root), code=2)
-        for inspection_target in (".", str(root)):
-            _run(root, inspection_target, code=2)
-        for removed in (("--full",), ("--revision", "HEAD")):
-            _run(root, *removed, code=2)
-        _run(root, "test", "unknown", code=2)
-        for path in (("args",), ("test", "names")):
-            for arguments in (
-                (),
-                (str(root),),
-                ("diff",),
-                ("show",),
-                ("--help",),
-                ("_textconv", "main.py"),
-            ):
-                rejected = _run(root, *path, *arguments, code=2)
-                _expect("error:" in rejected.stderr, rejected)
         _expect(not any(root.iterdir()), "invalid CLI request created state")
+
+
+@pytest.mark.parametrize("kind", ["python", "host"])
+@pytest.mark.parametrize(
+    "change",
+    ["working", "staged", "untracked", "ignored", "check", "nested"],
+)
+def test_resource_removal_requires_force_to_discard_local_data(
+    kind: str,
+    change: str,
+) -> None:
+    """Reject destructive previews and removals unless deletion is explicitly forced."""
+    with _fresh_repository() as root:
+        relative = "hosts/example" if kind == "host" else "packages/example"
+        _run(root, "create", relative, *(() if kind == "host" else (kind,)))
+        _fixture_git(root, "commit", "-qm", "Resource snapshot")
+        resource = root / relative
+        if change in {"working", "staged"}:
+            marker = "configuration.nix" if kind == "host" else "default.nix"
+            path = resource / marker
+            path.write_text(path.read_text() + "# local changes\n")
+            if change == "staged":
+                _git(root, "add", "--", str(path.relative_to(root)))
+        else:
+            check = "exampleVmWithDisko" if kind == "host" else "example"
+            path = (
+                root / "checks" / check / "asset"
+                if change == "check"
+                else resource / ("tmp/asset" if change == "ignored" else "prm/asset")
+            )
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("preserve local data")
+            if change == "nested":
+                _git(path.parent, "init", "--quiet")
+        before = _snapshot(root)
+        for arguments in (("--dry-run",), ()):
+            rejected = _run(root, "remove", relative, *arguments, code=1)
+            _expect("--force" in rejected.stderr, rejected)
+            _expect(_snapshot(root) == before, "rejected removal changed state")
+        _preview(root, "remove", relative, "--force")
+        _run(root, "remove", relative, "--force")
+        _expect(not resource.exists() and not path.exists(), "forced removal left data")
+
+
+def test_resource_commands_resolve_paths_from_the_repository_root() -> None:
+    """Resolve resource paths from the repository root from nested directories."""
+    with _fresh_repository() as root:
+        nested = root / "tmp/nested"
+        nested.mkdir(parents=True)
+        _run(nested, "create", "packages/example", "nix")
+        _expect((root / "packages/example/default.nix").is_file(), "wrong create root")
+        _run(nested, "move", "packages/example", "packages/renamed")
+        _fixture_git(root, "commit", "-qm", "Renamed resource")
+        _preview(nested, "remove", "packages/renamed")
+        _run(nested, "remove", "packages/renamed")
+        _expect(not (root / "packages/renamed").exists(), "wrong removal root")
+
+
+@pytest.mark.parametrize("case", ["collection", "resource", "dangling-marker"])
+def test_creation_rejects_symlinks_without_writing_outside_the_repository(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    """Reject existing resource trees and symlink ancestors before writing files."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    with _fresh_repository() as root:
+        package = root / "packages/example"
+        if case == "collection":
+            (root / "packages").symlink_to(outside, target_is_directory=True)
+        elif case == "resource":
+            package.parent.mkdir()
+            package.symlink_to(outside, target_is_directory=True)
+        else:
+            package.mkdir(parents=True)
+            (package / "default.nix").symlink_to(outside / "external.nix")
+        before = _snapshot(root)
+        _run(root, "create", "packages/example", "nix", code=1)
+        _expect(_snapshot(root) == before, "rejected creation changed repository state")
+        _expect(not any(outside.iterdir()), "creation wrote outside the repository")
+
+
+@pytest.mark.parametrize("kind", ["python", "host"])
+def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
+    """Restore distinct staged and working whitelist contents after Git add fails."""
+    with _fresh_repository() as root:
+        ignore = root / ".gitignore"
+        ignore.write_text("# staged whitelist\n")
+        _git(root, "add", ".gitignore")
+        ignore.write_text("# working whitelist\n")
+        ignore.chmod(0o600)
+        (root / ".git/index.lock").touch()
+        before = _snapshot(root)
+        resource = "hosts/example" if kind == "host" else "packages/example"
+        _run(root, "create", resource, *(() if kind == "host" else (kind,)), code=1)
+        _expect(_snapshot(root) == before, "failed creation left structural changes")
+
+
+@pytest.mark.parametrize("case", ["symlink", "file"])
+def test_removal_validates_all_targets_before_preview_or_deletion(
+    tmp_path: Path,
+    case: str,
+) -> None:
+    """Reject unsupported related checks before deleting the package."""
+    with _fresh_repository() as root:
+        _run(root, "create", "packages/example", "nix")
+        check = root / "checks/example"
+        check.parent.mkdir()
+        if case == "symlink":
+            check.symlink_to(tmp_path, target_is_directory=True)
+        else:
+            check.write_text("preserve check contents")
+        before = _snapshot(root)
+        for arguments in (("--dry-run",), ()):
+            _run(root, "remove", "packages/example", "--force", *arguments, code=1)
+            _expect(_snapshot(root) == before, "rejected removal deleted local files")
+
+
+def test_failed_clone_restores_home_whitelist_and_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restore whitelist contents, staging, and directories after clone failure."""
+    home = _home_repository(tmp_path / "home")
+    monkeypatch.setenv("HOME", str(home))
+    remote = "https://example.test/team/missing.git"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv(
+        "GIT_CONFIG_KEY_0",
+        f"url.{(tmp_path / 'missing').as_uri()}.insteadOf",
+    )
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    ignore = home / ".gitignore"
+    ignore.write_text(ignore.read_text() + "!/working-only\n")
+    before = _snapshot(home)
+    _run(tmp_path, "clone", remote, code=128)
+    _expect(_snapshot(home) == before, "failed clone changed the home repository")
+
+
+@pytest.mark.parametrize("case", ["whitelist", "registration", "symlink"])
+def test_flake_initialization_validates_home_before_creating_or_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """Reject invalid home state before creating a checkout or publishing a commit."""
+    home = _home_repository(tmp_path / "home")
+    origin = tmp_path / "remote.git"
+    origin.mkdir()
+    _git(origin, "init", "--bare", "--quiet")
+    remote = "https://example.test/team/new.git"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin.as_uri()}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    if case == "whitelist":
+        ignore = home / ".gitignore"
+        ignore.write_text(ignore.read_text() + "invalid\n")
+    elif case == "registration":
+        (home / ".gitmodules").write_text("invalid registration\n")
+    else:
+        (home / "example.test").symlink_to(tmp_path, target_is_directory=True)
+    before = _snapshot(home)
+    _run(tmp_path, "init-flake", remote, code=1)
+    _expect(_snapshot(home) == before, "failed initialization changed home state")
+    _expect(
+        not _git(origin, "for-each-ref"),
+        "failed initialization published a commit",
+    )
+
+
+@pytest.mark.parametrize("style", ["literal", "split", "annotated", "concatenated"])
+def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
+    style: str,
+) -> None:
+    """Move runtime data and update owned and input paths while preserving Git state."""
+    with _fresh_repository() as root:
+        _git(root, "remote", "add", "origin", "https://forge.example/team/repo.git")
+        for name in ("old", "consumer"):
+            _run(root, "create", f"packages/{name}", "python")
+        old_path = "forge.example/team/repo/packages/old/tmp"
+        new_path = "forge.example/team/repo/packages/new/tmp"
+        source = root / "packages/old/main.py"
+        declaration = {
+            "literal": f"RUNTIME_DIR = Path.home() / {old_path!r}\n",
+            "split": (
+                "RUNTIME_DIR = (\n    Path.home() / 'forge.example/team/repo'\n"
+                "    / 'packages' / 'old'  # preserve path comment\n    / 'tmp'\n)\n"
+            ),
+            "annotated": (
+                f"LABEL = 'Δ'; RUNTIME_DIR: Path = Path.home() / {old_path!r}\n"
+            ),
+            "concatenated": (
+                "RUNTIME_DIR = Path.home() / "
+                "('forge.example/team/repo/packages/ol' 'd/tmp')\n"
+            ),
+        }[style]
+        source.write_text(
+            source.read_text() + "\nfrom pathlib import Path\n" + declaration,
+        )
+        consumer = root / "packages/consumer/main.py"
+        consumer.write_text(
+            consumer.read_text() + "\nfrom pathlib import Path\n"
+            f"INPUT_DIRS = (Path.home() / {old_path!r}, "
+            "Path.home() / 'other.example/team/repo/packages/old/tmp',)\n",
+        )
+        _git(
+            root,
+            "add",
+            "--",
+            str(source.relative_to(root)),
+            str(consumer.relative_to(root)),
+        )
+        source.write_text(source.read_text() + "# unstaged owner edit\n")
+        consumer.write_text(consumer.read_text() + "# unstaged consumer edit\n")
+        data = root / "packages/old/tmp/asset"
+        data.parent.mkdir()
+        data.write_text("preserve runtime data")
+        _preview(root, "move", "packages/old", "packages/new")
+        _run(root, "move", "packages/old", "packages/new")
+        renamed_source = (root / "packages/new/main.py").read_text()
+        if style == "split":
+            _expect(
+                declaration.replace("'old'", "'new'") in renamed_source,
+                "rename changed path formatting or comments",
+            )
+        if style == "annotated":
+            _expect(
+                "LABEL = 'Δ'; RUNTIME_DIR: Path" in renamed_source,
+                "annotation changed",
+            )
+        for name, marker in (("new", "owner"), ("consumer", "consumer")):
+            relative = f"packages/{name}/main.py"
+            working = (root / relative).read_text()
+            indexed = _git(root, "show", f":{relative}")
+            if name == "consumer" or style != "split":
+                _expect(
+                    new_path in working and new_path in indexed,
+                    "runtime path stayed stale",
+                )
+            _expect(f"# unstaged {marker} edit" in working, "working edit was lost")
+            _expect(
+                f"# unstaged {marker} edit" not in indexed,
+                "working edit was staged",
+            )
+        _expect(
+            "other.example/team/repo/packages/old/tmp" in consumer.read_text(),
+            "rename changed another repository's input path",
+        )
+        _expect(
+            (root / "packages/new/tmp/asset").read_text() == "preserve runtime data",
+            "rename lost runtime data",
+        )
+        subject = import_module("packages.afairesi.main")
+        package = next(
+            item for item in subject.detect_packages(root) if item.name == "new"
+        )
+        _expect(
+            not subject._python_source_issues(package),  # noqa: SLF001
+            "renamed runtime path is invalid",
+        )
 
 
 def test_convergence_preserves_formatted_checks() -> None:
     """Keep generated checks stable after the real formatting pipeline."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _run(root, "create", "packages/example", "python")
         _check_formatted_checks(root)
 
 
@@ -861,7 +1063,7 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
 ) -> None:
     """Repair generated state, retain resources and scratch, and respect formatting."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _run(root, "create", "packages/example", "python")
         source = root / "packages/example/main.py"
         original = source.read_bytes()
         for relative in (
@@ -915,7 +1117,7 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
 ) -> None:
     """Reject embedded function and unittest definitions independently of paths."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _run(root, "create", "packages/example", "python")
         source = root / "packages/example/main.py"
         source.write_text(misplaced)
         before = _snapshot(root)
@@ -955,8 +1157,8 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
         )
         _expect("requires a home repository" in rejected.stderr, rejected)
         _expect(_snapshot(root) == before, "home repair changed flake state")
-        _run(root, "add", "packages/a", "python")
-        _run(root, "add", "packages/z", "python")
+        _run(root, "create", "packages/a", "python")
+        _run(root, "create", "packages/z", "python")
         (root / "packages/a/default.nix").write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
         )
@@ -977,8 +1179,8 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
 def test_convergence_rejects_invalid_test_sources_before_repairs(invalid: str) -> None:
     """Parse tests before repairing earlier packages or cleaning unsupported files."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/a", "python")
-        _run(root, "add", "packages/z", "python")
+        _run(root, "create", "packages/a", "python")
+        _run(root, "create", "packages/z", "python")
         (root / "packages/a/default.nix").write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
         )
@@ -1014,7 +1216,7 @@ def test_convergence_repairs_python_arguments_and_preserves_supported_entrypoint
 ) -> None:
     """Repair missing constructor arguments while retaining library and CLI sources."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _run(root, "create", "packages/example", "python")
         package = root / "packages/example"
         (package / "main.py").write_text(source)
         definition = package / "default.nix"
@@ -1080,7 +1282,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
 ) -> None:
     """Evaluate generated Nix and run installed Python and HTML launchers."""
     with _fresh_repository() as root:
-        _run(root, "add", f"packages/{name}", kind, description)
+        _run(root, "create", f"packages/{name}", kind, description)
         package = root / "packages" / name
         asset = package / "prm/asset.bin"
         asset.parent.mkdir()
@@ -1352,7 +1554,7 @@ def test_home_repair_targets_home_from_any_working_directory(
     before = _snapshot(home)
     checkout_before = _snapshot(checkout)
     flake_before = _snapshot(flake)
-    preview = _run(cwd, "repair-home", "--dry-run", code=1)
+    preview = _run(cwd, "repair-home", "--dry-run")
     _expect("would write '.gitignore'" in preview.stdout, preview)
     _expect(_snapshot(home) == before, "home repair preview changed state")
     _run(cwd, "repair-home")
@@ -1364,7 +1566,10 @@ def test_home_repair_targets_home_from_any_working_directory(
     _run(cwd, "repair-home", "--dry-run")
 
 
-@pytest.mark.parametrize("case", ["unknown", "parent", "dirty", "dirty-preview"])
+@pytest.mark.parametrize(
+    "case",
+    ["unknown", "parent", "dirty", "dirty-preview", "untracked", "ignored"],
+)
 def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
     tmp_path: Path,
     case: str,
@@ -1380,10 +1585,19 @@ def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
     )
     if case.startswith("dirty"):
         (root / relative / "README").write_text("local changes")
+    elif case in {"untracked", "ignored"}:
+        if case == "ignored":
+            exclude = _git(root / relative, "rev-parse", "--git-path", "info/exclude")
+            (root / relative / exclude.strip()).write_text("asset\n")
+        (root / relative / "asset").write_text("preserve local data")
     before = _snapshot(root)
     arguments = ("--dry-run",) if case == "dirty-preview" else ()
-    _run(root, "rm", target, *arguments, code=1)
+    _run(root, "remove", target, *arguments, code=1)
     _expect(_snapshot(root) == before, "rejected removal changed home state")
+    if case.startswith("dirty") or case in {"untracked", "ignored"}:
+        _preview(root, "remove", target, "--force")
+        _run(root, "remove", target, "--force")
+        _expect(not (root / target).exists(), "forced removal left a dirty submodule")
 
 
 def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
@@ -1404,10 +1618,10 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     _git(root, "add", ".gitignore")
     _fixture_git(root, "commit", "-qm", "Home snapshot")
     before = _snapshot(root)
-    preview = _run(root, "rm", relative, "--dry-run")
+    preview = _run(root, "remove", relative, "--dry-run")
     _expect(relative in preview.stdout and ".gitignore" in preview.stdout, preview)
     _expect(_snapshot(root) == before, "removal preview changed home state")
-    _run(root, "rm", relative)
+    _run(root, "remove", relative)
     _expect(not (root / relative).exists(), "submodule checkout was not removed")
     lines = ignore.read_text().splitlines()
     _expect(f"!/{relative}" not in lines and f"!/{relative}/README" not in lines, lines)
@@ -1491,7 +1705,7 @@ def test_implicit_runtime_paths_cannot_bypass_declarations(
 def test_python_packages_require_the_shared_constructor() -> None:
     """Reject unsupported builders before convergence changes repository state."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _run(root, "create", "packages/example", "python")
         definition = root / "packages/example/default.nix"
         definition.write_text(
             "{ pkgs, ... }: pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
@@ -1508,34 +1722,25 @@ def test_python_packages_require_the_shared_constructor() -> None:
         _expect(_snapshot(root) == before, "ambiguous markers changed repository")
 
 
-@settings(deadline=None)
-@given(
-    arguments=st.sampled_from(
-        (
-            ("mv", "packages/example", "hosts/example"),
-            ("add", "packages/bad--name", "python"),
-            ("add", "hosts/bad-name"),
-            ("rm", "../outside"),
-            ("rm", "/outside"),
-            ("mv", "packages/example", "packages/taken"),
-            ("add", "packages/example", "python"),
-        ),
-    ),
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("move", "packages/example", "hosts/example"),
+        ("create", "packages/bad--name", "python"),
+        ("create", "hosts/bad-name"),
+        ("remove", "../outside"),
+        ("remove", "/outside"),
+        ("move", "packages/example", "packages/taken"),
+        ("create", "packages/example", "python"),
+    ],
 )
-@example(arguments=("mv", "packages/example", "hosts/example"))
-@example(arguments=("rm", "../outside"))
-@example(arguments=("rm", "/outside"))
-@example(arguments=("add", "packages/bad--name", "python"))
-@example(arguments=("add", "hosts/bad-name"))
-@example(arguments=("mv", "packages/example", "packages/taken"))
-@example(arguments=("add", "packages/example", "python"))
 def test_rejected_operations_preserve_contents_modes_index_and_refs(
     arguments: tuple[str, ...],
 ) -> None:
     """Reject invalid paths and collisions before modifying work."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
-        _run(root, "add", "packages/taken", "nix")
+        _run(root, "create", "packages/example", "python")
+        _run(root, "create", "packages/taken", "nix")
         (root / "work-in-progress").write_text("preserve unrelated work")
         before = _snapshot(root)
         rejected = _run(root, *arguments, code=1)
@@ -1570,7 +1775,7 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
             package.mkdir(parents=True)
             (package / "default.nix").write_text("{}\n")
         else:
-            _run(root, "add", original, *(() if kind == "host" else (kind,)))
+            _run(root, "create", original, *(() if kind == "host" else (kind,)))
         check = f"checks/a{name}" + ("VmWithDisko" if kind == "host" else "")
         if kind == "python":
             _expect(
@@ -1607,8 +1812,8 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
             path.write_bytes(working[relative])
         untracked = package / "prm/untracked.bin"
         untracked.write_bytes(payload)
-        _preview(root, "mv", original, destination)
-        _run(root, "mv", original, destination)
+        _preview(root, "move", original, destination)
+        _run(root, "move", original, destination)
         new_check = check.replace(f"a{name}", f"b{name}")
         for relative in tracked:
             renamed = relative.replace(original, destination).replace(check, new_check)
@@ -1647,8 +1852,8 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
             )
             return
         _repair_flake(root)
-        _preview(root, "rm", destination)
-        _run(root, "rm", destination)
+        _preview(root, "remove", destination, "--force")
+        _run(root, "remove", destination, "--force")
         _expect(
             not (root / destination).exists() and not (root / new_check).exists(),
             "remove left resource or check",
@@ -1753,28 +1958,41 @@ def test_runtime_paths_can_derive_from_declared_directories(tmp_path: Path) -> N
     _expect(not issues, issues)
 
 
-@settings(deadline=None)
-@given(labels=TEST_LABELS, form=st.sampled_from(("functions", "classes", "unittest")))
-@example(labels=["double__underscore", "async_behavior"], form="functions")
-@example(labels=["result"], form="classes")
-@example(labels=["derived", "async"], form="unittest")
-@example(labels=[], form="functions")
-@example(labels=[], form="classes")
-@example(labels=[], form="unittest")
-def test_static_test_sentences_follow_public_definitions_without_execution(
-    labels: list[str],
-    form: str,
+@pytest.mark.parametrize(
+    ("source", "expected"),
+    [
+        ("def test_result(): pass", True),
+        ("async def test_result(): pass", True),
+        ("class TestBehavior:\n    def test_result(self): pass", True),
+        (
+            (
+                "import unittest as unit\n"
+                "class Reports(unit.TestCase):\n    def test_result(self): pass"
+            ),
+            True,
+        ),
+        (
+            (
+                "from unittest import IsolatedAsyncioTestCase as Case\n"
+                "class Base(Case): pass\n"
+                "class Reports(Base):\n    async def test_result(self): pass"
+            ),
+            True,
+        ),
+        ("class Helper:\n    def test_hidden(self): pass", False),
+        ("def helper():\n    def test_hidden(): pass", False),
+        ("class TestEmpty: pass", False),
+        ("", False),
+    ],
+)
+def test_static_test_detection_does_not_execute_source(
+    tmp_path: Path,
+    source: str,
+    *,
+    expected: bool,
 ) -> None:
-    """Ignore hidden helpers and preserve public definition order and spelling."""
+    """Recognize supported test definitions without running imports or bodies."""
     subject = import_module("packages.afairesi.main")
-    source = _test_declarations(labels, form)
-    expected = [label.replace("_", " ") for label in labels]
-    _expect(
-        subject.source_test_names(source.encode(), "test_main.py") == expected,
-        source,
-    )
-    changed = source.replace("assert False", "raise RuntimeError('changed body')")
-    _expect(
-        subject.source_test_names(changed.encode(), "test_main.py") == expected,
-        changed,
-    )
+    path = tmp_path / "test_main.py"
+    path.write_text("raise RuntimeError('must not execute')\n" + source)
+    _expect(subject.has_python_tests(path) == expected, source)

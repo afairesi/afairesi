@@ -221,7 +221,7 @@ def _prepare_coverage_flake(
     reports = []
     shutil.copytree(Path(afairesi.__file__).with_name("prm"), root / "prm/builders")
     for name in ("example", "z-last"):
-        _manage(root, "add", f"packages/{name}", "python")
+        _manage(root, "create", f"packages/{name}", "python")
         package = root / "packages" / name
         source = (
             "import os\n"
@@ -586,8 +586,6 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             == _run(root, "--help").stdout,
             "standalone command unavailable through PATH",
         )
-        for retired in ("test", "add", "repair-home", "converge"):
-            _run(root, retired, code=2)
         _expect(
             "not inside a Git repository" in _run(root, code=1).stderr,
             "bare test must require a repository",
@@ -612,7 +610,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         with _fresh_repository() as root:
             target = root
             if layout == "nonpython":
-                _manage(root, "add", "packages/web", "html")
+                _manage(root, "create", "packages/web", "html")
             elif layout in {"untested", "single_untested"}:
                 target = _make_runner_target(root, "", "")
                 (target / "test_main.py").unlink()
