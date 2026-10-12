@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Remove literal NixOS and treefmt assignments equal to option defaults."""
+"""Remove literal assignments equal to NixOS, treefmt, or package defaults."""
 
 from __future__ import annotations
 
@@ -21,6 +21,13 @@ if TYPE_CHECKING:
 SKIPPED_DIRECTORIES = {".agents", ".codex", ".git", "prm", "result", "target", "tmp"}
 Literal = None | bool | int | float | str | list["Literal"] | dict[str, "Literal"]
 Candidate = tuple[tuple[str, ...], Literal]
+PACKAGE_BUILDERS = {
+    "inputs.afairesi.lib.mkPythonPackage": "flake.inputs.afairesi",
+    "inputs.self.lib.mkPythonPackage": "flake",
+    "(inputs.afairesi or inputs.self).lib.mkPythonPackage": (
+        "(flake.inputs.afairesi or flake)"
+    ),
+}
 
 
 def find_flake_root(path: Path) -> Path | None:
@@ -114,6 +121,8 @@ def _returned_expression(node: Node) -> Node:
 def collect_candidates(
     document: nix_syntax.Document,
     root: Node | None = None,
+    *,
+    module_config: bool = True,
 ) -> list[Candidate]:
     """Collect literal option assignments from a module expression."""
     expression = _returned_expression(root or document.root)
@@ -137,7 +146,7 @@ def collect_candidates(
             if path is None or value is None:
                 continue
             effective = (*prefix, *path)
-            if not prefix and effective[:1] == ("config",):
+            if module_config and not prefix and effective[:1] == ("config",):
                 effective = effective[1:]
             with contextlib.suppress(ValueError):
                 result.append((effective, literal(document, value)))
@@ -171,6 +180,24 @@ def _path_list(path: tuple[str, ...]) -> str:
     return "[ " + " ".join(nix_syntax.quote_string(part) for part in path) + " ]"
 
 
+def package_arguments(document: nix_syntax.Document) -> list[tuple[Node, str]]:
+    """Recognize direct calls to supported Afairesi package builders."""
+    node = _returned_expression(document.root)
+    if node.type != "apply_expression":
+        return []
+    argument = node.child_by_field_name("argument")
+    function = node.child_by_field_name("function")
+    if (
+        argument is None
+        or function is None
+        or argument.type != "attrset_expression"
+        or document.text(argument).lstrip().startswith("rec")
+    ):
+        return []
+    builder = PACKAGE_BUILDERS.get(nix_syntax.compact(document.text(function)))
+    return [] if builder is None else [(argument, builder)]
+
+
 def _run_nix(expression: str) -> Any:  # noqa: ANN401
     completed = subprocess.run(  # noqa: S603
         ["nix", "eval", "--impure", "--json", "--expr", expression],  # noqa: S607
@@ -201,6 +228,57 @@ def treefmt_defaults(
         f"paths = [ {' '.join(_path_list(path) for path in sorted(paths))} ]; "
         'one = path: let raw = pkgs.lib.attrByPath (path ++ [ "default" ]) (throw "missing option default") evaluated.options; tried = builtins.tryEval (builtins.deepSeq raw raw); in if tried.success then [{ inherit path; default = tried.value; }] else []; '  # noqa: E501
         "in builtins.concatMap one paths"
+    )
+    return {tuple(record["path"]): record["default"] for record in _run_nix(expression)}
+
+
+def package_defaults(
+    root: Path,
+    builder: str,
+    document: nix_syntax.Document,
+    node: Node,
+) -> dict[tuple[str, ...], Literal]:
+    """Query candidate fields against the pinned builder's omitted arguments."""
+    candidates = collect_candidates(document, node, module_config=False)
+    if not candidates:
+        return {}
+    paths = "[ " + " ".join(_path_list(path) for path, _ in candidates) + " ]"
+    expression = (
+        "let flake = builtins.getFlake (toString (/. + "
+        f"{nix_syntax.quote_string(str(root))})); "
+        f"owner = {builder}; build = owner.lib.mkPythonPackage; "
+        "nixpkgs = owner.inputs.nixpkgs or (flake.inputs.nixpkgs or null); "
+        "base = if nixpkgs == null then {} else import nixpkgs { system = builtins.currentSystem; }; "  # noqa: E501
+        "python = base.python3 or {}; "
+        "pkgs = base // { python3 = python // { pkgs = (python.pkgs or {}) // { buildPythonPackage = attrs: attrs; }; }; }; "  # noqa: E501
+        "formal = builtins.functionArgs build; "
+        "required = builtins.filter (name: !formal.${name}) (builtins.attrNames formal); "  # noqa: E501
+        "omit = path: attrs: let name = builtins.head path; rest = builtins.tail path; "
+        "in if rest == [] then builtins.removeAttrs attrs [name] "
+        "else let nested = omit rest attrs.${name}; "
+        "in if nested == {} then builtins.removeAttrs attrs [name] "
+        "else attrs // { ${name} = nested; }; "
+        'literal = value: if builtins.isAttrs value then (value.type or null) != "derivation" && builtins.all (name: literal value.${name}) (builtins.attrNames value) '  # noqa: E501
+        "else if builtins.isList value then builtins.all literal value "
+        "else if builtins.isString value then builtins.getContext value == {} "
+        "else builtins.isNull value || builtins.isBool value || builtins.isInt value || builtins.isFloat value; "  # noqa: E501
+        "follow = path: value: if path == [] then value else "
+        "if builtins.isAttrs value && builtins.hasAttr (builtins.head path) value "
+        "then follow (builtins.tail path) value.${builtins.head path} "
+        'else throw "missing package default"; '
+        "one = path: let wrapped = original: original // { lib = original.lib // { "
+        "mkPythonPackage = arguments: { captured = true; "
+        "value = build (omit path arguments); }; }; }; "
+        "inputs = flake.inputs // { self = wrapped flake; } // "
+        "(if flake.inputs ? afairesi then { afairesi = wrapped flake.inputs.afairesi; } else {}); "  # noqa: E501
+        f"package = (import (/. + {nix_syntax.quote_string(document.path)})) {{ inherit inputs pkgs; }}; "  # noqa: E501
+        'raw = if package.captured or false then follow path package.value else throw "unrecognized package call"; '  # noqa: E501
+        "tried = builtins.tryEval (if literal raw then raw "
+        'else throw "not a literal default"); '
+        "in if builtins.elem (builtins.head path) required then [] "
+        "else if tried.success then [{ inherit path; default = tried.value; }] "
+        "else []; "
+        f"in builtins.concatMap one {paths}"
     )
     return {tuple(record["path"]): record["default"] for record in _run_nix(expression)}
 
@@ -244,6 +322,8 @@ def rewrite(
     document: nix_syntax.Document,
     removals: set[tuple[str, ...]],
     root: Node | None = None,
+    *,
+    module_config: bool = True,
 ) -> str:
     """Remove selected paths and parents that become empty."""
     target = _returned_expression(root or document.root)
@@ -268,7 +348,7 @@ def rewrite(
                 rendered.append(document.text(binding))
                 continue
             effective = (*prefix, *path)
-            if not prefix and effective[:1] == ("config",):
+            if module_config and not prefix and effective[:1] == ("config",):
                 effective = effective[1:]
             if effective in removals:
                 continue
@@ -314,16 +394,44 @@ def process_repository(root: Path) -> None:
         for candidate in collect_candidates(documents[path], node)
     ]
     defaults = treefmt_defaults(root, {path for path, _ in treefmt_candidates})
-    for path, document in documents.items():
-        removals = set(nixos.get(path.resolve(), set()))
-        for node in treefmt_nodes[path]:
-            removals.update(
+    package_values = {
+        path: package_defaults(root, builder, document, node)
+        for path, document in documents.items()
+        for node, builder in package_arguments(document)
+    }
+    for path, original in documents.items():
+        document = original
+        source = document.source.decode()
+        removals = nixos.get(path.resolve(), set())
+        if removals:
+            source = rewrite(document, removals)
+            document = nix_syntax.parse(source, str(path))
+        for index in reversed(range(len(treefmt_arguments(document)))):
+            node = treefmt_arguments(document)[index]
+            removals = {
                 candidate_path
                 for candidate_path, value in collect_candidates(document, node)
                 if candidate_path in defaults and defaults[candidate_path] == value
-            )
-        if removals:
-            nix_syntax.write_if_changed(path, rewrite(document, removals))
+            }
+            if removals:
+                source = rewrite(document, removals, node)
+                document = nix_syntax.parse(source, str(path))
+        for node, _ in package_arguments(document):
+            values = package_values.get(path, {})
+            removals = {
+                candidate_path
+                for candidate_path, value in collect_candidates(
+                    document,
+                    node,
+                    module_config=False,
+                )
+                if candidate_path in values
+                and json.dumps(values[candidate_path], sort_keys=True)
+                == json.dumps(value, sort_keys=True)
+            }
+            if removals:
+                source = rewrite(document, removals, node, module_config=False)
+        nix_syntax.write_if_changed(path, source)
 
 
 def main() -> None:
@@ -333,7 +441,9 @@ def main() -> None:
         epilog=(
             "The nearest parent containing flake.nix is processed. NixOS defaults "
             "come from evaluated option metadata; treefmt defaults come from the "
-            "flake's formatter configuration. Example: nix_remove_defaults ."
+            "flake's formatter configuration. Afairesi mkPythonPackage defaults "
+            "are discovered from its pinned builder for each candidate field. "
+            "Example: nix_remove_defaults ."
         ),
     )
     parser.add_argument(

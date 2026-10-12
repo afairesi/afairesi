@@ -14,10 +14,7 @@ pkgs.stdenv.mkDerivation rec {
     install -Dm755 ${pname} "$out/bin/${pname}"
     runHook postInstall
   '';
-  meta = {
-    description = "Remove comments from source code";
-    mainProgram = pname;
-  };
+  meta.mainProgram = pname;
   nativeBuildInputs = [ pkgs.autoPatchelfHook ];
   pname = baseNameOf ./.;
   sourceRoot = ".";
