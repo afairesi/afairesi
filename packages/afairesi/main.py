@@ -2104,17 +2104,7 @@ def parser() -> argparse.ArgumentParser:
         prog="afairesi",
         description="Manage Nix flake package, host, and check conventions.",
         epilog=(
-            "Packages live in packages/, hosts in hosts/, and generated checks "
-            "in checks/. "
-            "prm/ holds other tracked files; tmp/ holds untracked runtime data. "
-            "Each package owns its runtime data and declares inputs from other "
-            "packages. "
-            "nix fmt repairs managed definitions, checks and Git tracking, "
-            "removes files "
-            "outside the permitted layout, then formats and checks code. "
-            "Move files outside the layout into prm/ before adopting these "
-            "conventions. "
-            "Repairs stage structural changes without committing them. "
+            "Use nix fmt to repair flake structure and format code. "
             "Use afairesi-home to manage $HOME and its registered repositories."
         ),
     )
