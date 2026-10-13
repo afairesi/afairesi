@@ -2365,13 +2365,30 @@ def initialize_home() -> None:
     _converge_home_ignore(root, dry_run=False)
 
 
+def _require_home_repository() -> Path:
+    """Validate home setup and explain how to initialize it."""
+    home = Path.home()
+    completed = git(
+        home,
+        ["rev-parse", "--path-format=absolute", "--show-toplevel"],
+        check=False,
+    )
+    if completed.returncode != 0:
+        msg = "$HOME must be a Git repository; run 'afairesi init-home' first"
+        raise CommandError(msg)
+    if Path(completed.stdout.strip()) != home or repository_type(home, "git") != "home":
+        msg = (
+            "$HOME must be an initialized canonical home repository; "
+            "run 'afairesi init-home' first"
+        )
+        raise CommandError(msg)
+    return home
+
+
 def initialize_submodule(remote: str) -> None:
     """Add a hosted repository at its canonical home-relative path."""
     relative = canonical_remote_path(remote)
-    home = Path.home()
-    if repository_root(home) != home or repository_type(home) != "home":
-        message = "$HOME must be an initialized canonical home repository"
-        raise CommandError(message)
+    home = _require_home_repository()
     _validate_managed_path(home, relative)
     directories = _missing_directories(home, [relative.parent])
     try:
@@ -2412,16 +2429,42 @@ def _remote_is_empty(remote: str) -> bool:
     return not completed.stdout.strip()
 
 
+def _require_nix_flakes() -> str:
+    """Check the effective Nix features before initialization changes files."""
+    executable = os.environ.get("AFAIRESI_NIX", "nix")
+    try:
+        completed = _run(
+            [executable, "config", "show", "experimental-features"],
+            check=False,
+        )
+    except FileNotFoundError as error:
+        msg = f"Nix executable not found: {executable}; install Nix to use init-flake"
+        raise CommandError(msg) from error
+    if completed.returncode != 0:
+        msg = f"could not check Nix features: {completed.stderr.strip()}"
+        raise CommandError(
+            msg + "\ninit-flake requires Nix with "
+            "'experimental-features = nix-command flakes'",
+        )
+    missing = {"nix-command", "flakes"} - set(completed.stdout.split())
+    if missing:
+        msg = (
+            f"init-flake requires Nix features: {', '.join(sorted(missing))}; "
+            "enable them with 'experimental-features = nix-command flakes' "
+            "in your Nix configuration"
+        )
+        raise CommandError(msg)
+    return executable
+
+
 def initialize_flake(remote: str) -> None:
     """Create a canonical flake at its remote-derived home path."""
     relative = canonical_remote_path(remote)
-    home = Path.home()
-    if repository_root(home) != home or repository_type(home) != "home":
-        msg = "$HOME must be an initialized canonical home repository"
-        raise CommandError(msg)
+    home = _require_home_repository()
     _home_ignore_source(home)
     home_submodules(home)
     _validate_managed_path(home, relative)
+    nix_executable = _require_nix_flakes()
     if not _remote_is_empty(remote):
         msg = "init-flake requires an empty remote"
         raise CommandError(msg)
@@ -2440,7 +2483,7 @@ def initialize_flake(remote: str) -> None:
         )
         (directory / "README").write_text(readme, encoding="utf-8")
         _run(
-            [os.environ.get("AFAIRESI_NIX", "nix"), "flake", "lock"],
+            [nix_executable, "flake", "lock"],
             cwd=directory,
         )
         detected_packages = detect_packages(directory)
@@ -2453,7 +2496,7 @@ def initialize_flake(remote: str) -> None:
             encoding="utf-8",
         )
         _run(
-            [os.environ.get("AFAIRESI_NIX", "nix"), "fmt"],
+            [nix_executable, "fmt"],
             cwd=directory,
         )
         git(directory, ["add", "--all"])
@@ -2514,6 +2557,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="afairesi",
         description=(
+            "Afairesi — conventions for a minimal persistent computing environment.\n\n"
             "Manage persistent files and directory layouts in $HOME and its Git\n"
             "repositories through shared Git, Nix flake, and code conventions.\n"
             "These conventions reduce repository-specific configuration and,\n"
@@ -2523,8 +2567,6 @@ def parser() -> argparse.ArgumentParser:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "Requirements:\n"
-            "  Git and Nix with flakes enabled.\n\n"
             "Conventions:\n"
             "  Git tracks $HOME using a .gitignore whitelist. Submodules containing\n"
             "  Nix flakes live at $HOME/<remote-hostname>/<repository-path>, with\n"
@@ -2532,10 +2574,8 @@ def parser() -> argparse.ArgumentParser:
             "  Package layouts define source and test files; prm/ holds other\n"
             "  tracked files and tmp/ holds untracked runtime data. Code follows\n"
             "  shared formatting and strict lint rules.\n"
-            "  Packages store runtime data at\n"
-            "  $HOME/<remote-hostname>/<repository-path>/packages/NAME/tmp/,\n"
-            "  independently of the working directory, and may explicitly read\n"
-            "  another package's data.\n\n"
+            "  Each package owns its runtime data in tmp/ and declares inputs\n"
+            "  from other packages explicitly.\n\n"
             "Repository management:\n"
             "  Creating, moving, or removing resources updates the whitelist and\n"
             "  related checks. Home repairs keep submodule paths, registration, and\n"
@@ -2566,9 +2606,8 @@ def parser() -> argparse.ArgumentParser:
             "and register it as a submodule."
         ),
         epilog=(
-            "Requires an initialized home repository. Stage its whitelist and "
-            "submodule registration without creating commits or pushing. On "
-            "failure, restore the previous whitelist and its staged entry."
+            "Stage the home whitelist and submodule registration without "
+            "creating commits or pushing."
         ),
     )
     clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
@@ -2576,11 +2615,7 @@ def parser() -> argparse.ArgumentParser:
         "create",
         help="create a package or host",
         description="Create and stage a canonical package or host.",
-        epilog=(
-            "Update and stage the repository whitelist and related checks. "
-            "Reject existing resource directories and symlinks in managed paths. "
-            "On failure, restore the previous whitelist and its staged entry."
-        ),
+        epilog=("Update and stage the repository whitelist and related checks."),
     )
     create.add_argument(
         "resource",
@@ -2591,7 +2626,7 @@ def parser() -> argparse.ArgumentParser:
         "type",
         nargs="?",
         metavar="TYPE",
-        help="package type (html, latex, nix, python)",
+        help=f"package type ({', '.join(PACKAGE_KINDS)})",
     )
     create.add_argument(
         "description",
@@ -2607,7 +2642,7 @@ def parser() -> argparse.ArgumentParser:
             "$HOME/<remote-hostname>/<repository-path>."
         ),
         epilog=(
-            "Requires an initialized home repository. Clone the remote, scaffold "
+            "Clone the remote, scaffold "
             "and format the flake, commit its initial main branch, register and "
             "stage it as a home submodule, then push."
         ),
@@ -2654,8 +2689,7 @@ def parser() -> argparse.ArgumentParser:
             "entries while preserving shared parents. Removal rejects local changes "
             "and untracked data unless --force is given. Flake removal updates "
             "the whitelist and removes related checks, including runtime data "
-            "inside the removed resource. Validate every target before deleting "
-            "files. Paths are relative to the repository root."
+            "inside the removed resource. Paths are relative to the repository root."
         ),
     )
     remove.add_argument(

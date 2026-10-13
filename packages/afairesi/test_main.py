@@ -354,7 +354,8 @@ def test_init_flake_commits_registers_and_publishes_an_empty_remote(
     monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.test")
     fake_nix = tmp_path / "nix"
     fake_nix.write_text(
-        '#!/bin/sh\nif [ "$1" = flake ]; then printf "{}\\n" > flake.lock; '
+        '#!/bin/sh\nif [ "$1" = config ]; then printf "nix-command flakes\\n"; '
+        'elif [ "$1" = flake ]; then printf "{}\\n" > flake.lock; '
         "else mkdir -p .git/hooks; cat > .git/hooks/pre-push <<'HOOK'\n"
         '#!/bin/sh\ngit -C "$HOME" config --file .gitmodules '
         "--get-regexp '^submodule\\..*\\.path$' >/dev/null\n"
@@ -401,6 +402,83 @@ def test_init_flake_commits_registers_and_publishes_an_empty_remote(
     if not _git(home, "ls-files", "--stage", "--", relative).startswith("160000 "):
         message = "init-flake did not stage its submodule"
         raise AssertionError(message)
+
+
+@pytest.mark.parametrize("features", ["", "nix-command", "flakes"])
+def test_init_flake_checks_nix_features_before_creating_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    features: str,
+) -> None:
+    """Reject disabled features with instructions before cloning or staging."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(
+        "NIX_CONFIG",
+        f"experimental-features = {features}\nextra-experimental-features =\n",
+    )
+    _run(tmp_path, "init-home")
+    before = _snapshot(home)
+    result = _run(
+        tmp_path,
+        "init-flake",
+        "https://example.test/team/new.git",
+        code=1,
+    )
+    _expect("experimental-features = nix-command flakes" in result.stderr, result)
+    _expect(_snapshot(home) == before, "Nix prerequisite failure changed home")
+    _expect(not (home / "example.test").exists(), "prerequisite check created paths")
+
+
+def test_init_flake_reports_missing_nix_before_creating_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Explain missing Nix without creating the checkout or changing the index."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("AFAIRESI_NIX", str(tmp_path / "missing-nix"))
+    _run(tmp_path, "init-home")
+    before = _snapshot(home)
+    result = _run(
+        tmp_path,
+        "init-flake",
+        "https://example.test/team/new.git",
+        code=1,
+    )
+    _expect("Nix executable not found" in result.stderr, result)
+    _expect(_snapshot(home) == before, "missing Nix changed home")
+
+
+@pytest.mark.parametrize("command", ["clone", "init-flake"])
+@pytest.mark.parametrize("initialized_git", [False, True])
+def test_home_prerequisites_explain_initialization_without_changes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    *,
+    initialized_git: bool,
+) -> None:
+    """Direct missing home setup to init-home without modifying the home."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    if initialized_git:
+        _git(home, "init", "--quiet")
+    before = _snapshot(home) if initialized_git else None
+    result = _run(
+        tmp_path,
+        command,
+        "https://example.test/team/new.git",
+        code=1,
+    )
+    _expect("afairesi init-home" in result.stderr, result)
+    if initialized_git:
+        _expect(_snapshot(home) == before, "home prerequisite check changed Git state")
+    else:
+        _expect(not list(home.iterdir()), "home prerequisite check created files")
 
 
 def _check_home_commits(
