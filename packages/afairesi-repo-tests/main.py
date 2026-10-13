@@ -40,7 +40,7 @@ def _command_target(target: Path | None) -> Path:
     if repository_type(root) != "flake":
         msg = (
             "test campaigns require a flake; use git submodule foreach "
-            "'afairesi-tests' for home"
+            "'afairesi-repo-tests' for home"
         )
         raise CommandError(msg)
     return root
@@ -614,7 +614,9 @@ def _run_test_repository(
             )
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"afairesi-tests {command}: {package.name}: {error}\n")
+            sys.stderr.write(
+                f"afairesi-repo-tests {command}: {package.name}: {error}\n",
+            )
     sys.stdout.write("\nRepository summary:\n")
     for package_name, status in outcomes.items():
         sys.stdout.write(f"  {package_name}: {status}\n")
@@ -765,7 +767,7 @@ def _run_coverage(target: Path) -> bool:
             outcomes[package.name] = "passed"
         except (CommandError, OSError) as error:
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"afairesi-tests coverage: {package.name}: {error}\n")
+            sys.stderr.write(f"afairesi-repo-tests coverage: {package.name}: {error}\n")
     if repository:
         sys.stdout.write("\nRepository summary:\n")
         for name, status in outcomes.items():
@@ -796,11 +798,11 @@ def _mutation_lines(value: str) -> tuple[int, int]:
 def parser() -> argparse.ArgumentParser:
     """Construct the test campaign command-line parser."""
     result = argparse.ArgumentParser(
-        prog="afairesi-tests",
+        prog="afairesi-repo-tests",
         description=(
             "Run coverage, property tests, and mutation tests for Afairesi "
             "packages. Without a subcommand, run all three campaigns in the "
-            "current flake. Use git submodule foreach 'afairesi-tests' to test "
+            "current flake. Use git submodule foreach 'afairesi-repo-tests' to test "
             "home submodules."
         ),
     )
@@ -971,7 +973,7 @@ def _dispatch_test_command(
             )
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[command] = False
-            sys.stderr.write(f"afairesi-tests {command}: {target}: {error}\n")
+            sys.stderr.write(f"afairesi-repo-tests {command}: {target}: {error}\n")
     if combined:
         sys.stdout.write("\nCampaign summary:\n")
         for command, success in outcomes.items():

@@ -163,7 +163,7 @@ def _run_runner_cli(
     executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603
-        ["afairesi-tests", command, str(root), *arguments],  # noqa: S607
+        ["afairesi-repo-tests", command, str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
@@ -409,7 +409,7 @@ def _manage(
     code: int = 0,
 ) -> subprocess.CompletedProcess[str]:
     """Set up repository fixtures through the management executable."""
-    return _run(root, *arguments, code=code, executable="afairesi")
+    return _run(root, "repo", *arguments, code=code, executable="afairesi")
 
 
 def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
@@ -417,7 +417,7 @@ def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Route campaigns independently of their expensive test engines."""
-    subject = import_module("packages.afairesi-tests.main")
+    subject = import_module("packages.afairesi-repo-tests.main")
     root = _repository(tmp_path)
     package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
     nested = package / "prm/nested"
@@ -437,7 +437,7 @@ def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
     for cwd in (package, nested):
         monkeypatch.chdir(cwd)
         observed.clear()
-        monkeypatch.setattr(sys, "argv", ["afairesi-tests"])
+        monkeypatch.setattr(sys, "argv", ["afairesi-repo-tests"])
         with pytest.raises(SystemExit) as combined:
             subject.main()
         _expect(combined.value.code == 0 and observed == [root] * 3, observed)
@@ -478,7 +478,7 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
             _run(
                 root,
                 "--help",
-                executable="afairesi-tests",
+                executable="afairesi-repo-tests",
                 environment=environment,
             ).stdout
             == _run(root, "--help").stdout,
@@ -546,7 +546,7 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
     failure: str | None,
 ) -> None:
     """Execute every campaign in order even when an earlier campaign fails."""
-    subject = import_module("packages.afairesi-tests.main")
+    subject = import_module("packages.afairesi-repo-tests.main")
     _repository(tmp_path)
     monkeypatch.chdir(tmp_path)
     observed: list[str] = []
@@ -570,12 +570,12 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
 
     monkeypatch.setattr(subject, "_run_coverage", coverage_run)
     monkeypatch.setattr(subject, "_run_test_repository", runner)
-    monkeypatch.setattr(sys, "argv", ["afairesi-tests", "--help"])
+    monkeypatch.setattr(sys, "argv", ["afairesi-repo-tests", "--help"])
     with pytest.raises(SystemExit) as help_status:
         subject.main()
     _expect(help_status.value.code == 0 and not observed, observed)
     capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["afairesi-tests"])
+    monkeypatch.setattr(sys, "argv", ["afairesi-repo-tests"])
     with pytest.raises(SystemExit) as completed:
         subject.main()
     _expect(completed.value.code == (0 if failure is None else 1), completed)
@@ -684,7 +684,7 @@ def test_coverage_continues_after_failed_nix_builds() -> None:
         _expect(
             "z-last:" in result.stdout
             and "/html/index.html" in result.stdout
-            and "afairesi-tests coverage: example:" in result.stderr,
+            and "afairesi-repo-tests coverage: example:" in result.stderr,
             result,
         )
         _expect(
@@ -701,7 +701,7 @@ def test_coverage_rejects_missing_checks_and_report_files(
     missing: str,
 ) -> None:
     """Validate coverage output guards without rebuilding a successful package."""
-    subject = import_module("packages.afairesi-tests.main")
+    subject = import_module("packages.afairesi-repo-tests.main")
     root = tmp_path / "source"
     root.mkdir()
     _repository(root)
@@ -734,7 +734,7 @@ def test_coverage_rejects_missing_checks_and_report_files(
         "html": "no HTML report",
         "tests": "no test report",
     }[missing]
-    monkeypatch.setattr(sys, "argv", ["afairesi-tests", "coverage", str(package)])
+    monkeypatch.setattr(sys, "argv", ["afairesi-repo-tests", "coverage", str(package)])
     with pytest.raises(SystemExit) as completed:
         subject.main()
     _expect(completed.value.code == 1 and message in capsys.readouterr().err, completed)
@@ -748,7 +748,7 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Validate package eligibility and continuation separately from Nix builds."""
-    subject = import_module("packages.afairesi-tests.main")
+    subject = import_module("packages.afairesi-repo-tests.main")
     _repository(tmp_path)
     _make_source_package(tmp_path, "alpha", "def invalid(")
     untested = _make_source_package(tmp_path, "untested", "")
@@ -757,7 +757,7 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
     built: list[Path] = []
     monkeypatch.setattr(subject, "_build_package_coverage", built.append)
     before = _snapshot(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["afairesi-tests", "coverage", str(tmp_path)])
+    monkeypatch.setattr(sys, "argv", ["afairesi-repo-tests", "coverage", str(tmp_path)])
     with pytest.raises(SystemExit) as completed:
         subject.main()
     _expect(completed.value.code == 1, "invalid source must fail coverage")
@@ -765,7 +765,7 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
     _expect(built == [ready], built)
     _expect(
         "1 passed, 1 failed, 1 skipped" in output.out
-        and "afairesi-tests coverage: alpha:" in output.err,
+        and "afairesi-repo-tests coverage: alpha:" in output.err,
         output,
     )
     _expect(_snapshot(tmp_path) == before, "coverage eligibility modified sources")
@@ -1150,7 +1150,7 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
 
 def test_static_cli_declares_commands_and_campaign_filters() -> None:
     """Preserve campaign filter arguments in the public parser."""
-    subject = import_module("packages.afairesi-tests.main")
+    subject = import_module("packages.afairesi-repo-tests.main")
     for campaign in ("hypothesis", "mutation"):
         options = subject.parser().parse_args(
             [campaign, "-k", "keyword", "-m", "marker"],
@@ -1167,11 +1167,11 @@ def test_campaign_home_target_requires_native_git_traversal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Reject home scope instead of silently traversing registered submodules."""
-    subject = import_module("packages.afairesi-tests.main")
+    subject = import_module("packages.afairesi-repo-tests.main")
     _git(tmp_path, "init", "--quiet")
     (tmp_path / ".gitmodules").touch()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["afairesi-tests"])
+    monkeypatch.setattr(sys, "argv", ["afairesi-repo-tests"])
     with pytest.raises(SystemExit) as completed:
         subject.main()
     _expect(completed.value.code == 1, completed)
