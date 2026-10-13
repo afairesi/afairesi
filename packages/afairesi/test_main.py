@@ -677,6 +677,15 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
     _expect(_snapshot(root) == before, arguments)
 
 
+def _history_snapshot(root: Path) -> dict[Path, bytes]:
+    """Observe stored Git files without requiring a surviving worktree."""
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
 PACKAGE_NAMES = st.from_regex(
     r"[a-z][a-z0-9]{0,5}(?:[-_][a-z0-9]{1,5})?",
     fullmatch=True,
@@ -1775,15 +1784,33 @@ def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
         _expect(not (root / target).exists(), "forced removal left a dirty submodule")
 
 
+@pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
 def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    name: str,
 ) -> None:
     """Preview and remove a repository together with its owned whitelist entries."""
     root = _home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
     _git(root, "submodule", "absorbgitdirs")
+    if name != relative:
+        _git(
+            root,
+            "config",
+            "--file",
+            ".gitmodules",
+            "--rename-section",
+            f"submodule.{relative}",
+            f"submodule.{name}",
+        )
+        _git(root, "add", ".gitmodules")
+    _git(root, "config", f"submodule.{name}.url", "git@forge.example:owner/demo")
+    _git(root, "config", f"submodule.{name}.active", "true")
+    _git(root, "config", "submodule.unrelated.active", "false")
+    history = root / ".git/modules" / relative
+    history_before = _history_snapshot(history)
     ignore = root / ".gitignore"
     ignore.write_text(
         ignore.read_text()
@@ -1809,10 +1836,115 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
         _expect(entry in lines, lines)
     subject = import_module("packages.afairesi.main")
     _expect(subject.home_submodules(root) == [], "submodule remains registered")
+    _expect(
+        _git(root, "config", "--local", "--get-regexp", r"^submodule\.").strip()
+        == "submodule.unrelated.active false",
+        "removal left local registration or changed unrelated settings",
+    )
+    _expect(
+        _history_snapshot(history) == history_before,
+        "removal changed stored history",
+    )
     staged = _git(root, "diff", "--cached", "--name-only").splitlines()
     _expect(set(staged) == {".gitignore", ".gitmodules", relative}, staged)
     _expect(not _git(root, "diff", "--name-only"), "metadata was not staged")
     _run(root, "repair-home", "--dry-run")
+
+
+@pytest.mark.parametrize("registered", [True, False])
+@pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
+def test_home_repair_prunes_stale_local_submodule_configuration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    *,
+    registered: bool,
+) -> None:
+    """Prune stale sections without changing active settings or stored history."""
+    root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
+    relative = "forge.example/owner/demo"
+    _git(root, "submodule", "absorbgitdirs")
+    if name != relative:
+        _git(
+            root,
+            "config",
+            "--file",
+            ".gitmodules",
+            "--rename-section",
+            f"submodule.{relative}",
+            f"submodule.{name}",
+        )
+        _git(root, "add", ".gitmodules")
+    else:
+        _git(root, "config", f"submodule.{name}.url", "git@forge.example:owner/demo")
+    _git(root, "config", f"submodule.{name}.active", "true")
+    _git(root, "config", f"submodule.{name}.update", "none")
+    _git(root, "config", "submodule.active", "forge.example/*")
+    _git(
+        root,
+        "config",
+        "submodule.removed.with.dots.url",
+        "git@forge.example:old/repo",
+    )
+    _git(root, "config", "submodule.active-only.active", "true")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
+    if not registered:
+        _git(root, "rm", "--", relative)
+        (root / ".gitmodules").unlink()
+    history = root / ".git/modules" / relative
+    history_before = _history_snapshot(history)
+    before = _snapshot(root)
+    preview = _run(root, "repair-home", "--dry-run")
+    _expect("remove local submodule registration" in preview.stdout, preview)
+    _expect(_snapshot(root) == before, "pruning preview changed home state")
+    _run(root, "repair-home")
+    submodule_settings = {
+        line
+        for line in _git(root, "config", "--local", "--list").splitlines()
+        if line.startswith("submodule.") and not line.startswith("submodule.active=")
+    }
+    _expect(
+        submodule_settings
+        == (
+            {
+                f"submodule.{relative}.active=true",
+                f"submodule.{relative}.update=none",
+            }
+            | (
+                {f"submodule.{relative}.url=git@forge.example:owner/demo"}
+                if name == relative
+                else set()
+            )
+            if registered
+            else set()
+        ),
+        "repair left stale registrations",
+    )
+    _expect(
+        _git(root, "config", "--local", "--get", "submodule.active").strip()
+        == "forge.example/*",
+        "repair changed shared submodule settings",
+    )
+    if registered:
+        _expect(
+            _git(
+                root,
+                "config",
+                "--local",
+                "--get",
+                f"submodule.{relative}.update",
+            ).strip()
+            == "none",
+            "repair changed active submodule settings",
+        )
+    _expect(
+        _history_snapshot(history) == history_before,
+        "repair changed stored history",
+    )
+    after = _snapshot(root)
+    _run(root, "repair-home")
+    _expect(_snapshot(root) == after, "repeated repair changed home state")
 
 
 def test_home_submodule_whitelist_move_preserves_unrelated_entries(

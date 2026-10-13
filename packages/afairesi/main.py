@@ -309,6 +309,41 @@ def home_submodules(
     return repositories
 
 
+def _local_submodule_names(root: Path) -> set[str]:
+    """Read submodule section names from the repository's own configuration."""
+    completed = git(
+        root,
+        [
+            "config",
+            "--local",
+            "--null",
+            "--name-only",
+            "--get-regexp",
+            r"^submodule\..*\..*$",
+        ],
+        check=False,
+    )
+    if completed.returncode == 1 and not completed.stdout and not completed.stderr:
+        return set()
+    if completed.returncode != 0:
+        msg = (
+            f"could not read local submodule configuration: {completed.stderr.strip()}"
+        )
+        raise CommandError(msg)
+    return {
+        key.removeprefix("submodule.").rsplit(".", 1)[0]
+        for key in completed.stdout.split("\0")
+        if key
+    }
+
+
+def _remove_local_submodule(root: Path, name: str, *, dry_run: bool) -> None:
+    """Unregister a submodule while preserving its stored Git history."""
+    _change(f"remove local submodule registration '{name}'", dry_run=dry_run)
+    if not dry_run:
+        git(root, ["config", "--local", "--remove-section", f"submodule.{name}"])
+
+
 def _home_ignore_source(root: Path) -> str:
     """Validate the home whitelist and include its required entries."""
     path = root / ".gitignore"
@@ -408,16 +443,12 @@ def _converge_home_submodule(
                     f"submodule.{expected.as_posix()}",
                 ],
             )
-            configured = git(
-                root,
-                ["config", "--get", f"submodule.{repository['name']}.url"],
-                check=False,
-            )
-            if configured.returncode == 0:
+            if repository["name"] in _local_submodule_names(root):
                 git(
                     root,
                     [
                         "config",
+                        "--local",
                         "--rename-section",
                         f"submodule.{repository['name']}",
                         f"submodule.{expected.as_posix()}",
@@ -537,6 +568,12 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
             expected,
             dry_run=dry_run,
         )
+    registered = {
+        repository["name"]
+        for repository in (repositories if dry_run else home_submodules(root))
+    }
+    for name in sorted(_local_submodule_names(root) - registered):
+        _remove_local_submodule(root, name, dry_run=dry_run)
     return repositories
 
 
@@ -2006,11 +2043,12 @@ def remove_home_submodule(
 ) -> None:
     """Remove a registered home submodule and its owned whitelist entries."""
     relative = Path(value)
+    repositories = home_submodules(root)
     if (
         relative.is_absolute()
         or ".." in relative.parts
         or relative.as_posix()
-        not in {repository["path"] for repository in home_submodules(root)}
+        not in {repository["path"] for repository in repositories}
     ):
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
@@ -2040,6 +2078,13 @@ def remove_home_submodule(
     if dry_run:
         arguments.insert(2, "--dry-run")
     git(root, arguments)
+    name = next(
+        repository["name"]
+        for repository in repositories
+        if repository["path"] == relative.as_posix()
+    )
+    if name in _local_submodule_names(root):
+        _remove_local_submodule(root, name, dry_run=dry_run)
     _change(f"remove submodule '{relative}' and update '.gitmodules'", dry_run=dry_run)
     _write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
@@ -2719,6 +2764,7 @@ def parser() -> argparse.ArgumentParser:
         epilog=(
             "Move submodules to <remote-hostname>/<repository-path>, migrate "
             "whitelist entries, initialize missing checkouts, and stage repairs. "
+            "Remove stale local submodule registrations while keeping Git history. "
             "Existing checkouts retain their commits and local changes. "
             "Run nix fmt inside each flake repository to repair its layout and code."
         ),
