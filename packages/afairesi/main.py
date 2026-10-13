@@ -337,13 +337,6 @@ def _local_submodule_names(root: Path) -> set[str]:
     }
 
 
-def _remove_local_submodule(root: Path, name: str, *, dry_run: bool) -> None:
-    """Unregister a submodule while preserving its stored Git history."""
-    _change(f"remove local submodule registration '{name}'", dry_run=dry_run)
-    if not dry_run:
-        git(root, ["config", "--local", "--remove-section", f"submodule.{name}"])
-
-
 def _home_ignore_source(root: Path) -> str:
     """Validate the home whitelist and include its required entries."""
     path = root / ".gitignore"
@@ -568,12 +561,6 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
             expected,
             dry_run=dry_run,
         )
-    registered = {
-        repository["name"]
-        for repository in (repositories if dry_run else home_submodules(root))
-    }
-    for name in sorted(_local_submodule_names(root) - registered):
-        _remove_local_submodule(root, name, dry_run=dry_run)
     return repositories
 
 
@@ -2075,16 +2062,17 @@ def remove_home_submodule(
     arguments = ["rm", "-r", "--", f":(literal){relative.as_posix()}"]
     if force:
         arguments.insert(2, "--force")
-    if dry_run:
-        arguments.insert(2, "--dry-run")
+    arguments.insert(2, "--dry-run")
     git(root, arguments)
-    name = next(
-        repository["name"]
-        for repository in repositories
-        if repository["path"] == relative.as_posix()
-    )
-    if name in _local_submodule_names(root):
-        _remove_local_submodule(root, name, dry_run=dry_run)
+    _change(f"deinitialize submodule '{relative}' with Git", dry_run=dry_run)
+    if not dry_run:
+        git(root, ["submodule", "absorbgitdirs", "--", f":(literal){relative}"])
+        deinit = ["submodule", "deinit", "--", f":(literal){relative}"]
+        if force:
+            deinit.insert(2, "--force")
+        git(root, deinit)
+        arguments.remove("--dry-run")
+        git(root, arguments)
     _change(f"remove submodule '{relative}' and update '.gitmodules'", dry_run=dry_run)
     _write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
@@ -2622,6 +2610,9 @@ def parser() -> argparse.ArgumentParser:
             "  Each package owns its runtime data in tmp/ and declares inputs\n"
             "  from other packages explicitly.\n\n"
             "Repository management:\n"
+            "  Afairesi is a convention manager built on native Git and Nix commands.\n"
+            "  Its commands and repairs operate within the conventions above;\n"
+            "  other operations belong to the native tools.\n"
             "  Creating, moving, or removing resources updates the whitelist and\n"
             "  related checks. Home repairs keep submodule paths, registration, and\n"
             "  whitelist entries consistent with their remotes.\n"
@@ -2730,7 +2721,8 @@ def parser() -> argparse.ArgumentParser:
         help="remove a home submodule, package, or host",
         description="Remove and stage a registered home submodule or flake resource.",
         epilog=(
-            "Home removal uses git rm and removes the submodule's whitelist "
+            "Home removal uses git submodule deinit and git rm, and removes "
+            "the submodule's whitelist "
             "entries while preserving shared parents. Removal rejects local changes "
             "and untracked data unless --force is given. Flake removal updates "
             "the whitelist and removes related checks, including runtime data "
@@ -2764,7 +2756,6 @@ def parser() -> argparse.ArgumentParser:
         epilog=(
             "Move submodules to <remote-hostname>/<repository-path>, migrate "
             "whitelist entries, initialize missing checkouts, and stage repairs. "
-            "Remove stale local submodule registrations while keeping Git history. "
             "Existing checkouts retain their commits and local changes. "
             "Run nix fmt inside each flake repository to repair its layout and code."
         ),

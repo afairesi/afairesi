@@ -683,6 +683,7 @@ def _history_snapshot(root: Path) -> dict[Path, bytes]:
         path.relative_to(root): path.read_bytes()
         for path in root.rglob("*")
         if path.is_file()
+        and path.relative_to(root).parts[0] in {"objects", "refs", "logs", "HEAD"}
     }
 
 
@@ -1853,14 +1854,14 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
 
 @pytest.mark.parametrize("registered", [True, False])
 @pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
-def test_home_repair_prunes_stale_local_submodule_configuration(
+def test_home_repair_preserves_unrelated_local_submodule_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     name: str,
     *,
     registered: bool,
 ) -> None:
-    """Prune stale sections without changing active settings or stored history."""
+    """Keep unrelated local registrations while repairing convention metadata."""
     root = _home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
@@ -1896,30 +1897,26 @@ def test_home_repair_prunes_stale_local_submodule_configuration(
     history_before = _history_snapshot(history)
     before = _snapshot(root)
     preview = _run(root, "repair-home", "--dry-run")
-    _expect("remove local submodule registration" in preview.stdout, preview)
-    _expect(_snapshot(root) == before, "pruning preview changed home state")
+    _expect("remove local submodule registration" not in preview.stdout, preview)
+    _expect(_snapshot(root) == before, "repair preview changed home state")
     _run(root, "repair-home")
     submodule_settings = {
         line
         for line in _git(root, "config", "--local", "--list").splitlines()
         if line.startswith("submodule.") and not line.startswith("submodule.active=")
     }
+    expected_name = relative if registered else name
+    expected_settings = {
+        f"submodule.{expected_name}.active=true",
+        f"submodule.{expected_name}.update=none",
+        "submodule.removed.with.dots.url=git@forge.example:old/repo",
+        "submodule.active-only.active=true",
+    }
+    if name == relative:
+        expected_settings.add(f"submodule.{relative}.url=git@forge.example:owner/demo")
     _expect(
-        submodule_settings
-        == (
-            {
-                f"submodule.{relative}.active=true",
-                f"submodule.{relative}.update=none",
-            }
-            | (
-                {f"submodule.{relative}.url=git@forge.example:owner/demo"}
-                if name == relative
-                else set()
-            )
-            if registered
-            else set()
-        ),
-        "repair left stale registrations",
+        submodule_settings == expected_settings,
+        "repair changed unrelated registrations or lost active settings",
     )
     _expect(
         _git(root, "config", "--local", "--get", "submodule.active").strip()
