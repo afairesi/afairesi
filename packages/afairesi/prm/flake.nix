@@ -47,7 +47,7 @@ let
               _: package: package ? runtimeHook && package.runtimeHook != ""
             ) repositoryInputs.self.packages.${system};
             generated = nixlib.mapAttrs (name: package: {
-              inherit (package) meta;
+              meta = { description = "Run ${name}"; } // (package.meta or { });
               type = "app";
               program = toString (pkgs.writeShellScript "${name}-run" ''
                 set -e

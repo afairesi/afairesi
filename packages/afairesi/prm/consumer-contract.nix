@@ -15,6 +15,18 @@ let
   };
   system = pkgs.stdenv.hostPlatform.system;
   package = consumer.packages.${system}.example;
+  descriptionless = inputs.self.blueprint {
+    inputs = {
+      self = {
+        outPath = ./consumer-contract;
+        packages.${system}.example = package.overridePythonAttrs (attributes: {
+          meta = builtins.removeAttrs attributes.meta [ "description" ];
+        });
+      };
+      afairesi = inputs.self;
+    };
+    systems = [ system ];
+  };
   accepts = attributes:
     (builtins.tryEval (inputs.self.lib.mkPythonPackage ({
       inherit pkgs;
@@ -35,6 +47,8 @@ assert consumer.devShells.${system} ? example-test;
 assert consumer.apps.${system}.example.type == "app";
 assert consumer.apps.${system}.example.meta == package.meta;
 assert consumer.apps.${system}.example.meta.description == "Afairesi consumer contract example";
+assert descriptionless.apps.${system}.example.meta.description == "Run example";
+assert descriptionless.apps.${system}.example.meta.mainProgram == "example";
 assert !(package.drvAttrs ? runtimeHook);
 assert !(accepts { shellHook = "echo obsolete"; });
 assert !(accepts { executable = false; runtimeHook = "echo invalid"; });
