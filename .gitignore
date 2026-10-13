@@ -6,6 +6,8 @@
 !/LICENSE
 !/README
 !/checks/
+!/checks/afairesi-home/
+!/checks/afairesi-home/default.nix
 !/checks/afairesi-tests/
 !/checks/afairesi-tests/default.nix
 !/checks/afairesi/
@@ -24,6 +26,10 @@
 !/flake.nix
 !/formatter.nix
 !/packages/
+!/packages/afairesi-home/
+!/packages/afairesi-home/default.nix
+!/packages/afairesi-home/main.py
+!/packages/afairesi-home/test_main.py
 !/packages/afairesi-tests/
 !/packages/afairesi-tests/default.nix
 !/packages/afairesi-tests/main.py

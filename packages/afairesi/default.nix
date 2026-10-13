@@ -5,7 +5,7 @@ in
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
-  meta.description = "Manage persistent home and flake repository structure";
+  meta.description = "Manage Nix flake package, host, and check conventions";
   passthru = {
     checkInputs = [
       (import ../../formatter.nix {

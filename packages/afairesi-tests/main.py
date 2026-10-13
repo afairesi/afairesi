@@ -26,7 +26,6 @@ import afairesi
 from afairesi import (
     CommandError,
     has_python_tests,
-    home_submodules,
     repository_root,
     repository_type,
     validate_name,
@@ -38,7 +37,12 @@ def _command_target(target: Path | None) -> Path:
     if target is not None:
         return target.resolve()
     root = repository_root()
-    repository_type(root)
+    if repository_type(root) != "flake":
+        msg = (
+            "test campaigns require a flake; use git submodule foreach "
+            "'afairesi-tests' for home"
+        )
+        raise CommandError(msg)
     return root
 
 
@@ -796,7 +800,8 @@ def parser() -> argparse.ArgumentParser:
         description=(
             "Run coverage, property tests, and mutation tests for Afairesi "
             "packages. Without a subcommand, run all three campaigns in the "
-            "current flake or the registered submodules of the current home repository."
+            "current flake. Use git submodule foreach 'afairesi-tests' to test "
+            "home submodules."
         ),
     )
     result.set_defaults(test_command=None, target=None)
@@ -806,7 +811,7 @@ def parser() -> argparse.ArgumentParser:
         help="measure test coverage and print HTML report paths",
         description="Measure coverage from explicit test examples.",
         epilog=(
-            "Repository targets skip packages without tests and summarize results. "
+            "Repository targets skip packages without tests. "
             "HTML reports are stored in the Nix store. "
             "Use nix fmt to create or update checks."
         ),
@@ -817,15 +822,14 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="package, flake, or home (default: current repository and its submodules)",
+        help="package or flake (default: current flake repository)",
     )
     hypothesis = commands.add_parser(
         "hypothesis",
         help="run generated property tests in isolated package copies",
         description="Run generated property tests in isolated package copies.",
         epilog=(
-            "Repository targets run Python packages sequentially, skip packages "
-            "without test_main.py, and summarize results. Logs and reports "
+            "Repository targets skip packages without test_main.py. Logs and reports "
             "are retained under the flake's tmp/ directory."
         ),
     )
@@ -835,7 +839,7 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="package, flake, or home (default: current repository and its submodules)",
+        help="package or flake (default: current flake repository)",
     )
     hypothesis.add_argument(
         "--timeout",
@@ -856,8 +860,7 @@ def parser() -> argparse.ArgumentParser:
         help="run mutation tests in isolated package copies",
         description="Run mutation tests in isolated package copies.",
         epilog=(
-            "Repository targets run Python packages sequentially, skip packages "
-            "without test_main.py, and summarize results. Logs and reports "
+            "Repository targets skip packages without test_main.py. Logs and reports "
             "are retained under the flake's tmp/ directory."
         ),
     )
@@ -867,7 +870,7 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="package, flake, or home (default: current repository and its submodules)",
+        help="package or flake (default: current flake repository)",
     )
     mutation.add_argument(
         "--timeout",
@@ -939,43 +942,6 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _run_test_targets(
-    campaign: argparse.Namespace,
-    cli: argparse.ArgumentParser,
-    target: Path,
-    targets: list[Path],
-) -> bool:
-    """Run one campaign across selected repositories and collect every failure."""
-    command = campaign.test_command
-    results: dict[Path, bool] = {}
-    for selected in targets:
-        selected_options = argparse.Namespace(**vars(campaign))
-        selected_options.target = selected
-        if selected != target:
-            sys.stdout.write(f"\nRunning {command} for {selected}...\n")
-            sys.stdout.flush()
-        try:
-            results[selected] = (
-                _run_coverage(selected)
-                if command == "coverage"
-                else _dispatch_test_runner(selected_options, cli)
-            )
-        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-            results[selected] = False
-            sys.stderr.write(f"afairesi-tests {command}: {selected}: {error}\n")
-        except KeyboardInterrupt:
-            sys.stderr.write(f"afairesi-tests {command}: interrupted\n")
-            sys.exit(130)
-    if targets != [target]:
-        sys.stdout.write(f"\nSubmodule summary ({command}):\n")
-        for selected, success in results.items():
-            sys.stdout.write(
-                f"  {selected.relative_to(target)}: "
-                f"{'passed' if success else 'failed'}\n",
-            )
-    return all(results.values())
-
-
 def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
@@ -983,7 +949,6 @@ def _dispatch_test_command(
     """Run selected campaigns, continuing after failures and returning one status."""
     combined = options.test_command is None
     target = _command_target(options.target)
-    targets = _test_targets(target)
     if combined:
         campaigns = [
             cli.parse_args([command, str(target)])
@@ -997,31 +962,21 @@ def _dispatch_test_command(
         if combined:
             sys.stdout.write(f"\nRunning {command} campaign...\n")
             sys.stdout.flush()
-        outcomes[command] = _run_test_targets(campaign, cli, target, targets)
+        campaign.target = target
+        try:
+            outcomes[command] = (
+                _run_coverage(target)
+                if command == "coverage"
+                else _dispatch_test_runner(campaign, cli)
+            )
+        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
+            outcomes[command] = False
+            sys.stderr.write(f"afairesi-tests {command}: {target}: {error}\n")
     if combined:
         sys.stdout.write("\nCampaign summary:\n")
         for command, success in outcomes.items():
             sys.stdout.write(f"  {command}: {'passed' if success else 'failed'}\n")
     sys.exit(0 if all(outcomes.values()) else 1)
-
-
-def _test_targets(target: Path) -> list[Path]:
-    """Expand a home target into its registered submodules without changing them."""
-    if repository_type(target, "git") != "home":
-        return [target]
-    targets = []
-    for repository in home_submodules(target, require_url=False):
-        checkout = (target / repository["path"]).resolve()
-        if not checkout.is_relative_to(target) or checkout == target:
-            message = (
-                f"submodule path escapes the home repository: {repository['path']}"
-            )
-            raise CommandError(message)
-        targets.append(checkout)
-    if not targets:
-        message = f"no submodules found under {target}"
-        raise CommandError(message)
-    return targets
 
 
 def main() -> None:
