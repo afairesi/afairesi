@@ -13,13 +13,13 @@
   outputs =
     inputs:
     let
-      flake = lib.blueprint { inherit inputs; };
+      blueprint = import ./packages/afairesi/prm/blueprint.nix { inherit inputs; };
+      flake = blueprint { inherit inputs; };
       lib = import ./packages/afairesi/prm/flake.nix { inherit inputs; };
     in
     flake
     // {
-      inherit lib;
-      inherit (lib) blueprint;
+      inherit blueprint lib;
       formatter = lib.mkFormatter { inherit (inputs) self; };
       packages = builtins.mapAttrs (
         _: packages: packages // { default = packages.afairesi; }

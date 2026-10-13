@@ -2102,8 +2102,12 @@ def parser() -> argparse.ArgumentParser:
     """Construct the flake resource command-line parser."""
     result = argparse.ArgumentParser(
         prog="afairesi",
-        description="Manage Nix flake package, host, and check conventions.",
+        description=(
+            "Manage Nix flake package, host, and check conventions. "
+            "Structural changes are staged for review."
+        ),
         epilog=(
+            "Use Git for diffs, commits, branches, and remote synchronization. "
             "Use nix fmt to repair flake structure and format code. "
             "Use afairesi-home to manage $HOME and its registered repositories."
         ),

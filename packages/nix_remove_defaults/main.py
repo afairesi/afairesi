@@ -22,8 +22,6 @@ SKIPPED_DIRECTORIES = {".agents", ".codex", ".git", "prm", "result", "target", "
 Literal = None | bool | int | float | str | list["Literal"] | dict[str, "Literal"]
 Candidate = tuple[tuple[str, ...], Literal]
 PACKAGE_BUILDERS = {
-    "inputs.afairesi.lib.mkPythonPackage": "flake.inputs.afairesi",
-    "inputs.self.lib.mkPythonPackage": "flake",
     "(inputs.afairesi or inputs.self).lib.mkPythonPackage": (
         "(flake.inputs.afairesi or flake)"
     ),

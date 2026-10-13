@@ -27,12 +27,18 @@ let
     };
     systems = [ system ];
   };
-  accepts = attributes:
-    (builtins.tryEval (inputs.self.lib.mkPythonPackage ({
-      inherit pkgs;
-      executable = true;
-      src = ./consumer-contract/packages/example;
-    } // attributes))).success;
+  accepts =
+    attributes:
+    (builtins.tryEval (
+      inputs.self.lib.mkPythonPackage (
+        {
+          inherit pkgs;
+          executable = true;
+          src = ./consumer-contract/packages/example;
+        }
+        // attributes
+      )
+    )).success;
 in
 assert
   package.consumerConfig == {
@@ -51,9 +57,15 @@ assert descriptionless.apps.${system}.example.meta.description == "Run example";
 assert descriptionless.apps.${system}.example.meta.mainProgram == "example";
 assert !(package.drvAttrs ? runtimeHook);
 assert !(accepts { shellHook = "echo obsolete"; });
-assert !(accepts { executable = false; runtimeHook = "echo invalid"; });
+assert
+  !(accepts {
+    executable = false;
+    runtimeHook = "echo invalid";
+  });
 assert !(inputs.self.apps.${system} ? afairesi);
 assert !(inputs.self.lib ? mkFlake);
+assert !(inputs.self.lib ? blueprint);
+assert inputs.self.packages.${system}.default == inputs.self.packages.${system}.afairesi;
 pkgs.runCommand "afairesi-consumer-contract" { } ''
   unset AFAIRESI_CONSUMER_HOOK
   expected=$(printf '%s\n' loaded "['two words', '--flag']")

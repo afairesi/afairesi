@@ -973,11 +973,11 @@ def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
         (root / relative / "asset").write_text("preserve local data")
     before = _snapshot(root)
     arguments = ("--dry-run",) if case == "dirty-preview" else ()
-    _run(root, "remove", target, *arguments, code=1)
+    _run(root, "rm", target, *arguments, code=1)
     _expect(_snapshot(root) == before, "rejected removal changed home state")
     if case.startswith("dirty") or case in {"untracked", "ignored"}:
-        _preview(root, "remove", target, "--force")
-        _run(root, "remove", target, "--force")
+        _preview(root, "rm", target, "--force")
+        _run(root, "rm", target, "--force")
         _expect(not (root / target).exists(), "forced removal left a dirty submodule")
 
 
@@ -1036,10 +1036,10 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     _git(root, "add", ".gitignore")
     _fixture_git(root, "commit", "-qm", "Home snapshot")
     before = _snapshot(root)
-    preview = _run(cwd, "remove", relative, "--dry-run")
+    preview = _run(cwd, "rm", relative, "--dry-run")
     _expect(relative in preview.stdout and ".gitignore" in preview.stdout, preview)
     _expect(_snapshot(root) == before, "removal preview changed home state")
-    _run(cwd, "remove", relative)
+    _run(cwd, "rm", relative)
     _expect(_snapshot(flake) == flake_before, "removal changed unrelated flake")
     _expect(not list(outside.iterdir()), "removal changed outside path")
     _expect(not (root / relative).exists(), "submodule checkout was not removed")
@@ -1198,7 +1198,7 @@ def test_home_submodule_whitelist_move_preserves_unrelated_entries(
 
 def test_home_cli_exposes_only_home_lifecycle_commands(tmp_path: Path) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("clone", "init", "init-flake", "remove", "repair")
+    commands = ("clone", "init", "init-flake", "repair", "rm")
     help_output = _run(tmp_path, "--help").stdout
     _expect(_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -1208,6 +1208,7 @@ def test_home_cli_exposes_only_home_lifecycle_commands(tmp_path: Path) -> None:
     for arguments in (
         ("create",),
         ("move",),
+        ("remove", "github.com/example/repository"),
         ("clone",),
         ("init-flake",),
         ("init", "unexpected"),
@@ -1225,6 +1226,6 @@ def test_home_commands_reject_flake_repositories_without_changes(
     (tmp_path / "flake.nix").touch()
     monkeypatch.setenv("HOME", str(tmp_path))
     before = _snapshot(tmp_path)
-    for arguments in (("init",), ("repair",), ("remove", "packages/example")):
+    for arguments in (("init",), ("repair",), ("rm", "packages/example")):
         _run(tmp_path, *arguments, code=1)
         _expect(_snapshot(tmp_path) == before, "home command changed flake state")

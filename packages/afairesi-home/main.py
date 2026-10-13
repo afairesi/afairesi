@@ -493,6 +493,8 @@ def parser() -> argparse.ArgumentParser:
             "Repairs stage structural changes without committing them."
         ),
         epilog=(
+            "Use Git for diffs, commits, branches, and remote synchronization. "
+            "Only init-flake creates a commit and pushes. "
             "Use afairesi inside flake repositories to manage packages and hosts. "
             "Use nix fmt to repair flake structure and format code. "
             "Run git submodule foreach 'afairesi-tests' to test all "
@@ -536,8 +538,26 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     init_flake.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
+    repair_home = commands.add_parser(
+        "repair",
+        help="repair the home repository whitelist and submodule layout",
+        description=(
+            "Repair the repository at $HOME: its whitelist and registered "
+            "submodule paths and names, from any working directory."
+        ),
+        epilog=(
+            "Move submodules to <remote-hostname>/<repository-path>, migrate "
+            "whitelist entries, and stage repairs for existing checkouts. "
+        ),
+    )
+    repair_home.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="report required repairs without changes",
+    )
     remove = commands.add_parser(
-        "remove",
+        "rm",
         help="remove a registered home submodule",
         description=(
             "Remove and stage a registered submodule of $HOME "
@@ -565,24 +585,6 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="allow deletion of local changes and untracked data",
     )
-    repair_home = commands.add_parser(
-        "repair",
-        help="repair the home repository whitelist and submodule layout",
-        description=(
-            "Repair the repository at $HOME: its whitelist and registered "
-            "submodule paths and names, from any working directory."
-        ),
-        epilog=(
-            "Move submodules to <remote-hostname>/<repository-path>, migrate "
-            "whitelist entries, and stage repairs for existing checkouts. "
-        ),
-    )
-    repair_home.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="report required repairs without changes",
-    )
     return result
 
 
@@ -601,7 +603,7 @@ def main() -> None:
             initialize_flake(options.remote)
         elif options.command == "repair":
             converge_home(_require_home_repository(), options.dry_run)
-        elif options.command == "remove":
+        elif options.command == "rm":
             root = _require_home_repository()
             remove_home_submodule(
                 root,

@@ -51,7 +51,7 @@ def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
     )
     overrides = root / "overrides.nix"
     overrides.write_text(
-        """{ inputs, pkgs, ... }: inputs.afairesi.lib.mkPythonPackage {
+        """{ inputs, pkgs, ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {
           inherit pkgs; executable = true; src = ./.;
           version = "0.0.0"; propagatedBuildInputs = [ "dependency" ];
           customFlag = false; retryCount = 4; settings.mode = "manual";
@@ -62,7 +62,8 @@ def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
     )
     recursive = root / "recursive.nix"
     recursive.write_text(
-        """{ inputs, pkgs, ... }: inputs.afairesi.lib.mkPythonPackage rec {
+        """{ inputs, pkgs, ... }:
+        (inputs.afairesi or inputs.self).lib.mkPythonPackage rec {
           inherit pkgs; executable = true; src = ./.;
           version = "7.2.0"; passthru.version = version;
         }""",
@@ -75,7 +76,7 @@ def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
     )
     self_package = root / "self.nix"
     self_package.write_text(
-        """{ inputs, pkgs, ... }: inputs.self.lib.mkPythonPackage {
+        """{ inputs, pkgs, ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {
           inherit pkgs; src = ./.; executable = false; version = "7.2.0";
           propagatedBuildInputs = [];
           customFlag = false;
@@ -83,9 +84,21 @@ def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
         encoding="utf-8",
     )
     preserved = {path: path.read_text() for path in (overrides, recursive, unrelated)}
+    for name, constructor in (
+        ("external", "inputs.afairesi.lib.mkPythonPackage"),
+        ("self", "inputs.self.lib.mkPythonPackage"),
+    ):
+        path = root / f"noncanonical-{name}.nix"
+        path.write_text(
+            f"{{ inputs, pkgs, ... }}: {constructor} {{\n"
+            '  inherit pkgs; src = ./.; executable = false; version = "7.2.0";\n'
+            "}\n",
+            encoding="utf-8",
+        )
+        preserved[path] = path.read_text()
     contextual = root / "contextual.nix"
     contextual.write_text(
-        """{ inputs, pkgs, ... }: inputs.afairesi.lib.mkPythonPackage {
+        """{ inputs, pkgs, ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {
           inherit pkgs; src = ./.; executable = true;
           specialOption = 9; retryCount = 9;
         }""",
