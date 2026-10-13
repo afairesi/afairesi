@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Afairesi: a minimal computing environment."""
+"""Afairesi manages repository structure for Nix flakes through enforced conventions."""
 
 from __future__ import annotations
 
@@ -2751,7 +2751,10 @@ def parser() -> argparse.ArgumentParser:
     """Construct the workspace command-line parser."""
     result = argparse.ArgumentParser(
         prog="afairesi",
-        description="Afairesi: a minimal computing environment.",
+        description=(
+            "Afairesi manages repository structure for Nix flakes "
+            "through enforced conventions."
+        ),
     )
     scopes = result.add_subparsers(dest="scope", title="commands", metavar="SCOPE")
     repo = scopes.add_parser(
