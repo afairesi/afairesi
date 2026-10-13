@@ -951,10 +951,12 @@ def test_home_repair_targets_home_from_any_working_directory(
 )
 def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     case: str,
 ) -> None:
     """Reject ambiguous paths and local changes without changing home state."""
     root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
     _git(root, "submodule", "absorbgitdirs")
     _fixture_git(root, "commit", "-qm", "Home snapshot")
@@ -979,16 +981,35 @@ def test_home_submodule_removal_rejects_invalid_or_dirty_targets(
         _expect(not (root / target).exists(), "forced removal left a dirty submodule")
 
 
+@pytest.mark.parametrize(
+    "location",
+    ["home", "nested", "submodule", "flake", "outside"],
+)
 @pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
 def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     name: str,
+    location: str,
 ) -> None:
     """Preview and remove a repository together with its owned whitelist entries."""
-    root = _home_repository(tmp_path)
+    root = _home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
+    flake = tmp_path / "flake"
+    flake.mkdir()
+    _git(flake, "init", "--quiet")
+    (flake / "flake.nix").touch()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cwd = {
+        "home": root,
+        "nested": (root / relative).parent,
+        "submodule": root / relative,
+        "flake": flake,
+        "outside": outside,
+    }[location]
+    flake_before = _snapshot(flake)
     _git(root, "submodule", "absorbgitdirs")
     if name != relative:
         _git(
@@ -1015,10 +1036,12 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     _git(root, "add", ".gitignore")
     _fixture_git(root, "commit", "-qm", "Home snapshot")
     before = _snapshot(root)
-    preview = _run(root, "remove", relative, "--dry-run")
+    preview = _run(cwd, "remove", relative, "--dry-run")
     _expect(relative in preview.stdout and ".gitignore" in preview.stdout, preview)
     _expect(_snapshot(root) == before, "removal preview changed home state")
-    _run(root, "remove", relative)
+    _run(cwd, "remove", relative)
+    _expect(_snapshot(flake) == flake_before, "removal changed unrelated flake")
+    _expect(not list(outside.iterdir()), "removal changed outside path")
     _expect(not (root / relative).exists(), "submodule checkout was not removed")
     lines = ignore.read_text().splitlines()
     _expect(f"!/{relative}" not in lines and f"!/{relative}/README" not in lines, lines)

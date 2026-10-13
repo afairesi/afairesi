@@ -2117,7 +2117,11 @@ def parser() -> argparse.ArgumentParser:
         "create",
         help="create a package or host",
         description="Create and stage a canonical package or host.",
-        epilog=("Update and stage the repository whitelist and related checks."),
+        epilog=(
+            "Update and stage the repository whitelist. Host creation also "
+            "generates and stages its check. New Python packages have no tests "
+            "or checks; add tests, then run nix fmt to generate their checks."
+        ),
     )
     create.add_argument(
         "resource",

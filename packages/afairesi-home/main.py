@@ -20,7 +20,6 @@ from afairesi import (
     read_regular,
     remove_empty_directories,
     report_change,
-    repository_root,
     repository_type,
     require_nix_flakes,
     run,
@@ -540,7 +539,10 @@ def parser() -> argparse.ArgumentParser:
     remove = commands.add_parser(
         "remove",
         help="remove a registered home submodule",
-        description="Remove and stage a registered home submodule.",
+        description=(
+            "Remove and stage a registered submodule of $HOME "
+            "from any working directory."
+        ),
         epilog=(
             "Remove the submodule's registration and whitelist entries. "
             "Reject local changes and untracked data unless --force is given."
@@ -600,13 +602,7 @@ def main() -> None:
         elif options.command == "repair":
             converge_home(_require_home_repository(), options.dry_run)
         elif options.command == "remove":
-            root = repository_root()
-            if repository_type(root) != "home":
-                msg = (
-                    "remove requires a home repository; "
-                    "use afairesi for flake resources"
-                )
-                raise CommandError(msg)  # noqa: TRY301
+            root = _require_home_repository()
             remove_home_submodule(
                 root,
                 options.resource,
