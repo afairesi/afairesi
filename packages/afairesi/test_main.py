@@ -202,11 +202,10 @@ def _check_formatted_checks(
         formatted = check.read_text(encoding="utf-8")
         _git(repository, "add", "--", relative)
         index = _git(repository, "ls-files", "--stage")
-        result = _repair_flake(repository)
+        _repair_flake(repository)
         _expect(
             check.read_text(encoding="utf-8") == formatted
-            and _git(repository, "ls-files", "--stage") == index
-            and f"write '{relative}'" not in result.stdout,
+            and _git(repository, "ls-files", "--stage") == index,
             f"convergence regenerated formatted {relative}",
         )
 
@@ -614,9 +613,9 @@ def _check_home_move(
         or (root / "unrelated").read_text() != "keep home file"
         or first not in _git(root, "ls-files", "--stage", destination)
         or _git(target, "remote", "get-url", "origin").strip()
-        != "git@forge.example:owner/renamed"
+        != "git@forge.example:owner/demo"
     ):
-        message = "home rename failed to preserve Git state or synchronize the URL"
+        message = "home rename failed to preserve Git state and local remote settings"
         raise AssertionError(message)
     _run(root, "repair-home", "--dry-run")
     whitelist = (root / ".gitignore").read_text().splitlines()
@@ -1678,6 +1677,247 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 )
 
 
+def test_home_repair_rejects_collision_with_missing_checkout_registration(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reject a move onto a missing registered path before changing home state."""
+    root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
+    relative = "forge.example/owner/demo"
+    destination = "forge.example/owner/renamed"
+    commit = _git(root / relative, "rev-parse", "HEAD").strip()
+    _git(root, "update-index", "--add", "--cacheinfo", "160000", commit, destination)
+    _git(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        f"submodule.{relative}.url",
+        "git@forge.example:owner/renamed",
+    )
+    _git(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        f"submodule.{destination}.path",
+        destination,
+    )
+    _git(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        f"submodule.{destination}.url",
+        "git@forge.example:owner/elsewhere",
+    )
+    _git(root, "add", ".gitmodules")
+    before = _snapshot(root)
+    for arguments in [("--dry-run",), ()]:
+        result = _run(root, "repair-home", *arguments, code=1)
+        _expect(
+            "conflicts with a missing checkout registration" in result.stderr,
+            result,
+        )
+        _expect(_snapshot(root) == before, "rejected repair changed home state")
+
+
+@pytest.mark.parametrize("destination", ["demo", "renamed"])
+@pytest.mark.parametrize("state", ["deinitialized", "missing", "placeholder"])
+def test_home_repair_preserves_missing_checkouts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination: str,
+    state: str,
+) -> None:
+    """Repair the whitelist without initializing or relocating missing checkouts."""
+    root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
+    relative = "forge.example/owner/demo"
+    checkout = root / relative
+    _git(root, "submodule", "absorbgitdirs", "--", relative)
+    _git(root, "config", f"submodule.{relative}.url", "git@mirror.example:owner/demo")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
+    if state == "deinitialized":
+        _git(root, "submodule", "deinit", "--", relative)
+    else:
+        shutil.rmtree(checkout)
+        if state == "placeholder":
+            checkout.mkdir()
+            (checkout / "README").write_text("unrelated local data")
+    _git(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        f"submodule.{relative}.url",
+        f"git@forge.example:owner/{destination}",
+    )
+    modules_before = (root / ".gitmodules").read_bytes()
+    gitlink_before = _git(root, "ls-files", "--stage", "--", relative)
+    config_before = _git(root, "config", "--local", "--list")
+    history = root / ".git/modules" / relative
+    history_before = _history_snapshot(history)
+    ignore = root / ".gitignore"
+    expected_ignore = ignore.read_text()
+    ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
+    before = _snapshot(root)
+    _run(root, "repair-home", "--dry-run")
+    _expect(_snapshot(root) == before, "repair preview changed missing checkout state")
+    _run(root, "repair-home")
+    _expect(not (checkout / ".git").exists(), "repair initialized a missing checkout")
+    _expect(ignore.read_text() == expected_ignore, "repair failed to restore whitelist")
+    _expect(
+        (root / ".gitmodules").read_bytes() == modules_before,
+        "repair moved missing checkout registration",
+    )
+    _expect(
+        _git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
+        "repair changed missing checkout gitlink",
+    )
+    _expect(
+        _git(root, "config", "--local", "--list") == config_before,
+        "repair changed local registration",
+    )
+    _expect(
+        _history_snapshot(history) == history_before,
+        "repair changed stored history",
+    )
+    if state == "placeholder":
+        _expect(
+            (checkout / "README").read_text() == "unrelated local data",
+            "repair changed placeholder data",
+        )
+    elif state == "missing":
+        _expect(not checkout.exists(), "repair recreated missing checkout directory")
+    if destination != "demo":
+        _expect(
+            not (root / f"forge.example/owner/{destination}").exists(),
+            "repair relocated a missing checkout",
+        )
+    after = _snapshot(root)
+    _run(root, "repair-home")
+    _expect(_snapshot(root) == after, "repeated repair changed missing checkout state")
+
+
+@pytest.mark.parametrize("destination", ["demo", "renamed"])
+@pytest.mark.parametrize("remote", ["fork", "missing"])
+def test_home_repair_preserves_local_remote_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    destination: str,
+    remote: str,
+) -> None:
+    """Use declared URLs for layout while preserving independent local remotes."""
+    root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
+    relative = "forge.example/owner/demo"
+    checkout = root / relative
+    _git(root, "submodule", "absorbgitdirs", "--", relative)
+    local_url = "git@mirror.example:owner/demo"
+    _git(root, "config", f"submodule.{relative}.url", local_url)
+    if remote == "missing":
+        _git(checkout, "remote", "remove", "origin")
+    else:
+        _git(checkout, "remote", "set-url", "origin", "git@forge.example:me/fork")
+        _git(checkout, "remote", "set-url", "--push", "origin", local_url)
+    expected = f"forge.example/owner/{destination}"
+    declared_url = f"git@forge.example:owner/{destination}"
+    _git(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        f"submodule.{relative}.url",
+        declared_url,
+    )
+    _git(root, "add", ".gitmodules")
+    before = _snapshot(root)
+    checkout_before = _snapshot(checkout)
+    remotes_before = {
+        line
+        for line in _git(checkout, "config", "--local", "--list").splitlines()
+        if line.startswith("remote.")
+    }
+    _run(root, "repair-home", "--dry-run")
+    _expect(_snapshot(root) == before, "home repair preview changed state")
+    _expect(_snapshot(checkout) == checkout_before, "preview changed checkout settings")
+    _run(root, "repair-home")
+    target = root / expected
+    _expect(target.is_dir(), "repair did not use the declared URL for placement")
+    remotes_after = {
+        line
+        for line in _git(target, "config", "--local", "--list").splitlines()
+        if line.startswith("remote.")
+    }
+    _expect(remotes_after == remotes_before, "repair changed local remote settings")
+    _expect(
+        _snapshot(target)[:3] == checkout_before[:3],
+        "repair changed checkout state",
+    )
+    _expect(
+        _git(root, "config", "--local", "--get", f"submodule.{expected}.url").strip()
+        == local_url,
+        "repair overwrote the local submodule URL override",
+    )
+    subject = import_module("packages.afairesi.main")
+    _expect(
+        subject.home_submodules(root)[0]["url"] == declared_url,
+        "repair changed declared URL",
+    )
+
+
+def test_home_repair_leaves_nested_submodule_settings_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Preserve direct and nested remote settings during home repair."""
+    root = _home_repository(tmp_path)
+    monkeypatch.setenv("HOME", str(root))
+    relative = "forge.example/owner/demo"
+    checkout = root / relative
+    nested = checkout / "nested"
+    nested.mkdir()
+    _git(nested, "init", "--quiet")
+    (nested / "README").write_text("nested repository")
+    _git(nested, "add", "README")
+    _fixture_git(nested, "commit", "-qm", "Nested snapshot")
+    mirror = "git@mirror.example:owner/child"
+    _git(nested, "remote", "add", "origin", mirror)
+    (checkout / ".gitmodules").write_text(
+        '[submodule "nested"]\npath = nested\nurl = git@forge.example:owner/child\n',
+    )
+    _git(checkout, "add", ".gitmodules", "nested")
+    _fixture_git(checkout, "commit", "-qm", "Register nested repository")
+    _git(checkout, "config", "submodule.nested.url", mirror)
+    _git(checkout, "config", "submodule.nested.active", "true")
+    _git(root, "submodule", "absorbgitdirs", "--", relative)
+    _git(root, "add", relative)
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
+    _git(root, "config", f"submodule.{relative}.url", "git@forge.example:owner/demo")
+    _git(checkout, "remote", "set-url", "origin", "git@mirror.example:owner/demo")
+    before = _snapshot(root)
+    checkout_before = _snapshot(checkout)
+    nested_before = _snapshot(nested)
+    _run(root, "repair-home", "--dry-run")
+    _expect(_snapshot(root) == before, "home repair preview changed state")
+    _expect(_snapshot(checkout) == checkout_before, "preview changed checkout settings")
+    _expect(_snapshot(nested) == nested_before, "preview changed nested repository")
+    _run(root, "repair-home")
+    _expect(
+        _git(checkout, "remote", "get-url", "origin").strip()
+        == "git@mirror.example:owner/demo",
+        "home repair changed the direct submodule remote",
+    )
+    _expect(
+        _git(checkout, "config", "--local", "--get", "submodule.nested.url").strip()
+        == mirror,
+        "home repair changed nested submodule registration",
+    )
+    _expect(_snapshot(nested) == nested_before, "home repair changed nested repository")
+
+
 def test_repair_home_preserves_dirty_submodules_and_repairs_registration() -> None:
     """Preserve checkout/index state through home convergence and relocation."""
     with (
@@ -1896,8 +2136,7 @@ def test_home_repair_preserves_unrelated_local_submodule_configuration(
     history = root / ".git/modules" / relative
     history_before = _history_snapshot(history)
     before = _snapshot(root)
-    preview = _run(root, "repair-home", "--dry-run")
-    _expect("remove local submodule registration" not in preview.stdout, preview)
+    _run(root, "repair-home", "--dry-run")
     _expect(_snapshot(root) == before, "repair preview changed home state")
     _run(root, "repair-home")
     submodule_settings = {

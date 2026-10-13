@@ -400,6 +400,8 @@ def _converge_home_submodule(
 ) -> bool:
     """Converge one home submodule record and checkout."""
     actual = Path(repository["path"])
+    if not (root / actual / ".git").exists():
+        return False
     changed = False
     if actual != expected:
         _change(f"move '{actual}' to '{expected}'", dry_run=dry_run)
@@ -449,20 +451,6 @@ def _converge_home_submodule(
                 )
     if changed and not dry_run:
         git(root, ["add", "--", ".gitmodules"])
-    checkout = root / (actual if dry_run and actual != expected else expected)
-    if not (checkout / ".git").exists():
-        _change(f"initialize submodule '{expected}'", dry_run=dry_run)
-        changed = True
-        if not dry_run:
-            git(root, ["submodule", "update", "--init", "--", str(expected)])
-    if (checkout / ".git").exists():
-        changed |= _sync_submodule_url(
-            root,
-            checkout,
-            expected,
-            repository["url"],
-            dry_run=dry_run,
-        )
     return changed
 
 
@@ -492,38 +480,6 @@ def _move_home_whitelist(
     return _write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
 
-def _sync_submodule_url(
-    root: Path,
-    checkout: Path,
-    expected: Path,
-    configured_url: str,
-    *,
-    dry_run: bool,
-) -> bool:
-    """Synchronize a present submodule URL without changing its recorded commit."""
-    changed = False
-    origin = git(checkout, ["remote", "get-url", "origin"], check=False)
-    if origin.returncode != 0:
-        msg = f"{expected}: checkout has no origin remote"
-        raise CommandError(msg)
-    if origin.stdout.strip() != configured_url:
-        _change(
-            f"synchronize submodule URL for '{expected}'",
-            dry_run=dry_run,
-        )
-        changed = True
-        if not dry_run:
-            git(root, ["submodule", "sync", "--recursive", "--", str(expected)])
-            synchronized = git(checkout, ["remote", "get-url", "origin"], check=False)
-            if (
-                synchronized.returncode != 0
-                or synchronized.stdout.strip() != configured_url
-            ):
-                msg = f"{expected}: origin does not match .gitmodules URL after sync"
-                raise CommandError(msg)
-    return changed
-
-
 def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: FBT001
     """Converge a canonical home repository."""
     repositories = home_submodules(root)
@@ -537,12 +493,19 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
     if len(set(actual_paths)) != len(actual_paths):
         msg = "duplicate configured repository path"
         raise CommandError(msg)
-    for actual, expected in zip(actual_paths, expected_paths, strict=True):
+    repair_paths = [
+        expected if (root / actual / ".git").exists() else actual
+        for actual, expected in zip(actual_paths, expected_paths, strict=True)
+    ]
+    if len(set(repair_paths)) != len(repair_paths):
+        msg = "canonical repository path conflicts with a missing checkout registration"
+        raise CommandError(msg)
+    for actual, expected in zip(actual_paths, repair_paths, strict=True):
         if actual != expected and (root / expected).exists():
             msg = f"target already exists: {expected}"
             raise CommandError(msg)
     if (
-        actual_paths != expected_paths
+        actual_paths != repair_paths
         and git(
             root,
             ["diff", "--quiet", "--", ".gitmodules"],
@@ -552,9 +515,9 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
         msg = "stage .gitmodules with git add before moving submodules"
         raise CommandError(msg)
     _converge_home_ignore(root, dry_run=dry_run)
-    for expected in expected_paths:
+    for expected in repair_paths:
         _allow_home_submodule(root, expected, dry_run=dry_run)
-    for repository, expected in zip(repositories, expected_paths, strict=True):
+    for repository, expected in zip(repositories, repair_paths, strict=True):
         _converge_home_submodule(
             root,
             repository,
@@ -2615,7 +2578,7 @@ def parser() -> argparse.ArgumentParser:
             "  other operations belong to the native tools.\n"
             "  Creating, moving, or removing resources updates the whitelist and\n"
             "  related checks. Home repairs keep submodule paths, registration, and\n"
-            "  whitelist entries consistent with their remotes.\n"
+            "  whitelist entries consistent with .gitmodules.\n"
             "  In flake repositories, nix fmt repairs managed package definitions\n"
             "  and checks, updates Git tracking, and removes files outside the\n"
             "  permitted layout before formatting and checking code. Permitted\n"
@@ -2751,12 +2714,14 @@ def parser() -> argparse.ArgumentParser:
         help="repair the home repository whitelist and submodule layout",
         description=(
             "Repair the repository at $HOME: its whitelist and registered "
-            "submodule paths, names, and URLs, from any working directory."
+            "submodule paths and names, from any working directory."
         ),
         epilog=(
             "Move submodules to <remote-hostname>/<repository-path>, migrate "
-            "whitelist entries, initialize missing checkouts, and stage repairs. "
-            "Existing checkouts retain their commits and local changes. "
+            "whitelist entries, and stage repairs for existing checkouts. "
+            "Missing or deinitialized checkouts remain untouched. "
+            "Existing checkouts retain their commits, local changes, and "
+            "remote settings. "
             "Run nix fmt inside each flake repository to repair its layout and code."
         ),
     )
