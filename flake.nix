@@ -19,6 +19,7 @@
     // {
       inherit lib;
       inherit (lib) blueprint;
+      defaultPackage = builtins.mapAttrs (_: packages: packages.afairesi) inputs.self.packages;
       formatter = lib.mkFormatter { inherit (inputs) self; };
     };
 }
