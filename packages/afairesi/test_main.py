@@ -116,7 +116,7 @@ def _check_excluded_trees(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Skip excluded subtrees while still rejecting unmanaged files and symlinks."""
-    _run(repository, "create", "packages/example", "python")
+    _run(repository, "add", "packages/example", "python")
     excluded = [
         repository / name
         for name in (
@@ -157,7 +157,7 @@ def _check_formatted_checks(
     repository: Path,
 ) -> None:
     """Preserve formatted generated checks through the full formatting pipeline."""
-    _run(repository, "create", "hosts/laptop")
+    _run(repository, "add", "hosts/laptop")
     (repository / "packages/example/test_main.py").write_text(
         "def test_result(): pass\n",
     )
@@ -181,7 +181,7 @@ def _check_formatted_checks(
 
 def _check_host_repair(repository: Path) -> None:
     """Repair a changed check while preserving its host and resource inventory."""
-    _run(repository, "create", "hosts/laptop")
+    _run(repository, "add", "hosts/laptop")
     host = repository / "hosts/laptop/configuration.nix"
     original_host = host.read_bytes()
     original_paths = _git(repository, "ls-files").splitlines()
@@ -431,7 +431,7 @@ def test_create_stages_the_requested_resource_and_whitelist(
         head = _git(root, "rev-parse", "HEAD")
         relative = "hosts/example" if kind == "host" else "packages/example"
         arguments = () if kind == "host" else (kind, "Shared", "command description")
-        _run(root, "create", relative, *arguments)
+        _run(root, "add", relative, *arguments)
         resource = root / relative
         _expect(
             {path.name for path in resource.iterdir()} == filenames,
@@ -473,7 +473,7 @@ def test_create_rejects_invalid_resource_arguments_without_changes(
     """Reject missing or incompatible resource arguments with an actionable error."""
     with _fresh_repository() as root:
         before = _snapshot(root)
-        result = _run(root, "create", *arguments, code=1)
+        result = _run(root, "add", *arguments, code=1)
         _expect(message in result.stderr, result)
         _expect(_snapshot(root) == before, "invalid create changed state")
 
@@ -484,9 +484,9 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         root = Path(directory)
         commands = (
             (),
-            ("create",),
-            ("move",),
-            ("remove",),
+            ("add",),
+            ("mv",),
+            ("rm",),
         )
         for command_path in commands:
             option = _run(root, *command_path, "--help").stdout
@@ -506,17 +506,19 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             "standalone command unavailable through PATH",
         )
         for retired in (
+            "create",
+            "move",
+            "remove",
             "init",
-            "add",
             "init-home",
             "init-flake",
             "clone",
             "repair-home",
         ):
             _run(root, retired, code=2)
-        _run(root, "create", code=2)
+        _run(root, "add", code=2)
         help_output = _run(root, "--help").stdout
-        command_names = sorted(path[0] for path in commands if path)
+        command_names = ["add", "mv", "rm"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(positions == sorted(positions), "help commands must be alphabetical")
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
@@ -536,7 +538,7 @@ def test_resource_removal_requires_force_to_discard_local_data(
     """Reject destructive previews and removals unless deletion is explicitly forced."""
     with _fresh_repository() as root:
         relative = "hosts/example" if kind == "host" else "packages/example"
-        _run(root, "create", relative, *(() if kind == "host" else (kind,)))
+        _run(root, "add", relative, *(() if kind == "host" else (kind,)))
         _fixture_git(root, "commit", "-qm", "Resource snapshot")
         resource = root / relative
         if change in {"working", "staged"}:
@@ -558,11 +560,11 @@ def test_resource_removal_requires_force_to_discard_local_data(
                 _git(path.parent, "init", "--quiet")
         before = _snapshot(root)
         for arguments in (("--dry-run",), ()):
-            rejected = _run(root, "remove", relative, *arguments, code=1)
+            rejected = _run(root, "rm", relative, *arguments, code=1)
             _expect("--force" in rejected.stderr, rejected)
             _expect(_snapshot(root) == before, "rejected removal changed state")
-        _preview(root, "remove", relative, "--force")
-        _run(root, "remove", relative, "--force")
+        _preview(root, "rm", relative, "--force")
+        _run(root, "rm", relative, "--force")
         _expect(not resource.exists() and not path.exists(), "forced removal left data")
 
 
@@ -571,12 +573,12 @@ def test_resource_commands_resolve_paths_from_the_repository_root() -> None:
     with _fresh_repository() as root:
         nested = root / "tmp/nested"
         nested.mkdir(parents=True)
-        _run(nested, "create", "packages/example", "nix")
+        _run(nested, "add", "packages/example", "nix")
         _expect((root / "packages/example/default.nix").is_file(), "wrong create root")
-        _run(nested, "move", "packages/example", "packages/renamed")
+        _run(nested, "mv", "packages/example", "packages/renamed")
         _fixture_git(root, "commit", "-qm", "Renamed resource")
-        _preview(nested, "remove", "packages/renamed")
-        _run(nested, "remove", "packages/renamed")
+        _preview(nested, "rm", "packages/renamed")
+        _run(nested, "rm", "packages/renamed")
         _expect(not (root / "packages/renamed").exists(), "wrong removal root")
 
 
@@ -599,7 +601,7 @@ def test_creation_rejects_symlinks_without_writing_outside_the_repository(
             package.mkdir(parents=True)
             (package / "default.nix").symlink_to(outside / "external.nix")
         before = _snapshot(root)
-        _run(root, "create", "packages/example", "nix", code=1)
+        _run(root, "add", "packages/example", "nix", code=1)
         _expect(_snapshot(root) == before, "rejected creation changed repository state")
         _expect(not any(outside.iterdir()), "creation wrote outside the repository")
 
@@ -616,7 +618,7 @@ def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
         (root / ".git/index.lock").touch()
         before = _snapshot(root)
         resource = "hosts/example" if kind == "host" else "packages/example"
-        _run(root, "create", resource, *(() if kind == "host" else (kind,)), code=1)
+        _run(root, "add", resource, *(() if kind == "host" else (kind,)), code=1)
         _expect(_snapshot(root) == before, "failed creation left structural changes")
 
 
@@ -627,7 +629,7 @@ def test_removal_validates_all_targets_before_preview_or_deletion(
 ) -> None:
     """Reject unsupported related checks before deleting the package."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "nix")
+        _run(root, "add", "packages/example", "nix")
         check = root / "checks/example"
         check.parent.mkdir()
         if case == "symlink":
@@ -636,7 +638,7 @@ def test_removal_validates_all_targets_before_preview_or_deletion(
             check.write_text("preserve check contents")
         before = _snapshot(root)
         for arguments in (("--dry-run",), ()):
-            _run(root, "remove", "packages/example", "--force", *arguments, code=1)
+            _run(root, "rm", "packages/example", "--force", *arguments, code=1)
             _expect(_snapshot(root) == before, "rejected removal deleted local files")
 
 
@@ -648,7 +650,7 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
     with _fresh_repository() as root:
         _git(root, "remote", "add", "origin", "https://forge.example/team/repo.git")
         for name in ("old", "consumer"):
-            _run(root, "create", f"packages/{name}", "python")
+            _run(root, "add", f"packages/{name}", "python")
         old_path = "forge.example/team/repo/packages/old/tmp"
         new_path = "forge.example/team/repo/packages/new/tmp"
         source = root / "packages/old/main.py"
@@ -687,8 +689,8 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
         data = root / "packages/old/tmp/asset"
         data.parent.mkdir()
         data.write_text("preserve runtime data")
-        _preview(root, "move", "packages/old", "packages/new")
-        _run(root, "move", "packages/old", "packages/new")
+        _preview(root, "mv", "packages/old", "packages/new")
+        _run(root, "mv", "packages/old", "packages/new")
         renamed_source = (root / "packages/new/main.py").read_text()
         if style == "split":
             _expect(
@@ -735,7 +737,7 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
 def test_convergence_preserves_formatted_checks() -> None:
     """Keep generated checks stable after the real formatting pipeline."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "python")
+        _run(root, "add", "packages/example", "python")
         _check_formatted_checks(root)
 
 
@@ -750,7 +752,7 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
 ) -> None:
     """Repair generated state, retain resources and scratch, and respect formatting."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "python")
+        _run(root, "add", "packages/example", "python")
         source = root / "packages/example/main.py"
         original = source.read_bytes()
         for relative in (
@@ -804,7 +806,7 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
 ) -> None:
     """Reject embedded function and unittest definitions independently of paths."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "python")
+        _run(root, "add", "packages/example", "python")
         source = root / "packages/example/main.py"
         source.write_text(misplaced)
         before = _snapshot(root)
@@ -835,8 +837,8 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
 ) -> None:
     """Preserve files and Git state when an executable cannot call its entrypoint."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/a", "python")
-        _run(root, "create", "packages/z", "python")
+        _run(root, "add", "packages/a", "python")
+        _run(root, "add", "packages/z", "python")
         (root / "packages/a/default.nix").write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
         )
@@ -857,8 +859,8 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
 def test_convergence_rejects_invalid_test_sources_before_repairs(invalid: str) -> None:
     """Parse tests before repairing earlier packages or cleaning unsupported files."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/a", "python")
-        _run(root, "create", "packages/z", "python")
+        _run(root, "add", "packages/a", "python")
+        _run(root, "add", "packages/z", "python")
         (root / "packages/a/default.nix").write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
         )
@@ -894,7 +896,7 @@ def test_convergence_repairs_python_arguments_and_preserves_supported_entrypoint
 ) -> None:
     """Repair missing constructor arguments while retaining library and CLI sources."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "python")
+        _run(root, "add", "packages/example", "python")
         package = root / "packages/example"
         (package / "main.py").write_text(source)
         definition = package / "default.nix"
@@ -960,7 +962,7 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
 ) -> None:
     """Evaluate generated Nix and run installed Python and HTML launchers."""
     with _fresh_repository() as root:
-        _run(root, "create", f"packages/{name}", kind, description)
+        _run(root, "add", f"packages/{name}", kind, description)
         package = root / "packages" / name
         asset = package / "prm/asset.bin"
         asset.parent.mkdir()
@@ -1185,7 +1187,7 @@ def test_implicit_runtime_paths_cannot_bypass_declarations(
 def test_python_packages_require_the_shared_constructor() -> None:
     """Reject unsupported builders before convergence changes repository state."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "python")
+        _run(root, "add", "packages/example", "python")
         definition = root / "packages/example/default.nix"
         definition.write_text(
             "{ pkgs, ... }: pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
@@ -1205,13 +1207,13 @@ def test_python_packages_require_the_shared_constructor() -> None:
 @pytest.mark.parametrize(
     "arguments",
     [
-        ("move", "packages/example", "hosts/example"),
-        ("create", "packages/bad--name", "python"),
-        ("create", "hosts/bad-name"),
-        ("remove", "../outside"),
-        ("remove", "/outside"),
-        ("move", "packages/example", "packages/taken"),
-        ("create", "packages/example", "python"),
+        ("mv", "packages/example", "hosts/example"),
+        ("add", "packages/bad--name", "python"),
+        ("add", "hosts/bad-name"),
+        ("rm", "../outside"),
+        ("rm", "/outside"),
+        ("mv", "packages/example", "packages/taken"),
+        ("add", "packages/example", "python"),
     ],
 )
 def test_rejected_operations_preserve_contents_modes_index_and_refs(
@@ -1219,8 +1221,8 @@ def test_rejected_operations_preserve_contents_modes_index_and_refs(
 ) -> None:
     """Reject invalid paths and collisions before modifying work."""
     with _fresh_repository() as root:
-        _run(root, "create", "packages/example", "python")
-        _run(root, "create", "packages/taken", "nix")
+        _run(root, "add", "packages/example", "python")
+        _run(root, "add", "packages/taken", "nix")
         (root / "work-in-progress").write_text("preserve unrelated work")
         before = _snapshot(root)
         rejected = _run(root, *arguments, code=1)
@@ -1255,7 +1257,7 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
             package.mkdir(parents=True)
             (package / "default.nix").write_text("{}\n")
         else:
-            _run(root, "create", original, *(() if kind == "host" else (kind,)))
+            _run(root, "add", original, *(() if kind == "host" else (kind,)))
         check = f"checks/a{name}" + ("VmWithDisko" if kind == "host" else "")
         if kind == "python":
             _expect(
@@ -1292,8 +1294,8 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
             path.write_bytes(working[relative])
         untracked = package / "prm/untracked.bin"
         untracked.write_bytes(payload)
-        _preview(root, "move", original, destination)
-        _run(root, "move", original, destination)
+        _preview(root, "mv", original, destination)
+        _run(root, "mv", original, destination)
         new_check = check.replace(f"a{name}", f"b{name}")
         for relative in tracked:
             renamed = relative.replace(original, destination).replace(check, new_check)
@@ -1332,8 +1334,8 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
             )
             return
         _repair_flake(root)
-        _preview(root, "remove", destination, "--force")
-        _run(root, "remove", destination, "--force")
+        _preview(root, "rm", destination, "--force")
+        _run(root, "rm", destination, "--force")
         _expect(
             not (root / destination).exists() and not (root / new_check).exists(),
             "remove left resource or check",

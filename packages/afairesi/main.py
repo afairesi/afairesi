@@ -2114,7 +2114,7 @@ def parser() -> argparse.ArgumentParser:
         metavar="COMMAND",
     )
     create = commands.add_parser(
-        "create",
+        "add",
         help="create a package or host",
         description="Create and stage a canonical package or host.",
         epilog=(
@@ -2141,7 +2141,7 @@ def parser() -> argparse.ArgumentParser:
         help="optional package description",
     )
     move = commands.add_parser(
-        "move",
+        "mv",
         help="rename a package or host",
         description="Rename a canonical package or host and stage the result.",
         epilog=(
@@ -2168,7 +2168,7 @@ def parser() -> argparse.ArgumentParser:
         help="print moves without changing the repository",
     )
     remove = commands.add_parser(
-        "remove",
+        "rm",
         help="remove a package or host",
         description="Remove and stage a canonical package or host.",
         epilog=(
@@ -2257,16 +2257,16 @@ def main() -> None:
                 "afairesi-home for home"
             )
             raise CommandError(msg)  # noqa: TRY301
-        if options.command == "create":
+        if options.command == "add":
             _dispatch_create(root, options)
-        elif options.command == "remove":
+        elif options.command == "rm":
             remove_resource(
                 root,
                 options.resource,
                 dry_run=options.dry_run,
                 force=options.force,
             )
-        elif options.command == "move":
+        elif options.command == "mv":
             rename_resource(root, options.source, options.destination, options.dry_run)
     except (
         CommandError,

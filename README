@@ -1,11 +1,1 @@
 # Afairesi
-
-Run `afairesi --help` for flake conventions and resource commands, or
-`afairesi COMMAND --help` for command details.
-
-Run `afairesi-home --help` to manage the Git repository at `$HOME` and its
-registered submodules: `init`, `clone`, `init-flake`, `remove`, and `repair`.
-
-Run `afairesi-tests` inside a flake to run its test campaigns. From the home
-repository, run `git submodule foreach 'afairesi-tests'` to test every initialized
-submodule.
