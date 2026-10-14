@@ -28,6 +28,7 @@ from afairesi import (
     has_python_tests,
     repository_root,
     repository_type,
+    resolve_repository_path,
     validate_name,
 )
 
@@ -35,7 +36,7 @@ from afairesi import (
 def _command_target(target: Path | None) -> Path:
     """Honor an explicit path or select the current Afairesi repository."""
     if target is not None:
-        return target.resolve()
+        return resolve_repository_path(target)
     root = repository_root()
     if repository_type(root) != "flake":
         msg = (
@@ -824,7 +825,11 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="package or flake (default: current flake repository)",
+        help=(
+            "package or flake path relative to the Git root, "
+            "or cwd outside a repository "
+            "(default: current flake repository); absolute paths are accepted"
+        ),
     )
     hypothesis = commands.add_parser(
         "hypothesis",
@@ -841,7 +846,11 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="package or flake (default: current flake repository)",
+        help=(
+            "package or flake path relative to the Git root, "
+            "or cwd outside a repository "
+            "(default: current flake repository); absolute paths are accepted"
+        ),
     )
     hypothesis.add_argument(
         "--timeout",
@@ -872,7 +881,11 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         default=None,
         metavar="PATH",
-        help="package or flake (default: current flake repository)",
+        help=(
+            "package or flake path relative to the Git root, "
+            "or cwd outside a repository "
+            "(default: current flake repository); absolute paths are accepted"
+        ),
     )
     mutation.add_argument(
         "--timeout",
@@ -938,7 +951,8 @@ def parser() -> argparse.ArgumentParser:
         metavar="PATH",
         help=(
             "reuse a mutation-plan.json against the same "
-            "package source and different tests"
+            "package source and different tests; path is relative to the Git root, "
+            "or cwd outside a repository; absolute paths are accepted"
         ),
     )
     return result
@@ -950,6 +964,8 @@ def _dispatch_test_command(
 ) -> bool:
     """Run selected campaigns, continuing after failures and returning one status."""
     combined = options.test_command is None
+    if getattr(options, "mutation_plan", None) is not None:
+        options.mutation_plan = resolve_repository_path(options.mutation_plan)
     target = _command_target(options.target)
     if combined:
         campaigns = [

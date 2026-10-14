@@ -201,6 +201,31 @@ def test_cli_json_output(tmp_path: Path) -> None:
     )
 
 
+def test_cli_paths_resolve_from_git_root(tmp_path: Path) -> None:
+    """Inspect the same repository from nested directories with relative paths."""
+    _repository(tmp_path)
+    subprocess.run(  # noqa: S603
+        ["git", "init", "--quiet", str(tmp_path)],  # noqa: S607
+        check=True,
+        capture_output=True,
+        timeout=10,
+    )
+    nested = tmp_path / "packages/example"
+    for arguments in ([], ["."], [str(tmp_path)]):
+        completed = subprocess.run(  # noqa: S603
+            [os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
+            cwd=nested,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        _expect(
+            json.loads(completed.stdout) == subject.inspect_repository(tmp_path),
+            "wrong path base",
+        )
+
+
 def test_invalid_repository_and_source(tmp_path: Path) -> None:
     """Report invalid repositories and malformed source with useful errors."""
     with pytest.raises(CommandError, match=r"flake\.nix"):

@@ -11,7 +11,13 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from afairesi import CommandError, detect_packages, package_description, repository_root
+from afairesi import (
+    CommandError,
+    detect_packages,
+    package_description,
+    repository_root,
+    resolve_repository_path,
+)
 
 
 def _source(path: Path) -> ast.Module:
@@ -296,7 +302,11 @@ def parser() -> argparse.ArgumentParser:
         "repository",
         nargs="?",
         type=Path,
-        help="repository path (default: current Git repository)",
+        metavar="PATH",
+        help=(
+            "repository path relative to the Git root, or cwd outside a repository "
+            "(default: current Git repository); absolute paths are accepted"
+        ),
     )
     return result
 
@@ -306,7 +316,11 @@ def main() -> None:
     cli = parser()
     options = cli.parse_args()
     try:
-        root = options.repository.resolve() if options.repository else repository_root()
+        root = (
+            resolve_repository_path(options.repository)
+            if options.repository is not None
+            else repository_root()
+        )
         report = inspect_repository(root)
     except CommandError as error:
         cli.exit(1, f"{cli.prog}: {error}\n")

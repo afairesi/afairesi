@@ -119,6 +119,17 @@ def repository_root(path: Path = Path()) -> Path:
     return Path(completed.stdout.strip())
 
 
+def resolve_repository_path(path: Path) -> Path:
+    """Resolve explicit paths from the Git root, or cwd outside a repository."""
+    if path.is_absolute():
+        return path.resolve()
+    try:
+        root = repository_root()
+    except CommandError:
+        root = Path.cwd()
+    return (root / path).resolve()
+
+
 def repository_type(root: Path, default: str | None = None) -> str:
     """Detect home/submodule and flake repository layouts."""
     flake, home = _repository_type_markers(root)
@@ -134,7 +145,7 @@ def repository_type(root: Path, default: str | None = None) -> str:
     msg = (
         "cannot determine the repository type; run "
         "'afairesi home init' or "
-        "'afairesi home init-flake REMOTE'"
+        "'afairesi home init-repo REMOTE'"
     )
     raise CommandError(msg)
 
@@ -1434,7 +1445,12 @@ def _flake_resource_issues(root: Path) -> list[str]:
     return issues
 
 
-def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
+def converge_flake(
+    root: Path,
+    dry_run: bool,  # noqa: FBT001
+    *,
+    fail_on_changes: bool = True,
+) -> list[Package]:
     """Converge required files, structure, templates, and root whitelist."""
     missing = [
         name
@@ -1464,8 +1480,10 @@ def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
     changed |= _converge_checks(root, packages, dry_run)
     changed |= _cleanup_flake(root, packages, dry_run)
     if dry_run and changed:
-        msg = "flake repository would change"
-        raise CommandError(msg)
+        if fail_on_changes:
+            msg = "flake repository would change"
+            raise CommandError(msg)
+        return packages
     return validate_flake_source(root)
 
 
@@ -1740,7 +1758,14 @@ def preserve_whitelist_on_error(root: Path) -> Iterator[None]:
         raise
 
 
-def add_package(root: Path, kind: str, name: str, description: str | None) -> None:
+def add_package(
+    root: Path,
+    kind: str,
+    name: str,
+    description: str | None = None,
+    *,
+    dry_run: bool = False,
+) -> None:
     """Create a package transactionally and stage its managed files."""
     if kind not in PACKAGE_KINDS:
         msg = f"unsupported package type: {kind}\nhint: supported package types: {', '.join(PACKAGE_KINDS)}"  # noqa: E501
@@ -1755,6 +1780,12 @@ def add_package(root: Path, kind: str, name: str, description: str | None) -> No
     if (root / relative).exists() or (root / "checks" / name).exists():
         msg = f"package or generated check already exists: {name}"
         raise CommandError(msg)
+    if dry_run:
+        read_regular(root / ".gitignore")
+        for path in files:
+            report_change(f"write '{path}'", dry_run=True)
+        report_change("update and stage '.gitignore' and package files", dry_run=True)
+        return
     directories = missing_directories(root, [relative])
     created: list[Path] = []
     try:
@@ -1779,7 +1810,7 @@ def add_package(root: Path, kind: str, name: str, description: str | None) -> No
         raise
 
 
-def add_host(root: Path, name: str) -> None:
+def add_host(root: Path, name: str, *, dry_run: bool = False) -> None:
     """Create a host and stage its canonical configuration."""
     validate_host_name(name)
     relative = Path("hosts") / name / "configuration.nix"
@@ -1796,6 +1827,12 @@ def add_host(root: Path, name: str) -> None:
     ):
         msg = f"host or generated check already exists: {name}"
         raise CommandError(msg)
+    if dry_run:
+        read_regular(root / ".gitignore")
+        report_change(f"write '{relative}'", dry_run=True)
+        report_change(f"write '{check_relative}'", dry_run=True)
+        report_change("update and stage '.gitignore' and host files", dry_run=True)
+        return
     directories = missing_directories(root, [relative.parent, check_relative.parent])
     try:
         with preserve_whitelist_on_error(root):
@@ -2143,18 +2180,18 @@ def require_nix_flakes() -> str:
             check=False,
         )
     except FileNotFoundError as error:
-        msg = f"Nix executable not found: {executable}; install Nix to use init-flake"
+        msg = f"Nix executable not found: {executable}; install Nix to use init-repo"
         raise CommandError(msg) from error
     if completed.returncode != 0:
         msg = f"could not check Nix features: {completed.stderr.strip()}"
         raise CommandError(
-            msg + "\ninit-flake requires Nix with "
+            msg + "\ninit-repo requires Nix with "
             "'experimental-features = nix-command flakes'",
         )
     missing = {"nix-command", "flakes"} - set(completed.stdout.split())
     if missing:
         msg = (
-            f"init-flake requires Nix features: {', '.join(sorted(missing))}; "
+            f"init-repo requires Nix features: {', '.join(sorted(missing))}; "
             "enable them with 'experimental-features = nix-command flakes' "
             "in your Nix configuration"
         )
@@ -2222,6 +2259,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     create = commands.add_parser(
         "add",
+        usage="%(prog)s [-h] [-n] {packages/NAME TYPE | hosts/NAME}",
         help="create a package or host",
         description="Create and stage a canonical package or host.",
         epilog=(
@@ -2239,13 +2277,14 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "type",
         nargs="?",
         metavar="TYPE",
-        help=f"package type ({', '.join(PACKAGE_KINDS)})",
+        choices=PACKAGE_KINDS,
+        help=f"required for packages, omitted for hosts ({', '.join(PACKAGE_KINDS)})",
     )
     create.add_argument(
-        "description",
-        nargs="*",
-        metavar="DESCRIPTION",
-        help="optional package description",
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="print additions without changing the repository",
     )
     move = commands.add_parser(
         "mv",
@@ -2273,6 +2312,20 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="print moves without changing the repository",
+    )
+    repair = commands.add_parser(
+        "repair",
+        help="repair and stage the current repository structure",
+        description=(
+            "Repair and stage canonical flake structure from any working directory."
+        ),
+        epilog="Use nix fmt to repair structure and also format code.",
+    )
+    repair.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="report required repairs without changes",
     )
     remove = commands.add_parser(
         "rm",
@@ -2712,7 +2765,7 @@ def _remote_is_empty(remote: str) -> bool:
     return not completed.stdout.strip()
 
 
-def initialize_home_flake(remote: str) -> None:
+def initialize_home_repo(remote: str) -> None:
     """Create a canonical flake at its remote-derived home path."""
     relative = canonical_remote_path(remote)
     home = _require_home_repository()
@@ -2721,7 +2774,7 @@ def initialize_home_flake(remote: str) -> None:
     validate_managed_path(home, relative)
     nix_executable = require_nix_flakes()
     if not _remote_is_empty(remote):
-        msg = "init-flake requires an empty remote"
+        msg = "init-repo requires an empty remote"
         raise CommandError(msg)
     directory = home / relative
     if directory.exists():
@@ -2779,8 +2832,8 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         help="initialize the home repository and stage its whitelist",
         description="Initialize the repository at $HOME and stage its whitelist.",
     )
-    init_flake = commands.add_parser(
-        "init-flake",
+    init_repo = commands.add_parser(
+        "init-repo",
         help="create, commit, and push a flake under HOME",
         description=(
             "Create a flake from an empty hosted remote at "
@@ -2792,7 +2845,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
             "stage it as a home submodule, then push."
         ),
     )
-    init_flake.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
+    init_repo.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
     repair_home = commands.add_parser(
         "repair",
         help="repair the home repository whitelist and submodule layout",
@@ -2848,8 +2901,8 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         initialize_home()
     elif options.command == "clone":
         initialize_submodule(options.remote)
-    elif options.command == "init-flake":
-        initialize_home_flake(options.remote)
+    elif options.command == "init-repo":
+        initialize_home_repo(options.remote)
     elif options.command == "repair":
         converge_home(_require_home_repository(), options.dry_run)
     elif options.command == "rm":
@@ -2880,7 +2933,7 @@ def parser() -> argparse.ArgumentParser:
             "Structural changes are staged for review."
         ),
         epilog=(
-            "Use nix fmt to repair flake structure and format code. "
+            "Use repair to repair flake structure, or nix fmt to also format code. "
             "Use afairesi-repo-test to run test campaigns."
         ),
     )
@@ -2894,7 +2947,7 @@ def parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Use Git for diffs, commits, branches, and remote synchronization. "
-            "Only init-flake creates a commit and pushes."
+            "Only init-repo creates a commit and pushes."
         ),
     )
     _configure_repo_parser(repo)
@@ -2908,28 +2961,52 @@ def parser() -> argparse.ArgumentParser:
 def _dispatch_create(root: Path, options: argparse.Namespace) -> None:
     """Create the selected package or host resource."""
     kind, name, _relative = _parse_resource_path(options.resource)
-    description = " ".join(options.description) or None
     if kind == "host":
-        if options.type is not None or description is not None:
-            msg = "host creation does not accept a type or description"
-            raise CommandError(msg)
-        add_host(root, name)
+        add_host(root, name, dry_run=options.dry_run)
         return
-    if options.type is None:
-        msg = "package creation requires TYPE"
-        raise CommandError(msg)
-    add_package(root, options.type, name, description)
+    add_package(root, options.type, name, dry_run=options.dry_run)
+
+
+def _validate_resource_arguments(
+    cli: argparse.ArgumentParser,
+    options: argparse.Namespace,
+) -> None:
+    """Reject invalid resource arguments before discovering the repository."""
+    if options.scope != "repo" or options.command not in {"add", "mv", "rm"}:
+        return
+    try:
+        if options.command == "mv":
+            source_kind, _name, _relative = _parse_resource_path(options.source)
+            destination_kind, _name, _relative = _parse_resource_path(
+                options.destination,
+            )
+        else:
+            kind, _name, _relative = _parse_resource_path(options.resource)
+    except CommandError as error:
+        cli.error(str(error))
+    if options.command == "mv":
+        if source_kind != destination_kind:
+            cli.error("source and destination must be in the same resource collection")
+    elif options.command == "add":
+        if kind == "host" and options.type is not None:
+            cli.error("host creation does not accept TYPE")
+        if kind == "package" and options.type is None:
+            cli.error("package creation requires TYPE")
 
 
 def formatter_main() -> None:
     """Repair a flake repository before formatting; called internally by nix fmt."""
     cli = argparse.ArgumentParser(description="Repair the flake formatting inputs.")
-    cli.add_argument("--dry-run", action="store_true")
-    cli.add_argument("--source", type=Path)
+    cli.add_argument("-n", "--dry-run", action="store_true")
+    cli.add_argument(
+        "--source",
+        type=Path,
+        help="source path relative to the Git root, or cwd outside a repository",
+    )
     options = cli.parse_args()
     try:
         if options.source is not None:
-            validate_flake_source(options.source.resolve())
+            validate_flake_source(resolve_repository_path(options.source))
             return
         root = repository_root()
         if repository_type(root) != "flake":
@@ -2954,6 +3031,7 @@ def main() -> None:
     """Dispatch the flake resource commands."""
     cli = parser()
     options = cli.parse_args()
+    _validate_resource_arguments(cli, options)
     try:
         if options.command is None:
             options.scope_parser.print_help()
@@ -2979,6 +3057,8 @@ def main() -> None:
             )
         elif options.command == "mv":
             rename_resource(root, options.source, options.destination, options.dry_run)
+        elif options.command == "repair":
+            converge_flake(root, options.dry_run, fail_on_changes=False)
     except (
         CommandError,
         OSError,

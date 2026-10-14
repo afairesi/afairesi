@@ -447,7 +447,10 @@ def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
             ("mutation",),
         ):
             targets = (
-                (((), root), ((".",), package)) if cwd == package else (((), root),)
+                ((), root),
+                ((".",), root),
+                (("packages/alpha",), package),
+                ((str(package),), package),
             )
             for arguments, expected in targets:
                 monkeypatch.setattr(sys, "argv", ["afairesi", *path, *arguments])

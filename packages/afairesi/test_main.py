@@ -434,7 +434,7 @@ def test_create_stages_the_requested_resource_and_whitelist(
         _fixture_git(root, "commit", "-qm", "Initial repository")
         head = _git(root, "rev-parse", "HEAD")
         relative = "hosts/example" if kind == "host" else "packages/example"
-        arguments = () if kind == "host" else (kind, "Shared", "command description")
+        arguments = () if kind == "host" else (kind,)
         _run(root, "add", relative, *arguments)
         resource = root / relative
         _expect(
@@ -445,10 +445,16 @@ def test_create_stages_the_requested_resource_and_whitelist(
         if kind == "host":
             staged.add("checks/exampleVmWithDisko/default.nix")
         else:
+            descriptions = {
+                "python": "A Python package.",
+                "html": "An HTML package.",
+                "latex": "A LaTeX package.",
+                "nix": "A Nix package.",
+            }
             _expect(
-                'meta.description = "Shared command description";'
+                f'meta.description = "{descriptions[kind]}";'
                 in (resource / "default.nix").read_text(),
-                "create lost the description arguments",
+                "create lost the default description",
             )
         _expect(
             set(_git(root, "diff", "--cached", "--name-only").splitlines()) == staged,
@@ -463,10 +469,15 @@ def test_create_stages_the_requested_resource_and_whitelist(
     ("arguments", "message"),
     [
         (("packages/example",), "package creation requires TYPE"),
-        (("packages/example", "unknown"), "unsupported package type"),
+        (("packages/example", "unknown"), "invalid choice"),
+        (("packages/example", "python", "description"), "unrecognized arguments"),
+        (
+            ("packages/example", "python", "--description", "text"),
+            "unrecognized arguments",
+        ),
         (
             ("hosts/example", "python"),
-            "host creation does not accept a type or description",
+            "host creation does not accept TYPE",
         ),
     ],
 )
@@ -477,9 +488,99 @@ def test_create_rejects_invalid_resource_arguments_without_changes(
     """Reject missing or incompatible resource arguments with an actionable error."""
     with _fresh_repository() as root:
         before = _snapshot(root)
-        result = _run(root, "add", *arguments, code=1)
+        result = _run(root, "add", *arguments, code=2)
         _expect(message in result.stderr, result)
         _expect(_snapshot(root) == before, "invalid create changed state")
+
+
+def test_invalid_resource_arguments_are_usage_errors_outside_git(
+    tmp_path: Path,
+) -> None:
+    """Reject malformed resource requests before requiring a Git repository."""
+    for arguments in (
+        ("add", "packages/example"),
+        ("add", "hosts/example", "python"),
+        ("add", "packages/example", "unknown"),
+        ("rm", "other/example"),
+        ("mv", "packages/example", "hosts/example"),
+    ):
+        result = _run(tmp_path, *arguments, code=2)
+        _expect("not inside a Git repository" not in result.stderr, result.stderr)
+    _expect(not any(tmp_path.iterdir()), "invalid arguments created files")
+
+
+@pytest.mark.parametrize("kind", ["python", "html", "latex", "nix", "host"])
+def test_add_preview_preserves_state_and_rejects_existing_resources(kind: str) -> None:
+    """Preview additions from a nested cwd without writing files or staging data."""
+    with _fresh_repository() as root:
+        nested = root / "tmp/nested"
+        nested.mkdir(parents=True)
+        relative = "hosts/example" if kind == "host" else "packages/example"
+        arguments = () if kind == "host" else (kind,)
+        before = _snapshot(root)
+        preview = _run(nested, "add", relative, *arguments, "-n")
+        _expect(f"would write '{relative}/" in preview.stdout, preview.stdout)
+        if kind == "host":
+            _expect(
+                "checks/exampleVmWithDisko/default.nix" in preview.stdout,
+                preview.stdout,
+            )
+        _expect(_snapshot(root) == before, "add preview changed files or Git state")
+        _run(nested, "add", relative, *arguments)
+        _expect(
+            (root / relative).is_dir(),
+            "add used the working directory as its root",
+        )
+        before = _snapshot(root)
+        _run(nested, "add", relative, *arguments, "--dry-run", code=1)
+        _expect(_snapshot(root) == before, "conflicting preview changed state")
+
+
+def test_public_repo_repair_matches_formatter_repair() -> None:
+    """Repair from nested directories and preview without changing Git state."""
+    with _fresh_repository() as root:
+        nested = root / "tmp/nested"
+        nested.mkdir(parents=True)
+        _run(root, "add", "packages/example", "python")
+        (root / "packages/example/test_main.py").write_text(
+            "def test_example(): pass\n",
+        )
+        before = _snapshot(root)
+        result = _run(nested, "repair", "-n")
+        _expect("checks/example/default.nix" in result.stdout, result.stdout)
+        _expect(_snapshot(root) == before, "repair preview changed state")
+        _run(nested, "repair")
+        _expect(
+            (root / "checks/example/default.nix").is_file(),
+            "repair omitted the check",
+        )
+        after = _snapshot(root)
+        _run(nested, "repair", "--dry-run")
+        _expect(_snapshot(root) == after, "converged repair changed state")
+
+
+def test_explicit_repository_paths_use_git_root_or_cwd(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolve paths predictably inside and outside Git, including absolute paths."""
+    subject = import_module("packages.afairesi.main")
+    monkeypatch.chdir(tmp_path)
+    _expect(
+        subject.resolve_repository_path(Path("example")) == tmp_path / "example",
+        tmp_path,
+    )
+    _fixture_git(tmp_path, "init", "--quiet")
+    nested = tmp_path / "prm/nested"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir(nested)
+    _expect(subject.resolve_repository_path(Path()) == tmp_path, tmp_path)
+    _expect(
+        subject.resolve_repository_path(Path("packages/example"))
+        == tmp_path / "packages/example",
+        tmp_path,
+    )
+    _expect(subject.resolve_repository_path(nested) == nested, nested)
 
 
 def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
@@ -490,6 +591,7 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             (),
             ("add",),
             ("mv",),
+            ("repair",),
             ("rm",),
         )
         for command_path in commands:
@@ -515,14 +617,14 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             "remove",
             "init",
             "init-home",
-            "init-flake",
+            "init-repo",
             "clone",
             "repair-home",
         ):
             _run(root, retired, code=2)
         _run(root, "add", code=2)
         help_output = _run(root, "--help").stdout
-        command_names = ["add", "mv", "rm"]
+        command_names = ["add", "mv", "repair", "rm"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(positions == sorted(positions), "help commands must be alphabetical")
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
@@ -1062,7 +1164,8 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
 ) -> None:
     """Evaluate generated Nix and run installed Python and HTML launchers."""
     with _fresh_repository() as root:
-        _run(root, "add", f"packages/{name}", kind, description)
+        subject = import_module("packages.afairesi.main")
+        subject.add_package(root, kind, name, description)
         package = root / "packages" / name
         asset = package / "prm/asset.bin"
         asset.parent.mkdir()
@@ -1305,19 +1408,20 @@ def test_python_packages_require_the_shared_constructor() -> None:
 
 
 @pytest.mark.parametrize(
-    "arguments",
+    ("arguments", "code"),
     [
-        ("mv", "packages/example", "hosts/example"),
-        ("add", "packages/bad--name", "python"),
-        ("add", "hosts/bad-name"),
-        ("rm", "../outside"),
-        ("rm", "/outside"),
-        ("mv", "packages/example", "packages/taken"),
-        ("add", "packages/example", "python"),
+        (("mv", "packages/example", "hosts/example"), 2),
+        (("add", "packages/bad--name", "python"), 2),
+        (("add", "hosts/bad-name"), 2),
+        (("rm", "../outside"), 2),
+        (("rm", "/outside"), 2),
+        (("mv", "packages/example", "packages/taken"), 1),
+        (("add", "packages/example", "python"), 1),
     ],
 )
 def test_rejected_operations_preserve_contents_modes_index_and_refs(
     arguments: tuple[str, ...],
+    code: int,
 ) -> None:
     """Reject invalid paths and collisions before modifying work."""
     with _fresh_repository() as root:
@@ -1325,7 +1429,7 @@ def test_rejected_operations_preserve_contents_modes_index_and_refs(
         _run(root, "add", "packages/taken", "nix")
         (root / "work-in-progress").write_text("preserve unrelated work")
         before = _snapshot(root)
-        rejected = _run(root, *arguments, code=1)
+        rejected = _run(root, *arguments, code=code)
         _expect(bool(rejected.stderr) and _snapshot(root) == before, rejected)
 
 
@@ -1811,42 +1915,42 @@ def test_merged_init_flake_commits_registers_and_publishes_an_empty_remote(
     _home_test_run(tmp_path, "init")
     _home_test_git(home, "commit", "--quiet", "-m", "Home policy")
     home_head = _home_test_git(home, "rev-parse", "HEAD")
-    _home_test_run(tmp_path, "init-flake", remote)
+    _home_test_run(tmp_path, "init-repo", remote)
     relative = "example.test/team/new"
     checkout = home / relative
     _home_test_expect(
         _home_test_git(checkout, "branch", "--show-current").strip() == "main",
-        "init-flake did not select main",
+        "init-repo did not select main",
     )
     _home_test_expect(
         _home_test_git(origin, "rev-parse", "refs/heads/main")
         == _home_test_git(checkout, "rev-parse", "HEAD"),
-        "init-flake did not publish its initial commit",
+        "init-repo did not publish its initial commit",
     )
     _home_test_expect(
         _home_test_git(home, "rev-parse", "HEAD") == home_head,
-        "init-flake committed the home registration",
+        "init-repo committed the home registration",
     )
     _home_test_expect(
         set(_home_test_git(checkout, "ls-files").splitlines())
         == {".gitignore", "README", "flake.lock", "flake.nix"},
-        "init-flake did not commit the canonical initial files",
+        "init-repo did not commit the canonical initial files",
     )
     _home_test_expect(
         (checkout / "README").read_text() == "# new\n"
         and "inputs.afairesi.url" in (checkout / "flake.nix").read_text(),
-        "init-flake did not scaffold the requested repository",
+        "init-repo did not scaffold the requested repository",
     )
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     if f"!/{relative}" not in ignore.splitlines():
         raise AssertionError(ignore)
     if _home_test_git(home, "show", ":.gitignore") != ignore:
-        message = "init-flake did not stage the home whitelist"
+        message = "init-repo did not stage the home whitelist"
         raise AssertionError(message)
     if not _home_test_git(home, "ls-files", "--stage", "--", relative).startswith(
         "160000 ",
     ):
-        message = "init-flake did not stage its submodule"
+        message = "init-repo did not stage its submodule"
         raise AssertionError(message)
 
 
@@ -1868,7 +1972,7 @@ def test_merged_init_flake_checks_nix_features_before_creating_state(
     before = _home_test_snapshot(home)
     result = _home_test_run(
         tmp_path,
-        "init-flake",
+        "init-repo",
         "https://example.test/team/new.git",
         code=1,
     )
@@ -1899,7 +2003,7 @@ def test_merged_init_flake_reports_missing_nix_before_creating_state(
     before = _home_test_snapshot(home)
     result = _home_test_run(
         tmp_path,
-        "init-flake",
+        "init-repo",
         "https://example.test/team/new.git",
         code=1,
     )
@@ -1907,7 +2011,7 @@ def test_merged_init_flake_reports_missing_nix_before_creating_state(
     _home_test_expect(_home_test_snapshot(home) == before, "missing Nix changed home")
 
 
-@pytest.mark.parametrize("command", ["clone", "init-flake"])
+@pytest.mark.parametrize("command", ["clone", "init-repo"])
 @pytest.mark.parametrize("initialized_git", [False, True])
 def test_merged_home_prerequisites_explain_initialization_without_changes(
     tmp_path: Path,
@@ -2238,7 +2342,7 @@ def test_merged_flake_initialization_validates_home_before_creating_or_publishin
     else:
         (home / "example.test").symlink_to(tmp_path, target_is_directory=True)
     before = _home_test_snapshot(home)
-    _home_test_run(tmp_path, "init-flake", remote, code=1)
+    _home_test_run(tmp_path, "init-repo", remote, code=1)
     _home_test_expect(
         _home_test_snapshot(home) == before,
         "failed initialization changed home state",
@@ -2975,7 +3079,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("clone", "init", "init-flake", "repair", "rm")
+    commands = ("clone", "init", "init-repo", "repair", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
     _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -2990,8 +3094,9 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
         ("move",),
         ("remove", "github.com/example/repository"),
         ("clone",),
-        ("init-flake",),
+        ("init-repo",),
         ("init", "unexpected"),
+        ("init-flake", "git@forge.example:owner/example"),
     ):
         _home_test_run(tmp_path, *arguments, code=2)
     _home_test_expect(not list(tmp_path.iterdir()), "invalid requests created files")
