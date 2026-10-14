@@ -145,7 +145,7 @@ def repository_type(root: Path, default: str | None = None) -> str:
     msg = (
         "cannot determine the repository type; run "
         "'afairesi home init' or "
-        "'afairesi home init-repo REMOTE'"
+        "'afairesi home create REMOTE'"
     )
     raise CommandError(msg)
 
@@ -2180,18 +2180,18 @@ def require_nix_flakes() -> str:
             check=False,
         )
     except FileNotFoundError as error:
-        msg = f"Nix executable not found: {executable}; install Nix to use init-repo"
+        msg = f"Nix executable not found: {executable}; install Nix to use home create"
         raise CommandError(msg) from error
     if completed.returncode != 0:
         msg = f"could not check Nix features: {completed.stderr.strip()}"
         raise CommandError(
-            msg + "\ninit-repo requires Nix with "
+            msg + "\nhome create requires Nix with "
             "'experimental-features = nix-command flakes'",
         )
     missing = {"nix-command", "flakes"} - set(completed.stdout.split())
     if missing:
         msg = (
-            f"init-repo requires Nix features: {', '.join(sorted(missing))}; "
+            f"home create requires Nix features: {', '.join(sorted(missing))}; "
             "enable them with 'experimental-features = nix-command flakes' "
             "in your Nix configuration"
         )
@@ -2765,7 +2765,7 @@ def _remote_is_empty(remote: str) -> bool:
     return not completed.stdout.strip()
 
 
-def initialize_home_repo(remote: str) -> None:
+def create_home_repo(remote: str) -> None:
     """Create a canonical flake at its remote-derived home path."""
     relative = canonical_remote_path(remote)
     home = _require_home_repository()
@@ -2774,7 +2774,7 @@ def initialize_home_repo(remote: str) -> None:
     validate_managed_path(home, relative)
     nix_executable = require_nix_flakes()
     if not _remote_is_empty(remote):
-        msg = "init-repo requires an empty remote"
+        msg = "home create requires an empty remote"
         raise CommandError(msg)
     directory = home / relative
     if directory.exists():
@@ -2827,13 +2827,8 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
-    commands.add_parser(
-        "init",
-        help="initialize the home repository and stage its whitelist",
-        description="Initialize the repository at $HOME and stage its whitelist.",
-    )
-    init_repo = commands.add_parser(
-        "init-repo",
+    create = commands.add_parser(
+        "create",
         help="create, commit, and push a flake under HOME",
         description=(
             "Create a flake from an empty hosted remote at "
@@ -2845,7 +2840,12 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
             "stage it as a home submodule, then push."
         ),
     )
-    init_repo.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
+    create.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
+    commands.add_parser(
+        "init",
+        help="initialize the home repository and stage its whitelist",
+        description="Initialize the repository at $HOME and stage its whitelist.",
+    )
     repair_home = commands.add_parser(
         "repair",
         help="repair the home repository whitelist and submodule layout",
@@ -2901,8 +2901,8 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         initialize_home()
     elif options.command == "clone":
         initialize_submodule(options.remote)
-    elif options.command == "init-repo":
-        initialize_home_repo(options.remote)
+    elif options.command == "create":
+        create_home_repo(options.remote)
     elif options.command == "repair":
         converge_home(_require_home_repository(), options.dry_run)
     elif options.command == "rm":
@@ -2947,7 +2947,7 @@ def parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Use Git for diffs, commits, branches, and remote synchronization. "
-            "Only init-repo creates a commit and pushes."
+            "The home create command creates a commit and pushes."
         ),
     )
     _configure_repo_parser(repo)

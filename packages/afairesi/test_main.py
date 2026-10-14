@@ -1880,7 +1880,7 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
         raise AssertionError(message)
 
 
-def test_merged_init_flake_commits_registers_and_publishes_an_empty_remote(
+def test_merged_create_flake_commits_registers_and_publishes_an_empty_remote(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1915,47 +1915,47 @@ def test_merged_init_flake_commits_registers_and_publishes_an_empty_remote(
     _home_test_run(tmp_path, "init")
     _home_test_git(home, "commit", "--quiet", "-m", "Home policy")
     home_head = _home_test_git(home, "rev-parse", "HEAD")
-    _home_test_run(tmp_path, "init-repo", remote)
+    _home_test_run(tmp_path, "create", remote)
     relative = "example.test/team/new"
     checkout = home / relative
     _home_test_expect(
         _home_test_git(checkout, "branch", "--show-current").strip() == "main",
-        "init-repo did not select main",
+        "create did not select main",
     )
     _home_test_expect(
         _home_test_git(origin, "rev-parse", "refs/heads/main")
         == _home_test_git(checkout, "rev-parse", "HEAD"),
-        "init-repo did not publish its initial commit",
+        "create did not publish its initial commit",
     )
     _home_test_expect(
         _home_test_git(home, "rev-parse", "HEAD") == home_head,
-        "init-repo committed the home registration",
+        "create committed the home registration",
     )
     _home_test_expect(
         set(_home_test_git(checkout, "ls-files").splitlines())
         == {".gitignore", "README", "flake.lock", "flake.nix"},
-        "init-repo did not commit the canonical initial files",
+        "create did not commit the canonical initial files",
     )
     _home_test_expect(
         (checkout / "README").read_text() == "# new\n"
         and "inputs.afairesi.url" in (checkout / "flake.nix").read_text(),
-        "init-repo did not scaffold the requested repository",
+        "create did not scaffold the requested repository",
     )
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     if f"!/{relative}" not in ignore.splitlines():
         raise AssertionError(ignore)
     if _home_test_git(home, "show", ":.gitignore") != ignore:
-        message = "init-repo did not stage the home whitelist"
+        message = "create did not stage the home whitelist"
         raise AssertionError(message)
     if not _home_test_git(home, "ls-files", "--stage", "--", relative).startswith(
         "160000 ",
     ):
-        message = "init-repo did not stage its submodule"
+        message = "create did not stage its submodule"
         raise AssertionError(message)
 
 
 @pytest.mark.parametrize("features", ["", "nix-command", "flakes"])
-def test_merged_init_flake_checks_nix_features_before_creating_state(
+def test_merged_create_flake_checks_nix_features_before_creating_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     features: str,
@@ -1972,7 +1972,7 @@ def test_merged_init_flake_checks_nix_features_before_creating_state(
     before = _home_test_snapshot(home)
     result = _home_test_run(
         tmp_path,
-        "init-repo",
+        "create",
         "https://example.test/team/new.git",
         code=1,
     )
@@ -1990,7 +1990,7 @@ def test_merged_init_flake_checks_nix_features_before_creating_state(
     )
 
 
-def test_merged_init_flake_reports_missing_nix_before_creating_state(
+def test_merged_create_flake_reports_missing_nix_before_creating_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2003,7 +2003,7 @@ def test_merged_init_flake_reports_missing_nix_before_creating_state(
     before = _home_test_snapshot(home)
     result = _home_test_run(
         tmp_path,
-        "init-repo",
+        "create",
         "https://example.test/team/new.git",
         code=1,
     )
@@ -2011,7 +2011,7 @@ def test_merged_init_flake_reports_missing_nix_before_creating_state(
     _home_test_expect(_home_test_snapshot(home) == before, "missing Nix changed home")
 
 
-@pytest.mark.parametrize("command", ["clone", "init-repo"])
+@pytest.mark.parametrize("command", ["clone", "create"])
 @pytest.mark.parametrize("initialized_git", [False, True])
 def test_merged_home_prerequisites_explain_initialization_without_changes(
     tmp_path: Path,
@@ -2342,7 +2342,7 @@ def test_merged_flake_initialization_validates_home_before_creating_or_publishin
     else:
         (home / "example.test").symlink_to(tmp_path, target_is_directory=True)
     before = _home_test_snapshot(home)
-    _home_test_run(tmp_path, "init-repo", remote, code=1)
+    _home_test_run(tmp_path, "create", remote, code=1)
     _home_test_expect(
         _home_test_snapshot(home) == before,
         "failed initialization changed home state",
@@ -3079,7 +3079,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("clone", "init", "init-repo", "repair", "rm")
+    commands = ("clone", "create", "init", "repair", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
     _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -3090,11 +3090,11 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
             command,
         )
     for arguments in (
-        ("create",),
+        ("init-repo", "https://example.test/team/new.git"),
         ("move",),
         ("remove", "github.com/example/repository"),
         ("clone",),
-        ("init-repo",),
+        ("create",),
         ("init", "unexpected"),
         ("init-flake", "git@forge.example:owner/example"),
     ):
