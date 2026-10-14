@@ -62,7 +62,7 @@ let
               ];
             modules = [ "packages/${name}" ];
             options = [
-              "--cache-dir=/tmp/.mypy_cache/${name}"
+              "--cache-dir=packages/${name}/tmp/.mypy_cache"
               "--exclude=/(prm|tmp)/"
               "--explicit-package-bases"
               "--ignore-missing-imports"
@@ -186,17 +186,16 @@ let
           priority = 2;
         };
         ruff-check.options = [
-          "--cache-dir=/tmp/.ruff_cache"
+          "--cache-dir=tmp/.ruff_cache"
           "--per-file-ignores=test_main.py:INP001"
           "--unsafe-fixes"
         ];
-        ruff-format.options = [ "--cache-dir=/tmp/.ruff_cache" ];
+        ruff-format.options = [ "--cache-dir=tmp/.ruff_cache" ];
         uncomment = {
           command = inputs.self.packages.${pkgs.stdenv.system}.uncomment;
           includes = [
             ".gitignore"
             "LICENSE"
-            "README"
             "flake.lock"
             "flake.nix"
             "formatter.nix"

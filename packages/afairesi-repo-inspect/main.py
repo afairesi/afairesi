@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import contextlib
 import json
 import sys
 from pathlib import Path
@@ -14,6 +15,7 @@ from typing import Any
 from afairesi import (
     CommandError,
     detect_packages,
+    inspection_remote_repository,
     package_description,
     python_test_definitions,
     repository_root,
@@ -264,11 +266,14 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument(
         "repository",
         nargs="?",
-        type=Path,
-        metavar="PATH",
+        metavar="PATH_OR_REMOTE",
         help=(
             "repository path relative to the Git root, or cwd outside a repository "
-            "(default: current Git repository); absolute paths are accepted"
+            "(default: current Git repository), or a hosted Git remote URL; "
+            "remote URLs reuse the canonical home checkout when present, otherwise "
+            "cache Git data in the initialized home repository's module storage "
+            "and inspect a temporary checkout; without an initialized home "
+            "repository, use a temporary clone"
         ),
     )
     return result
@@ -279,12 +284,22 @@ def main() -> None:
     cli = parser()
     options = cli.parse_args()
     try:
-        root = (
-            resolve_repository_path(options.repository)
-            if options.repository is not None
-            else repository_root()
+        value = options.repository
+        remote = value is not None and (
+            "://" in value
+            or (":" in value.split("/", 1)[0] and not Path(value).exists())
         )
-        report = inspect_repository(root)
+        repository = (
+            inspection_remote_repository(value)
+            if remote
+            else contextlib.nullcontext(
+                resolve_repository_path(Path(value))
+                if value is not None
+                else repository_root(),
+            )
+        )
+        with repository as root:
+            report = inspect_repository(root)
     except CommandError as error:
         cli.exit(1, f"{cli.prog}: {error}\n")
     sys.stdout.write(json.dumps(report, indent=2) + "\n")
