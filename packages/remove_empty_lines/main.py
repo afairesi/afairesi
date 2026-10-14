@@ -38,7 +38,7 @@ def main() -> None:
     """Remove blank and whitespace-only lines from selected text files in place."""
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Example: remove_empty_lines README.md src/*.txt",
+        epilog="Example: remove_empty_lines LICENSE flake.lock",
     )
     parser.add_argument(
         "files",

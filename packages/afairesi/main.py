@@ -2644,15 +2644,14 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="create a package or host",
         description="Create and stage a canonical package or host.",
         epilog=(
-            "Update and stage the repository whitelist. Host creation also "
-            "generates and stages its check. New Python packages have no tests "
-            "or checks; add tests, then run nix fmt to generate their checks."
+            "Host checks are generated automatically. For Python checks, "
+            "add tests and run nix fmt."
         ),
     )
     create.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="new repository-relative packages/NAME or hosts/NAME path",
+        help="new packages/NAME or hosts/NAME",
     )
     create.add_argument(
         "type",
@@ -2665,69 +2664,64 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "-n",
         "--dry-run",
         action="store_true",
-        help="print additions without changing the repository",
+        help="preview changes",
     )
     fix = commands.add_parser(
         "fix",
         help="fix and stage the current repository structure",
-        description=(
-            "Fix and stage canonical flake structure from any working directory."
-        ),
+        description="Fix and stage flake structure; remove unsupported files.",
         epilog="Use nix fmt to fix structure and also format code.",
     )
     fix.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="report required fixes without changes",
+        help="preview changes",
     )
     move = commands.add_parser(
         "mv",
         help="rename a package or host",
         description="Rename a canonical package or host and stage the result.",
         epilog=(
-            "Update and stage the repository whitelist and related checks. Package "
-            "renames update declared runtime paths and references from other "
-            "packages in the repository, preserving unstaged edits. Runtime data "
-            "moves with the package directory."
+            "Update checks, runtime paths, and package references. "
+            "Move runtime data; preserve unstaged edits."
         ),
     )
     move.add_argument(
         "source",
         metavar="SOURCE",
-        help="existing repository-relative packages/NAME or hosts/NAME path",
+        help="existing packages/NAME or hosts/NAME",
     )
     move.add_argument(
         "destination",
         metavar="DESTINATION",
-        help="new repository-relative path in the same resource collection",
+        help="new path in the same collection",
     )
     move.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="print moves without changing the repository",
+        help="preview changes",
     )
     remove = commands.add_parser(
         "rm",
         help="remove a package or host",
         description="Remove and stage a canonical package or host.",
         epilog=(
-            "Reject local changes and untracked data unless --force is given. "
-            "Update the whitelist and remove related checks, including runtime data "
-            "inside the removed resource."
+            "Remove related checks and runtime data. "
+            "Reject local changes and untracked data unless --force is given."
         ),
     )
     remove.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="repository-relative packages/NAME or hosts/NAME",
+        help="packages/NAME or hosts/NAME",
     )
     remove.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="print removals without changing the repository",
+        help="preview changes",
     )
     remove.add_argument(
         "-f",
@@ -3306,15 +3300,12 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     clone = commands.add_parser(
         "clone",
-        help="clone and register an existing remote as a home submodule",
+        help="clone and register a home submodule",
         description=(
             "Clone a hosted remote at $HOME/<remote-hostname>/<repository-path> "
             "and register it as a submodule."
         ),
-        epilog=(
-            "Stage the home whitelist and submodule registration without "
-            "creating commits or pushing."
-        ),
+        epilog="Stage registration; no commit or push.",
     )
     clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
     create = commands.add_parser(
@@ -3325,29 +3316,22 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
             "$HOME/<remote-hostname>/<repository-path>."
         ),
         epilog=(
-            "Clone the remote, scaffold "
-            "and format the flake, commit its initial main branch, register and "
-            "stage it as a home submodule, then push."
+            "Commit the initial main branch, stage home submodule registration, "
+            "and push."
         ),
     )
     create.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
     fix_home = commands.add_parser(
         "fix",
-        help="fix the home repository whitelist and submodule layout",
-        description=(
-            "Fix the repository at $HOME: its whitelist and registered "
-            "submodule paths and names, from any working directory."
-        ),
-        epilog=(
-            "Move submodules to <remote-hostname>/<repository-path>, migrate "
-            "whitelist entries, and stage fixes for existing checkouts. "
-        ),
+        help="fix and stage home structure",
+        description="Fix and stage the $HOME whitelist and submodule layout.",
+        epilog=("Move submodules to <remote-hostname>/<repository-path>."),
     )
     fix_home.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="report required fixes without changes",
+        help="preview changes",
     )
     commands.add_parser(
         "init",
@@ -3357,14 +3341,8 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     remove = commands.add_parser(
         "rm",
         help="remove a registered home submodule",
-        description=(
-            "Remove and stage a registered submodule of $HOME "
-            "from any working directory."
-        ),
-        epilog=(
-            "Remove the submodule's registration and whitelist entries. "
-            "Reject local changes and untracked data unless --force is given."
-        ),
+        description="Remove a home submodule and stage its unregistration.",
+        epilog="Reject local changes and untracked data unless --force is given.",
     )
     remove.add_argument(
         "resource",
@@ -3375,7 +3353,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         "-n",
         "--dry-run",
         action="store_true",
-        help="print removals without changing the repository",
+        help="preview changes",
     )
     remove.add_argument(
         "-f",
@@ -3423,22 +3401,16 @@ def parser() -> argparse.ArgumentParser:
             "Structural changes are staged for review."
         ),
         epilog=(
-            "Use fix to correct flake structure, or nix fmt to also format code. "
-            "Use afairesi-repo-test to run test campaigns."
+            "Keep prm/ minimal: only necessary supporting files. "
+            "Use nix fmt to fix and format; afairesi-repo-inspect to inspect; "
+            "afairesi-repo-test to test."
         ),
     )
     home = scopes.add_parser(
         "home",
         help="manage the home repository and its submodules",
-        description=(
-            "Manage the Git repository at $HOME and its submodules. "
-            "Hosted repositories live at $HOME/<remote-hostname>/<repository-path>. "
-            "Fixes stage structural changes without committing them."
-        ),
-        epilog=(
-            "Use Git for diffs, commits, branches, and remote synchronization. "
-            "The home create command creates a commit and pushes."
-        ),
+        description=("Manage $HOME submodules at <remote-hostname>/<repository-path>."),
+        epilog=("Changes are staged. Only create commits and pushes."),
     )
     _configure_repo_parser(repo)
     _configure_home_parser(home)

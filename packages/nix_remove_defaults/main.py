@@ -437,11 +437,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
         epilog=(
-            "The nearest parent containing flake.nix is processed. NixOS defaults "
-            "come from evaluated option metadata; treefmt defaults come from the "
-            "flake's formatter configuration. Afairesi mkPythonPackage defaults "
-            "are discovered from its pinned builder for each candidate field. "
-            "Example: nix_remove_defaults ."
+            "Process the nearest parent flake using evaluated NixOS, treefmt, "
+            "and Afairesi package defaults."
         ),
     )
     parser.add_argument(
@@ -449,9 +446,7 @@ def main() -> None:
         nargs="?",
         default=".",
         metavar="PATH",
-        help=(
-            "repository directory or a directory inside it (default: current directory)"
-        ),
+        help="directory within a flake (default: cwd)",
     )
     argument = Path(parser.parse_args().directory)
     if not argument.is_dir():

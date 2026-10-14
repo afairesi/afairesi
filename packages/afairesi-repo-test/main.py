@@ -798,22 +798,19 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="afairesi-repo-test",
         description=(
-            "Run coverage, property tests, and mutation tests for Afairesi "
-            "packages. Without a subcommand, run all three campaigns in the "
-            "current flake. Use git submodule foreach 'afairesi-repo-test' to test "
-            "home submodules."
+            "Run coverage, property tests, and mutation tests. "
+            "Default: all three in the current flake."
         ),
     )
     result.set_defaults(test_command=None, target=None)
     commands = result.add_subparsers(dest="test_command", metavar="COMMAND")
     coverage = commands.add_parser(
         "coverage",
-        help="measure test coverage and print HTML report paths",
+        help="measure coverage and print report paths",
         description="Measure coverage from explicit test examples.",
         epilog=(
-            "Repository targets skip packages without tests. "
-            "HTML reports are stored in the Nix store. "
-            "Use nix fmt to create or update checks."
+            "Skip packages without tests. HTML reports: Nix store. "
+            "Update checks with nix fmt."
         ),
     )
     coverage.add_argument(
@@ -823,19 +820,15 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "package or flake path relative to the Git root, "
-            "or cwd outside a repository "
-            "(default: current flake repository); absolute paths are accepted"
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
         ),
     )
     hypothesis = commands.add_parser(
         "hypothesis",
-        help="run generated property tests in isolated package copies",
+        help="run generated property tests",
         description="Run generated property tests in isolated package copies.",
-        epilog=(
-            "Repository targets skip packages without test_main.py. Logs and reports "
-            "are retained under the flake's tmp/ directory."
-        ),
+        epilog=("Skip packages without test_main.py. Logs and reports: flake tmp/."),
     )
     hypothesis.add_argument(
         "target",
@@ -844,18 +837,14 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "package or flake path relative to the Git root, "
-            "or cwd outside a repository "
-            "(default: current flake repository); absolute paths are accepted"
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
         ),
     )
     hypothesis.add_argument(
         "--timeout",
         type=float,
-        help=(
-            "seconds per test-suite invocation, excluding environment build "
-            "(default: unlimited)"
-        ),
+        help=("seconds per test run, excluding build (default: unlimited)"),
     )
     hypothesis.add_argument(
         "--max-examples",
@@ -865,12 +854,9 @@ def parser() -> argparse.ArgumentParser:
     )
     mutation = commands.add_parser(
         "mutation",
-        help="run mutation tests in isolated package copies",
+        help="run mutation tests",
         description="Run mutation tests in isolated package copies.",
-        epilog=(
-            "Repository targets skip packages without test_main.py. Logs and reports "
-            "are retained under the flake's tmp/ directory."
-        ),
+        epilog=("Skip packages without test_main.py. Logs and reports: flake tmp/."),
     )
     mutation.add_argument(
         "target",
@@ -879,43 +865,39 @@ def parser() -> argparse.ArgumentParser:
         default=None,
         metavar="PATH",
         help=(
-            "package or flake path relative to the Git root, "
-            "or cwd outside a repository "
-            "(default: current flake repository); absolute paths are accepted"
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
         ),
     )
     mutation.add_argument(
         "--timeout",
         type=float,
         default=300.0,
-        help=(
-            "seconds per test-suite invocation, excluding environment build "
-            "(default: 300)"
-        ),
+        help=("seconds per test run, excluding build (default: 300)"),
     )
     hypothesis.add_argument(
         "-k",
         dest="keywords",
         default="",
-        help="run pytest cases matching this keyword expression",
+        help="pytest keyword expression",
     )
     hypothesis.add_argument(
         "-m",
         dest="markers",
         default="",
-        help="run pytest cases matching this marker expression",
+        help="pytest marker expression",
     )
     mutation.add_argument(
         "-k",
         dest="keywords",
         default="",
-        help="run pytest cases matching this keyword expression",
+        help="pytest keyword expression",
     )
     mutation.add_argument(
         "-m",
         dest="markers",
         default="",
-        help="run pytest cases matching this marker expression",
+        help="pytest marker expression",
     )
     mutation.add_argument(
         "--lines",
@@ -923,10 +905,7 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="START:END",
-        help=(
-            "select mutations starting in this inclusive "
-            "main.py line range (repeatable)"
-        ),
+        help=("inclusive main.py range for mutation starts (repeatable)"),
     )
     mutation.add_argument(
         "--operator",
@@ -934,7 +913,7 @@ def parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="REGEX",
-        help="select mutation operators matching a regular expression (repeatable)",
+        help="mutation operator regex (repeatable)",
     )
     mutation.add_argument(
         "--max-mutations",
@@ -947,9 +926,8 @@ def parser() -> argparse.ArgumentParser:
         type=Path,
         metavar="PATH",
         help=(
-            "reuse a mutation-plan.json against the same "
-            "package source and different tests; path is relative to the Git root, "
-            "or cwd outside a repository; absolute paths are accepted"
+            "reuse a plan with unchanged source and new tests; "
+            "relative to Git root, or cwd outside Git"
         ),
     )
     return result

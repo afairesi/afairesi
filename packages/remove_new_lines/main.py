@@ -29,7 +29,7 @@ def main() -> None:
     """Remove CR and LF bytes from selected text files in place."""
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Example: remove_new_lines README.md src/*.txt",
+        epilog="Example: remove_new_lines packages/site/index.html",
     )
     parser.add_argument(
         "files",

@@ -268,12 +268,8 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         metavar="PATH_OR_REMOTE",
         help=(
-            "repository path relative to the Git root, or cwd outside a repository "
-            "(default: current Git repository), or a hosted Git remote URL; "
-            "remote URLs reuse the canonical home checkout when present, otherwise "
-            "cache Git data in the initialized home repository's module storage "
-            "and inspect a temporary checkout; without an initialized home "
-            "repository, use a temporary clone"
+            "repository path or hosted Git URL (default: current repository); "
+            "relative paths use the Git root, or cwd outside Git"
         ),
     )
     return result
