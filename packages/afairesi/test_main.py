@@ -823,6 +823,102 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
 
 
 @pytest.mark.parametrize(
+    "definition",
+    [
+        'pkgs.runCommand "integration" {} "python -m pytest ./prm/test_live.py"',
+        'pkgs.runCommand "site" {} "cp -r ./prm/site $out"',
+        'pkgs.runCommandLocal "data" {} "touch $out"',
+        'pkgs.stdenv.mkDerivation { name = "parallel"; src = ./prm; }',
+        'pkgs.python3.pkgs.buildPythonPackage { pname = "parallel"; src = ./prm; }',
+        "inputs.afairesi.lib.mkPythonPackage { inherit pkgs; src = ./prm; }",
+        "inputs.afairesi.lib.mkPythonCheck { inherit pkgs; packageDrv = base.foo; }",
+        "inputs.nixpkgs.lib.nixosSystem { modules = [ ./prm/host.nix ]; }",
+        'builtins.derivation { name = "parallel"; builder = "/bin/sh"; }',
+        '(let build = pkgs.runCommand; in build "parallel" {} "touch $out")',
+    ],
+)
+def test_flake_resource_ownership_rejects_parallel_definitions(
+    definition: str,
+) -> None:
+    """Reject independently defined resources before repair or source validation."""
+    with _fresh_repository() as root:
+        _repair_flake(root)
+        (root / "flake.nix").write_text(
+            "{ outputs = inputs: let base = inputs.afairesi.blueprint "
+            "{ inherit inputs; }; pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux; "
+            f"in base // {{ checks.x86_64-linux.parallel = {definition}; }}; }}",
+        )
+        (root / "prm").mkdir()
+        (root / "prm/test_live.py").write_text("def test_live(): pass\n")
+        (root / "discarded").write_text("preserve until ownership is resolved")
+        before = _snapshot(root)
+        rejected = _repair_flake(root, code=1)
+        _expect(
+            "resource outside its owner" in rejected.stderr
+            and "flake.nix:" in rejected.stderr
+            and _snapshot(root) == before,
+            rejected,
+        )
+        (root / "discarded").unlink()
+        rejected_source = _repair_flake(root, "--source", str(root), code=1)
+        _expect("resource outside its owner" in rejected_source.stderr, rejected_source)
+
+
+@pytest.mark.parametrize(
+    "composition",
+    [
+        "base // { formatter = inputs.afairesi.lib.mkFormatter { inherit inputs; }; }",
+        (
+            "base // { packages = builtins.mapAttrs "
+            "(_: packages: packages // { default = packages.foo; }) base.packages; }"
+        ),
+        "base // { inherit (inputs.afairesi) blueprint lib; }",
+        (
+            "base // { checks = base.checks // { x86_64-linux = "
+            "base.checks.x86_64-linux // { foo = pkgs.vmTools.runInLinuxVM "
+            '(base.checks.x86_64-linux.foo.overrideAttrs { QEMU_OPTS = "-smp 2"; '
+            "memSize = 4096; }); }; }; }"
+        ),
+        (
+            "base // { packages.x86_64-linux.foo = import ./packages/foo/default.nix "
+            "{ inherit inputs pkgs; }; }"
+        ),
+        'base // { note = "pkgs.runCommand \\"fake\\" {} \\"touch $out\\""; }',
+        (
+            "let build = pkgs.runCommand; in base // { lib.wrapper = build: "
+            'build "external" {} "touch $out"; }'
+        ),
+        (
+            "let build = pkgs.runCommand; in base // { lib.wrapper = { build }: "
+            'build "external" {} "touch $out"; }'
+        ),
+        (
+            "let build = pkgs.runCommand; in let build = x: x; in base // "
+            '{ lib.wrapper = build "external" {} "touch $out"; }'
+        ),
+        "base // { lib.command = pkgs.runCommand; }",
+        'base // { lib.command = pkgs.runCommand "partial"; }',
+    ],
+)
+def test_flake_resource_ownership_preserves_composition(composition: str) -> None:
+    """Preserve policies, output aliases, VM wrappers, imports, and lexical scopes."""
+    with _fresh_repository() as root:
+        source = (
+            "{ outputs = inputs: let base = inputs.afairesi.blueprint "
+            "{ inherit inputs; nixpkgs.config.allowUnfree = true; }; "
+            f"pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux; in {composition}; }}"
+        )
+        (root / "flake.nix").write_text(source)
+        _repair_flake(root)
+        stable = _snapshot(root)
+        _repair_flake(root)
+        _expect(
+            _snapshot(root) == stable and (root / "flake.nix").read_text() == source,
+            "composition was rewritten",
+        )
+
+
+@pytest.mark.parametrize(
     ("source", "message"),
     [
         ("async def main(): pass\n", "main must be synchronous"),

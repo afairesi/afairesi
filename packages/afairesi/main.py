@@ -1320,6 +1320,120 @@ def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool: 
     return changed
 
 
+def _resource_constructor(
+    document: nix_syntax.Document,
+    expression: Node,
+    visited: frozenset[int] = frozenset(),
+) -> str | None:
+    """Resolve static constructor references and lexical let aliases."""
+    if expression.start_byte in visited:
+        return None
+    visited = visited | {expression.start_byte}
+    if expression.type == "parenthesized_expression":
+        inner = expression.child_by_field_name("expression")
+        return (
+            None if inner is None else _resource_constructor(document, inner, visited)
+        )
+    if expression.type == "select_expression":
+        attrpath = expression.child_by_field_name("attrpath")
+        path = (
+            None if attrpath is None else nix_syntax.static_attrpath(document, attrpath)
+        )
+        return None if path is None else path[-1]
+    if expression.type != "variable_expression":
+        return None
+    return _resource_variable_constructor(document, expression, visited)
+
+
+def _resource_variable_constructor(
+    document: nix_syntax.Document,
+    expression: Node,
+    visited: frozenset[int],
+) -> str | None:
+    """Resolve aliases without crossing a binding that shadows their names."""
+    name = document.text(expression)
+    scope = expression.parent
+    while scope is not None:
+        if scope.type == "function_expression":
+            parameters = [
+                child
+                for field in ("universal", "formals")
+                if (child := scope.child_by_field_name(field)) is not None
+            ]
+            if any(
+                node.type == "identifier" and document.text(node) == name
+                for parameter in parameters
+                for node in nix_syntax.walk(parameter)
+            ):
+                return None
+        if scope.type in {"let_expression", "rec_attrset_expression"}:
+            bindings = next(
+                (node for node in scope.named_children if node.type == "binding_set"),
+                None,
+            )
+            for binding in [] if bindings is None else bindings.named_children:
+                path = binding.child_by_field_name("attrpath")
+                value = binding.child_by_field_name("expression")
+                if (
+                    path is not None
+                    and nix_syntax.static_attrpath(document, path) == (name,)
+                    and value is not None
+                ):
+                    return _resource_constructor(document, value, visited)
+        scope = scope.parent
+    return name if name == "derivation" else None
+
+
+def _flake_resource_issues(root: Path) -> list[str]:
+    """Keep resource definitions in their owners and composition in the flake."""
+    source = read_regular(root / "flake.nix")
+    if source is None or not source.strip():
+        return []
+    document = nix_syntax.parse(source, "flake.nix")
+    outputs = _attrset_expression(document, document.root, ("outputs",))
+    constructors = {
+        "buildPythonPackage": (1, "packages/NAME/default.nix"),
+        "buildPythonApplication": (1, "packages/NAME/default.nix"),
+        "derivation": (1, "packages/NAME/default.nix"),
+        "mkDerivation": (1, "packages/NAME/default.nix"),
+        "mkPythonPackage": (1, "packages/NAME/default.nix"),
+        "mkPythonCheck": (1, "the package testing structure"),
+        "mkHostCheck": (1, "the host testing structure"),
+        "nixosSystem": (1, "hosts/NAME/configuration.nix"),
+        "runNixOSTest": (1, "the host testing structure"),
+        "runCommand": (3, "the package or host structure"),
+        "runCommandLocal": (3, "the package or host structure"),
+    }
+    issues = []
+    reported = set()
+    for output in outputs:
+        for node in nix_syntax.walk(output):
+            if node.type != "apply_expression":
+                continue
+            function = node
+            arguments = 0
+            while function.type == "apply_expression":
+                child = function.child_by_field_name("function")
+                if child is None:
+                    break
+                arguments += 1
+                function = child
+            constructor = _resource_constructor(document, function)
+            if constructor not in constructors or function.start_byte in reported:
+                continue
+            arity, destination = constructors[constructor]
+            if arguments < arity:
+                continue
+            reported.add(function.start_byte)
+            issues.append(
+                f"flake.nix:{node.start_point.row + 1}: {constructor} defines a "
+                f"resource outside its owner; move the definition to {destination}. "
+                "flake.nix should compose existing resources and apply repository "
+                "policy; aliases and wrappers of generated outputs are supported",
+            )
+    return issues
+
+
 def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
     """Converge required files, structure, templates, and root whitelist."""
     missing = [
@@ -1330,7 +1444,7 @@ def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
     if missing:
         raise CommandError("missing required file: " + missing[0])
     packages = detect_packages(root)
-    issues = []
+    issues = _flake_resource_issues(root)
     for package in packages:
         validate_name(package.name)
         issues.extend(_python_source_issues(package))
@@ -1358,6 +1472,7 @@ def converge_flake(root: Path, dry_run: bool) -> list[Package]:  # noqa: FBT001
 def validate_flake_source(root: Path) -> list[Package]:  # noqa: C901
     """Validate a Git-filtered flake source without requiring Git metadata."""
     packages, issues = inspect_structure(root)
+    issues.extend(_flake_resource_issues(root))
     for required in (".gitignore", "README", "flake.lock", "flake.nix"):
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
