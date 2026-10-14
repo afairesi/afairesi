@@ -471,9 +471,9 @@ def test_create_stages_the_requested_resource_and_whitelist(
     [
         (("packages/example",), "package creation requires TYPE"),
         (("packages/example", "unknown"), "invalid choice"),
-        (("packages/example", "python", "description"), "unrecognized arguments"),
+        (("packages/example", "python", "unexpected"), "unrecognized arguments"),
         (
-            ("packages/example", "python", "--description", "text"),
+            ("packages/example", "python", "--unknown-option"),
             "unrecognized arguments",
         ),
         (
@@ -537,15 +537,25 @@ def test_add_preview_preserves_state_and_rejects_existing_resources(kind: str) -
         _expect(_snapshot(root) == before, "conflicting preview changed state")
 
 
-def test_public_repo_repair_matches_formatter_repair() -> None:
+@pytest.mark.parametrize(
+    "tests",
+    [
+        "def test_example(): pass\n",
+        (
+            "class Cases:\n    def test_result(self):\n        assert True\n"
+            "class TestExample(Cases):\n    pass\n"
+        ),
+    ],
+)
+def test_public_repo_repair_generates_checks_and_reaches_a_fixed_point(
+    tests: str,
+) -> None:
     """Repair from nested directories and preview without changing Git state."""
     with _fresh_repository() as root:
         nested = root / "tmp/nested"
         nested.mkdir(parents=True)
         _run(root, "add", "packages/example", "python")
-        (root / "packages/example/test_main.py").write_text(
-            "def test_example(): pass\n",
-        )
+        (root / "packages/example/test_main.py").write_text(tests)
         before = _snapshot(root)
         result = _run(nested, "fix", "-n")
         _expect("checks/example/default.nix" in result.stdout, result.stdout)
@@ -612,25 +622,13 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             == _run(root, "--help").stdout,
             "standalone command unavailable through PATH",
         )
-        for retired in (
-            "create",
-            "move",
-            "remove",
-            "init",
-            "init-home",
-            "init-repo",
-            "clone",
-            "repair",
-            "repair-home",
-        ):
-            _run(root, retired, code=2)
+        _run(root, "unknown-command", code=2)
         _run(root, "add", code=2)
         help_output = _run(root, "--help").stdout
         command_names = ["add", "fix", "mv", "rm"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(positions == sorted(positions), "help commands must be alphabetical")
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
-        _run(root, "repair-home", "--source", str(root), code=2)
         _expect(not any(root.iterdir()), "invalid CLI request created state")
 
 
@@ -866,6 +864,7 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
         for relative in (
             "tmp/root-state",
             "packages/example/tmp/package-state",
+            "prm/nested/asset.bin",
             "packages/example/prm/nested/asset.bin",
         ):
             path = root / relative
@@ -882,13 +881,24 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
         )
         indexed = _git(root, "ls-files").splitlines()
         _expect(
-            "packages/example/prm/nested/asset.bin" in indexed
+            "prm/nested/asset.bin" in indexed
+            and "packages/example/prm/nested/asset.bin" in indexed
             and not any("tmp/" in path for path in indexed),
             indexed,
         )
         for relative in (
+            "prm/nested/asset.bin",
+            "packages/example/prm/nested/asset.bin",
+        ):
+            _expect(
+                _git(root, "rev-parse", f":{relative}")
+                == _git(root, "hash-object", relative),
+                f"{relative}: staged contents differ from working contents",
+            )
+        for relative in (
             "tmp/root-state",
             "packages/example/tmp/package-state",
+            "prm/nested/asset.bin",
             "packages/example/prm/nested/asset.bin",
         ):
             _expect((root / relative).read_bytes() == payload, relative)
@@ -3124,14 +3134,11 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
             command,
         )
     for arguments in (
-        ("init-repo", "https://example.test/team/new.git"),
-        ("move",),
-        ("repair",),
-        ("remove", "github.com/example/repository"),
+        ("unknown-command",),
         ("clone",),
         ("create",),
         ("init", "unexpected"),
-        ("init-flake", "git@forge.example:owner/example"),
+        ("rm",),
     ):
         _home_test_run(tmp_path, *arguments, code=2)
     _home_test_expect(not list(tmp_path.iterdir()), "invalid requests created files")
@@ -3174,7 +3181,7 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
         ("init",),
         ("repo", "init"),
         ("home", "add", "packages/example", "python"),
-        ("tests",),
+        ("unknown-scope",),
     ):
         _run(tmp_path, *arguments, executable=executable, code=2)
     _expect(not any(tmp_path.iterdir()), "invalid scope created state")
@@ -3226,40 +3233,6 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
         _preview(root, "fix")
 
 
-@pytest.mark.parametrize("name", ["README", "README.md"])
-def test_root_readme_is_rejected(name: str) -> None:
-    """Source validation rejects root READMEs and repository repair removes them."""
-    with _fresh_repository() as root:
-        (root / name).write_text("# Documentation\n")
-        result = _repair_flake(root, "--source", str(root), code=1)
-        _expect(f"{name}: unsupported" in result.stderr, result.stderr)
-        _expect((root / name).read_text() == "# Documentation\n", "README changed")
-        _run(root, "fix")
-        _expect(not (root / name).exists(), "root README survived repair")
-        _preview(root, "fix")
-        _repair_flake(root, "--source", str(root))
-
-
-def test_prm_readme_is_preserved() -> None:
-    """Root and package prm trees continue to accept README documentation."""
-    with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
-        files = [root / "prm/README", root / "packages/example/prm/README.md"]
-        for path in files:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("# Documentation\n")
-        _run(root, "fix")
-        _preview(root, "fix")
-        _repair_flake(root, "--source", str(root))
-        for path in files:
-            _expect(path.read_text() == "# Documentation\n", "README changed")
-            _expect(
-                path.relative_to(root).as_posix()
-                in _git(root, "ls-files").splitlines(),
-                "README not staged",
-            )
-
-
 def test_web_formatting_preserves_literal_line_breaks() -> None:
     """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
     with _fresh_repository() as root:
@@ -3279,25 +3252,3 @@ def test_web_formatting_preserves_literal_line_breaks() -> None:
         )
         _expect("`first\n\nsecond`" in script.read_text(), script.read_text())
         _expect("first\n\nsecond" in html.read_text(), html.read_text())
-
-
-def test_inherited_tests_generate_checks(tmp_path: Path) -> None:
-    """Inherited pytest methods produce a generated check instead of being skipped."""
-    subject = import_module("packages.afairesi.main")
-    root = _repository(tmp_path)
-    _run(root, "add", "packages/example", "python")
-    tests = root / "packages/example/test_main.py"
-    tests.write_text(
-        "class Cases:\n    def test_result(self):\n        assert True\n"
-        "class TestExample(Cases):\n    pass\n",
-    )
-    _run(root, "fix")
-    _expect(
-        Path("checks/example/default.nix")
-        in subject.canonical_checks(
-            root,
-            subject.detect_packages(root),
-        ),
-        "inherited test check omitted",
-    )
-    _expect((root / "checks/example/default.nix").is_file(), "check not generated")

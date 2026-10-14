@@ -184,46 +184,41 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
     )
 
 
-def test_cli_json_output(tmp_path: Path) -> None:
-    """Exercise the installed executable's JSON inventory."""
+@pytest.mark.parametrize("location", ["outside", "root", "nested"])
+def test_cli_inventory_resolves_repository_paths(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    """Return the same JSON inventory through supported paths inside and outside Git."""
     _repository(tmp_path)
-    completed = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(tmp_path)],
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=30,
-    )
-    report = json.loads(completed.stdout)
-    _expect(report == subject.inspect_repository(tmp_path), "incomplete CLI inventory")
+    expected = subject.inspect_repository(tmp_path)
     _expect(
-        report["packages"][0]["tests"][0]["id"] == "test_default_output",
-        "JSON lost test identifier",
+        expected["packages"][0]["tests"][0]["id"] == "test_default_output",
+        "inventory lost test identifier",
     )
-
-
-def test_cli_paths_resolve_from_git_root(tmp_path: Path) -> None:
-    """Inspect the same repository from nested directories with relative paths."""
-    _repository(tmp_path)
-    subprocess.run(  # noqa: S603
-        ["git", "init", "--quiet", str(tmp_path)],  # noqa: S607
-        check=True,
-        capture_output=True,
-        timeout=10,
-    )
-    nested = tmp_path / "packages/example"
-    for arguments in ([], ["."], [str(tmp_path)]):
+    if location != "outside":
+        subprocess.run(  # noqa: S603
+            ["git", "init", "--quiet", str(tmp_path)],  # noqa: S607
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    cwd = tmp_path / "packages/example" if location == "nested" else tmp_path
+    paths = [["."], [str(tmp_path)]]
+    if location != "outside":
+        paths.append([])
+    for arguments in paths:
         completed = subprocess.run(  # noqa: S603
             [os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
-            cwd=nested,
+            cwd=cwd,
             capture_output=True,
             text=True,
             check=True,
             timeout=30,
         )
         _expect(
-            json.loads(completed.stdout) == subject.inspect_repository(tmp_path),
-            "wrong path base",
+            json.loads(completed.stdout) == expected,
+            "path resolution changed the CLI inventory",
         )
 
 

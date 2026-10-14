@@ -414,20 +414,22 @@ def _manage(
     return _run(root, "repo", *arguments, code=code, executable="afairesi")
 
 
-def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
+def test_campaigns_route_targets_and_forward_test_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Route campaigns independently of their expensive test engines."""
+    """Route repository and package campaigns with their requested test filters."""
     subject = import_module("packages.afairesi-repo-test.main")
     root = _repository(tmp_path)
     package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
     nested = package / "prm/nested"
     nested.mkdir(parents=True)
     observed: list[Path] = []
+    forwarded: list[tuple[object, ...]] = []
 
-    def run(target: Path, *_arguments: object) -> bool:
+    def run(target: Path, *arguments: object) -> bool:
         observed.append(target)
+        forwarded.append(arguments)
         return True
 
     for runner in (
@@ -455,11 +457,24 @@ def test_campaign_targets_respect_repository_defaults_and_explicit_packages(
                 ((str(package),), package),
             )
             for arguments, expected in targets:
-                monkeypatch.setattr(sys, "argv", ["afairesi", *path, *arguments])
+                filters = (
+                    ["-k", "keyword", "-m", "marker"] if path != ("coverage",) else []
+                )
+                monkeypatch.setattr(
+                    sys,
+                    "argv",
+                    ["afairesi-repo-test", *path, *arguments, *filters],
+                )
                 with pytest.raises(SystemExit) as completed:
                     subject.main()
                 _expect(completed.value.code == 0, path)
                 _expect(observed[-1] == expected, (path, arguments, observed))
+                if filters:
+                    _expect(
+                        forwarded[-1][-1]
+                        == subject.TestSelection(keywords="keyword", markers="marker"),
+                        forwarded[-1],
+                    )
 
 
 def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
@@ -1157,19 +1172,6 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         _expect(
             mismatch.returncode == 1 and "does not match" in mismatch.stderr,
             mismatch,
-        )
-
-
-def test_static_cli_declares_commands_and_campaign_filters() -> None:
-    """Preserve campaign filter arguments in the public parser."""
-    subject = import_module("packages.afairesi-repo-test.main")
-    for campaign in ("hypothesis", "mutation"):
-        options = subject.parser().parse_args(
-            [campaign, "-k", "keyword", "-m", "marker"],
-        )
-        _expect(
-            options.keywords == "keyword" and options.markers == "marker",
-            "Campaign filter arguments must retain their runtime behavior",
         )
 
 
