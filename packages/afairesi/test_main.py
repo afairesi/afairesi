@@ -546,16 +546,16 @@ def test_public_repo_repair_matches_formatter_repair() -> None:
             "def test_example(): pass\n",
         )
         before = _snapshot(root)
-        result = _run(nested, "repair", "-n")
+        result = _run(nested, "fix", "-n")
         _expect("checks/example/default.nix" in result.stdout, result.stdout)
         _expect(_snapshot(root) == before, "repair preview changed state")
-        _run(nested, "repair")
+        _run(nested, "fix")
         _expect(
             (root / "checks/example/default.nix").is_file(),
             "repair omitted the check",
         )
         after = _snapshot(root)
-        _run(nested, "repair", "--dry-run")
+        _run(nested, "fix", "--dry-run")
         _expect(_snapshot(root) == after, "converged repair changed state")
 
 
@@ -591,7 +591,7 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             (),
             ("add",),
             ("mv",),
-            ("repair",),
+            ("fix",),
             ("rm",),
         )
         for command_path in commands:
@@ -619,12 +619,13 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             "init-home",
             "init-repo",
             "clone",
+            "repair",
             "repair-home",
         ):
             _run(root, retired, code=2)
         _run(root, "add", code=2)
         help_output = _run(root, "--help").stdout
-        command_names = ["add", "mv", "repair", "rm"]
+        command_names = ["add", "fix", "mv", "rm"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(positions == sorted(positions), "help commands must be alphabetical")
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
@@ -2056,7 +2057,7 @@ def _home_test_check_home_commits(
     source = checkout / "README"
     first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
     source.write_text("second", encoding="utf-8")
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     if source.read_text() != "second":
         message = "convergence changed dirty submodule content"
         raise AssertionError(message)
@@ -2066,7 +2067,7 @@ def _home_test_check_home_commits(
     for published in (False, True):
         if published:
             _home_test_git(checkout, "update-ref", "refs/remotes/origin/main", second)
-        _home_test_run(root, "repair")
+        _home_test_run(root, "fix")
         if first not in _home_test_git(root, "ls-files", "--stage", relative):
             message = "convergence advanced the recorded submodule commit"
             raise AssertionError(message)
@@ -2080,7 +2081,7 @@ def _home_test_check_home_whitelist(home_repository: Path) -> None:
     expected = ignore.read_text(encoding="utf-8")
     ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n", encoding="utf-8")
     before = _home_test_git(root, "show", ":.gitignore")
-    preview = _home_test_run(root, "repair", "--dry-run")
+    preview = _home_test_run(root, "fix", "--dry-run")
     if "would write '.gitignore'" not in preview.stdout:
         raise AssertionError(preview.stdout)
     if (
@@ -2089,13 +2090,13 @@ def _home_test_check_home_whitelist(home_repository: Path) -> None:
     ):
         message = "dry-run changed the home whitelist"
         raise AssertionError(message)
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     if ignore.read_text(encoding="utf-8") != expected:
         raise AssertionError(ignore.read_text(encoding="utf-8"))
     if _home_test_git(root, "show", ":.gitignore") != expected:
         message = "convergence did not stage the repaired whitelist"
         raise AssertionError(message)
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
 
 
 def _home_test_check_home_settings(
@@ -2110,8 +2111,8 @@ def _home_test_check_home_settings(
     modules.write_text(source)
     _home_test_git(root, "add", ".gitmodules")
     index = _home_test_git(root, "ls-files", "--stage")
-    _home_test_run(root, "repair", "--dry-run")
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix", "--dry-run")
+    _home_test_run(root, "fix")
     if (
         modules.read_text() != source
         or _home_test_git(root, "ls-files", "--stage") != index
@@ -2157,7 +2158,7 @@ def _home_test_check_home_move(
     indexed = _home_test_git(checkout, "show", ":README")
     target = root / destination
     target.mkdir()
-    rejected = _home_test_run(root, "repair", code=1)
+    rejected = _home_test_run(root, "fix", code=1)
     if "target already exists" not in rejected.stderr or not checkout.exists():
         raise AssertionError(rejected.stderr)
     if destination in _home_test_git(
@@ -2170,15 +2171,15 @@ def _home_test_check_home_move(
         message = "collision changed the submodule path"
         raise AssertionError(message)
     target.rmdir()
-    rejected = _home_test_run(root, "repair", code=1)
+    rejected = _home_test_run(root, "fix", code=1)
     if "stage .gitmodules" not in rejected.stderr or not checkout.exists():
         raise AssertionError(rejected.stderr)
     _home_test_git(root, "add", ".gitmodules")
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
     if not checkout.exists() or target.exists():
         message = "dry-run moved the checkout"
         raise AssertionError(message)
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     if (
         checkout.exists()
         or _home_test_git(target, "status", "--porcelain") != before
@@ -2191,7 +2192,7 @@ def _home_test_check_home_move(
     ):
         message = "home rename failed to preserve Git state and local remote settings"
         raise AssertionError(message)
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
     whitelist = (root / ".gitignore").read_text().splitlines()
     _home_test_expect(f"!/{relative}" not in whitelist, whitelist)
     _home_test_expect(f"!/{destination}" in whitelist, whitelist)
@@ -2399,7 +2400,7 @@ def test_merged_home_repair_rejects_collision_with_missing_checkout_registration
     _home_test_git(root, "add", ".gitmodules")
     before = _home_test_snapshot(root)
     for arguments in [("--dry-run",), ()]:
-        result = _home_test_run(root, "repair", *arguments, code=1)
+        result = _home_test_run(root, "fix", *arguments, code=1)
         _home_test_expect(
             "conflicts with a missing checkout registration" in result.stderr,
             result,
@@ -2455,12 +2456,12 @@ def test_merged_home_repair_preserves_missing_checkouts(
     expected_ignore = ignore.read_text()
     ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
     before = _home_test_snapshot(root)
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
     _home_test_expect(
         _home_test_snapshot(root) == before,
         "repair preview changed missing checkout state",
     )
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     _home_test_expect(
         not (checkout / ".git").exists(),
         "repair initialized a missing checkout",
@@ -2501,7 +2502,7 @@ def test_merged_home_repair_preserves_missing_checkouts(
             "repair relocated a missing checkout",
         )
     after = _home_test_snapshot(root)
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     _home_test_expect(
         _home_test_snapshot(root) == after,
         "repeated repair changed missing checkout state",
@@ -2553,7 +2554,7 @@ def test_merged_home_repair_preserves_local_remote_settings(
         for line in _home_test_git(checkout, "config", "--local", "--list").splitlines()
         if line.startswith("remote.")
     }
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
     _home_test_expect(
         _home_test_snapshot(root) == before,
         "home repair preview changed state",
@@ -2562,7 +2563,7 @@ def test_merged_home_repair_preserves_local_remote_settings(
         _home_test_snapshot(checkout) == checkout_before,
         "preview changed checkout settings",
     )
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     target = root / expected
     _home_test_expect(
         target.is_dir(),
@@ -2642,7 +2643,7 @@ def test_merged_home_repair_leaves_nested_submodule_settings_untouched(
     before = _home_test_snapshot(root)
     checkout_before = _home_test_snapshot(checkout)
     nested_before = _home_test_snapshot(nested)
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
     _home_test_expect(
         _home_test_snapshot(root) == before,
         "home repair preview changed state",
@@ -2655,7 +2656,7 @@ def test_merged_home_repair_leaves_nested_submodule_settings_untouched(
         _home_test_snapshot(nested) == nested_before,
         "preview changed nested repository",
     )
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     _home_test_expect(
         _home_test_git(checkout, "remote", "get-url", "origin").strip()
         == "git@mirror.example:owner/demo",
@@ -2688,7 +2689,7 @@ def test_merged_home_repair_preserves_dirty_submodules() -> None:
         patch.setenv("HOME", str(root))
         before = _home_test_snapshot(root)
         rejected = _home_test_repair_flake(root, code=1)
-        _home_test_expect("run afairesi home repair" in rejected.stderr, rejected)
+        _home_test_expect("run afairesi home fix" in rejected.stderr, rejected)
         _home_test_expect(
             _home_test_snapshot(root) == before,
             "flake repair changed home state",
@@ -2702,7 +2703,7 @@ def test_merged_home_repair_preserves_dirty_submodules() -> None:
             modules.read_text() + "url = git@forge.example:owner/other\n",
         )
         before = _home_test_snapshot(root)
-        result = _home_test_run(root, "repair", code=1)
+        result = _home_test_run(root, "fix", code=1)
         _home_test_expect(
             "duplicate url field" in result.stderr
             and _home_test_snapshot(root) == before,
@@ -2743,13 +2744,13 @@ def test_merged_home_repair_targets_home_from_any_working_directory(
     before = _home_test_snapshot(home)
     checkout_before = _home_test_snapshot(checkout)
     flake_before = _home_test_snapshot(flake)
-    preview = _home_test_run(cwd, "repair", "--dry-run")
+    preview = _home_test_run(cwd, "fix", "--dry-run")
     _home_test_expect("would write '.gitignore'" in preview.stdout, preview)
     _home_test_expect(
         _home_test_snapshot(home) == before,
         "home repair preview changed state",
     )
-    _home_test_run(cwd, "repair")
+    _home_test_run(cwd, "fix")
     _home_test_expect(ignore.read_text() == expected, "home whitelist was not repaired")
     _home_test_expect(
         _home_test_git(home, "show", ":.gitignore") == expected,
@@ -2764,7 +2765,7 @@ def test_merged_home_repair_targets_home_from_any_working_directory(
         "home repair changed unrelated flake",
     )
     _home_test_expect(not list(outside.iterdir()), "home repair changed outside path")
-    _home_test_run(cwd, "repair", "--dry-run")
+    _home_test_run(cwd, "fix", "--dry-run")
 
 
 @pytest.mark.parametrize(
@@ -2931,7 +2932,7 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
         not _home_test_git(root, "diff", "--name-only"),
         "metadata was not staged",
     )
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
 
 
 @pytest.mark.parametrize("registered", [True, False])
@@ -2983,12 +2984,12 @@ def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
     history = root / ".git/modules" / relative
     history_before = _home_test_history_snapshot(history)
     before = _home_test_snapshot(root)
-    _home_test_run(root, "repair", "--dry-run")
+    _home_test_run(root, "fix", "--dry-run")
     _home_test_expect(
         _home_test_snapshot(root) == before,
         "repair preview changed home state",
     )
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     submodule_settings = {
         line
         for line in _home_test_git(root, "config", "--local", "--list").splitlines()
@@ -3029,7 +3030,7 @@ def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
         "repair changed stored history",
     )
     after = _home_test_snapshot(root)
-    _home_test_run(root, "repair")
+    _home_test_run(root, "fix")
     _home_test_expect(
         _home_test_snapshot(root) == after,
         "repeated repair changed home state",
@@ -3079,7 +3080,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("clone", "create", "init", "repair", "rm")
+    commands = ("clone", "create", "fix", "init", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
     _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -3092,6 +3093,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     for arguments in (
         ("init-repo", "https://example.test/team/new.git"),
         ("move",),
+        ("repair",),
         ("remove", "github.com/example/repository"),
         ("clone",),
         ("create",),
@@ -3111,7 +3113,7 @@ def test_merged_home_commands_reject_flake_repositories_without_changes(
     (tmp_path / "flake.nix").touch()
     monkeypatch.setenv("HOME", str(tmp_path))
     before = _home_test_snapshot(tmp_path)
-    for arguments in (("init",), ("repair",), ("rm", "packages/example")):
+    for arguments in (("init",), ("fix",), ("rm", "packages/example")):
         _home_test_run(tmp_path, *arguments, code=1)
         _home_test_expect(
             _home_test_snapshot(tmp_path) == before,

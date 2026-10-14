@@ -2286,6 +2286,20 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         action="store_true",
         help="print additions without changing the repository",
     )
+    fix = commands.add_parser(
+        "fix",
+        help="fix and stage the current repository structure",
+        description=(
+            "Fix and stage canonical flake structure from any working directory."
+        ),
+        epilog="Use nix fmt to fix structure and also format code.",
+    )
+    fix.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="report required fixes without changes",
+    )
     move = commands.add_parser(
         "mv",
         help="rename a package or host",
@@ -2312,20 +2326,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="print moves without changing the repository",
-    )
-    repair = commands.add_parser(
-        "repair",
-        help="repair and stage the current repository structure",
-        description=(
-            "Repair and stage canonical flake structure from any working directory."
-        ),
-        epilog="Use nix fmt to repair structure and also format code.",
-    )
-    repair.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="report required repairs without changes",
     )
     remove = commands.add_parser(
         "rm",
@@ -2841,28 +2841,28 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     create.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
-    commands.add_parser(
-        "init",
-        help="initialize the home repository and stage its whitelist",
-        description="Initialize the repository at $HOME and stage its whitelist.",
-    )
-    repair_home = commands.add_parser(
-        "repair",
-        help="repair the home repository whitelist and submodule layout",
+    fix_home = commands.add_parser(
+        "fix",
+        help="fix the home repository whitelist and submodule layout",
         description=(
-            "Repair the repository at $HOME: its whitelist and registered "
+            "Fix the repository at $HOME: its whitelist and registered "
             "submodule paths and names, from any working directory."
         ),
         epilog=(
             "Move submodules to <remote-hostname>/<repository-path>, migrate "
-            "whitelist entries, and stage repairs for existing checkouts. "
+            "whitelist entries, and stage fixes for existing checkouts. "
         ),
     )
-    repair_home.add_argument(
+    fix_home.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="report required repairs without changes",
+        help="report required fixes without changes",
+    )
+    commands.add_parser(
+        "init",
+        help="initialize the home repository and stage its whitelist",
+        description="Initialize the repository at $HOME and stage its whitelist.",
     )
     remove = commands.add_parser(
         "rm",
@@ -2903,7 +2903,7 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         initialize_submodule(options.remote)
     elif options.command == "create":
         create_home_repo(options.remote)
-    elif options.command == "repair":
+    elif options.command == "fix":
         converge_home(_require_home_repository(), options.dry_run)
     elif options.command == "rm":
         root = _require_home_repository()
@@ -2933,7 +2933,7 @@ def parser() -> argparse.ArgumentParser:
             "Structural changes are staged for review."
         ),
         epilog=(
-            "Use repair to repair flake structure, or nix fmt to also format code. "
+            "Use fix to correct flake structure, or nix fmt to also format code. "
             "Use afairesi-repo-test to run test campaigns."
         ),
     )
@@ -2943,7 +2943,7 @@ def parser() -> argparse.ArgumentParser:
         description=(
             "Manage the Git repository at $HOME and its submodules. "
             "Hosted repositories live at $HOME/<remote-hostname>/<repository-path>. "
-            "Repairs stage structural changes without committing them."
+            "Fixes stage structural changes without committing them."
         ),
         epilog=(
             "Use Git for diffs, commits, branches, and remote synchronization. "
@@ -3010,9 +3010,7 @@ def formatter_main() -> None:
             return
         root = repository_root()
         if repository_type(root) != "flake":
-            msg = (
-                "nix fmt requires a flake repository; run afairesi home repair for home"
-            )
+            msg = "nix fmt requires a flake repository; run afairesi home fix for home"
             raise CommandError(msg)  # noqa: TRY301
         converge_flake(root, options.dry_run)
     except (
@@ -3057,7 +3055,7 @@ def main() -> None:
             )
         elif options.command == "mv":
             rename_resource(root, options.source, options.destination, options.dry_run)
-        elif options.command == "repair":
+        elif options.command == "fix":
             converge_flake(root, options.dry_run, fail_on_changes=False)
     except (
         CommandError,
