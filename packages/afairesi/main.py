@@ -2881,7 +2881,7 @@ def parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Use nix fmt to repair flake structure and format code. "
-            "Use afairesi-repo-tests to run test campaigns."
+            "Use afairesi-repo-test to run test campaigns."
         ),
     )
     home = scopes.add_parser(
