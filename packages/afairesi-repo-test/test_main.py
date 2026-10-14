@@ -114,6 +114,7 @@ def _prepare_runner_flake(
     (package / "main.py").write_text(source, encoding="utf-8")
     builders = root / "prm/builders"
     shutil.copytree(Path(afairesi.__file__).with_name("prm"), builders)
+    shutil.copyfile(afairesi.__file__, builders.parent / "main.py")
     environment = dict(os.environ)
     store = root.parent / "nix"
     environment["NIX_REMOTE"] = (
@@ -220,6 +221,7 @@ def _prepare_coverage_flake(
     checks = []
     reports = []
     shutil.copytree(Path(afairesi.__file__).with_name("prm"), root / "prm/builders")
+    shutil.copyfile(afairesi.__file__, root / "prm/main.py")
     for name in ("example", "z-last"):
         _manage(root, "add", f"packages/{name}", "python")
         package = root / "packages" / name
@@ -651,7 +653,8 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
             rows = {row["nodeid"]: row for row in audit["tests"]}
             expected_counts = {"collected_cases": 5, "functions": 4, "skipped": 2}
             _expect(
-                all(
+                audit["package"] in {"example", "z-last"}
+                and all(
                     audit["summary"][key] == value
                     for key, value in expected_counts.items()
                 )
@@ -891,6 +894,11 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         caller_home.mkdir()
         sentinel = caller_home / "sentinel"
         sentinel.write_text("preserve")
+        environment.update(
+            AFAIRESI_TEST_REPORT=str(sentinel),
+            AFAIRESI_TEST_PACKAGE="unrelated-package",
+            AFAIRESI_MUTATION_REPORT="1",
+        )
         for variable in (
             "HOME",
             "XDG_CACHE_HOME",
@@ -934,7 +942,8 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
             report = json.loads((workspace / "tests.json").read_text())
             rows = {row["nodeid"]: row for row in report["tests"]}
             _expect(
-                report["summary"]["selected_cases"] == expected_case_count
+                report["package"] == "git-example"
+                and report["summary"]["selected_cases"] == expected_case_count
                 and rows["test_main.py::test_property"]["body_calls"]
                 == max_examples + 1
                 and rows["test_main.py::test_cli"]["body_calls"] == 1

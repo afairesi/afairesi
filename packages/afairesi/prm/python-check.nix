@@ -6,6 +6,15 @@
 }:
 let
   pythonEnv = testEnvironment.python;
+  source = builtins.readFile ../main.py;
+  testSupportSource =
+    "from __future__ import annotations\n\ndef make_test_report_plugin"
+    + builtins.head (
+      builtins.split "\ndef python_test_support_source" (
+        builtins.elemAt (builtins.split "\ndef make_test_report_plugin" source) 2
+      )
+    );
+  bootstrap = builtins.toFile "python-check.py" (testSupportSource + "\nrun_python_check()\n");
 in
 pkgs.runCommand packageName
   (
@@ -24,17 +33,5 @@ pkgs.runCommand packageName
     ln -s "$src" "packages/${packageName}"
     export PYTHONPATH="$PWD:$PYTHONPATH"
     cd "$out"
-    "${pythonEnv}/bin/python" - <<'PYTHON'
-    import os
-    import sys
-    from hypothesis import Phase, settings
-    settings.register_profile("explicit", phases=[Phase.explicit])
-    settings.load_profile("explicit")
-    import pytest
-    sys.exit(pytest.main([
-        "-p", "no:cacheprovider",
-        "--import-mode=importlib",
-        os.environ["src"] + "/test_main.py",
-    ]))
-    PYTHON
+    "${pythonEnv}/bin/python" "${bootstrap}" "''${afairesi_pytest_args[@]}"
   ''

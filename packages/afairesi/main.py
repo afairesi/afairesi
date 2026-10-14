@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
-import os
 import re
 import shutil
 import stat
@@ -55,6 +54,277 @@ SOURCE_SUFFIXES = {
     ".tsx",
     ".jsx",
 }
+
+
+def make_test_report_plugin(  # noqa: C901, PLR0915 - Keep reporting independently serializable.
+    package_name: str,
+    *,
+    mutation_report: bool = False,
+) -> object:
+    """Create the standalone pytest reporter used by all test campaigns."""
+    import functools  # noqa: PLC0415 - Standalone test helper.
+    import json  # noqa: PLC0415 - Standalone test helper.
+    import os  # noqa: PLC0415 - Standalone test helper.
+    import sys  # noqa: PLC0415 - Standalone test helper.
+    from collections import Counter  # noqa: PLC0415 - Standalone test helper.
+    from pathlib import Path  # noqa: PLC0415 - Standalone test helper.
+    from types import SimpleNamespace  # noqa: PLC0415 - Standalone test helper.
+    from typing import (  # noqa: PLC0415 - Standalone test helper.
+        TYPE_CHECKING,
+        Any,
+        cast,
+    )
+
+    import pytest  # noqa: PLC0415 - Standalone test helper.
+
+    if TYPE_CHECKING:
+        from collections.abc import Generator  # noqa: PLC0415 - Standalone test helper.
+    from hypothesis import (  # noqa: PLC0415 - Standalone test helper.
+        Phase,
+        is_hypothesis_test,
+        settings,
+    )
+
+    tests: dict[str, dict[str, Any]] = {}
+    collection_errors: list[str] = []
+    owner = os.environ.setdefault("AFAIRESI_TEST_REPORT_OWNER", str(os.getpid()))
+
+    def node_id(item: pytest.Item) -> str:
+        path, separator, name = item.nodeid.partition("::")
+        return Path(path).name + separator + name
+
+    def record(item: pytest.Item) -> dict[str, Any]:
+        key = node_id(item)
+        if key not in tests:
+            function = getattr(item, "obj", None)
+            property_test = is_hypothesis_test(function)
+            instance = getattr(function, "__self__", None)
+            profile = cast(
+                "settings",
+                getattr(
+                    function,
+                    "_hypothesis_internal_use_settings",
+                    getattr(instance, "settings", settings.default),
+                ),
+            )
+            examples = getattr(function, "hypothesis_explicit_examples", ())
+            handle = getattr(function, "hypothesis", None)
+            measured = not property_test or hasattr(handle, "inner_test")
+            tests[key] = {
+                "nodeid": key,
+                "function": key.split("[", 1)[0],
+                "outcome": "not_run",
+                "duration": 0.0,
+                "body_calls": 0 if measured else None,
+                "is_property": property_test,
+                "explicit_examples": len(examples),
+                "generation_enabled": property_test
+                and Phase.generate in profile.phases,
+            }
+        return tests[key]
+
+    def pytest_collection_finish(session: pytest.Session) -> None:
+        for item in session.items:
+            record(item)
+
+    def pytest_deselected(items: list[pytest.Item]) -> None:
+        for item in items:
+            record(item)["outcome"] = "deselected"
+
+    def pytest_collectreport(report: pytest.CollectReport) -> None:
+        if report.failed:
+            collection_errors.append(str(report.longrepr))
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_protocol(
+        item: pytest.Item,
+        nextitem: pytest.Item | None,  # noqa: ARG001 - pytest hook signature.
+    ) -> Generator[None, object, object]:
+        previous = os.environ.get("AFAIRESI_TEST_CONTEXT", "")
+        context = node_id(item) if owner == str(os.getpid()) else previous
+        os.environ["AFAIRESI_TEST_CONTEXT"] = context
+        try:
+            import coverage  # noqa: PLC0415 - Standalone test helper.
+
+            tracer = coverage.Coverage.current()
+        except ImportError:
+            tracer = None
+        if tracer is not None:
+            tracer.switch_context(context)
+        try:
+            return (yield)
+        finally:
+            os.environ["AFAIRESI_TEST_CONTEXT"] = previous
+            if tracer is not None:
+                tracer.switch_context(previous)
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_call(item: pytest.Item) -> Generator[None, object, object]:
+        row = record(item)
+        handle = getattr(getattr(item, "obj", None), "hypothesis", None)
+        original = getattr(handle, "inner_test", None)
+        if original is None or handle is None:
+            if not row["is_property"]:
+                row["body_calls"] += 1
+        else:
+
+            @functools.wraps(original)
+            def counted(*args: object, **kwargs: object) -> object:
+                row["body_calls"] += 1
+                return cast("object", original(*args, **kwargs))
+
+            handle.inner_test = counted
+        try:
+            return (yield)
+        finally:
+            if original is not None and handle is not None:
+                handle.inner_test = original
+
+    @pytest.hookimpl(wrapper=True, tryfirst=True)
+    def pytest_runtest_makereport(
+        item: pytest.Item,
+        call: pytest.CallInfo[None],  # noqa: ARG001 - pytest hook signature.
+    ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
+        report = yield
+        row = record(item)
+        row["duration"] += report.duration
+        if (report.failed or row["outcome"] != "failed") and (
+            report.failed or report.skipped or report.when == "call"
+        ):
+            row["outcome"] = report.outcome
+        if report.skipped:
+            reason = report.longrepr
+            reason_text = str(reason[-1] if isinstance(reason, tuple) else reason)
+            row["skip_reason"] = reason_text.removeprefix("Skipped: ")
+        if hasattr(report, "wasxfail"):
+            row["xfail_reason"] = report.wasxfail
+        statistics = getattr(item, "hypothesis_statistics", None)
+        if statistics:
+            row["hypothesis_statistics"] = statistics
+        return report
+
+    def pytest_sessionfinish(
+        session: pytest.Session,  # noqa: ARG001 - pytest hook signature.
+        exitstatus: int,
+    ) -> None:
+        if owner != str(os.getpid()):
+            return
+        rows = sorted(tests.values(), key=lambda row: row["nodeid"])
+        selected = [row for row in rows if row["outcome"] != "deselected"]
+        unexecuted = [
+            row["nodeid"]
+            for row in selected
+            if row["is_property"] and row["body_calls"] == 0
+        ]
+        summary = dict(Counter(row["outcome"] for row in rows))
+        summary.update(
+            {
+                "collected_cases": len(rows),
+                "selected_cases": len(selected),
+                "functions": len({row["function"] for row in rows}),
+                "properties": sum(row["is_property"] for row in selected),
+                "unexecuted_properties": unexecuted,
+                "unmeasured_properties": [
+                    row["nodeid"] for row in selected if row["body_calls"] is None
+                ],
+                "body_calls": sum(row["body_calls"] or 0 for row in selected),
+                "duration": sum(row["duration"] for row in selected),
+            },
+        )
+        document = {
+            "schema": "afairesi.tests",
+            "schema_version": 1,
+            "package": package_name,
+            "exit_code": int(exitstatus),
+            "summary": summary,
+            "tests": rows,
+            "collection_errors": collection_errors,
+        }
+        Path("tests.json").write_text(json.dumps(document, indent=2) + "\n")
+        if mutation_report:
+            attribution = {
+                "failed_tests": [
+                    row["nodeid"] for row in rows if row["outcome"] == "failed"
+                ],
+                "collection_errors": collection_errors,
+            }
+            sys.stdout.write("\nAFAIRESI_TEST_REPORT " + json.dumps(attribution) + "\n")
+
+    return SimpleNamespace(
+        pytest_collection_finish=pytest_collection_finish,
+        pytest_deselected=pytest_deselected,
+        pytest_collectreport=pytest_collectreport,
+        pytest_runtest_protocol=pytest_runtest_protocol,
+        pytest_runtest_call=pytest_runtest_call,
+        pytest_runtest_makereport=pytest_runtest_makereport,
+        pytest_sessionfinish=pytest_sessionfinish,
+    )
+
+
+def start_subprocess_coverage() -> None:
+    """Start coverage in child interpreters and inherit the active test context."""
+    import os  # noqa: PLC0415 - Standalone test helper.
+
+    import coverage  # noqa: PLC0415 - Standalone test helper.
+
+    tracer = coverage.Coverage.current() or coverage.process_startup()
+    if tracer is not None:
+        tracer.switch_context(os.environ.get("AFAIRESI_TEST_CONTEXT", ""))
+
+
+def remap_coverage_paths(installed_path: str) -> None:
+    """Combine installed-module coverage with the corresponding source file."""
+    import os  # noqa: PLC0415 - Standalone test helper.
+    from pathlib import Path  # noqa: PLC0415 - Standalone test helper.
+
+    import coverage  # noqa: PLC0415 - Standalone test helper.
+
+    data = coverage.CoverageData()
+    data.read()
+    mapped = coverage.CoverageData(basename=".coverage-mapped")
+    mapped.update(
+        data,
+        map_path=lambda path: (
+            os.environ["src"] + "/main.py"  # noqa: SIM112 - Nix build environment.
+            if path == installed_path
+            else path
+        ),
+    )
+    mapped.write()
+    Path(mapped.data_filename()).replace(data.data_filename())
+
+
+def run_python_check() -> None:
+    """Run a Nix package check using only explicit Hypothesis examples."""
+    import os  # noqa: PLC0415 - Standalone test helper.
+    import sys  # noqa: PLC0415 - Standalone test helper.
+
+    import pytest  # noqa: PLC0415 - Standalone test helper.
+    from hypothesis import Phase, settings  # noqa: PLC0415 - Standalone test helper.
+
+    settings.register_profile("explicit", phases=[Phase.explicit])
+    settings.load_profile("explicit")
+    raise SystemExit(
+        pytest.main(
+            [
+                "-p",
+                "no:cacheprovider",
+                "--import-mode=importlib",
+                os.environ["src"] + "/test_main.py",  # noqa: SIM112 - Nix build environment.
+                *sys.argv[1:],
+            ],
+        ),
+    )
+
+
+def python_test_support_source() -> str:
+    """Copy standalone test helpers without importing Afairesi in target runtimes."""
+    source = Path(__file__).read_text(encoding="utf-8")
+    helpers = source.split("\ndef make_test_report_plugin", 1)[1].split(
+        "\ndef python_test_support_source",
+        1,
+    )[0]
+    return "from __future__ import annotations\n\ndef make_test_report_plugin" + helpers
 
 
 class CommandError(RuntimeError):
@@ -2173,7 +2443,7 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
 
 def require_nix_flakes() -> str:
     """Check the effective Nix features before initialization changes files."""
-    executable = os.environ.get("AFAIRESI_NIX", "nix")
+    executable = "nix"
     try:
         completed = run(
             [executable, "config", "show", "experimental-features"],

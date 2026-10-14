@@ -184,9 +184,7 @@ class TestSelection:
 
 def _test_report_source() -> str:
     """Read the pytest plugin shared by coverage and on-demand campaigns."""
-    return (Path(afairesi.__file__).with_name("prm") / "test_report.py").read_text(
-        encoding="utf-8",
-    )
+    return afairesi.python_test_support_source()
 
 
 def _prepare_package_tests(
@@ -225,7 +223,10 @@ def _prepare_package_tests(
         '    settings.load_profile("ondemand")\n'
     )
     (workspace / "_afairesi_test_report.py").write_text(
-        _test_report_source(),
+        _test_report_source()
+        + "\nglobals().update(vars(make_test_report_plugin(\n"
+        + f"    {name!r}, mutation_report={max_examples is None!r},\n"
+        + ")))\n",
         encoding="utf-8",
     )
     pytest_arguments = [
@@ -261,10 +262,6 @@ def _prepare_package_tests(
         "os.environ.pop('PYTEST_PLUGINS', None)\n"
         "os.environ.pop('AFAIRESI_TEST_REPORT_OWNER', None)\n"
         "os.environ.pop('AFAIRESI_TEST_CONTEXT', None)\n"
-        f"os.environ['AFAIRESI_TEST_PACKAGE'] = {name!r}\n"
-        f"os.environ['AFAIRESI_TEST_REPORT'] = {str(workspace / 'tests.json')!r}\n"
-        "os.environ['AFAIRESI_MUTATION_REPORT'] = "
-        f"{str(int(max_examples is None))!r}\n"
         "os.environ['HYPOTHESIS_STORAGE_DIRECTORY'] = "
         f"{str(workspace / 'hypothesis')!r}\n"
         "runtime = TemporaryDirectory(prefix='test-runtime-', "

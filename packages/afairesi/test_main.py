@@ -1912,11 +1912,19 @@ def test_merged_create_flake_commits_registers_and_publishes_an_empty_remote(
         encoding="utf-8",
     )
     fake_nix.chmod(0o755)
-    monkeypatch.setenv("AFAIRESI_NIX", str(fake_nix))
+    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
     _home_test_run(tmp_path, "init")
     _home_test_git(home, "commit", "--quiet", "-m", "Home policy")
     home_head = _home_test_git(home, "rev-parse", "HEAD")
-    _home_test_run(tmp_path, "create", remote)
+    _home_test_run(
+        tmp_path,
+        "-c",
+        "from packages.afairesi.main import main; main()",
+        "home",
+        "create",
+        remote,
+        executable=sys.executable,
+    )
     relative = "example.test/team/new"
     checkout = home / relative
     _home_test_expect(
@@ -1999,14 +2007,24 @@ def test_merged_create_flake_reports_missing_nix_before_creating_state(
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("AFAIRESI_NIX", str(tmp_path / "missing-nix"))
     _home_test_run(tmp_path, "init")
     before = _home_test_snapshot(home)
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    git_executable = shutil.which("git")
+    if git_executable is None:
+        pytest.fail("Missing Git executable")
+    (tools / "git").symlink_to(git_executable)
+    monkeypatch.setenv("PATH", str(tools))
     result = _home_test_run(
         tmp_path,
+        "-c",
+        "from packages.afairesi.main import main; main()",
+        "home",
         "create",
         "https://example.test/team/new.git",
         code=1,
+        executable=sys.executable,
     )
     _home_test_expect("Nix executable not found" in result.stderr, result)
     _home_test_expect(_home_test_snapshot(home) == before, "missing Nix changed home")
