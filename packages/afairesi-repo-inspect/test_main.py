@@ -177,35 +177,28 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         report["packages"][1]["cli"]["status"] == "not applicable",
         "non-Python package has CLI metadata",
     )
-    text = subject.render(report)
     _expect(
-        "default output" in text and "test_default_output" not in text,
+        report["packages"][0]["tests"][0]["name"] == "default output",
         "test name was not humanized",
     )
 
 
-def test_cli_json_and_readable_output(tmp_path: Path) -> None:
-    """Exercise the installed executable in both output modes."""
+def test_cli_json_output(tmp_path: Path) -> None:
+    """Exercise the installed executable's JSON inventory."""
     _repository(tmp_path)
-    for arguments in ([], ["--json"]):
-        completed = subprocess.run(  # noqa: S603
-            [os.environ["PACKAGE_E2E_EXECUTABLE"], str(tmp_path), *arguments],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=30,
-        )
-        if arguments:
-            report = json.loads(completed.stdout)
-            _expect(
-                report["packages"][0]["tests"][0]["id"] == "test_default_output",
-                "JSON lost test identifier",
-            )
-        else:
-            _expect(
-                "laptop" in completed.stdout and "--output" in completed.stdout,
-                "incomplete CLI inventory",
-            )
+    completed = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(tmp_path)],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    report = json.loads(completed.stdout)
+    _expect(report == subject.inspect_repository(tmp_path), "incomplete CLI inventory")
+    _expect(
+        report["packages"][0]["tests"][0]["id"] == "test_default_output",
+        "JSON lost test identifier",
+    )
 
 
 def test_invalid_repository_and_source(tmp_path: Path) -> None:
@@ -219,10 +212,9 @@ def test_invalid_repository_and_source(tmp_path: Path) -> None:
 
 
 def test_empty_repository(tmp_path: Path) -> None:
-    """Render missing collections explicitly."""
+    """Report missing collections as empty lists."""
     (tmp_path / "flake.nix").touch()
     _expect(
-        subject.render(subject.inspect_repository(tmp_path))
-        == "hosts/\n  (none)\npackages/\n  (none)",
+        subject.inspect_repository(tmp_path) == {"hosts": [], "packages": []},
         "empty collections were omitted",
     )

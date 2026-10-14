@@ -289,50 +289,6 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     return {"hosts": host_rows, "packages": packages}
 
 
-def _display(value: object) -> str:
-    if isinstance(value, dict) and "unknown" in value:
-        return f"unknown ({value['unknown']})"
-    return str(value)
-
-
-def render(report: dict[str, Any]) -> str:
-    """Render inventory with readable test names and argument metadata."""
-    lines = ["hosts/"]
-    lines.extend(
-        f"  {host['name']} ({host['configuration']})" for host in report["hosts"]
-    )
-    if not report["hosts"]:
-        lines.append("  (none)")
-    lines.append("packages/")
-    for package in report["packages"]:
-        lines.append(f"  {package['name']} [{package['kind']}]")
-        if package["description"]:
-            lines.append(f"    {package['description']}")
-        cli = package["cli"]
-        lines.append(f"    args: {cli['status']}")
-        lines.extend(
-            f"      command: {' '.join(command)}" for command in cli["commands"]
-        )
-        for argument in cli["arguments"]:
-            prefix = f"{' '.join(argument['command'])}: " if argument["command"] else ""
-            names = ", ".join(_display(name) for name in argument["names"]) or "unknown"
-            options = ", ".join(
-                f"{name}={_display(value)}"
-                for name, value in argument["options"].items()
-            )
-            lines.append(
-                f"      {prefix}{names}" + (f" ({options})" if options else ""),
-            )
-        lines.extend(f"      {warning}" for warning in cli["warnings"])
-        lines.append("    tests:" if package["tests"] else "    tests: (none)")
-        lines.extend(f"      {test['name']}" for test in package["tests"])
-        if package["check"]:
-            lines.append(f"    check: {package['check']}")
-    if not report["packages"]:
-        lines.append("  (none)")
-    return "\n".join(lines)
-
-
 def parser() -> argparse.ArgumentParser:
     """Declare the inspection command-line interface."""
     result = argparse.ArgumentParser(description=__doc__)
@@ -341,11 +297,6 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         type=Path,
         help="repository path (default: current Git repository)",
-    )
-    result.add_argument(
-        "--json",
-        action="store_true",
-        help="print JSON with original test identifiers",
     )
     return result
 
@@ -359,9 +310,7 @@ def main() -> None:
         report = inspect_repository(root)
     except CommandError as error:
         cli.exit(1, f"{cli.prog}: {error}\n")
-    sys.stdout.write(
-        (json.dumps(report, indent=2) if options.json else render(report)) + "\n",
-    )
+    sys.stdout.write(json.dumps(report, indent=2) + "\n")
 
 
 if __name__ == "__main__":
