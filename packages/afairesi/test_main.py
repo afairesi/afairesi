@@ -224,7 +224,7 @@ def _expect(condition: bool, detail: object) -> None:  # noqa: FBT001
 def _repository(root: Path, *, object_format: str = "sha1") -> Path:
     """Index a minimal flake in an existing temporary directory."""
     _git(root, "init", "--quiet", f"--object-format={object_format}")
-    for name in (".gitignore", "flake.nix", "flake.lock", "README"):
+    for name in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
         (root / name).write_text("", encoding="utf-8")
     _git(root, "add", ".")
     return root
@@ -1785,9 +1785,9 @@ def _home_test_home_repository(root: Path) -> Path:
     _home_test_git(checkout, "config", "user.email", "test@example.org")
     _home_test_git(checkout, "config", "commit.gpgSign", "false")
     _home_test_git(checkout, "remote", "add", "origin", "git@forge.example:owner/demo")
-    source = checkout / "README"
+    source = checkout / "LICENSE"
     source.write_text("first", encoding="utf-8")
-    _home_test_git(checkout, "add", "README")
+    _home_test_git(checkout, "add", "LICENSE")
     _home_test_git(checkout, "commit", "--quiet", "-m", "first")
     first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
     _home_test_git(checkout, "update-ref", "refs/remotes/origin/main", first)
@@ -1825,8 +1825,8 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
     origin = tmp_path / "remote"
     origin.mkdir()
     _home_test_git(origin, "init", "--quiet")
-    (origin / "README").write_text("existing repository")
-    _home_test_git(origin, "add", "README")
+    (origin / "LICENSE").write_text("existing repository")
+    _home_test_git(origin, "add", "LICENSE")
     _home_test_git(
         origin,
         "-c",
@@ -1869,7 +1869,7 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
     if _home_test_git(home, "show", ":.gitignore") != ignore:
         message = "clone REMOTE did not stage the home whitelist"
         raise AssertionError(message)
-    if (checkout / "README").read_text() != "existing repository":
+    if (checkout / "LICENSE").read_text() != "existing repository":
         raise AssertionError(result.stdout + result.stderr)
     if _home_test_git(home, "rev-parse", "HEAD") != head:
         message = "clone REMOTE created a home commit"
@@ -1958,12 +1958,11 @@ def test_merged_create_flake_commits_registers_and_publishes_an_empty_remote(
     )
     _home_test_expect(
         set(_home_test_git(checkout, "ls-files").splitlines())
-        == {".gitignore", "README", "flake.lock", "flake.nix"},
+        == {".gitignore", "flake.lock", "flake.nix"},
         "create did not commit the canonical initial files",
     )
     _home_test_expect(
-        (checkout / "README").read_text() == "# new\n"
-        and "inputs.afairesi.url" in (checkout / "flake.nix").read_text(),
+        "inputs.afairesi.url" in (checkout / "flake.nix").read_text(),
         "create did not scaffold the requested repository",
     )
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
@@ -2088,14 +2087,14 @@ def _home_test_check_home_commits(
     root = home_repository
     relative = "forge.example/owner/demo"
     checkout = root / relative
-    source = checkout / "README"
+    source = checkout / "LICENSE"
     first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
     source.write_text("second", encoding="utf-8")
     _home_test_run(root, "fix")
     if source.read_text() != "second":
         message = "convergence changed dirty submodule content"
         raise AssertionError(message)
-    _home_test_git(checkout, "add", "README")
+    _home_test_git(checkout, "add", "LICENSE")
     _home_test_git(checkout, "commit", "--quiet", "-m", "second")
     second = _home_test_git(checkout, "rev-parse", "HEAD").strip()
     for published in (False, True):
@@ -2162,10 +2161,10 @@ def _home_test_check_home_move(
     root = home_repository
     relative = "forge.example/owner/demo"
     checkout = root / relative
-    source = checkout / "README"
+    source = checkout / "LICENSE"
     first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
     source.write_text("move snapshot", encoding="utf-8")
-    _home_test_git(checkout, "add", "README")
+    _home_test_git(checkout, "add", "LICENSE")
     _home_test_git(checkout, "commit", "--quiet", "-m", "second")
     _home_test_git(root, "submodule", "absorbgitdirs", relative)
     _home_test_git(
@@ -2184,12 +2183,12 @@ def _home_test_check_home_move(
         "git@forge.example:owner/renamed",
     )
     source.write_text("staged", encoding="utf-8")
-    _home_test_git(checkout, "add", "README")
+    _home_test_git(checkout, "add", "LICENSE")
     source.write_text("unstaged", encoding="utf-8")
     (checkout / "untracked").write_text("keep", encoding="utf-8")
     (root / "unrelated").write_text("keep home file", encoding="utf-8")
     before = _home_test_git(checkout, "status", "--porcelain")
-    indexed = _home_test_git(checkout, "show", ":README")
+    indexed = _home_test_git(checkout, "show", ":LICENSE")
     target = root / destination
     target.mkdir()
     rejected = _home_test_run(root, "fix", code=1)
@@ -2217,7 +2216,7 @@ def _home_test_check_home_move(
     if (
         checkout.exists()
         or _home_test_git(target, "status", "--porcelain") != before
-        or _home_test_git(target, "show", ":README") != indexed
+        or _home_test_git(target, "show", ":LICENSE") != indexed
         or (target / "untracked").read_text() != "keep"
         or (root / "unrelated").read_text() != "keep home file"
         or first not in _home_test_git(root, "ls-files", "--stage", destination)
@@ -2472,7 +2471,7 @@ def test_merged_home_repair_preserves_missing_checkouts(
         shutil.rmtree(checkout)
         if state == "placeholder":
             checkout.mkdir()
-            (checkout / "README").write_text("unrelated local data")
+            (checkout / "LICENSE").write_text("unrelated local data")
     _home_test_git(
         root,
         "config",
@@ -2522,7 +2521,7 @@ def test_merged_home_repair_preserves_missing_checkouts(
     )
     if state == "placeholder":
         _home_test_expect(
-            (checkout / "README").read_text() == "unrelated local data",
+            (checkout / "LICENSE").read_text() == "unrelated local data",
             "repair changed placeholder data",
         )
     elif state == "missing":
@@ -2646,8 +2645,8 @@ def test_merged_home_repair_leaves_nested_submodule_settings_untouched(
     nested = checkout / "nested"
     nested.mkdir()
     _home_test_git(nested, "init", "--quiet")
-    (nested / "README").write_text("nested repository")
-    _home_test_git(nested, "add", "README")
+    (nested / "LICENSE").write_text("nested repository")
+    _home_test_git(nested, "add", "LICENSE")
     _home_test_fixture_git(nested, "commit", "-qm", "Nested snapshot")
     mirror = "git@mirror.example:owner/child"
     _home_test_git(nested, "remote", "add", "origin", mirror)
@@ -2822,7 +2821,7 @@ def test_merged_home_submodule_removal_rejects_invalid_or_dirty_targets(
         relative,
     )
     if case.startswith("dirty"):
-        (root / relative / "README").write_text("local changes")
+        (root / relative / "LICENSE").write_text("local changes")
     elif case in {"untracked", "ignored"}:
         if case == "ignored":
             exclude = _home_test_git(
@@ -2903,7 +2902,7 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
     ignore = root / ".gitignore"
     ignore.write_text(
         ignore.read_text()
-        + f"!/{relative}/\n!/{relative}/README\n"
+        + f"!/{relative}/\n!/{relative}/LICENSE\n"
         + "!/forge.example/owner/demo-other\n!/.ssh/\n",
     )
     _home_test_git(root, "add", ".gitignore")
@@ -2930,7 +2929,7 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
     )
     lines = ignore.read_text().splitlines()
     _home_test_expect(
-        f"!/{relative}" not in lines and f"!/{relative}/README" not in lines,
+        f"!/{relative}" not in lines and f"!/{relative}/LICENSE" not in lines,
         lines,
     )
     for entry in (
@@ -3227,22 +3226,37 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
         _preview(root, "fix")
 
 
-@pytest.mark.parametrize("readme_present", [False, True])
-def test_readme_is_optional_and_preserved_when_present(*, readme_present: bool) -> None:
-    """Repair and source validation accept repositories with or without README."""
+@pytest.mark.parametrize("name", ["README", "README.md"])
+def test_root_readme_is_rejected(name: str) -> None:
+    """Source validation rejects root READMEs and repository repair removes them."""
     with _fresh_repository() as root:
-        if readme_present:
-            (root / "README").write_text("# Optional documentation\n")
-        else:
-            _git(root, "rm", "--force", "README")
+        (root / name).write_text("# Documentation\n")
+        result = _repair_flake(root, "--source", str(root), code=1)
+        _expect(f"{name}: unsupported" in result.stderr, result.stderr)
+        _expect((root / name).read_text() == "# Documentation\n", "README changed")
+        _run(root, "fix")
+        _expect(not (root / name).exists(), "root README survived repair")
+        _preview(root, "fix")
+        _repair_flake(root, "--source", str(root))
+
+
+def test_prm_readme_is_preserved() -> None:
+    """Root and package prm trees continue to accept README documentation."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        files = [root / "prm/README", root / "packages/example/prm/README.md"]
+        for path in files:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("# Documentation\n")
         _run(root, "fix")
         _preview(root, "fix")
         _repair_flake(root, "--source", str(root))
-        _expect((root / "README").exists() == readme_present, "README presence changed")
-        if readme_present:
+        for path in files:
+            _expect(path.read_text() == "# Documentation\n", "README changed")
             _expect(
-                (root / "README").read_text() == "# Optional documentation\n",
-                "README contents changed",
+                path.relative_to(root).as_posix()
+                in _git(root, "ls-files").splitlines(),
+                "README not staged",
             )
 
 

@@ -35,7 +35,6 @@ ROOT_FILES = {
     ".github/workflows/workflow.yml",
     ".gitignore",
     "LICENSE",
-    "README",
     "flake.lock",
     "flake.nix",
     "formatter.nix",
@@ -2588,7 +2587,6 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         '{ inputs.afairesi.url = "github:afairesi/afairesi"; outputs = inputs: inputs.afairesi.blueprint { inherit inputs; }; }\n',  # noqa: E501
         encoding="utf-8",
     )
-    (root / "README").write_text(f"# {root.name}\n", encoding="utf-8")
     run([executable, "flake", "lock"], cwd=root)
     packages = detect_packages(root)
     _converge_checks(root, packages, False)  # noqa: FBT003

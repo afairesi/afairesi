@@ -181,7 +181,7 @@ def _prepare_coverage_flake(
     """Build generated checks and coverage variants with offline Nix inputs."""
     root.mkdir(parents=True)
     _git(root, "init", "--quiet")
-    for filename in (".gitignore", "flake.nix", "flake.lock", "README"):
+    for filename in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
         (root / filename).write_text(
             "{}" if filename.endswith((".nix", ".lock")) else "",
         )
@@ -335,7 +335,7 @@ def _expect(condition: bool, detail: object) -> None:  # noqa: FBT001
 def _repository(root: Path, *, object_format: str = "sha1") -> Path:
     """Index a minimal flake in an existing temporary directory."""
     _git(root, "init", "--quiet", f"--object-format={object_format}")
-    for name in (".gitignore", "flake.nix", "flake.lock", "README"):
+    for name in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
         (root / name).write_text("", encoding="utf-8")
     _git(root, "add", ".")
     return root
