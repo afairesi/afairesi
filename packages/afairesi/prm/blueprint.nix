@@ -15,6 +15,7 @@ let
     ) (if builtins.pathExists packagePath then builtins.readDir packagePath else { })
   );
   systems = builtins.attrNames base.packages;
+  moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) names;
   environments = nixlib.genAttrs systems (
     system:
     nixlib.genAttrs names (
@@ -28,6 +29,13 @@ let
 in
 (builtins.removeAttrs base [ "__functor" ])
 // {
+  packages = builtins.mapAttrs (
+    _: packages:
+    assert nixlib.assertMsg (
+      builtins.length (nixlib.unique moduleNames) == builtins.length moduleNames
+    ) "Afairesi Python packages have colliding installed module names";
+    packages
+  ) base.packages;
   apps = nixlib.genAttrs systems (
     system:
     let

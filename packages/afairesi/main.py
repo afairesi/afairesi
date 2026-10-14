@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import keyword
 import re
 import shutil
 import stat
@@ -533,6 +534,17 @@ def canonical_remote_path(remote: str) -> Path:
     return Path(*components)
 
 
+def _repository_remote_path(root: Path) -> Path | None:
+    """Return a hosted origin's canonical path when one is available."""
+    origin = git(root, ["remote", "get-url", "origin"], check=False)
+    if origin.returncode != 0:
+        return None
+    try:
+        return canonical_remote_path(origin.stdout.strip())
+    except CommandError:
+        return None
+
+
 def _package_kind(name: str, markers: set[str]) -> str:
     """Classify regular package markers consistently across source snapshots."""
     matches = [kind for kind, marker in KIND_MARKERS.items() if marker in markers]
@@ -565,6 +577,7 @@ def detect_packages(root: Path) -> list[Package]:
                 package_root,
             ),
         )
+    validate_python_package_names(result)
     return result
 
 
@@ -573,6 +586,28 @@ def validate_name(name: str) -> None:
     if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*|[a-z0-9]+(?:-[a-z0-9]+)*", name):
         msg = f"package name must use snake_case or dash-case: {name}"
         raise CommandError(msg)
+
+
+def validate_python_package_names(packages: list[Package]) -> None:
+    """Reject invalid or conflicting installed Python module names."""
+    modules: dict[str, str] = {}
+    for package in packages:
+        if package.kind != "python":
+            continue
+        module = package.name.replace("-", "_")
+        if not module.isidentifier() or keyword.iskeyword(module):
+            msg = (
+                f"packages/{package.name}: installed Python module must be "
+                "a valid non-keyword identifier"
+            )
+            raise CommandError(msg)
+        if module in modules:
+            msg = (
+                f"packages/{package.name} and packages/{modules[module]}: "
+                f"installed Python module names collide: {module}"
+            )
+            raise CommandError(msg)
+        modules[module] = package.name
 
 
 def validate_host_name(name: str) -> None:
@@ -760,23 +795,93 @@ def has_python_tests(path: Path) -> bool:
     """Detect static Python test definitions without executing the source."""
     try:
         module = ast.parse(path.read_bytes(), filename=str(path))
-        case_classes = _unittest_classes(module)
-        return any(
-            isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and definition.name.startswith("test_")
-            for node in module.body
-            for definition in (
-                node.body
-                if isinstance(node, ast.ClassDef)
-                and (node.name.startswith("Test") or node.name in case_classes)
-                else [node]
-            )
-        )
+        return bool(python_test_definitions(module))
     except (OSError, SyntaxError, UnicodeError) as error:
         msg = f"{path}: Python source could not be parsed: {error}"
         raise CommandError(
             msg,
         ) from error
+
+
+def _python_class_mro(
+    classes: dict[str, ast.ClassDef],
+    name: str,
+    seen: set[str],
+) -> list[str]:
+    """Compute Python's class precedence without executing base declarations."""
+    if name in seen:
+        msg = f"cyclic class inheritance: {name}"
+        raise CommandError(msg)
+    if name not in classes:
+        return [name]
+    bases = [ast.unparse(base) for base in classes[name].bases]
+    sequences = [_python_class_mro(classes, base, seen | {name}) for base in bases] + [
+        bases.copy(),
+    ]
+    result = [name]
+    while sequences := [sequence for sequence in sequences if sequence]:
+        candidate = next(
+            (
+                sequence[0]
+                for sequence in sequences
+                if all(sequence[0] not in other[1:] for other in sequences)
+            ),
+            None,
+        )
+        if candidate is None:
+            msg = f"inconsistent class inheritance: {name}"
+            raise CommandError(msg)
+        result.append(candidate)
+        for sequence in sequences:
+            if sequence[0] == candidate:
+                sequence.pop(0)
+    return result
+
+
+def python_test_definitions(
+    module: ast.Module,
+) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
+    """Find static test definitions, including methods inherited from local bases."""
+    classes = {
+        node.name: node for node in module.body if isinstance(node, ast.ClassDef)
+    }
+    case_classes = _unittest_classes(module)
+
+    def methods(name: str) -> dict[str, ast.stmt]:
+        result: dict[str, ast.stmt] = {}
+        for ancestor in reversed(_python_class_mro(classes, name, set())):
+            if ancestor not in classes:
+                continue
+            for statement in classes[ancestor].body:
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    result[statement.name] = statement
+                elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    targets = (
+                        statement.targets
+                        if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                    for target in targets:
+                        if isinstance(target, ast.Name):
+                            result[target.id] = statement
+        return result
+
+    result: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
+    for node in module.body:
+        owner = node.name if isinstance(node, ast.ClassDef) else ""
+        definitions = (
+            methods(owner).values()
+            if isinstance(node, ast.ClassDef)
+            and (owner.startswith("Test") or owner in case_classes)
+            else [node]
+        )
+        result.extend(
+            (owner, definition)
+            for definition in definitions
+            if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and definition.name.startswith("test_")
+        )
+    return result
 
 
 def _runtime_path(expression: ast.expr) -> Path | None:
@@ -893,9 +998,7 @@ def _runtime_directory_issues(
     repository = package.root.parent.parent
     expected = None
     if check_repository and (repository / ".git").exists():
-        origin = git(repository, ["remote", "get-url", "origin"], check=False)
-        if origin.returncode == 0:
-            expected = canonical_remote_path(origin.stdout.strip())
+        expected = _repository_remote_path(repository)
     for statement in bindings:
         targets = (
             statement.targets
@@ -1761,7 +1864,7 @@ def validate_flake_source(root: Path) -> list[Package]:  # noqa: C901
     """Validate a Git-filtered flake source without requiring Git metadata."""
     packages, issues = inspect_structure(root)
     issues.extend(_flake_resource_issues(root))
-    for required in (".gitignore", "README", "flake.lock", "flake.nix"):
+    for required in (".gitignore", "flake.lock", "flake.nix"):
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
     expected_ignore = render_gitignore(
@@ -2050,6 +2153,9 @@ def add_package(
     if (root / relative).exists() or (root / "checks" / name).exists():
         msg = f"package or generated check already exists: {name}"
         raise CommandError(msg)
+    validate_python_package_names(
+        [*detect_packages(root), Package(name, kind, root / relative)],
+    )
     if dry_run:
         read_regular(root / ".gitignore")
         for path in files:
@@ -2321,10 +2427,7 @@ def _runtime_rename_updates(
     new: Path,
 ) -> list[tuple[Path, str, str | None, str | None]]:
     """Prepare working and indexed runtime edits independently before moving files."""
-    origin = git(root, ["remote", "get-url", "origin"], check=False)
-    repository = (
-        canonical_remote_path(origin.stdout.strip()) if origin.returncode == 0 else None
-    )
+    repository = _repository_remote_path(root)
     updates = []
     for package in detect_packages(root):
         if package.kind != "python":
@@ -2407,6 +2510,15 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
     if destination_path.exists() or destination_path.is_symlink():
         msg = f"destination already exists: {destination_relative}"
         raise CommandError(msg)
+    packages = detect_packages(root)
+    validate_python_package_names(
+        [
+            Package(destination_relative.name, package.kind, destination_path)
+            if package.root == source_path
+            else package
+            for package in packages
+        ],
+    )
     moves = [(source_relative, destination_relative)]
     check_suffix = "" if source_kind == "package" else "VmWithDisko"
     source_check = Path("checks") / f"{source_name}{check_suffix}"

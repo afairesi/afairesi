@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import keyword
 import os
 import shutil
 import stat
@@ -270,7 +271,7 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
 PACKAGE_NAMES = st.from_regex(
     r"[a-z][a-z0-9]{0,5}(?:[-_][a-z0-9]{1,5})?",
     fullmatch=True,
-)
+).filter(lambda name: not keyword.iskeyword(name.replace("-", "_")))
 DESCRIPTIONS = st.text(
     alphabet=st.characters(exclude_categories=["Cs"], exclude_characters="\x00"),
     min_size=1,
@@ -1651,6 +1652,21 @@ def test_runtime_paths_can_derive_from_declared_directories(tmp_path: Path) -> N
         ("def test_result(): pass", True),
         ("async def test_result(): pass", True),
         ("class TestBehavior:\n    def test_result(self): pass", True),
+        (
+            (
+                "class Cases:\n    def test_result(self): pass\n"
+                "class Intermediate(Cases): pass\n"
+                "class TestBehavior(Intermediate): pass"
+            ),
+            True,
+        ),
+        (
+            (
+                "class Cases:\n    def test_result(self): pass\n"
+                "class TestBehavior(Cases):\n    test_result = None"
+            ),
+            False,
+        ),
         (
             (
                 "import unittest as unit\n"
@@ -3163,3 +3179,111 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     ):
         _run(tmp_path, *arguments, executable=executable, code=2)
     _expect(not any(tmp_path.iterdir()), "invalid scope created state")
+
+
+@pytest.mark.parametrize("name", ["123", "1app", "class", "async"])
+def test_python_names_are_rejected_before_creation_or_rename(name: str) -> None:
+    """Reject names that cannot be imported by the installed executable."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        before = _snapshot(root)
+        for arguments in (
+            ("add", f"packages/{name}", "python"),
+            ("mv", "packages/example", f"packages/{name}"),
+        ):
+            _run(root, *arguments, code=1)
+            _expect(_snapshot(root) == before, arguments)
+        _run(root, "add", f"packages/{name}", "nix")
+
+
+def test_python_module_collisions_are_rejected_before_changes() -> None:
+    """Keep distinct resources from sharing one installed Python module."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/foo-bar", "python")
+        _run(root, "add", "packages/example", "python")
+        before = _snapshot(root)
+        for arguments in (
+            ("add", "packages/foo_bar", "python"),
+            ("mv", "packages/example", "packages/foo_bar"),
+        ):
+            rejected = _run(root, *arguments, code=1)
+            _expect("collide" in rejected.stderr, rejected)
+            _expect(_snapshot(root) == before, arguments)
+        _run(root, "mv", "packages/foo-bar", "packages/foo_bar")
+
+
+@pytest.mark.parametrize("remote_kind", ["path", "file"])
+def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> None:
+    """Local Git origins do not require a hosted home-repository identity."""
+    with _fresh_repository() as root:
+        upstream = root / "upstream.git"
+        remote = str(upstream) if remote_kind == "path" else upstream.as_uri()
+        _run(root, "add", "packages/example", "python")
+        _git(root, "remote", "add", "origin", remote)
+        _preview(root, "mv", "packages/example", "packages/renamed")
+        _run(root, "mv", "packages/example", "packages/renamed")
+        _run(root, "fix")
+        _expect((root / "packages/renamed/main.py").is_file(), "rename failed")
+        _preview(root, "fix")
+
+
+@pytest.mark.parametrize("readme_present", [False, True])
+def test_readme_is_optional_and_preserved_when_present(*, readme_present: bool) -> None:
+    """Repair and source validation accept repositories with or without README."""
+    with _fresh_repository() as root:
+        if readme_present:
+            (root / "README").write_text("# Optional documentation\n")
+        else:
+            _git(root, "rm", "--force", "README")
+        _run(root, "fix")
+        _preview(root, "fix")
+        _repair_flake(root, "--source", str(root))
+        _expect((root / "README").exists() == readme_present, "README presence changed")
+        if readme_present:
+            _expect(
+                (root / "README").read_text() == "# Optional documentation\n",
+                "README contents changed",
+            )
+
+
+def test_web_formatting_preserves_literal_line_breaks() -> None:
+    """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/site", "html")
+        script = root / "packages/site/script.js"
+        script.write_text("document.body.dataset.value = `first\n\nsecond`;\n")
+        html = root / "packages/site/index.html"
+        html.write_text(
+            "<!doctype html><html><body><pre>first\n\nsecond</pre></body></html>\n",
+        )
+        _run(
+            root,
+            "--no-cache",
+            "packages/site/script.js",
+            "packages/site/index.html",
+            executable="treefmt",
+        )
+        _expect("`first\n\nsecond`" in script.read_text(), script.read_text())
+        _expect("first\n\nsecond" in html.read_text(), html.read_text())
+
+
+def test_inherited_tests_generate_checks(tmp_path: Path) -> None:
+    """Inherited pytest methods produce a generated check instead of being skipped."""
+    subject = import_module("packages.afairesi.main")
+    root = _repository(tmp_path)
+    _run(root, "add", "packages/example", "python")
+    tests = root / "packages/example/test_main.py"
+    tests.write_text(
+        "class Cases:\n    def test_result(self):\n        assert True\n"
+        "class TestExample(Cases):\n    pass\n",
+    )
+    _run(root, "fix")
+    _expect(
+        Path("checks/example/default.nix")
+        in subject.canonical_checks(
+            root,
+            subject.detect_packages(root),
+        ),
+        "inherited test check omitted",
+    )
+    _expect((root / "checks/example/default.nix").is_file(), "check not generated")

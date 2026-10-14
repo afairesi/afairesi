@@ -118,6 +118,7 @@ class Helper:
         == [
             {"id": "Arguments::test_valid_input", "name": "Arguments: valid input"},
             {"id": "Derived::test_other_input", "name": "Derived: other input"},
+            {"id": "Derived::test_valid_input", "name": "Derived: valid input"},
             {
                 "id": "TestArguments::test_missing_input",
                 "name": "TestArguments: missing input",

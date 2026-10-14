@@ -10,12 +10,52 @@ let
   pname = builtins.replaceStrings [ "-" ] [ "_" ] cliName;
 in
 assert
+  (
+    builtins.match "[a-zA-Z_][a-zA-Z0-9_]*" pname != null
+    && !(builtins.elem pname [
+      "False"
+      "None"
+      "True"
+      "and"
+      "as"
+      "assert"
+      "async"
+      "await"
+      "break"
+      "class"
+      "continue"
+      "def"
+      "del"
+      "elif"
+      "else"
+      "except"
+      "finally"
+      "for"
+      "from"
+      "global"
+      "if"
+      "import"
+      "in"
+      "is"
+      "lambda"
+      "nonlocal"
+      "not"
+      "or"
+      "pass"
+      "raise"
+      "return"
+      "try"
+      "while"
+      "with"
+      "yield"
+    ])
+  )
+  || throw "mkPythonPackage requires a valid non-keyword Python module name: ${pname}";
+assert
   !(arguments ? shellHook)
   || throw "mkPythonPackage does not accept shellHook; use runtimeHook for app initialization";
 assert
-  !(arguments ? runtimeHook)
-  || executable
-  || throw "runtimeHook requires an executable package";
+  !(arguments ? runtimeHook) || executable || throw "runtimeHook requires an executable package";
 python.pkgs.buildPythonPackage (
   {
     version = "0.0.0";
@@ -44,9 +84,12 @@ python.pkgs.buildPythonPackage (
     meta =
       builtins.removeAttrs (arguments.meta or { }) [ "mainProgram" ]
       // pkgs.lib.optionalAttrs executable { mainProgram = cliName; };
-    passthru = (arguments.passthru or { }) // {
-      inherit python;
-    } // pkgs.lib.optionalAttrs (arguments ? runtimeHook) { inherit (arguments) runtimeHook; };
+    passthru =
+      (arguments.passthru or { })
+      // {
+        inherit python;
+      }
+      // pkgs.lib.optionalAttrs (arguments ? runtimeHook) { inherit (arguments) runtimeHook; };
     pyproject = false;
     strictDeps = true;
   }

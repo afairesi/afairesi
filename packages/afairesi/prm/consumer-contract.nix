@@ -57,6 +57,8 @@ assert descriptionless.apps.${system}.example.meta.description == "Run example";
 assert descriptionless.apps.${system}.example.meta.mainProgram == "example";
 assert !(package.drvAttrs ? runtimeHook);
 assert !(accepts { shellHook = "echo obsolete"; });
+assert !(accepts { src = "/invalid/123"; });
+assert !(accepts { src = "/invalid/class"; });
 assert
   !(accepts {
     executable = false;

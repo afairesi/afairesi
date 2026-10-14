@@ -15,6 +15,7 @@ from afairesi import (
     CommandError,
     detect_packages,
     package_description,
+    python_test_definitions,
     repository_root,
     resolve_repository_path,
 )
@@ -200,53 +201,15 @@ class ArgumentDiscovery:
 
 def declared_tests(module: ast.Module) -> list[dict[str, str]]:
     """List declared test functions and methods, retaining their identifiers."""
-    imports = _imports(module, "unittest")
-    classes = [node for node in module.body if isinstance(node, ast.ClassDef)]
-    case_classes: set[str] = set()
-    while additions := {
-        node.name
-        for node in classes
-        if node.name not in case_classes
-        and any(
-            ast.unparse(base) in case_classes
-            or imports.get(ast.unparse(base), ast.unparse(base))
-            in {
-                "unittest.TestCase",
-                "unittest.IsolatedAsyncioTestCase",
-            }
-            or any(
-                ast.unparse(base) == f"{alias}.{kind}"
-                for alias, original in imports.items()
-                if original == "unittest"
-                for kind in ("TestCase", "IsolatedAsyncioTestCase")
-            )
-            for base in node.bases
-        )
-    }:
-        case_classes.update(additions)
     result = []
-    for node in module.body:
-        owner = node.name if isinstance(node, ast.ClassDef) else ""
-        definitions = (
-            node.body
-            if isinstance(node, ast.ClassDef)
-            and (owner.startswith("Test") or owner in case_classes)
-            else [node]
+    for owner, definition in python_test_definitions(module):
+        label = definition.name.removeprefix("test_").replace("_", " ")
+        result.append(
+            {
+                "id": f"{owner}::{definition.name}" if owner else definition.name,
+                "name": f"{owner}: {label}" if owner else label,
+            },
         )
-        for definition in definitions:
-            if isinstance(
-                definition,
-                (ast.FunctionDef, ast.AsyncFunctionDef),
-            ) and definition.name.startswith("test_"):
-                label = definition.name.removeprefix("test_").replace("_", " ")
-                result.append(
-                    {
-                        "id": f"{owner}::{definition.name}"
-                        if owner
-                        else definition.name,
-                        "name": f"{owner}: {label}" if owner else label,
-                    },
-                )
     return sorted(result, key=lambda item: item["id"])
 
 

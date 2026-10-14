@@ -4,7 +4,6 @@
 !/.github/workflows/workflow.yml
 !/.gitignore
 !/LICENSE
-!/README
 !/checks/
 !/checks/afairesi-repo-inspect/
 !/checks/afairesi-repo-inspect/default.nix

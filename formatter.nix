@@ -178,36 +178,10 @@ let
         };
         remove-empty-lines = {
           command = inputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines;
-          excludes = [ "README" ];
           includes = [
             ".gitignore"
             "LICENSE"
-            "README"
             "flake.lock"
-            "flake.nix"
-            "formatter.nix"
-            "packages/*/default.nix"
-            "checks/*/default.nix"
-            "hosts/*/configuration.nix"
-            "hosts/*/hardware-configuration.nix"
-            "packages/*/main.py"
-            "packages/*/test_main.py"
-            "packages/*/index.html"
-            "packages/*/script.js"
-            "packages/*/style.css"
-            "packages/*/ms.tex"
-            "packages/*/ms.bib"
-            ".github/workflows/workflow.yml"
-            ".forgejo/workflows/workflow.yml"
-          ];
-          priority = 2;
-        };
-        remove-new-lines = {
-          command = inputs.self.packages.${pkgs.stdenv.system}.remove_new_lines;
-          includes = [
-            "packages/*/style.css"
-            "packages/*/index.html"
-            "packages/*/script.js"
           ];
           priority = 2;
         };
