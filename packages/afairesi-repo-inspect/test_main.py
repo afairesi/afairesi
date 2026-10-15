@@ -6,6 +6,8 @@ from __future__ import annotations
 import ast
 import json
 import os
+import re
+import stat
 import subprocess
 from importlib import import_module
 from pathlib import Path
@@ -15,14 +17,11 @@ import pytest
 from afairesi import (
     CommandError,
     git,
-    home_module_directory,
     initialize_home,
     initialize_submodule,
-    inspection_remote_repository,
 )
 
 subject = import_module("packages.afairesi-repo-inspect.main")
-GIT_FATAL_EXIT_CODE = 128
 
 
 def _expect(condition: bool, message: str) -> None:  # noqa: FBT001
@@ -320,10 +319,10 @@ def _remote_fixture(
     return home, source, remote
 
 
-def _inspect_remote(remote: str) -> dict[str, Any]:
-    """Exercise the installed CLI with an unchanged remote URL argument."""
+def _inspect_target(target: str) -> dict[str, Any]:
+    """Exercise the installed CLI with an unchanged path or Git URL."""
     completed = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], remote],
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], target],
         capture_output=True,
         text=True,
         check=True,
@@ -332,157 +331,211 @@ def _inspect_remote(remote: str) -> dict[str, Any]:
     return json.loads(completed.stdout)  # type: ignore[no-any-return]
 
 
+def _tree_snapshot(root: Path) -> dict[Path, tuple[int, bytes]]:
+    """Observe contents and modes, including Git metadata and symbolic links."""
+    return {
+        path.relative_to(root): (
+            path.lstat().st_mode,
+            os.fsencode(path.readlink())
+            if path.is_symlink()
+            else path.read_bytes()
+            if stat.S_ISREG(path.lstat().st_mode)
+            else b"",
+        )
+        for path in root.rglob("*")
+    }
+
+
+def _advance_remote(source: Path) -> None:
+    """Publish a fixture change that existing checkouts and cached refs lack."""
+    (source / "hosts/new").mkdir(parents=True)
+    (source / "hosts/new/configuration.nix").touch()
+    git(source, ["add", "."])
+    git(source, ["commit", "--quiet", "-m", "add host"])
+
+
 @pytest.mark.parametrize("initialized", [False, True])
-def test_remote_inspection_caches_without_registration_and_refreshes(
+def test_remote_inspection_preserves_home_and_does_not_block_submodule_add(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
     initialized: bool,
 ) -> None:
-    """Inspect remote changes without staging home files or forcing cache adoption."""
+    """Inspect fresh remote contents without creating persistent home state."""
     home, source, remote = _remote_fixture(tmp_path, monkeypatch)
-    relative = Path("example.test/team/repository")
     if initialized:
         initialize_home()
-        before = git(home, ["ls-files", "--stage"]).stdout
+    before = _tree_snapshot(home)
     _expect(
-        _inspect_remote(remote) == subject.inspect_repository(source),
+        _inspect_target(remote) == subject.inspect_repository(source),
         "wrong remote inventory",
     )
-    _expect(not (home / relative).exists(), "inspection created a home checkout")
-    _expect(not (home / ".gitmodules").exists(), "inspection registered a submodule")
-    if not initialized:
-        _expect(not list(home.iterdir()), "standalone inspection changed HOME")
-        return
+    _advance_remote(source)
     _expect(
-        git(home, ["ls-files", "--stage"]).stdout == before,
-        "inspection staged files",
+        _inspect_target(remote) == subject.inspect_repository(source),
+        "remote inspection was stale",
     )
-    directory = home_module_directory(home, relative)
-    _expect(directory.is_dir(), "inspection did not cache Git data")
-    (source / "hosts/new").mkdir(parents=True)
-    (source / "hosts/new/configuration.nix").touch()
-    git(source, ["add", "."])
-    git(source, ["commit", "--quiet", "-m", "add host"])
-    _expect(
-        _inspect_remote(remote) == subject.inspect_repository(source),
-        "cache was stale",
-    )
-    before_ignore = (home / ".gitignore").read_text()
-    with pytest.raises(SystemExit) as failure:
+    _expect(_tree_snapshot(home) == before, "remote inspection changed HOME")
+    if initialized:
         initialize_submodule(remote)
-    _expect(
-        failure.value.code == GIT_FATAL_EXIT_CODE,
-        "clone suppressed Git's cache collision",
-    )
-    _expect(
-        (home / ".gitignore").read_text() == before_ignore,
-        "failed clone changed the whitelist",
-    )
-    _expect(
-        git(directory, ["config", "--get", "core.bare"]).stdout.strip() == "true",
-        "clone converted the inspection cache",
-    )
+        checkout = home / "example.test/team/repository"
+        _expect(
+            git(checkout, ["rev-parse", "HEAD"]).stdout
+            == git(source, ["rev-parse", "HEAD"]).stdout,
+            "inspection interfered with native submodule add",
+        )
 
 
-def test_remote_inspection_reuses_local_checkout(
+@pytest.mark.parametrize("malformed", [False, True])
+def test_remote_inspection_cleans_temporary_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    malformed: bool,
+) -> None:
+    """Remove temporary clones after successful inspection and parser errors."""
+    home, source, remote = _remote_fixture(tmp_path, monkeypatch)
+    if malformed:
+        (source / "packages/example/main.py").write_text("def invalid(")
+        git(source, ["add", "."])
+        git(source, ["commit", "--quiet", "-m", "malformed source"])
+        with (
+            pytest.raises(CommandError, match="could not parse Python source"),
+            subject.inspection_remote_repository(remote) as checkout,
+        ):
+            subject.inspect_repository(checkout)
+    else:
+        with subject.inspection_remote_repository(remote) as checkout:
+            _expect(
+                subject.inspect_repository(checkout)
+                == subject.inspect_repository(source),
+                "wrong temporary checkout contents",
+            )
+    _expect(not checkout.exists(), "temporary checkout survived inspection")
+    _expect(not list(home.iterdir()), "temporary inspection changed HOME")
+
+
+def test_local_path_and_remote_url_inspect_the_requested_contents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inspect local content without changing the checkout."""
+    """Keep local dirty content visible only when explicitly inspecting its path."""
     home, source, remote = _remote_fixture(tmp_path, monkeypatch)
     initialize_home()
     initialize_submodule(remote)
     checkout = home / "example.test/team/repository"
-    _expect(
-        git(checkout, ["rev-parse", "HEAD"]).stdout
-        == git(source, ["rev-parse", "HEAD"]).stdout,
-        "clone checked out the wrong revision",
-    )
     (checkout / "hosts/local").mkdir(parents=True)
     (checkout / "hosts/local/configuration.nix").touch()
-    before_status = git(checkout, ["status", "--porcelain"]).stdout
+    git(checkout, ["remote", "set-url", "origin", "https://fork.test/team/repository"])
+    before = _tree_snapshot(home)
     _expect(
-        _inspect_remote(remote) == subject.inspect_repository(checkout),
-        "local changes were ignored",
+        _inspect_target(str(checkout)) == subject.inspect_repository(checkout),
+        "explicit local inspection ignored local content",
     )
     _expect(
-        _inspect_remote("git@example.test:team/repository")
-        == subject.inspect_repository(checkout),
-        "SSH spelling did not reuse the local HTTPS checkout",
+        _inspect_target(remote) == subject.inspect_repository(source),
+        "remote URL inspected a local fork or untracked files",
     )
-    _expect(
-        git(checkout, ["status", "--porcelain"]).stdout == before_status,
-        "inspection changed local files",
-    )
+    _expect(_tree_snapshot(home) == before, "inspection changed local Git state")
 
 
-def test_remote_inspection_preserves_deinitialized_submodule_branches(
+@pytest.mark.parametrize("state", ["checkout", "deinitialized", "cache", "placeholder"])
+def test_remote_inspection_ignores_existing_home_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    """Leave existing worktrees, retained Git data, and unrelated paths untouched."""
+    home, source, remote = _remote_fixture(tmp_path, monkeypatch)
+    initialize_home()
+    relative = Path("example.test/team/repository")
+    checkout = home / relative
+    if state == "cache":
+        modules = Path(
+            git(
+                home,
+                ["rev-parse", "--path-format=absolute", "--git-path", "modules"],
+            ).stdout.strip(),
+        )
+        storage = modules / relative
+        storage.parent.mkdir(parents=True)
+        git(home, ["clone", "--bare", "--", str(source), str(storage)])
+    elif state == "placeholder":
+        checkout.mkdir(parents=True)
+        (checkout / "personal-data").write_bytes(b"preserve data\\x00\\xff")
+    else:
+        initialize_submodule(remote)
+        if state == "deinitialized":
+            git(home, ["submodule", "deinit", "--force", "--", str(relative)])
+        else:
+            git(checkout, ["remote", "remove", "origin"])
+            (checkout / "LICENSE").write_text("local changes")
+    _advance_remote(source)
+    before = _tree_snapshot(home)
+    _expect(
+        _inspect_target(remote) == subject.inspect_repository(source),
+        "local state affected remote inspection",
+    )
+    _expect(_tree_snapshot(home) == before, "inspection changed existing Git storage")
+
+
+def test_remote_inspection_accepts_native_file_urls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Refresh inspection data without advancing retained user branch refs."""
-    home, source, remote = _remote_fixture(tmp_path, monkeypatch)
-    initialize_home()
-    initialize_submodule(remote)
-    relative = Path("example.test/team/repository")
-    checkout = home / relative
-    before = git(checkout, ["for-each-ref", "refs/heads"]).stdout
-    git(home, ["submodule", "deinit", "--force", "--", str(relative)])
-    checkout.rmdir()
-    (source / "hosts/new").mkdir(parents=True)
-    (source / "hosts/new/configuration.nix").touch()
-    git(source, ["add", "."])
-    git(source, ["commit", "--quiet", "-m", "add host"])
+    """Let Git handle transports without imposing hosted repository conventions."""
+    home, source, _remote = _remote_fixture(tmp_path, monkeypatch)
     _expect(
-        _inspect_remote(remote) == subject.inspect_repository(source),
-        "retained submodule inspection was stale",
+        _inspect_target(source.as_uri()) == subject.inspect_repository(source),
+        "native file URL was rejected",
     )
-    directory = home_module_directory(home, relative)
-    completed = subprocess.run(  # noqa: S603
-        ["git", "--git-dir", str(directory), "for-each-ref", "refs/heads"],  # noqa: S607
+    _expect(not list(home.iterdir()), "file URL inspection changed HOME")
+
+
+@pytest.mark.parametrize("remote_kind", ["missing", "unsupported", "invalid"])
+def test_remote_inspection_preserves_native_clone_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote_kind: str,
+) -> None:
+    """Compare failed remote inspection with Git's exit status and diagnostics."""
+    home, _source, _remote = _remote_fixture(tmp_path, monkeypatch)
+    remote = {
+        "missing": (tmp_path / "missing.git").as_uri(),
+        "unsupported": "unsupported://example.test/team/repository",
+        "invalid": "https://",
+    }[remote_kind]
+    scratch = tmp_path / "temporary"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    native_checkout = tmp_path / "native-checkout"
+    expected = subprocess.run(  # noqa: S603
+        ["git", "clone", "--", remote, str(native_checkout)],  # noqa: S607
         capture_output=True,
         text=True,
-        check=True,
-        timeout=10,
+        check=False,
+        timeout=30,
     )
-    _expect(completed.stdout == before, "inspection advanced retained local branches")
-    _expect(not checkout.exists(), "inspection recreated a home checkout")
-
-
-def test_remote_inspection_rejects_checkout_and_cache_collisions(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reject inspection collisions and let Git reject submodule cache collisions."""
-    home, source, remote = _remote_fixture(tmp_path, monkeypatch)
-    initialize_home()
-    with inspection_remote_repository(remote):
-        pass
-    relative = Path("example.test/team/repository")
-    directory = home_module_directory(home, relative)
-    git(
-        directory,
-        ["config", "remote.origin.url", "https://other.test/team/repository"],
+    actual = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], remote],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
     )
-    with (
-        pytest.raises(CommandError, match="origin does not match"),
-        inspection_remote_repository(remote),
-    ):
-        pass
-    with pytest.raises(SystemExit) as failure:
-        initialize_submodule(remote)
+    actual_error = re.sub(
+        re.escape(str(scratch)) + r"/afairesi-repo-inspect-[^/]+/repository",
+        "<CHECKOUT>",
+        actual.stderr,
+    )
     _expect(
-        failure.value.code == GIT_FATAL_EXIT_CODE,
-        "clone suppressed Git's cache collision",
+        (actual.returncode, actual.stdout, actual_error)
+        == (
+            expected.returncode,
+            expected.stdout,
+            expected.stderr.replace(str(native_checkout), "<CHECKOUT>"),
+        ),
+        f"native clone error changed: {expected.stderr!r}, {actual.stderr!r}",
     )
-    _expect(not (home / ".gitmodules").exists(), "collision registered a submodule")
-    checkout = home / relative
-    checkout.parent.mkdir(parents=True)
-    source.rename(checkout)
-    git(checkout, ["remote", "add", "origin", "https://other.test/team/repository"])
-    with (
-        pytest.raises(CommandError, match="origin does not match"),
-        inspection_remote_repository(remote),
-    ):
-        pass
+    _expect(not list(scratch.iterdir()), "failed clone left temporary files")
+    _expect(not list(home.iterdir()), "failed clone changed HOME")

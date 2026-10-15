@@ -123,8 +123,22 @@ def _run_test_command(
             process.wait()
             raise
     if code:
-        message = f"command failed ({code}); see {log}"
-        raise CommandError(message)
+        error = subprocess.CalledProcessError(
+            code,
+            command,
+            output=log.read_text(encoding="utf-8"),
+        )
+        error.add_note(f"Log: {log}")
+        raise error
+
+
+def _report_process_failure(error: subprocess.CalledProcessError) -> None:
+    """Replay captured tool diagnostics and identify retained campaign logs."""
+    for output in (error.stdout, error.stderr):
+        if output:
+            sys.stderr.write(output)
+    for note in getattr(error, "__notes__", ()):
+        sys.stderr.write(note + "\n")
 
 
 @dataclass(frozen=True)
@@ -569,9 +583,11 @@ def _run_test_package(
     log = workspace / "tests.log"
     try:
         _run_test_command(arguments, workspace, log, timeout=timeout)
-    finally:
+    except (KeyboardInterrupt, subprocess.TimeoutExpired):
         if log.exists():
             sys.stdout.write(log.read_text(encoding="utf-8"))
+        raise
+    sys.stdout.write(log.read_text(encoding="utf-8"))
     return True
 
 
@@ -610,11 +626,18 @@ def _run_test_repository(
                 if _run_test_package(package, command, timeout, max_examples, selection)
                 else "failed"
             )
-        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
+        except (
+            CommandError,
+            OSError,
+            subprocess.TimeoutExpired,
+            subprocess.CalledProcessError,
+        ) as error:
             outcomes[package.name] = "failed"
             sys.stderr.write(
                 f"afairesi-repo-test {command}: {package.name}: {error}\n",
             )
+            if isinstance(error, subprocess.CalledProcessError):
+                _report_process_failure(error)
     sys.stdout.write("\nRepository summary:\n")
     for package_name, status in outcomes.items():
         sys.stdout.write(f"  {package_name}: {status}\n")
@@ -678,10 +701,6 @@ def _flake_installable(root: Path, attribute: str) -> str:
 def _build_package_coverage(package: Path) -> None:
     """Build an instrumented variant of the test check and print its report path."""
     root = _test_target_root(package)
-    check = root / "checks" / package.name / "default.nix"
-    if not check.is_file():
-        message = f"missing {check}; run nix fmt to generate checks"
-        raise CommandError(message)
     sys.stdout.write(f"Building coverage for {package.name}...\n")
     sys.stdout.flush()
     completed = subprocess.run(  # noqa: S603
@@ -695,11 +714,8 @@ def _build_package_coverage(package: Path) -> None:
         ],
         stdout=subprocess.PIPE,
         text=True,
-        check=False,
+        check=True,
     )
-    if completed.returncode:
-        message = f"coverage check failed for {package.name}"
-        raise CommandError(message)
     outputs = completed.stdout.splitlines()
     if len(outputs) != 1:
         message = f"expected one coverage output for {package.name}"
@@ -763,9 +779,13 @@ def _run_coverage(target: Path) -> bool:
                 continue
             _build_package_coverage(package)
             outcomes[package.name] = "passed"
-        except (CommandError, OSError) as error:
+        except (CommandError, OSError, subprocess.CalledProcessError) as error:
+            if not repository and isinstance(error, subprocess.CalledProcessError):
+                raise
             outcomes[package.name] = "failed"
             sys.stderr.write(f"afairesi-repo-test coverage: {package.name}: {error}\n")
+            if isinstance(error, subprocess.CalledProcessError):
+                _report_process_failure(error)
     if repository:
         sys.stdout.write("\nRepository summary:\n")
         for name, status in outcomes.items():
@@ -962,6 +982,11 @@ def _dispatch_test_command(
                 if command == "coverage"
                 else _dispatch_test_runner(campaign, cli)
             )
+        except subprocess.CalledProcessError as error:
+            if not combined:
+                raise
+            outcomes[command] = False
+            _report_process_failure(error)
         except (CommandError, OSError, subprocess.TimeoutExpired) as error:
             outcomes[command] = False
             sys.stderr.write(f"afairesi-repo-test {command}: {target}: {error}\n")
@@ -978,6 +1003,11 @@ def main() -> None:
     options = cli.parse_args()
     try:
         _dispatch_test_command(options, cli)
+    except subprocess.CalledProcessError as error:
+        _report_process_failure(error)
+        raise SystemExit(
+            error.returncode if error.returncode >= 0 else 128 - error.returncode,
+        ) from error
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
         print(f"error: {error}", file=sys.stderr)  # noqa: T201
         raise SystemExit(1) from error

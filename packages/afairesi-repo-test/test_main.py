@@ -559,11 +559,13 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
 
 
 @pytest.mark.parametrize("failure", [None, "coverage", "hypothesis", "mutation"])
+@pytest.mark.parametrize("failure_kind", ["policy", "process"])
 def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
     failure: str | None,
+    failure_kind: str,
 ) -> None:
     """Execute every campaign in order even when an earlier campaign fails."""
     subject = import_module("packages.afairesi-repo-test.main")
@@ -573,6 +575,12 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
 
     def run(command: str) -> bool:
         observed.append(command)
+        if command == failure and failure_kind == "process":
+            raise subprocess.CalledProcessError(
+                17,
+                ["native-tool"],
+                output="native campaign failure\n",
+            )
         if command == failure and command != "mutation":
             message = "campaign failed"
             raise subject.CommandError(message)
@@ -605,6 +613,8 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
     for command in observed:
         status = "failed" if command == failure else "passed"
         _expect(f"  {command}: {status}\n" in output.out, output)
+    if failure is not None and failure_kind == "process":
+        _expect("native campaign failure" in output.err, output)
 
 
 def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None:
@@ -712,10 +722,36 @@ def test_coverage_continues_after_failed_nix_builds() -> None:
             _snapshot(root) == before,
             "failed coverage build changed repository state",
         )
+        expected = subprocess.run(  # noqa: S603
+            [  # noqa: S607
+                "nix",
+                "build",
+                "--no-link",
+                "--no-update-lock-file",
+                "--print-out-paths",
+                f"git+{root.as_uri()}#example-coverage",
+            ],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        single = _run(
+            root,
+            "coverage",
+            str(root / "packages/example"),
+            code=expected.returncode,
+            environment=environment,
+        )
+        for diagnostic in expected.stderr.splitlines():
+            if diagnostic.startswith("error:"):
+                _expect(diagnostic in single.stderr, (diagnostic, single.stderr))
 
 
-@pytest.mark.parametrize("missing", ["check", "html", "tests"])
-def test_coverage_rejects_missing_checks_and_report_files(
+@pytest.mark.parametrize("missing", ["html", "tests"])
+def test_coverage_rejects_missing_report_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -727,10 +763,6 @@ def test_coverage_rejects_missing_checks_and_report_files(
     root.mkdir()
     _repository(root)
     package = _make_source_package(root, "example", "def test_ready(): pass\n")
-    check = root / "checks/example/default.nix"
-    check.parent.mkdir(parents=True)
-    if missing != "check":
-        check.write_text("{}")
     report = tmp_path / "report"
     report.mkdir()
     if missing == "tests":
@@ -751,7 +783,6 @@ def test_coverage_rejects_missing_checks_and_report_files(
     monkeypatch.setattr(subject.subprocess, "run", run)
     before = _snapshot(root)
     message = {
-        "check": f"missing {check}",
         "html": "no HTML report",
         "tests": "no test report",
     }[missing]
@@ -759,8 +790,122 @@ def test_coverage_rejects_missing_checks_and_report_files(
     with pytest.raises(SystemExit) as completed:
         subject.main()
     _expect(completed.value.code == 1 and message in capsys.readouterr().err, completed)
-    _expect(len(builds) == (0 if missing == "check" else 1), builds)
+    _expect(len(builds) == 1, builds)
     _expect(_snapshot(root) == before, "coverage validation modified source state")
+
+
+@pytest.mark.parametrize("command", ["coverage", "hypothesis", "mutation"])
+@pytest.mark.parametrize("failure", ["missing-output", "invalid-flake"])
+def test_package_campaign_preserves_native_nix_errors(
+    tmp_path: Path,
+    command: str,
+    failure: str,
+) -> None:
+    """Use Nix as the oracle rather than guessing whether a flake output exists."""
+    root = tmp_path / "source with spaces"
+    environment = _prepare_runner_flake(root, "def test_ready(): pass\n")
+    (root / "flake.nix").write_text(
+        "{ outputs = _: {}; }" if failure == "missing-output" else "{",
+    )
+    _git(root, "add", "flake.nix")
+    attribute = (
+        "example-coverage" if command == "coverage" else "example-test-environment"
+    )
+    expected = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "nix",
+            "build",
+            "--no-link",
+            "--no-update-lock-file",
+            "--print-out-paths",
+            f"git+{root.as_uri()}#{attribute}",
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    _expect(expected.returncode != 0, expected)
+    before = _snapshot(root, exclude=("tmp",))
+    actual = _run(
+        root,
+        command,
+        str(root / "packages/example"),
+        code=expected.returncode,
+        environment=environment,
+    )
+    _expect(expected.stderr.strip() in actual.stderr, (expected.stderr, actual.stderr))
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
+        "failed campaign changed package sources or Git state",
+    )
+
+
+@pytest.mark.parametrize("failure", ["assertion", "collection", "selection", "usage"])
+def test_package_hypothesis_preserves_native_pytest_status(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """Preserve pytest's distinct failures instead of collapsing them to exit one."""
+    root = tmp_path / "source"
+    tests = {
+        "assertion": "def test_failure(): assert False, 'native assertion failure'\n",
+        "collection": "def test_broken(:\n    pass\n",
+        "selection": "def test_ready(): pass\n",
+        "usage": "def test_ready(): pass\n",
+    }[failure]
+    environment = _prepare_runner_flake(root, tests)
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    environment.pop("PYTEST_ADDOPTS", None)
+    selectors = {
+        "assertion": (),
+        "collection": (),
+        "selection": ("-k", "missing_test"),
+        "usage": ("-k", "("),
+    }[failure]
+    package = root / "packages/example"
+    expected = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            *selectors,
+            str(package / "test_main.py"),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    _expect(expected.returncode != 0, expected)
+    before = _snapshot(root, exclude=("tmp",))
+    actual = _run(
+        root,
+        "hypothesis",
+        str(package),
+        *selectors,
+        code=expected.returncode,
+        environment=environment,
+    )
+    diagnostics = [
+        line.strip()
+        for line in (expected.stdout + expected.stderr).splitlines()
+        if line.startswith("ERROR:") or "SyntaxError:" in line
+    ]
+    for diagnostic in diagnostics:
+        _expect(diagnostic in actual.stderr, (diagnostic, actual.stderr))
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
+        "pytest failure changed original package sources or Git state",
+    )
 
 
 def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(

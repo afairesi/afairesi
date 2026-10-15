@@ -6,6 +6,9 @@ in
   inherit pkgs;
   executable = true;
   meta.description = "Parse, validate, and rewrite Nix source files";
-  propagatedBuildInputs = [ python.pkgs.tree-sitter-language-pack ];
+  propagatedBuildInputs = [
+    pkgs.nix
+    python.pkgs.tree-sitter-language-pack
+  ];
   src = ./.;
 }

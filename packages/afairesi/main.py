@@ -12,7 +12,6 @@ import re
 import stat
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -2989,91 +2988,6 @@ def initialize_submodule(remote: str) -> None:
     except BaseException:
         remove_empty_directories(directories)
         raise
-
-
-def home_module_directory(home: Path, relative: Path) -> Path:
-    """Resolve submodule storage through Git, including separate Git directories."""
-    modules = Path(
-        git(
-            home,
-            ["rev-parse", "--path-format=absolute", "--git-path", "modules"],
-        ).stdout.strip(),
-    )
-    validate_managed_path(modules, relative)
-    return modules / relative
-
-
-def validate_cached_remote(directory: Path, remote: str) -> None:
-    """Reject stored repositories belonging to a different hosted remote."""
-    origin = run(
-        ["git", "--git-dir", str(directory), "config", "--get", "remote.origin.url"],
-        check=False,
-    )
-    if origin.returncode != 0 or canonical_remote_path(
-        origin.stdout.strip(),
-    ) != canonical_remote_path(remote):
-        msg = f"{directory}: repository origin does not match {remote}"
-        raise CommandError(msg)
-
-
-@contextlib.contextmanager
-def inspection_remote_repository(remote: str) -> Iterator[Path]:
-    """Reuse a local checkout or inspect a remote without registering a submodule."""
-    relative = canonical_remote_path(remote)
-    home = Path.home()
-    validate_managed_path(home, relative)
-    local = home / relative
-    if local.exists():
-        if repository_root(local) != local:
-            msg = f"{local}: expected a Git repository checkout"
-            raise CommandError(msg)
-        origin = git(local, ["config", "--get", "remote.origin.url"], check=False)
-        if (
-            origin.returncode != 0
-            or canonical_remote_path(
-                origin.stdout.strip(),
-            )
-            != relative
-        ):
-            msg = f"{local}: repository origin does not match {remote}"
-            raise CommandError(msg)
-        yield local
-        return
-    try:
-        _require_home_repository()
-    except CommandError:
-        with tempfile.TemporaryDirectory(prefix="afairesi-repo-inspect-") as temporary:
-            checkout = Path(temporary) / "repository"
-            run(["git", "clone", "--", remote, str(checkout)])
-            yield checkout
-        return
-    directory = home_module_directory(home, relative)
-    if directory.exists():
-        validate_cached_remote(directory, remote)
-        run(["git", "--git-dir", str(directory), "fetch", "origin", "HEAD"])
-        revision = run(
-            ["git", "--git-dir", str(directory), "rev-parse", "FETCH_HEAD"],
-        ).stdout.strip()
-        bare = run(
-            ["git", "--git-dir", str(directory), "config", "--get", "core.bare"],
-        ).stdout.strip()
-        if bare == "true":
-            run(["git", "--git-dir", str(directory), "update-ref", "HEAD", revision])
-    else:
-        directory.parent.mkdir(parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(
-            prefix=".afairesi-inspect-",
-            dir=directory.parent,
-        ) as temporary:
-            staged = Path(temporary) / "repository.git"
-            run(["git", "clone", "--bare", "--", remote, str(staged)])
-            staged.rename(directory)
-        revision = "HEAD"
-    with tempfile.TemporaryDirectory(prefix="afairesi-repo-inspect-") as temporary:
-        checkout = Path(temporary) / "repository"
-        run(["git", "clone", "--no-checkout", "--", str(directory), str(checkout)])
-        git(checkout, ["checkout", "--detach", revision])
-        yield checkout
 
 
 def _remote_is_empty(remote: str) -> bool:

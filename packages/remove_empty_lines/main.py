@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 
@@ -24,7 +25,7 @@ def _is_empty_utf8_line(line: bytes) -> bool:
 
 def process_file(path: Path) -> None:
     """Rewrite one regular text file without following symbolic links."""
-    if path.is_symlink() or not path.is_file():
+    if path.is_symlink():
         return
     contents = path.read_bytes()
     if b"\0" in contents:
@@ -46,8 +47,15 @@ def main() -> None:
         metavar="FILE",
         help="text files to rewrite in place",
     )
+    failed = False
     for path in map(Path, parser.parse_args().files):
-        process_file(path)
+        try:
+            process_file(path)
+        except OSError as error:  # noqa: PERF203
+            print(error, file=sys.stderr)  # noqa: T201
+            failed = True
+    if failed:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

@@ -6,18 +6,18 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import json
 import os
-import re
-import sys
+import subprocess
 import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from tree_sitter_language_pack import get_parser
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
+    from pathlib import Path
 
     from tree_sitter import Node, Tree
 _PARSER = get_parser("nix")
@@ -98,13 +98,22 @@ def string_value(document: Document, node: Node) -> str | None:
         child.type == "interpolation" for child in walk(node)
     ):
         return None
-    escapes = {"n": "\n", "r": "\r", "t": "\t"}
-    return re.sub(
-        r"\\(.)",
-        lambda match: escapes.get(match[1], match[1]),
-        document.text(node)[1:-1],
-        flags=re.DOTALL,
+    completed = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "nix-instantiate",
+            "--store",
+            "dummy://",
+            "--eval",
+            "--strict",
+            "--json",
+            "--expr",
+            document.text(node),
+        ],
+        capture_output=True,
+        check=True,
+        text=True,
     )
+    return str(json.loads(completed.stdout))
 
 
 def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | None:
@@ -199,15 +208,21 @@ def main() -> None:
         metavar="FILE",
         help="Nix files to validate",
     )
-    failed = False
+    status = 0
     for argument in parser.parse_args().files:
-        try:
-            parse(Path(argument).read_bytes(), argument)
-        except (OSError, NixSyntaxError) as error:  # noqa: PERF203
-            print(f"error: {error}", file=sys.stderr)  # noqa: T201
-            failed = True
-    if failed:
-        raise SystemExit(1)
+        completed = subprocess.run(  # noqa: S603
+            ["nix-instantiate", "--parse", "--", argument],  # noqa: S607
+            stdout=subprocess.DEVNULL,
+            check=False,
+        )
+        if not status and completed.returncode:
+            status = (
+                completed.returncode
+                if completed.returncode >= 0
+                else 128 - completed.returncode
+            )
+    if status:
+        raise SystemExit(status)
 
 
 if __name__ == "__main__":

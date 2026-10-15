@@ -129,6 +129,8 @@ def collect_candidates(
     result: list[Candidate] = []
 
     def collect_set(set_node: Node, prefix: tuple[str, ...]) -> None:
+        if document.text(set_node).lstrip().startswith("rec"):
+            return
         binding_set = next(
             (child for child in set_node.named_children if child.type == "binding_set"),
             None,
@@ -200,11 +202,9 @@ def _run_nix(expression: str) -> Any:  # noqa: ANN401
     completed = subprocess.run(  # noqa: S603
         ["nix", "eval", "--impure", "--json", "--expr", expression],  # noqa: S607
         capture_output=True,
-        check=False,
+        check=True,
         text=True,
     )
-    if completed.returncode != 0:
-        raise RuntimeError("nix evaluation failed: " + completed.stderr)
     try:
         return json.loads(completed.stdout)
     except json.JSONDecodeError as error:
@@ -333,7 +333,8 @@ def rewrite(
         )
         if binding_set is None:
             return document.text(node), False
-        rendered: list[str] = []
+        edits: list[tuple[int, int, bytes]] = []
+        remaining = 0
         for binding in binding_set.named_children:
             attrpath = binding.child_by_field_name("attrpath")
             value = binding.child_by_field_name("expression")
@@ -343,21 +344,29 @@ def rewrite(
                 else nix_syntax.static_attrpath(document, attrpath)
             )
             if path is None or value is None:
-                rendered.append(document.text(binding))
+                remaining += 1
                 continue
             effective = (*prefix, *path)
             if module_config and not prefix and effective[:1] == ("config",):
                 effective = effective[1:]
             if effective in removals:
+                edits.append((binding.start_byte, binding.end_byte, b""))
                 continue
-            value_text = document.text(value)
             if value.type == "attrset_expression":
                 value_text, empty = rewrite_set(value, effective)
                 if empty:
+                    edits.append((binding.start_byte, binding.end_byte, b""))
                     continue
-            rendered.append(f"{document.text(attrpath)} = {value_text};")
-        prefix_text = "rec " if document.text(node).lstrip().startswith("rec") else ""
-        return prefix_text + "{ " + " ".join(rendered) + " }", not rendered
+                edits.append((value.start_byte, value.end_byte, value_text.encode()))
+            remaining += 1
+        source = nix_syntax.apply_edits(document.source, edits)
+        end = node.end_byte + len(source) - len(document.source)
+        empty = (
+            bool(edits)
+            and not remaining
+            and not any(child.type == "comment" for child in nix_syntax.walk(node))
+        )
+        return source[node.start_byte : end].decode(), empty
 
     transformed, _ = rewrite_set(target, ())
     source = document.source
@@ -371,10 +380,16 @@ def rewrite(
 
 def process_repository(root: Path) -> None:
     """Parse, resolve defaults, and safely rewrite a flake repository."""
-    documents = {
-        path: nix_syntax.parse(path.read_bytes(), str(path))
-        for path in find_nix_files(root)
-    }
+    paths = find_nix_files(root)
+    for path in paths:
+        subprocess.run(  # noqa: S603
+            ["nix-instantiate", "--parse", str(path)],  # noqa: S607
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    documents = {path: nix_syntax.parse(path.read_bytes(), str(path)) for path in paths}
     candidates = {
         path: collect_candidates(document) for path, document in documents.items()
     }
@@ -409,7 +424,9 @@ def process_repository(root: Path) -> None:
             removals = {
                 candidate_path
                 for candidate_path, value in collect_candidates(document, node)
-                if candidate_path in defaults and defaults[candidate_path] == value
+                if candidate_path in defaults
+                and json.dumps(defaults[candidate_path], sort_keys=True)
+                == json.dumps(value, sort_keys=True)
             }
             if removals:
                 source = rewrite(document, removals, node)
@@ -457,6 +474,11 @@ def main() -> None:
         raise SystemExit(1)
     try:
         process_repository(root)
+    except subprocess.CalledProcessError as error:
+        sys.stderr.write(error.stderr or "")
+        raise SystemExit(
+            error.returncode if error.returncode >= 0 else 128 - error.returncode,
+        ) from error
     except (OSError, ValueError, RuntimeError) as error:
         print(f"error: {error}", file=sys.stderr)  # noqa: T201
         raise SystemExit(1) from error

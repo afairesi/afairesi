@@ -33,8 +33,6 @@ def test_cli_cleans_selected_files_and_preserves_protected_inputs(
                 str(binary),
                 str(link),
                 str(empty),
-                str(tmp_path / "missing"),
-                str(tmp_path),
             ],
             capture_output=True,
             check=False,
@@ -52,3 +50,39 @@ def test_cli_cleans_selected_files_and_preserves_protected_inputs(
         ):
             message = "cleanup changed a protected input"
             raise AssertionError(message)
+
+
+def test_cli_reports_filesystem_errors_and_processes_other_files(
+    tmp_path: Path,
+) -> None:
+    """Report each native filesystem error and still clean selected text files."""
+    missing = tmp_path / "missing.txt"
+    directory = tmp_path / "directory"
+    directory.mkdir()
+    selected = tmp_path / "selected.txt"
+    selected.write_bytes(b"first\r\nlast\n")
+    expected_errors = []
+    for path in (missing, directory):
+        try:
+            path.read_bytes()
+        except OSError as error:  # noqa: PERF203
+            expected_errors.append(str(error))
+    result = subprocess.run(  # noqa: S603
+        [
+            os.environ["PACKAGE_E2E_EXECUTABLE"],
+            str(missing),
+            str(selected),
+            str(directory),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if (
+        result.returncode != 1
+        or result.stdout
+        or result.stderr.splitlines() != expected_errors
+        or selected.read_bytes() != b"firstlast"
+    ):
+        raise AssertionError(result)

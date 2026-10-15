@@ -173,6 +173,10 @@ def _render_set(bindings: list[Binding]) -> str:
 
 def render_node(document: nix_syntax.Document, node: Node) -> str:
     """Render a node after recursively applying canonical ordering."""
+    if node.type in {"binding_set", "formals"} and any(
+        child.type == "comment" for child in nix_syntax.walk(node)
+    ):
+        return _replace_children(document, node)
     if node.type == "binding_set":
         bindings = [_binding(document, child) for child in node.named_children]
         return " ".join(_render_binding(binding) for binding in _normalize(bindings))
@@ -185,12 +189,6 @@ def render_node(document: nix_syntax.Document, node: Node) -> str:
         if any(child.type == "ellipses" for child in node.named_children):
             rendered.append("...")
         return "{ " + ", ".join(rendered) + " }"
-    if node.type == "list_expression":
-        elements = [render_node(document, child) for child in node.named_children]
-        contains_string = any("string" in child.type for child in node.named_children)
-        if not contains_string:
-            elements.sort()
-        return "[ " + " ".join(elements) + " ]"
     return (
         _replace_children(document, node)
         if node.named_child_count
@@ -201,7 +199,7 @@ def render_node(document: nix_syntax.Document, node: Node) -> str:
 def format_text(source: str, path: str = "<expression>") -> str:
     """Sort a Nix expression and apply deterministic formatting."""
     document = nix_syntax.parse(source, path)
-    transformed = render_node(document, document.root)
+    transformed = render_node(document, document.tree.root_node)
     nix_syntax.parse(transformed, path)
     return transformed
 

@@ -9,18 +9,31 @@ import ast
 import contextlib
 import json
 import sys
+import tempfile
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from afairesi import (
     CommandError,
     detect_packages,
-    inspection_remote_repository,
     package_description,
     python_test_definitions,
     repository_root,
     resolve_repository_path,
+    run,
 )
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+@contextlib.contextmanager
+def inspection_remote_repository(remote: str) -> Iterator[Path]:
+    """Inspect a native Git clone without changing existing repositories."""
+    with tempfile.TemporaryDirectory(prefix="afairesi-repo-inspect-") as temporary:
+        checkout = Path(temporary) / "repository"
+        run(["git", "clone", "--", remote, str(checkout)])
+        yield checkout
 
 
 def _source(path: Path) -> ast.Module:
@@ -263,7 +276,7 @@ def parser() -> argparse.ArgumentParser:
         nargs="?",
         metavar="PATH_OR_REMOTE",
         help=(
-            "repository path or hosted Git URL (default: current repository); "
+            "repository path or Git URL (default: current repository); "
             "relative paths use the Git root, or cwd outside Git"
         ),
     )
