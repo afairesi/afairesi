@@ -11,13 +11,13 @@ import os
 import subprocess
 import tempfile
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from tree_sitter_language_pack import get_parser
 
 if TYPE_CHECKING:
     from collections.abc import Iterable
-    from pathlib import Path
 
     from tree_sitter import Node, Tree
 _PARSER = get_parser("nix")
@@ -186,14 +186,15 @@ def write_if_changed(path: Path, contents: str) -> None:
         prefix=f".{path.name}.",
         dir=path.parent,
     )
+    temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
             handle.write(contents)
-        os.chmod(temporary_name, path.stat().st_mode)  # noqa: PTH101
-        os.replace(temporary_name, path)  # noqa: PTH105
+        temporary_path.chmod(path.stat().st_mode)
+        temporary_path.replace(path)
     finally:
         with contextlib.suppress(FileNotFoundError):
-            os.unlink(temporary_name)  # noqa: PTH108
+            temporary_path.unlink()
 
 
 def main() -> None:

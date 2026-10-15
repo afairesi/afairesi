@@ -224,7 +224,10 @@ def treefmt_defaults(
         "pkgs = import flake.inputs.nixpkgs { system = builtins.currentSystem; }; "
         "evaluated = flake.inputs.treefmt-nix.lib.evalModule pkgs {}; "
         f"paths = [ {' '.join(_path_list(path) for path in sorted(paths))} ]; "
-        'one = path: let raw = pkgs.lib.attrByPath (path ++ [ "default" ]) (throw "missing option default") evaluated.options; tried = builtins.tryEval (builtins.deepSeq raw raw); in if tried.success then [{ inherit path; default = tried.value; }] else []; '  # noqa: E501
+        'one = path: let raw = pkgs.lib.attrByPath (path ++ [ "default" ])'
+        ' (throw "missing option default") evaluated.options; tried = '
+        "builtins.tryEval (builtins.deepSeq raw raw); in if tried.success "
+        "then [{ inherit path; default = tried.value; }] else []; "
         "in builtins.concatMap one paths"
     )
     return {tuple(record["path"]): record["default"] for record in _run_nix(expression)}
@@ -246,20 +249,26 @@ def package_defaults(
         f"{nix_syntax.quote_string(str(root))})); "
         f"owner = {builder}; build = owner.lib.mkPythonPackage; "
         "nixpkgs = owner.inputs.nixpkgs or (flake.inputs.nixpkgs or null); "
-        "base = if nixpkgs == null then {} else import nixpkgs { system = builtins.currentSystem; }; "  # noqa: E501
+        "base = if nixpkgs == null then {} else import nixpkgs { system = "
+        "builtins.currentSystem; }; "
         "python = base.python3 or {}; "
-        "pkgs = base // { python3 = python // { pkgs = (python.pkgs or {}) // { buildPythonPackage = attrs: attrs; }; }; }; "  # noqa: E501
+        "pkgs = base // { python3 = python // { pkgs = (python.pkgs or {})"
+        " // { buildPythonPackage = attrs: attrs; }; }; }; "
         "formal = builtins.functionArgs build; "
-        "required = builtins.filter (name: !formal.${name}) (builtins.attrNames formal); "  # noqa: E501
+        "required = builtins.filter (name: !formal.${name}) "
+        "(builtins.attrNames formal); "
         "omit = path: attrs: let name = builtins.head path; rest = builtins.tail path; "
         "in if rest == [] then builtins.removeAttrs attrs [name] "
         "else let nested = omit rest attrs.${name}; "
         "in if nested == {} then builtins.removeAttrs attrs [name] "
         "else attrs // { ${name} = nested; }; "
-        'literal = value: if builtins.isAttrs value then (value.type or null) != "derivation" && builtins.all (name: literal value.${name}) (builtins.attrNames value) '  # noqa: E501
+        "literal = value: if builtins.isAttrs value then (value.type or "
+        'null) != "derivation" && builtins.all (name: literal '
+        "value.${name}) (builtins.attrNames value) "
         "else if builtins.isList value then builtins.all literal value "
         "else if builtins.isString value then builtins.getContext value == {} "
-        "else builtins.isNull value || builtins.isBool value || builtins.isInt value || builtins.isFloat value; "  # noqa: E501
+        "else builtins.isNull value || builtins.isBool value || "
+        "builtins.isInt value || builtins.isFloat value; "
         "follow = path: value: if path == [] then value else "
         "if builtins.isAttrs value && builtins.hasAttr (builtins.head path) value "
         "then follow (builtins.tail path) value.${builtins.head path} "
@@ -268,9 +277,12 @@ def package_defaults(
         "mkPythonPackage = arguments: { captured = true; "
         "value = build (omit path arguments); }; }; }; "
         "inputs = flake.inputs // { self = wrapped flake; } // "
-        "(if flake.inputs ? afairesi then { afairesi = wrapped flake.inputs.afairesi; } else {}); "  # noqa: E501
-        f"package = (import (/. + {nix_syntax.quote_string(document.path)})) {{ inherit inputs pkgs; }}; "  # noqa: E501
-        'raw = if package.captured or false then follow path package.value else throw "unrecognized package call"; '  # noqa: E501
+        "(if flake.inputs ? afairesi then { afairesi = wrapped "
+        "flake.inputs.afairesi; } else {}); "
+        f"package = (import (/. + {nix_syntax.quote_string(document.path)})) "
+        "{ inherit inputs pkgs; }; "
+        "raw = if package.captured or false then follow path package.value"
+        ' else throw "unrecognized package call"; '
         "tried = builtins.tryEval (if literal raw then raw "
         'else throw "not a literal default"); '
         "in if builtins.elem (builtins.head path) required then [] "
@@ -302,9 +314,21 @@ def nixos_removals(
         + " ]"
     )
     expression = (
-        f"let f = builtins.getFlake (toString (/. + {nix_syntax.quote_string(str(root))})); lib = f.inputs.nixpkgs.lib; cs = f.nixosConfigurations or {{}}; names = builtins.attrNames cs; candidates = {rendered}; "  # noqa: E501
-        "eq = a: b: builtins.toJSON a == builtins.toJSON b; files = name: candidate: let option = lib.attrByPath candidate.path {} (builtins.getAttr name cs).options; raw = if builtins.isAttrs option && option ? default && eq candidate.value option.default then builtins.concatMap (d: if builtins.isAttrs d && d ? file then [d.file] else []) (option.definitionsWithLocations or []) else []; tried = builtins.tryEval (builtins.deepSeq raw raw); in if tried.success then tried.value else []; "  # noqa: E501
-        "one = candidate: { inherit (candidate) path; files = builtins.concatMap (name: files name candidate) names; }; in builtins.map one candidates"  # noqa: E501
+        "let f = builtins.getFlake (toString (/. + "
+        f"{nix_syntax.quote_string(str(root))})); lib = f.inputs.nixpkgs.lib; "
+        "cs = f.nixosConfigurations or {}; names = builtins.attrNames cs; "
+        f"candidates = {rendered}; "
+        "eq = a: b: builtins.toJSON a == builtins.toJSON b; files = name: "
+        "candidate: let option = lib.attrByPath candidate.path {} "
+        "(builtins.getAttr name cs).options; raw = if builtins.isAttrs "
+        "option && option ? default && eq candidate.value option.default "
+        "then builtins.concatMap (d: if builtins.isAttrs d && d ? file "
+        "then [d.file] else []) (option.definitionsWithLocations or []) "
+        "else []; tried = builtins.tryEval (builtins.deepSeq raw raw); in "
+        "if tried.success then tried.value else []; "
+        "one = candidate: { inherit (candidate) path; files = "
+        "builtins.concatMap (name: files name candidate) names; }; in "
+        "builtins.map one candidates"
     )
     removals: dict[Path, set[tuple[str, ...]]] = {}
     for record in _run_nix(expression):

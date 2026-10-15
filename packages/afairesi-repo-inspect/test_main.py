@@ -11,7 +11,7 @@ import stat
 import subprocess
 from importlib import import_module
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pytest
 from afairesi import (
@@ -30,7 +30,7 @@ def _expect(condition: bool, message: str) -> None:  # noqa: FBT001
 
 
 def _discovery(source: str) -> dict[str, Any]:
-    return subject.ArgumentDiscovery(ast.parse(source)).report()  # type: ignore[no-any-return]
+    return cast("dict[str, Any]", subject.ArgumentDiscovery(ast.parse(source)).report())
 
 
 def test_argparse_helpers_factories_and_subcommands() -> None:
@@ -328,7 +328,7 @@ def _inspect_target(target: str) -> dict[str, Any]:
         check=True,
         timeout=30,
     )
-    return json.loads(completed.stdout)  # type: ignore[no-any-return]
+    return cast("dict[str, Any]", json.loads(completed.stdout))
 
 
 def _tree_snapshot(root: Path) -> dict[Path, tuple[int, bytes]]:

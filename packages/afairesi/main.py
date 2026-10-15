@@ -331,7 +331,9 @@ class CommandError(RuntimeError):
 
 
 @dataclass(frozen=True)
-class Package:  # noqa: D101
+class Package:
+    """A repository package with its kind and source directory."""
+
     name: str
     kind: str
     root: Path
@@ -525,7 +527,10 @@ def canonical_remote_path(remote: str) -> Path:
         not re.fullmatch(r"[A-Za-z0-9._-]+", component) or component in {".", ".."}
         for component in components
     ):
-        msg = "repository path components must contain only ASCII letters, digits, '.', '-', or '_'"  # noqa: E501
+        msg = (
+            "repository path components must contain only ASCII letters, "
+            "digits, '.', '-', or '_'"
+        )
         raise CommandError(
             msg,
         )
@@ -2037,7 +2042,14 @@ pkgs.writeTextFile {
     files: dict[Path, str] = {root / "default.nix": default}
     if kind == "python":
         files[root / "main.py"] = (
-            f'''#!/usr/bin/env python3\n{description!r}\n\nimport argparse\n\n\ndef parser() -> argparse.ArgumentParser:\n    """Declare the command-line interface."""\n    return argparse.ArgumentParser(description={description!r})\n\n\ndef main(argv: list[str] | None = None) -> None:\n    """Run {name}."""\n    parser().parse_args(argv)\n\n\nif __name__ == "__main__":\n    main()\n'''  # noqa: E501
+            f"#!/usr/bin/env python3\n{description!r}\n\nimport argparse\n\n\n"
+            "def parser() -> argparse.ArgumentParser:\n"
+            '    """Declare the command-line interface."""\n'
+            f"    return argparse.ArgumentParser(description={description!r})\n\n\n"
+            "def main(argv: list[str] | None = None) -> None:\n"
+            f'    """Run {name}."""\n'
+            "    parser().parse_args(argv)\n\n\n"
+            'if __name__ == "__main__":\n    main()\n'
         )
     elif kind == "html":
         files.update(
@@ -2052,8 +2064,9 @@ pkgs.writeTextFile {
     elif kind == "latex":
         files.update(
             {
-                root
-                / "ms.tex": "\\documentclass{article}\n\\begin{document}\n\\end{document}\n",  # noqa: E501
+                root / "ms.tex": (
+                    "\\documentclass{article}\n\\begin{document}\n\\end{document}\n"
+                ),
                 root / "ms.bib": "",
             },
         )
@@ -2137,7 +2150,10 @@ def add_package(
 ) -> None:
     """Create a package transactionally and stage its managed files."""
     if kind not in PACKAGE_KINDS:
-        msg = f"unsupported package type: {kind}\nhint: supported package types: {', '.join(PACKAGE_KINDS)}"  # noqa: E501
+        msg = (
+            f"unsupported package type: {kind}\n"
+            f"hint: supported package types: {', '.join(PACKAGE_KINDS)}"
+        )
         raise CommandError(
             msg,
         )
@@ -2551,7 +2567,8 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
     """Scaffold and format a new flake in an existing repository directory."""
     executable = nix_executable or require_nix_flakes()
     (root / "flake.nix").write_text(
-        '{ inputs.afairesi.url = "github:afairesi/afairesi"; outputs = inputs: inputs.afairesi.blueprint { inherit inputs; }; }\n',  # noqa: E501
+        '{ inputs.afairesi.url = "github:afairesi/afairesi"; '
+        "outputs = inputs: inputs.afairesi.blueprint { inherit inputs; }; }\n",
         encoding="utf-8",
     )
     run([executable, "flake", "lock"], cwd=root)

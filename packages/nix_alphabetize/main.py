@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 
 
 @dataclass(frozen=True)
-class Binding:  # noqa: D101
+class Binding:
+    """A Nix binding and its optional nested attributes."""
+
     path: tuple[str, ...] | None
     value: str | None
     raw: str

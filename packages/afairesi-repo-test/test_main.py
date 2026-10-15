@@ -161,7 +161,7 @@ def _run_runner_cli(
 ) -> subprocess.CompletedProcess[str]:
     """Exercise test runners through the public standalone command."""
     environment = dict(environment)
-    executable_directory = os.path.dirname(os.environ["PACKAGE_E2E_EXECUTABLE"])  # noqa: PTH120
+    executable_directory = str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603
         ["afairesi-repo-test", command, str(root), *arguments],  # noqa: S607
