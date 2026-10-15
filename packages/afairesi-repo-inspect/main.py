@@ -67,6 +67,14 @@ def _value(node: ast.expr) -> object:
         return value
 
 
+def _command_node(tree: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
+    """Find or create the command node at a resolved path."""
+    node = tree
+    for name in path:
+        node = node["commands"].setdefault(name, {"arguments": [], "commands": {}})
+    return node
+
+
 class ArgumentDiscovery:
     """Follow static parser bindings, factory returns, and configuration helpers."""
 
@@ -165,15 +173,21 @@ class ArgumentDiscovery:
         return set()
 
     def report(self) -> dict[str, Any]:
-        """Return declared arguments and command paths with unresolved warnings."""
-        arguments: list[dict[str, Any]] = []
-        commands: set[tuple[str, ...]] = set()
+        """Return a command tree with declared arguments and unresolved warnings."""
+        result: dict[str, Any] = {
+            "status": "argparse" if self.imports else "unknown",
+            "arguments": [],
+            "commands": {},
+            "warnings": [],
+        }
+
         warnings = []
         for scope, call in self.calls:
             if not isinstance(call.func, ast.Attribute):
                 continue
             if call.func.attr == "add_parser":
-                commands.update(self._resolve(scope, call))
+                for path in sorted(self._resolve(scope, call)):
+                    _command_node(result, path)
             if call.func.attr != "add_argument":
                 continue
             contexts = self._resolve(scope, call.func.value)
@@ -188,31 +202,20 @@ class ArgumentDiscovery:
                 keyword.arg or "**kwargs": _value(keyword.value)
                 for keyword in call.keywords
             }
-            arguments.extend(
-                {"command": list(context), "names": names, "options": options}
-                for context in sorted(contexts)
-            )
-        status = "argparse" if self.imports else "unknown"
-        return {
-            "status": status,
-            "arguments": arguments,
-            "commands": [list(command) for command in sorted(commands)],
-            "warnings": warnings,
-        }
+            for context in sorted(contexts):
+                _command_node(result, context)["arguments"].append(
+                    {"names": names, "options": options},
+                )
+        result["warnings"] = warnings
+        return result
 
 
-def declared_tests(module: ast.Module) -> list[dict[str, str]]:
-    """List declared test functions and methods, retaining their identifiers."""
-    result = []
-    for owner, definition in python_test_definitions(module):
-        label = definition.name.removeprefix("test_").replace("_", " ")
-        result.append(
-            {
-                "id": f"{owner}::{definition.name}" if owner else definition.name,
-                "name": f"{owner}: {label}" if owner else label,
-            },
-        )
-    return sorted(result, key=lambda item: item["id"])
+def declared_tests(module: ast.Module) -> list[str]:
+    """List declared test identifiers in deterministic order."""
+    return sorted(
+        f"{owner}::{definition.name}" if owner else definition.name
+        for owner, definition in python_test_definitions(module)
+    )
 
 
 def inspect_repository(root: Path) -> dict[str, Any]:
@@ -221,43 +224,35 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
     hosts = root / "hosts"
-    host_rows = (
+    host_names = (
         [
-            {"name": host.name, "configuration": f"hosts/{host.name}/configuration.nix"}
+            host.name
             for host in sorted(hosts.iterdir())
             if host.is_dir() and not host.is_symlink()
         ]
         if hosts.is_dir()
         else []
     )
-    packages = []
+    packages = {}
     for package in detect_packages(root):
-        relative = f"packages/{package.name}"
         cli = (
             ArgumentDiscovery(_source(package.root / "main.py")).report()
             if package.kind == "python"
             else {
                 "status": "not applicable",
                 "arguments": [],
-                "commands": [],
+                "commands": {},
                 "warnings": [],
             }
         )
         tests = package.root / "test_main.py"
-        packages.append(
-            {
-                "name": package.name,
-                "kind": package.kind,
-                "path": relative,
-                "description": package_description(package),
-                "cli": cli,
-                "tests": declared_tests(_source(tests)) if tests.is_file() else [],
-                "check": f"checks/{package.name}/default.nix"
-                if (root / "checks" / package.name / "default.nix").is_file()
-                else None,
-            },
-        )
-    return {"hosts": host_rows, "packages": packages}
+        packages[package.name] = {
+            "kind": package.kind,
+            "description": package_description(package),
+            "cli": cli,
+            "tests": declared_tests(_source(tests)) if tests.is_file() else [],
+        }
+    return {"hosts": host_names, "packages": packages}
 
 
 def parser() -> argparse.ArgumentParser:

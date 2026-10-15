@@ -51,16 +51,68 @@ def parser():
 def main():
     parser().parse_args()
 """)
-    _expect(report["commands"] == [["build"]], "lost subcommand")
-    rows = {tuple(row["names"]): row for row in report["arguments"]}
-    _expect(rows[("input",)]["command"] == [], "wrong positional scope")
+    _expect(list(report["commands"]) == ["build"], "lost subcommand")
+    _expect(
+        report["arguments"] == [{"names": ["input"], "options": {"type": "str"}}],
+        "wrong positional scope",
+    )
+    rows = {
+        tuple(row["names"]): row for row in report["commands"]["build"]["arguments"]
+    }
     _expect(
         rows[("-j", "--jobs")]["options"]
         == {"type": "int", "default": 2, "choices": [1, 2]},
         "lost metadata",
     )
-    _expect(rows[("--quiet",)]["command"] == ["build"], "lost helper context")
+    _expect(
+        rows[("--quiet",)]
+        == {"names": ["--quiet"], "options": {"action": "store_true"}},
+        "lost helper context",
+    )
     _expect(not report["warnings"], "resolved declarations produced warnings")
+
+
+def test_nested_commands_and_commands_without_arguments() -> None:
+    """Keep empty commands and arguments with the same name in distinct scopes."""
+    report = _discovery("""
+import argparse
+cli = argparse.ArgumentParser()
+cli.add_argument("--verbose", action="store_true")
+commands = cli.add_subparsers()
+commands.add_parser("version")
+remote = commands.add_parser("remote")
+remote.add_argument("--verbose", action="count")
+subcommands = remote.add_subparsers()
+subcommands.add_parser("list")
+add = subcommands.add_parser("add")
+add.add_argument("url")
+""")
+    _expect(
+        report
+        == {
+            "status": "argparse",
+            "arguments": [
+                {"names": ["--verbose"], "options": {"action": "store_true"}},
+            ],
+            "commands": {
+                "version": {"arguments": [], "commands": {}},
+                "remote": {
+                    "arguments": [
+                        {"names": ["--verbose"], "options": {"action": "count"}},
+                    ],
+                    "commands": {
+                        "list": {"arguments": [], "commands": {}},
+                        "add": {
+                            "arguments": [{"names": ["url"], "options": {}}],
+                            "commands": {},
+                        },
+                    },
+                },
+            },
+            "warnings": [],
+        },
+        "command tree lost scope or empty commands",
+    )
 
 
 def test_unknown_declarations_are_explicit() -> None:
@@ -97,13 +149,13 @@ def main():
 """)
     _expect(
         report["arguments"]
-        == [{"command": [], "names": ["--required"], "options": {"required": True}}],
+        == [{"names": ["--required"], "options": {"required": True}}],
         "factory or keyword binding was lost",
     )
 
 
-def test_declared_test_names() -> None:
-    """Humanize declared tests while retaining class context and identifiers."""
+def test_declared_test_identifiers() -> None:
+    """Retain sorted test identifiers and class context."""
     module = ast.parse("""
 from unittest import TestCase as Case
 def test_default_output(): pass
@@ -122,16 +174,13 @@ class Helper:
     _expect(
         rows
         == [
-            {"id": "Arguments::test_valid_input", "name": "Arguments: valid input"},
-            {"id": "Derived::test_other_input", "name": "Derived: other input"},
-            {"id": "Derived::test_valid_input", "name": "Derived: valid input"},
-            {
-                "id": "TestArguments::test_missing_input",
-                "name": "TestArguments: missing input",
-            },
-            {"id": "test_default_output", "name": "default output"},
+            "Arguments::test_valid_input",
+            "Derived::test_other_input",
+            "Derived::test_valid_input",
+            "TestArguments::test_missing_input",
+            "test_default_output",
         ],
-        "wrong test names or collection scope",
+        "wrong test identifiers or collection scope",
     )
 
 
@@ -176,18 +225,18 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
     }
     _expect(before == after, "inspection wrote to the repository")
     _expect(
-        report["hosts"]
-        == [{"name": "laptop", "configuration": "hosts/laptop/configuration.nix"}],
+        report["hosts"] == ["laptop"],
         "wrong hosts",
     )
     _expect(
-        report["packages"][1]["cli"]["status"] == "not applicable",
+        report["packages"]["library"]["cli"]["status"] == "not applicable",
         "non-Python package has CLI metadata",
     )
     _expect(
-        report["packages"][0]["tests"][0]["name"] == "default output",
-        "test name was not humanized",
+        report["packages"]["example"]["tests"] == ["test_default_output"],
+        "wrong test identifiers",
     )
+    _expect(report["packages"]["library"]["tests"] == [], "wrong empty tests")
 
 
 @pytest.mark.parametrize("location", ["outside", "root", "nested"])
@@ -199,7 +248,7 @@ def test_cli_inventory_resolves_repository_paths(
     _repository(tmp_path)
     expected = subject.inspect_repository(tmp_path)
     _expect(
-        expected["packages"][0]["tests"][0]["id"] == "test_default_output",
+        "test_default_output" in expected["packages"]["example"]["tests"],
         "inventory lost test identifier",
     )
     if location != "outside":
@@ -239,10 +288,10 @@ def test_invalid_repository_and_source(tmp_path: Path) -> None:
 
 
 def test_empty_repository(tmp_path: Path) -> None:
-    """Report missing collections as empty lists."""
+    """Report missing hosts as a list and missing packages as an object."""
     (tmp_path / "flake.nix").touch()
     _expect(
-        subject.inspect_repository(tmp_path) == {"hosts": [], "packages": []},
+        subject.inspect_repository(tmp_path) == {"hosts": [], "packages": {}},
         "empty collections were omitted",
     )
 
