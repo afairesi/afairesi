@@ -9,7 +9,6 @@ import ast
 import contextlib
 import keyword
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -1695,9 +1694,7 @@ def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool: 
         for relative in sorted(allowed | prm_files):
             if (root / relative).exists():
                 clean_arguments.extend(("-e", f"/{relative.as_posix()}"))
-    clean = git(root, clean_arguments, check=False)
-    if clean.returncode != 0:
-        raise CommandError(clean.stderr.strip() or "git clean failed")
+    clean = git(root, clean_arguments)
     if clean.stdout:
         print(clean.stdout, end="")  # noqa: T201
         changed = True
@@ -2176,9 +2173,7 @@ def add_package(
             generated = [str(path.relative_to(root)) for path in created] + [
                 ".gitignore",
             ]
-            completed = git(root, ["add", "--", *generated], check=False)
-            if completed.returncode != 0:
-                raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
+            git(root, ["add", "--", *generated])
     except BaseException:
         for path in reversed(created):
             path.unlink(missing_ok=True)
@@ -2217,7 +2212,7 @@ def add_host(root: Path, name: str, *, dry_run: bool = False) -> None:
             check.parent.mkdir(parents=True)
             check.write_text(_current_host_check_source(), encoding="utf-8")
             _refresh_gitignore(root)
-            completed = git(
+            git(
                 root,
                 [
                     "add",
@@ -2226,10 +2221,7 @@ def add_host(root: Path, name: str, *, dry_run: bool = False) -> None:
                     str(check_relative),
                     ".gitignore",
                 ],
-                check=False,
             )
-            if completed.returncode != 0:
-                raise CommandError(completed.stderr.strip() or "git add failed")  # noqa: TRY301
     except BaseException:
         path.unlink(missing_ok=True)
         check.unlink(missing_ok=True)
@@ -2267,25 +2259,7 @@ def remove_resource(
             raise CommandError(msg)
     read_regular(root / ".gitignore")
     target_relatives = [str(target.relative_to(root)) for target in targets]
-    if not force:
-        status = git(
-            root,
-            [
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--ignored",
-                "--",
-                *target_relatives,
-            ],
-        )
-        if status.stdout:
-            msg = (
-                "resource or related checks contain local changes or untracked data; "
-                "commit or preserve them, or use --force to remove them"
-            )
-            raise CommandError(msg)
-    arguments = ["rm", "-r", "--ignore-unmatch"]
+    arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
     if dry_run:
@@ -2293,11 +2267,6 @@ def remove_resource(
     removal = git(root, [*arguments, "--", *target_relatives])
     print(removal.stdout, end="")  # noqa: T201
     report_change("update '.gitignore'", dry_run=dry_run)
-    clean_arguments = ["clean", "-dx", "--dry-run" if dry_run else "--force"]
-    if force:
-        clean_arguments.extend(("--force", "--force"))
-    clean = git(root, [*clean_arguments, "--", *target_relatives])
-    print(clean.stdout, end="")  # noqa: T201
     if not dry_run:
         _refresh_gitignore(root)
         git(root, ["add", "--", ".gitignore"])
@@ -2538,16 +2507,14 @@ def rename_resource(root: Path, source: str, destination: str, dry_run: bool) ->
         validate_managed_path(root, old)
         validate_managed_path(root, new)
         report_change(f"move '{old}' to '{new}'", dry_run=dry_run)
+        if dry_run:
+            git(root, ["mv", "--dry-run", "--", str(old), str(new)])
     report_change("update '.gitignore'", dry_run=dry_run)
     if dry_run:
         _apply_runtime_updates(root, updates, dry_run=True)
         return
-    tracked = _tracked_paths(root)
     for old, new in moves:
-        if any(beneath(path, {old}) for path in tracked):
-            git(root, ["mv", "--", str(old), str(new)])
-        else:
-            shutil.move(root / old, root / new)
+        git(root, ["mv", "--", str(old), str(new)])
     _apply_runtime_updates(root, updates, dry_run=False)
     _refresh_gitignore(root)
     git(root, ["add", "--", ".gitignore"])
@@ -2708,8 +2675,8 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="remove a package or host",
         description="Remove and stage a canonical package or host.",
         epilog=(
-            "Remove related checks and runtime data. "
-            "Reject local changes and untracked data unless --force is given."
+            "Remove tracked resource and related check files with git rm. "
+            "Untracked and ignored files remain."
         ),
     )
     remove.add_argument(
@@ -2727,7 +2694,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "-f",
         "--force",
         action="store_true",
-        help="allow deletion of local changes and untracked data",
+        help="pass --force to git rm",
     )
 
 
@@ -2786,34 +2753,6 @@ def home_submodules(
             )
         repositories.append({"name": name, **fields})
     return repositories
-
-
-def _local_submodule_names(root: Path) -> set[str]:
-    """Read submodule section names from the repository's own configuration."""
-    completed = git(
-        root,
-        [
-            "config",
-            "--local",
-            "--null",
-            "--name-only",
-            "--get-regexp",
-            r"^submodule\..*\..*$",
-        ],
-        check=False,
-    )
-    if completed.returncode == 1 and not completed.stdout and not completed.stderr:
-        return set()
-    if completed.returncode != 0:
-        msg = (
-            f"could not read local submodule configuration: {completed.stderr.strip()}"
-        )
-        raise CommandError(msg)
-    return {
-        key.removeprefix("submodule.").rsplit(".", 1)[0]
-        for key in completed.stdout.split("\0")
-        if key
-    }
 
 
 def _home_ignore_source(root: Path) -> str:
@@ -2879,58 +2818,17 @@ def _converge_home_submodule(
 ) -> bool:
     """Converge one home submodule record and checkout."""
     actual = Path(repository["path"])
-    if not (root / actual / ".git").exists():
+    if actual == expected or not (root / actual / ".git").exists():
         return False
-    changed = False
-    if actual != expected:
-        report_change(f"move '{actual}' to '{expected}'", dry_run=dry_run)
-        changed = True
-        if not dry_run:
-            (root / expected).parent.mkdir(parents=True, exist_ok=True)
-            git(root, ["mv", "--", str(actual), str(expected)])
-            git(
-                root,
-                [
-                    "config",
-                    "--file",
-                    ".gitmodules",
-                    f"submodule.{repository['name']}.path",
-                    expected.as_posix(),
-                ],
-            )
-        changed |= _move_home_whitelist(root, actual, expected, dry_run=dry_run)
-    if repository["name"] != expected.as_posix():
-        report_change(
-            f"rename submodule '{repository['name']}' to '{expected.as_posix()}'",
-            dry_run=dry_run,
-        )
-        changed = True
-        if not dry_run:
-            git(
-                root,
-                [
-                    "config",
-                    "--file",
-                    ".gitmodules",
-                    "--rename-section",
-                    f"submodule.{repository['name']}",
-                    f"submodule.{expected.as_posix()}",
-                ],
-            )
-            if repository["name"] in _local_submodule_names(root):
-                git(
-                    root,
-                    [
-                        "config",
-                        "--local",
-                        "--rename-section",
-                        f"submodule.{repository['name']}",
-                        f"submodule.{expected.as_posix()}",
-                    ],
-                )
-    if changed and not dry_run:
-        git(root, ["add", "--", ".gitmodules"])
-    return changed
+    report_change(f"move '{actual}' to '{expected}'", dry_run=dry_run)
+    arguments = ["mv"]
+    if dry_run:
+        arguments.append("--dry-run")
+    else:
+        (root / expected).parent.mkdir(parents=True, exist_ok=True)
+    git(root, [*arguments, "--", str(actual), str(expected)])
+    _move_home_whitelist(root, actual, expected, dry_run=dry_run)
+    return True
 
 
 def _move_home_whitelist(
@@ -2948,6 +2846,8 @@ def _move_home_whitelist(
     retained = [
         line for line in lines if line != old and not line.startswith(old + "/")
     ]
+    if retained == lines:
+        return False
     for line in lines:
         if line == old or line.startswith(old + "/"):
             replacement = new + line[len(old) :]
@@ -2983,19 +2883,7 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
         if actual != expected and (root / expected).exists():
             msg = f"target already exists: {expected}"
             raise CommandError(msg)
-    if (
-        actual_paths != repair_paths
-        and git(
-            root,
-            ["diff", "--quiet", "--", ".gitmodules"],
-            check=False,
-        ).returncode
-    ):
-        msg = "stage .gitmodules with git add before moving submodules"
-        raise CommandError(msg)
-    _converge_home_ignore(root, dry_run=dry_run)
-    for expected in repair_paths:
-        _allow_home_submodule(root, expected, dry_run=dry_run)
+    _home_ignore_source(root)
     for repository, expected in zip(repositories, repair_paths, strict=True):
         _converge_home_submodule(
             root,
@@ -3003,6 +2891,9 @@ def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: F
             expected,
             dry_run=dry_run,
         )
+    _converge_home_ignore(root, dry_run=dry_run)
+    for expected in repair_paths:
+        _allow_home_submodule(root, expected, dry_run=dry_run)
     return repositories
 
 
@@ -3015,7 +2906,7 @@ def remove_home_submodule(
 ) -> None:
     """Remove a registered home submodule and its owned whitelist entries."""
     relative = Path(value)
-    repositories = home_submodules(root)
+    repositories = home_submodules(root, require_url=False)
     if (
         relative.is_absolute()
         or ".." in relative.parts
@@ -3024,18 +2915,6 @@ def remove_home_submodule(
     ):
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
-    checkout = root / relative
-    if not force and (checkout / ".git").exists():
-        status = git(
-            checkout,
-            ["status", "--porcelain", "--untracked-files=all", "--ignored"],
-        )
-        if status.stdout:
-            msg = (
-                "submodule contains local changes or untracked data; "
-                "commit or preserve them, or use --force to remove them"
-            )
-            raise CommandError(msg)
     source = read_regular(root / ".gitignore") or ""
     entry = f"!/{relative.as_posix()}"
     retained = [
@@ -3044,35 +2923,29 @@ def remove_home_submodule(
         if line != entry and not line.startswith(entry + "/")
     ]
     updated = "\n".join(retained) + "\n" if retained else ""
-    arguments = ["rm", "-r", "--", f":(literal){relative.as_posix()}"]
+    arguments = ["rm", "-r"]
     if force:
-        arguments.insert(2, "--force")
-    arguments.insert(2, "--dry-run")
-    git(root, arguments)
-    report_change(f"deinitialize submodule '{relative}' with Git", dry_run=dry_run)
-    if not dry_run:
-        git(root, ["submodule", "absorbgitdirs", "--", f":(literal){relative}"])
-        deinit = ["submodule", "deinit", "--", f":(literal){relative}"]
-        if force:
-            deinit.insert(2, "--force")
-        git(root, deinit)
-        arguments.remove("--dry-run")
-        git(root, arguments)
-    report_change(
-        f"remove submodule '{relative}' and update '.gitmodules'",
-        dry_run=dry_run,
+        arguments.append("--force")
+    if dry_run:
+        arguments.append("--dry-run")
+    removal = run(
+        ["git", *arguments, "--", f":(literal){relative.as_posix()}"],
+        cwd=root,
     )
+    print(removal.stdout, end="")  # noqa: T201
+    if removal.stderr:
+        print(removal.stderr, end="", file=sys.stderr)  # noqa: T201
     write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
 
 def initialize_home() -> None:
     """Initialize and stage the canonical home policy without cleaning."""
     root = Path.home()
-    if not (root / ".git").exists():
-        run(["git", "init", str(root)])
     if repository_type(root, "home") != "home":
         msg = "cannot initialize a flake repository as a home repository"
         raise CommandError(msg)
+    _home_ignore_source(root)
+    run(["git", "init", "--", str(root)])
     _converge_home_ignore(root, dry_run=False)
 
 
@@ -3101,36 +2974,12 @@ def initialize_submodule(remote: str) -> None:
     relative = canonical_remote_path(remote)
     home = _require_home_repository()
     validate_managed_path(home, relative)
-    cached = home_module_directory(home, relative)
-    reuse_cache = cached.exists() and not (home / relative).exists()
-    if reuse_cache:
-        validate_cached_remote(cached, remote)
     directories = missing_directories(home, [relative.parent])
     try:
         with preserve_whitelist_on_error(home):
             _allow_home_submodule(home, relative)
-            registered = any(
-                Path(repository["path"]) == relative and repository["url"] == remote
-                for repository in home_submodules(home)
-            )
-            indexed = git(home, ["ls-files", "--stage", "--", str(relative)]).stdout
-            if (
-                registered
-                and indexed.startswith("160000 ")
-                and (home / relative / ".git").exists()
-            ):
-                return
-            arguments = ["git", "submodule", "add"]
-            if reuse_cache:
-                bare = run(
-                    ["git", "--git-dir", str(cached), "config", "--get", "core.bare"],
-                ).stdout.strip()
-                if bare == "true":
-                    prepare_cached_submodule(cached)
-                run(["git", "--git-dir", str(cached), "config", "core.bare", "false"])
-                arguments.append("--force")
             completed = run(
-                [*arguments, "--", remote, relative.as_posix()],
+                ["git", "submodule", "add", "--", remote, relative.as_posix()],
                 cwd=home,
             )
             if completed.stdout:
@@ -3165,17 +3014,6 @@ def validate_cached_remote(directory: Path, remote: str) -> None:
     ) != canonical_remote_path(remote):
         msg = f"{directory}: repository origin does not match {remote}"
         raise CommandError(msg)
-
-
-def prepare_cached_submodule(directory: Path) -> None:
-    """Give a bare inspection cache normal clone tracking refs and configuration."""
-    command = ["git", "--git-dir", str(directory)]
-    refspec = "+refs/heads/*:refs/remotes/origin/*"
-    run([*command, "fetch", str(directory), refspec])
-    run([*command, "config", "remote.origin.fetch", refspec])
-    branch = run([*command, "symbolic-ref", "--short", "HEAD"]).stdout.strip()
-    run([*command, "config", f"branch.{branch}.remote", "origin"])
-    run([*command, "config", f"branch.{branch}.merge", f"refs/heads/{branch}"])
 
 
 @contextlib.contextmanager
@@ -3240,12 +3078,7 @@ def inspection_remote_repository(remote: str) -> Iterator[Path]:
 
 def _remote_is_empty(remote: str) -> bool:
     """Return whether a hosted remote advertises no heads."""
-    completed = run(
-        ["git", "ls-remote", remote],
-        check=False,
-    )
-    if completed.returncode != 0:
-        raise CommandError(completed.stderr.strip() or "could not read remote")
+    completed = run(["git", "ls-remote", "--", remote])
     return not completed.stdout.strip()
 
 
@@ -3261,34 +3094,22 @@ def create_home_repo(remote: str) -> None:
         msg = "home create requires an empty remote"
         raise CommandError(msg)
     directory = home / relative
-    if directory.exists():
-        msg = f"target already exists: {directory}"
-        raise CommandError(msg)
-    directory.parent.mkdir(parents=True, exist_ok=True)
-    run(["git", "clone", remote, str(directory)])
-    try:
-        initialize_flake(directory, nix_executable=nix_executable)
-        git(directory, ["add", "--all"])
-        git(directory, ["branch", "-M", "main"])
-        git(directory, ["commit", "-m", "Initialize repository"])
-    except BaseException:
-        shutil.rmtree(directory)
-        with contextlib.suppress(OSError):
-            directory.parent.rmdir()
-        raise
+    run(["git", "clone", "--", remote, str(directory)])
+    initialize_flake(directory, nix_executable=nix_executable)
+    git(directory, ["add", "--all"])
+    git(directory, ["commit", "-m", "Initialize repository"])
     _allow_home_submodule(home, relative)
     git(
         home,
         [
             "submodule",
             "add",
-            "--name",
-            relative.as_posix(),
+            "--",
             remote,
             str(relative),
         ],
     )
-    git(directory, ["push", "--set-upstream", "origin", "main"])
+    git(directory, ["push", "--set-upstream", "origin", "HEAD"])
 
 
 def _configure_home_parser(result: argparse.ArgumentParser) -> None:
@@ -3316,8 +3137,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
             "$HOME/<remote-hostname>/<repository-path>."
         ),
         epilog=(
-            "Commit the initial main branch, stage home submodule registration, "
-            "and push."
+            "Commit the initial branch, stage home submodule registration, and push."
         ),
     )
     create.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
@@ -3342,7 +3162,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         "rm",
         help="remove a registered home submodule",
         description="Remove a home submodule and stage its unregistration.",
-        epilog="Reject local changes and untracked data unless --force is given.",
+        epilog="Use git rm for removal and update the home whitelist.",
     )
     remove.add_argument(
         "resource",
@@ -3359,7 +3179,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         "-f",
         "--force",
         action="store_true",
-        help="allow deletion of local changes and untracked data",
+        help="pass --force to git rm",
     )
 
 

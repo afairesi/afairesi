@@ -22,6 +22,7 @@ from afairesi import (
 )
 
 subject = import_module("packages.afairesi-repo-inspect.main")
+GIT_FATAL_EXIT_CODE = 128
 
 
 def _expect(condition: bool, message: str) -> None:  # noqa: FBT001
@@ -338,7 +339,7 @@ def test_remote_inspection_caches_without_registration_and_refreshes(
     *,
     initialized: bool,
 ) -> None:
-    """Inspect remote changes without staging home files, then adopt cached Git data."""
+    """Inspect remote changes without staging home files or forcing cache adoption."""
     home, source, remote = _remote_fixture(tmp_path, monkeypatch)
     relative = Path("example.test/team/repository")
     if initialized:
@@ -367,22 +368,36 @@ def test_remote_inspection_caches_without_registration_and_refreshes(
         _inspect_remote(remote) == subject.inspect_repository(source),
         "cache was stale",
     )
-    expected_revision = git(source, ["rev-parse", "HEAD"]).stdout
-    source.rename(tmp_path / "offline-source")
+    before_ignore = (home / ".gitignore").read_text()
+    with pytest.raises(SystemExit) as failure:
+        initialize_submodule(remote)
+    _expect(
+        failure.value.code == GIT_FATAL_EXIT_CODE,
+        "clone suppressed Git's cache collision",
+    )
+    _expect(
+        (home / ".gitignore").read_text() == before_ignore,
+        "failed clone changed the whitelist",
+    )
+    _expect(
+        git(directory, ["config", "--get", "core.bare"]).stdout.strip() == "true",
+        "clone converted the inspection cache",
+    )
+
+
+def test_remote_inspection_reuses_local_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inspect local content without changing the checkout."""
+    home, source, remote = _remote_fixture(tmp_path, monkeypatch)
+    initialize_home()
     initialize_submodule(remote)
-    checkout = home / relative
+    checkout = home / "example.test/team/repository"
     _expect(
-        git(checkout, ["rev-parse", "HEAD"]).stdout == expected_revision,
-        "clone lost cached revision",
-    )
-    _expect(
-        git(checkout, ["rev-parse", "--absolute-git-dir"]).stdout.strip()
-        == str(directory),
-        "clone did not adopt cache",
-    )
-    _expect(
-        git(checkout, ["rev-parse", "@{upstream}"]).stdout == expected_revision,
-        "adopted checkout has no upstream tracking branch",
+        git(checkout, ["rev-parse", "HEAD"]).stdout
+        == git(source, ["rev-parse", "HEAD"]).stdout,
+        "clone checked out the wrong revision",
     )
     (checkout / "hosts/local").mkdir(parents=True)
     (checkout / "hosts/local/configuration.nix").touch()
@@ -439,7 +454,7 @@ def test_remote_inspection_rejects_checkout_and_cache_collisions(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Do not inspect or adopt a repository with a different canonical origin."""
+    """Reject inspection collisions and let Git reject submodule cache collisions."""
     home, source, remote = _remote_fixture(tmp_path, monkeypatch)
     initialize_home()
     with inspection_remote_repository(remote):
@@ -455,8 +470,12 @@ def test_remote_inspection_rejects_checkout_and_cache_collisions(
         inspection_remote_repository(remote),
     ):
         pass
-    with pytest.raises(CommandError, match="origin does not match"):
+    with pytest.raises(SystemExit) as failure:
         initialize_submodule(remote)
+    _expect(
+        failure.value.code == GIT_FATAL_EXIT_CODE,
+        "clone suppressed Git's cache collision",
+    )
     _expect(not (home / ".gitmodules").exists(), "collision registered a submodule")
     checkout = home / relative
     checkout.parent.mkdir(parents=True)
