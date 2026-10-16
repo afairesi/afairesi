@@ -517,30 +517,21 @@ def test_invalid_resource_arguments_are_usage_errors_outside_git(
 
 
 @pytest.mark.parametrize("kind", ["python", "html", "latex", "nix", "host"])
-def test_add_preview_preserves_state_and_rejects_existing_resources(kind: str) -> None:
-    """Preview additions from a nested cwd without writing files or staging data."""
+def test_add_targets_repository_root_and_rejects_existing_resources(kind: str) -> None:
+    """Add from a nested cwd and reject existing resources without changes."""
     with _fresh_repository() as root:
         nested = root / "tmp/nested"
         nested.mkdir(parents=True)
         relative = "hosts/example" if kind == "host" else "packages/example"
         arguments = () if kind == "host" else (kind,)
-        before = _snapshot(root)
-        preview = _run(nested, "add", relative, *arguments, "-n")
-        _expect(f"would write '{relative}/" in preview.stdout, preview.stdout)
-        if kind == "host":
-            _expect(
-                "checks/exampleVmWithDisko/default.nix" in preview.stdout,
-                preview.stdout,
-            )
-        _expect(_snapshot(root) == before, "add preview changed files or Git state")
         _run(nested, "add", relative, *arguments)
         _expect(
             (root / relative).is_dir(),
             "add used the working directory as its root",
         )
         before = _snapshot(root)
-        _run(nested, "add", relative, *arguments, "--dry-run", code=1)
-        _expect(_snapshot(root) == before, "conflicting preview changed state")
+        _run(nested, "add", relative, *arguments, code=1)
+        _expect(_snapshot(root) == before, "conflicting addition changed state")
 
 
 @pytest.mark.parametrize(
@@ -679,12 +670,10 @@ def test_resource_removal_uses_git_rules_and_preserves_untracked_data(
         before = _snapshot(root)
         arguments = ("--force",) if force else ()
         if change in {"working", "staged"} and not force:
-            for preview in (("--dry-run",), ()):
-                rejected = _run(root, "rm", relative, *preview, code=1)
-                _expect("-f" in rejected.stderr, rejected)
-                _expect(_snapshot(root) == before, "rejected removal changed state")
+            rejected = _run(root, "rm", relative, code=1)
+            _expect("-f" in rejected.stderr, rejected)
+            _expect(_snapshot(root) == before, "rejected removal changed state")
             return
-        _preview(root, "rm", relative, *arguments)
         _run(root, "rm", relative, *arguments)
         if change in {"working", "staged"}:
             _expect(not resource.exists(), "forced removal left tracked resource")
@@ -701,11 +690,9 @@ def test_resource_removal_uses_git_rules_and_preserves_untracked_data(
 
 
 @pytest.mark.parametrize("force", [False, True])
-@pytest.mark.parametrize("dry_run", [False, True])
 def test_resource_removal_rejects_untracked_resources(
     *,
     force: bool,
-    dry_run: bool,
 ) -> None:
     """Preserve Git's unmatched-path error without deleting untracked resources."""
     with _fresh_repository() as root:
@@ -715,8 +702,6 @@ def test_resource_removal_rejects_untracked_resources(
         arguments = []
         if force:
             arguments.append("--force")
-        if dry_run:
-            arguments.append("--dry-run")
         before = _snapshot(root)
         rejected = _run(root, "rm", "packages/example", *arguments, code=128)
         _expect("did not match any files" in rejected.stderr, rejected)
@@ -732,7 +717,6 @@ def test_resource_commands_resolve_paths_from_the_repository_root() -> None:
         _expect((root / "packages/example/default.nix").is_file(), "wrong create root")
         _run(nested, "mv", "packages/example", "packages/renamed")
         _fixture_git(root, "commit", "-qm", "Renamed resource")
-        _preview(nested, "rm", "packages/renamed")
         _run(nested, "rm", "packages/renamed")
         _expect(not (root / "packages/renamed").exists(), "wrong removal root")
 
@@ -785,7 +769,7 @@ def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
 
 
 @pytest.mark.parametrize("case", ["symlink", "file"])
-def test_removal_validates_all_targets_before_preview_or_deletion(
+def test_removal_validates_all_targets_before_deletion(
     tmp_path: Path,
     case: str,
 ) -> None:
@@ -799,9 +783,8 @@ def test_removal_validates_all_targets_before_preview_or_deletion(
         else:
             check.write_text("preserve check contents")
         before = _snapshot(root)
-        for arguments in (("--dry-run",), ()):
-            _run(root, "rm", "packages/example", "--force", *arguments, code=1)
-            _expect(_snapshot(root) == before, "rejected removal deleted local files")
+        _run(root, "rm", "packages/example", "--force", code=1)
+        _expect(_snapshot(root) == before, "rejected removal deleted local files")
 
 
 @pytest.mark.parametrize("style", ["literal", "split", "annotated", "concatenated"])
@@ -851,7 +834,6 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
         data = root / "packages/old/tmp/asset"
         data.parent.mkdir()
         data.write_text("preserve runtime data")
-        _preview(root, "mv", "packages/old", "packages/new")
         _run(root, "mv", "packages/old", "packages/new")
         renamed_source = (root / "packages/new/main.py").read_text()
         if style == "split":
@@ -1563,7 +1545,7 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
     name: str,
     payload: bytes,
 ) -> None:
-    """Add, preview, rename, converge, and remove resources without losing Git state."""
+    """Add, rename, converge, and remove resources without losing Git state."""
     with _fresh_repository() as root:
         if kind == "host":
             name = name.replace("-", "").replace("_", "")
@@ -1606,12 +1588,10 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
         untracked.write_bytes(payload)
         if kind == "untracked":
             before = _snapshot(root)
-            for arguments in (("--dry-run",), ()):
-                rejected = _run(root, "mv", original, destination, *arguments, code=128)
-                _expect("fatal:" in rejected.stderr, rejected)
-                _expect(_snapshot(root) == before, "failed move changed untracked data")
+            rejected = _run(root, "mv", original, destination, code=128)
+            _expect("fatal:" in rejected.stderr, rejected)
+            _expect(_snapshot(root) == before, "failed move changed untracked data")
             return
-        _preview(root, "mv", original, destination)
         _run(root, "mv", original, destination)
         new_check = check.replace(f"a{name}", f"b{name}")
         for relative in tracked:
@@ -1647,7 +1627,6 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
         _repair_flake(root)
         survivor = root / destination / "prm/survivor.bin"
         survivor.write_bytes(payload)
-        _preview(root, "rm", destination, "--force")
         _run(root, "rm", destination, "--force")
         _expect(
             survivor.read_bytes() == payload and not (root / new_check).exists(),
@@ -2458,13 +2437,6 @@ def _home_test_snapshot(
     )
 
 
-def _home_test_preview(root: Path, *arguments: str, code: int = 0) -> None:
-    """Preserve the whole repository during successful and rejected previews."""
-    before = _home_test_snapshot(root)
-    _home_test_run(root, *arguments, "--dry-run", code=code)
-    _home_test_expect(_home_test_snapshot(root) == before, arguments)
-
-
 def _home_test_history_snapshot(root: Path) -> dict[Path, bytes]:
     """Observe stored Git files without requiring a surviving worktree."""
     return {
@@ -2600,7 +2572,6 @@ def _git_rule_home_fixture(root: Path, state: str) -> Path:
     return native
 
 
-@pytest.mark.parametrize("dry_run", [False, True])
 @pytest.mark.parametrize("force", [False, True])
 @pytest.mark.parametrize(
     "state",
@@ -2623,7 +2594,6 @@ def test_home_rm_matches_native_git(
     state: str,
     *,
     force: bool,
-    dry_run: bool,
 ) -> None:
     """Use real Git as the oracle for removal errors, force rules, and side effects."""
     native = _git_rule_home_fixture(tmp_path / "native", state)
@@ -2634,8 +2604,6 @@ def test_home_rm_matches_native_git(
     arguments = []
     if force:
         arguments.append("--force")
-    if dry_run:
-        arguments.append("--dry-run")
     expected = subprocess.run(  # noqa: S603
         ["git", "rm", "-r", *arguments, "--", relative],  # noqa: S607
         cwd=native,
@@ -2659,11 +2627,10 @@ def test_home_rm_matches_native_git(
     _expect_git_rule_state(
         native,
         wrapped,
-        allow_whitelist_edits=expected.returncode == 0 and not dry_run,
+        allow_whitelist_edits=expected.returncode == 0,
     )
 
 
-@pytest.mark.parametrize("dry_run", [False, True])
 @pytest.mark.parametrize(
     "state",
     [
@@ -2679,8 +2646,6 @@ def test_home_rm_matches_native_git(
 def test_repo_mv_matches_native_git(
     tmp_path: Path,
     state: str,
-    *,
-    dry_run: bool,
 ) -> None:
     """Keep Git's move semantics for staged edits, local data, and rejected moves."""
     native = tmp_path / "native"
@@ -2706,9 +2671,8 @@ def test_repo_mv_matches_native_git(
         (native / ".git/index.lock").touch()
     wrapped = tmp_path / "wrapped"
     shutil.copytree(native, wrapped)
-    arguments = ("--dry-run",) if dry_run else ()
-    expected = subprocess.run(  # noqa: S603
-        ["git", "mv", *arguments, "--", "packages/old", "packages/new"],  # noqa: S607
+    expected = subprocess.run(
+        ["git", "mv", "--", "packages/old", "packages/new"],  # noqa: S607
         cwd=native,
         capture_output=True,
         text=True,
@@ -2720,7 +2684,6 @@ def test_repo_mv_matches_native_git(
         "mv",
         "packages/old",
         "packages/new",
-        *arguments,
         code=expected.returncode,
     )
     _expect(
@@ -2731,7 +2694,7 @@ def test_repo_mv_matches_native_git(
     _expect_git_rule_state(
         native,
         wrapped,
-        allow_whitelist_edits=expected.returncode == 0 and not dry_run,
+        allow_whitelist_edits=expected.returncode == 0,
     )
 
 
@@ -3315,7 +3278,6 @@ def test_merged_home_repair_targets_home_from_any_working_directory(
         "unknown",
         "parent",
         "dirty",
-        "dirty-preview",
         "staged",
         "advanced",
         "untracked",
@@ -3355,18 +3317,15 @@ def test_merged_home_submodule_removal_uses_native_git_rules(
         (root / relative / "asset").write_text("preserve local data")
     before = _home_test_snapshot(root)
     if case == "ignored":
-        _home_test_preview(root, "rm", target)
         _home_test_run(root, "rm", target)
         _home_test_expect(not (root / target).exists(), "native removal left submodule")
         return
-    arguments = ("--dry-run",) if case == "dirty-preview" else ()
-    _home_test_run(root, "rm", target, *arguments, code=1)
+    _home_test_run(root, "rm", target, code=1)
     _home_test_expect(
         _home_test_snapshot(root) == before,
         "rejected removal changed home state",
     )
     if case.startswith("dirty") or case in {"staged", "advanced", "untracked"}:
-        _home_test_preview(root, "rm", target, "--force")
         _home_test_run(root, "rm", target, "--force")
         _home_test_expect(
             not (root / target).exists(),
@@ -3434,16 +3393,6 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
     )
     _home_test_git(root, "add", ".gitignore")
     _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
-    before = _home_test_snapshot(root)
-    preview = _home_test_run(cwd, "rm", relative, "--dry-run")
-    _home_test_expect(
-        relative in preview.stdout and ".gitignore" in preview.stdout,
-        preview,
-    )
-    _home_test_expect(
-        _home_test_snapshot(root) == before,
-        "removal preview changed home state",
-    )
     _home_test_run(cwd, "rm", relative)
     _home_test_expect(
         _home_test_snapshot(flake) == flake_before,
@@ -3521,22 +3470,7 @@ def test_home_submodule_removal_leaves_storage_to_git(
             f"submodule.{relative}.url",
         )
         _home_test_git(root, "add", ".gitmodules")
-    index_before = _home_test_git(root, "ls-files", "--stage")
-    modules_before = (root / ".gitmodules").read_bytes()
-    ignore_before = (root / ".gitignore").read_bytes()
     config_before = _home_test_git(root, "config", "--local", "--list")
-    _home_test_run(root, "rm", relative, "--dry-run")
-    if storage == "directory":
-        _home_test_expect(
-            (checkout / ".git").is_file(),
-            "Git did not migrate legacy storage",
-        )
-    _home_test_expect(
-        _home_test_git(root, "ls-files", "--stage") == index_before
-        and (root / ".gitmodules").read_bytes() == modules_before
-        and (root / ".gitignore").read_bytes() == ignore_before,
-        "preview changed registration or whitelist",
-    )
     _home_test_run(root, "rm", relative)
     _home_test_expect(not checkout.exists(), "removal left checkout")
     _home_test_expect(
@@ -3757,6 +3691,37 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
         ("unknown-scope",),
     ):
         _run(tmp_path, *arguments, executable=executable, code=2)
+    for arguments in (
+        ("repo", "add", "packages/example", "python"),
+        ("repo", "mv", "packages/example", "packages/renamed"),
+        ("repo", "rm", "packages/example"),
+        ("home", "rm", "forge.example/owner/demo"),
+    ):
+        command_help = _run(
+            tmp_path,
+            *arguments[:2],
+            "--help",
+            executable=executable,
+        ).stdout
+        _expect("--dry-run" not in command_help, command_help)
+        for flag in ("-n", "--dry-run"):
+            rejected = _run(
+                tmp_path,
+                *arguments,
+                flag,
+                executable=executable,
+                code=2,
+            )
+            _expect("unrecognized arguments" in rejected.stderr, rejected)
+    for scope in ("repo", "home"):
+        fix_help = _run(
+            tmp_path,
+            scope,
+            "fix",
+            "--help",
+            executable=executable,
+        ).stdout
+        _expect("--dry-run" in fix_help, fix_help)
     _expect(not any(tmp_path.iterdir()), "invalid scope created state")
 
 
@@ -3799,7 +3764,6 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
         remote = str(upstream) if remote_kind == "path" else upstream.as_uri()
         _run(root, "add", "packages/example", "python")
         _git(root, "remote", "add", "origin", remote)
-        _preview(root, "mv", "packages/example", "packages/renamed")
         _run(root, "mv", "packages/example", "packages/renamed")
         _run(root, "fix")
         _expect((root / "packages/renamed/main.py").is_file(), "rename failed")

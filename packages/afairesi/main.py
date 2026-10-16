@@ -2159,8 +2159,6 @@ def add_package(
     kind: str,
     name: str,
     description: str | None = None,
-    *,
-    dry_run: bool = False,
 ) -> None:
     """Create a package transactionally and stage its managed files."""
     if kind not in PACKAGE_KINDS:
@@ -2182,12 +2180,6 @@ def add_package(
     validate_python_package_names(
         [*detect_packages(root), Package(name, kind, root / relative)],
     )
-    if dry_run:
-        read_regular(root / ".gitignore")
-        for path in files:
-            report_change(f"write '{path}'", dry_run=True)
-        report_change("update and stage '.gitignore' and package files", dry_run=True)
-        return
     directories = missing_directories(root, [relative])
     created: list[Path] = []
     try:
@@ -2210,7 +2202,7 @@ def add_package(
         raise
 
 
-def add_host(root: Path, name: str, *, dry_run: bool = False) -> None:
+def add_host(root: Path, name: str) -> None:
     """Create a host and stage its canonical configuration."""
     validate_host_name(name)
     relative = Path("hosts") / name / "configuration.nix"
@@ -2227,12 +2219,6 @@ def add_host(root: Path, name: str, *, dry_run: bool = False) -> None:
     ):
         msg = f"host or generated check already exists: {name}"
         raise CommandError(msg)
-    if dry_run:
-        read_regular(root / ".gitignore")
-        report_change(f"write '{relative}'", dry_run=True)
-        report_change(f"write '{check_relative}'", dry_run=True)
-        report_change("update and stage '.gitignore' and host files", dry_run=True)
-        return
     directories = missing_directories(root, [relative.parent, check_relative.parent])
     try:
         with preserve_whitelist_on_error(root):
@@ -2262,7 +2248,6 @@ def remove_resource(
     root: Path,
     value: str,
     *,
-    dry_run: bool,
     force: bool = False,
 ) -> None:
     """Remove a canonical package or host and stage its related metadata."""
@@ -2291,14 +2276,11 @@ def remove_resource(
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
-    if dry_run:
-        arguments.append("--dry-run")
     removal = git(root, [*arguments, "--", *target_relatives])
     sys.stdout.write(removal.stdout)
-    report_change("update '.gitignore'", dry_run=dry_run)
-    if not dry_run:
-        _refresh_gitignore(root)
-        git(root, ["add", "--", ".gitignore"])
+    report_change("update '.gitignore'", dry_run=False)
+    _refresh_gitignore(root)
+    git(root, ["add", "--", ".gitignore"])
 
 
 def _parse_resource_path(value: str) -> tuple[str, str, Path]:
@@ -2464,14 +2446,10 @@ def _runtime_rename_updates(
 def _apply_runtime_updates(
     root: Path,
     updates: list[tuple[Path, str, str | None, str | None]],
-    *,
-    dry_run: bool,
 ) -> None:
     """Apply prepared edits without staging unrelated working changes."""
     for relative, working, staged, mode in updates:
-        report_change(f"update runtime paths in '{relative}'", dry_run=dry_run)
-        if dry_run:
-            continue
+        report_change(f"update runtime paths in '{relative}'", dry_run=False)
         (root / relative).write_text(working, encoding="utf-8")
         if staged is not None and mode is not None:
             blob = run(
@@ -2486,8 +2464,6 @@ def rename_resource(
     root: Path,
     source: str,
     destination: str,
-    *,
-    dry_run: bool,
 ) -> None:
     """Rename one canonical package or host and stage its related metadata."""
     source_kind, source_name, source_relative = _parse_resource_path(source)
@@ -2537,16 +2513,11 @@ def rename_resource(
     for old, new in moves:
         validate_managed_path(root, old)
         validate_managed_path(root, new)
-        report_change(f"move '{old}' to '{new}'", dry_run=dry_run)
-        if dry_run:
-            git(root, ["mv", "--dry-run", "--", str(old), str(new)])
-    report_change("update '.gitignore'", dry_run=dry_run)
-    if dry_run:
-        _apply_runtime_updates(root, updates, dry_run=True)
-        return
+        report_change(f"move '{old}' to '{new}'", dry_run=False)
+    report_change("update '.gitignore'", dry_run=False)
     for old, new in moves:
         git(root, ["mv", "--", str(old), str(new)])
-    _apply_runtime_updates(root, updates, dry_run=False)
+    _apply_runtime_updates(root, updates)
     _refresh_gitignore(root)
     git(root, ["add", "--", ".gitignore"])
 
@@ -2639,7 +2610,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     create = commands.add_parser(
         "add",
-        usage="%(prog)s [-h] [-n] {packages/NAME TYPE | hosts/NAME}",
+        usage="%(prog)s [-h] {packages/NAME TYPE | hosts/NAME}",
         help="create a package or host",
         description="Create and stage a canonical package or host.",
         epilog=(
@@ -2658,12 +2629,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         metavar="TYPE",
         choices=PACKAGE_KINDS,
         help=f"required for packages, omitted for hosts ({', '.join(PACKAGE_KINDS)})",
-    )
-    create.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview changes",
     )
     fix = commands.add_parser(
         "fix",
@@ -2696,12 +2661,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         metavar="DESTINATION",
         help="new path in the same collection",
     )
-    move.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview changes",
-    )
     remove = commands.add_parser(
         "rm",
         help="remove a package or host",
@@ -2715,12 +2674,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "resource",
         metavar="RESOURCE",
         help="packages/NAME or hosts/NAME",
-    )
-    remove.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview changes",
     )
     remove.add_argument(
         "-f",
@@ -2933,7 +2886,6 @@ def remove_home_submodule(
     root: Path,
     value: str,
     *,
-    dry_run: bool,
     force: bool = False,
 ) -> None:
     """Remove a registered home submodule and its owned whitelist entries."""
@@ -2958,8 +2910,6 @@ def remove_home_submodule(
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
-    if dry_run:
-        arguments.append("--dry-run")
     removal = run(
         ["git", *arguments, "--", f":(literal){relative.as_posix()}"],
         cwd=root,
@@ -2967,7 +2917,7 @@ def remove_home_submodule(
     sys.stdout.write(removal.stdout)
     if removal.stderr:
         sys.stderr.write(removal.stderr)
-    write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
+    write_managed(root, Path(".gitignore"), updated, dry_run=False)
 
 
 def initialize_home() -> None:
@@ -3117,12 +3067,6 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         help="home-relative registered submodule path",
     )
     remove.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview changes",
-    )
-    remove.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -3145,7 +3089,6 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         remove_home_submodule(
             root,
             options.resource,
-            dry_run=options.dry_run,
             force=options.force,
         )
 
@@ -3188,9 +3131,9 @@ def _dispatch_create(root: Path, options: argparse.Namespace) -> None:
     """Create the selected package or host resource."""
     kind, name, _relative = _parse_resource_path(options.resource)
     if kind == "host":
-        add_host(root, name, dry_run=options.dry_run)
+        add_host(root, name)
         return
-    add_package(root, options.type, name, dry_run=options.dry_run)
+    add_package(root, options.type, name)
 
 
 def _validate_resource_arguments(
@@ -3280,7 +3223,6 @@ def main() -> None:
             remove_resource(
                 root,
                 options.resource,
-                dry_run=options.dry_run,
                 force=options.force,
             )
         elif options.command == "mv":
@@ -3288,7 +3230,6 @@ def main() -> None:
                 root,
                 options.source,
                 options.destination,
-                dry_run=options.dry_run,
             )
         elif options.command == "fix":
             converge_flake(root, dry_run=options.dry_run, fail_on_changes=False)
