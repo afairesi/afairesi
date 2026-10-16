@@ -306,8 +306,7 @@ def _prepare_coverage_flake(
         f"builder = {json.dumps(bash)}; "
         f"PATH = {json.dumps(sys.prefix + '/bin:' + environment['PATH'])}; "
         f"PYTHONPATH = {json.dumps(os.pathsep.join(sys.path))}; "
-        'args = [ "-e" (builtins.toFile "check-builder" '
-        '("export -n src PACKAGE_E2E_EXECUTABLE\\n" + current.buildCommand)) ]; '
+        'args = [ "-e" (builtins.toFile "check-builder" current.buildCommand) ]; '
         "}) // { overrideAttrs = f: build (current // f current); }; "
         "in build (attrs // { inherit name; buildCommand = script; }); "
         "pkgs = { stdenv.system = system; runCommand = mkCheck; lib = { "
