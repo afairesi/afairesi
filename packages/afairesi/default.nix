@@ -5,7 +5,7 @@ in
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
-  meta.description = "Afairesi manages repository structure for Nix flakes through enforced conventions.";
+  meta.description = "Afairesi aims to minimize the description of a software system.";
   passthru = {
     checkInputs = [
       (import ../../formatter.nix {
