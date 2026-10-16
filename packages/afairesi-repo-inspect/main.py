@@ -169,7 +169,7 @@ class ArgumentDiscovery:
         seen: frozenset[tuple[str, int]],
     ) -> set[tuple[str, ...]]:
         if self._qualified(node.func) == "argparse.ArgumentParser":
-            return {()}
+            return {(f"{node.lineno}:{node.col_offset}",)}
         if isinstance(node.func, ast.Name):
             return set().union(
                 *(
@@ -193,6 +193,29 @@ class ArgumentDiscovery:
                 return {(*parent, label) for parent in parents}
         return set()
 
+    def _public_roots(self) -> set[str]:
+        """Select parsers consumed by the public entry point, when identifiable."""
+        scopes = {"", "main"}
+        while True:
+            reachable = scopes | {
+                call.func.id
+                for scope, call in self.calls
+                if scope in scopes
+                and isinstance(call.func, ast.Name)
+                and call.func.id in self.functions
+            }
+            if reachable == scopes:
+                break
+            scopes = reachable
+        return {
+            path[0]
+            for scope, call in self.calls
+            if scope in scopes
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr in {"parse_args", "parse_known_args"}
+            for path in self._resolve(scope, call.func.value)
+        }
+
     def report(self) -> dict[str, Any]:
         """Return a command tree with declared arguments and unresolved warnings."""
         result: dict[str, Any] = {
@@ -203,11 +226,17 @@ class ArgumentDiscovery:
         }
 
         warnings = []
+        roots = self._public_roots()
         for scope, call in self.calls:
             if not isinstance(call.func, ast.Attribute):
                 continue
             if call.func.attr == "add_parser":
-                for path in sorted(self._resolve(scope, call)):
+                paths = {
+                    path[1:]
+                    for path in self._resolve(scope, call)
+                    if not roots or path[0] in roots
+                }
+                for path in sorted(paths):
                     _command_node(result, path)
             if call.func.attr != "add_argument":
                 continue
@@ -223,7 +252,10 @@ class ArgumentDiscovery:
                 keyword.arg or "**kwargs": _value(keyword.value)
                 for keyword in call.keywords
             }
-            for context in sorted(contexts):
+            public_contexts = {
+                context[1:] for context in contexts if not roots or context[0] in roots
+            }
+            for context in sorted(public_contexts):
                 _command_node(result, context)["arguments"].append(
                     {"names": names, "options": options},
                 )

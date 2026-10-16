@@ -154,6 +154,41 @@ def main():
     )
 
 
+@pytest.mark.parametrize("entrypoint", ["parser().parse_args()", "parse(parser())"])
+def test_inspection_keeps_internal_parsers_out_of_the_public_cli(
+    entrypoint: str,
+) -> None:
+    """Select the parser consumed by main while retaining its configured helpers."""
+    source = """
+import argparse
+def configure(cli):
+    cli.add_argument("--shared")
+def formatter_main():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.add_argument("--source")
+    cli.add_subparsers().add_parser("internal")
+    cli.parse_args()
+def parser():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.add_argument("--public")
+    cli.add_subparsers().add_parser("repo")
+    return cli
+def main():
+    ENTRYPOINT
+def parse(cli):
+    cli.parse_args()
+"""
+    report = _discovery(source.replace("ENTRYPOINT", entrypoint))
+    _expect(
+        [row["names"] for row in report["arguments"]] == [["--shared"], ["--public"]],
+        "internal parser arguments leaked into the public CLI",
+    )
+    _expect(list(report["commands"]) == ["repo"], "internal command leaked")
+    _expect(not report["warnings"], "known internal parser produced warnings")
+
+
 def test_declared_test_identifiers() -> None:
     """Retain sorted test identifiers and class context."""
     module = ast.parse("""

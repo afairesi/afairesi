@@ -458,8 +458,8 @@ def write_managed(
 ) -> bool:
     """Write and stage one managed file when its contents or mode differ."""
     path = root / relative
-    current = read_regular(path) if path.exists() and not path.is_symlink() else None
-    current_mode = path.lstat().st_mode if path.exists() or path.is_symlink() else 0
+    current = read_regular(path)
+    current_mode = path.lstat().st_mode if path.exists() else 0
     mode_matches = bool(current_mode & 0o111) == executable
     if current == source and mode_matches:
         return False
@@ -467,8 +467,6 @@ def write_managed(
     if dry_run:
         return True
     path.parent.mkdir(parents=True, exist_ok=True)
-    if path.is_symlink():
-        path.unlink()
     path.write_text(source, encoding="utf-8")
     path.chmod(0o755 if executable else 0o644)
     git(root, ["add", "--", str(relative)])
@@ -755,6 +753,28 @@ def _structure_paths(root: Path, excluded: set[Path]) -> list[Path]:
             if relative / name not in excluded
         )
     return sorted(paths)
+
+
+def validate_flake_layout(root: Path, *, removing: Path | None = None) -> None:
+    """Establish the managed layout and readable test metadata before a command."""
+    excluded = prm_directories(root) | tmp_directories(root) | {Path(".git")}
+    for path in _structure_paths(root, excluded):
+        relative = path.relative_to(root)
+        directory = (
+            relative.parts[0] in {"packages", "checks", "hosts"}
+            and len(relative.parts) <= RESOURCE_PATH_COMPONENTS
+        )
+        if path.is_symlink() or (directory and not path.is_dir()):
+            msg = f"{relative}: managed layout requires regular files and directories"
+            raise CommandError(msg)
+    for package in detect_packages(root):
+        tests = package.root / "test_main.py"
+        if (
+            package.kind == "python"
+            and package.root.relative_to(root) != removing
+            and tests.is_file()
+        ):
+            has_python_tests(tests)
 
 
 def inspect_structure(root: Path) -> tuple[list[Package], list[str]]:
@@ -2172,8 +2192,6 @@ def add_package(
     validate_name(name)
     files = scaffold(kind, name, description)
     relative = Path("packages") / name
-    validate_managed_path(root, relative)
-    validate_managed_path(root, Path("checks") / name)
     if (root / relative).exists() or (root / "checks" / name).exists():
         msg = f"package or generated check already exists: {name}"
         raise CommandError(msg)
@@ -2209,14 +2227,7 @@ def add_host(root: Path, name: str) -> None:
     path = root / relative
     check_relative = Path("checks") / f"{name}VmWithDisko" / "default.nix"
     check = root / check_relative
-    validate_managed_path(root, relative)
-    validate_managed_path(root, check_relative)
-    if (
-        path.parent.exists()
-        or path.parent.is_symlink()
-        or check.parent.exists()
-        or check.parent.is_symlink()
-    ):
+    if path.parent.exists() or check.parent.exists():
         msg = f"host or generated check already exists: {name}"
         raise CommandError(msg)
     directories = missing_directories(root, [relative.parent, check_relative.parent])
@@ -2254,11 +2265,7 @@ def remove_resource(
     kind, name, relative = _parse_resource_path(value)
     resource_root = root / relative
     marker = "default.nix" if kind == "package" else "configuration.nix"
-    if (
-        not resource_root.is_dir()
-        or resource_root.is_symlink()
-        or not (resource_root / marker).is_file()
-    ):
+    if not resource_root.is_dir() or not (resource_root / marker).is_file():
         msg = f"{kind} does not exist: {name}"
         raise CommandError(msg)
     check_root = root / "checks" / (name if kind == "package" else f"{name}VmWithDisko")
@@ -2266,12 +2273,6 @@ def remove_resource(
         resource_root,
         *([check_root] if check_root.exists() else []),
     ]
-    for target in targets:
-        validate_managed_path(root, target.relative_to(root))
-        if not target.is_dir():
-            msg = f"{target.relative_to(root)}: removal target must be a directory"
-            raise CommandError(msg)
-    read_regular(root / ".gitignore")
     target_relatives = [str(target.relative_to(root)) for target in targets]
     arguments = ["rm", "-r"]
     if force:
@@ -2409,7 +2410,6 @@ def _runtime_rename_updates(
         if package.kind != "python":
             continue
         relative = Path("packages") / package.name / "main.py"
-        validate_managed_path(root, relative)
         source = read_regular(root / relative)
         if source is None:
             continue
@@ -2471,19 +2471,13 @@ def rename_resource(
     if source_kind != destination_kind:
         msg = "cannot rename a package to a host or a host to a package"
         raise CommandError(msg)
-    validate_managed_path(root, source_relative)
-    validate_managed_path(root, destination_relative)
     source_path = root / source_relative
     destination_path = root / destination_relative
     marker = "default.nix" if source_kind == "package" else "configuration.nix"
-    if (
-        not source_path.is_dir()
-        or source_path.is_symlink()
-        or not (source_path / marker).is_file()
-    ):
+    if not source_path.is_dir() or not (source_path / marker).is_file():
         msg = f"{source_kind} does not exist: {source_name}"
         raise CommandError(msg)
-    if destination_path.exists() or destination_path.is_symlink():
+    if destination_path.exists():
         msg = f"destination already exists: {destination_relative}"
         raise CommandError(msg)
     packages = detect_packages(root)
@@ -2511,8 +2505,6 @@ def rename_resource(
         else []
     )
     for old, new in moves:
-        validate_managed_path(root, old)
-        validate_managed_path(root, new)
         report_change(f"move '{old}' to '{new}'", dry_run=False)
     report_change("update '.gitignore'", dry_run=False)
     for old, new in moves:
@@ -3163,11 +3155,12 @@ def _validate_resource_arguments(
             cli.error("package creation requires TYPE")
 
 
-def _require_flake_repository(message: str) -> Path:
+def _require_flake_repository(message: str, *, removing: Path | None = None) -> Path:
     """Select the current repository and require flake lifecycle commands."""
     root = repository_root()
     if repository_type(root) != "flake":
         raise CommandError(message)
+    validate_flake_layout(root, removing=removing)
     return root
 
 
@@ -3216,6 +3209,7 @@ def main() -> None:
         root = _require_flake_repository(
             "afairesi repo commands require a flake repository; use "
             "afairesi home for home",
+            removing=Path(options.resource) if options.command == "rm" else None,
         )
         if options.command == "add":
             _dispatch_create(root, options)

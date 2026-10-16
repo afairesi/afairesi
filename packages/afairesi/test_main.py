@@ -745,6 +745,81 @@ def test_creation_rejects_symlinks_without_writing_outside_the_repository(
         _expect(not any(outside.iterdir()), "creation wrote outside the repository")
 
 
+@pytest.mark.parametrize(
+    "relative",
+    ["checks", "checks/example", "checks/example/default.nix"],
+)
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_repair_rejects_check_symlinks_before_changing_state(
+    tmp_path: Path,
+    relative: str,
+    *,
+    dry_run: bool,
+) -> None:
+    """Reject check symlinks before writing templates or changing the index."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    external = outside / "default.nix"
+    external.write_text("{}\n")
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        (root / "packages/example/test_main.py").write_text(
+            "def test_example(): pass\n",
+        )
+        _run(root, "fix")
+        path = root / relative
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+        path.symlink_to(external if path.suffix else outside)
+        before = _snapshot(root)
+        rejected = _run(root, "fix", *(("--dry-run",) if dry_run else ()), code=1)
+        _expect("managed layout" in rejected.stderr, rejected)
+        _expect(_snapshot(root) == before, "rejected repair changed repository state")
+        _expect(external.read_text() == "{}\n", "repair wrote outside the repository")
+
+
+@pytest.mark.parametrize("command", ["mv", "rm"])
+@pytest.mark.parametrize("invalid", ["tests", "whitelist"])
+def test_resource_changes_validate_metadata_before_mutation(
+    command: str,
+    invalid: str,
+) -> None:
+    """Leave resources and their index entries intact when metadata cannot refresh."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        _run(root, "add", "packages/other", "python")
+        _run(root, "fix")
+        _fixture_git(root, "commit", "-qm", "Resources")
+        if invalid == "tests":
+            (root / "packages/other/test_main.py").write_text("def test_broken(:\n")
+        else:
+            (root / ".gitignore").unlink()
+            (root / ".gitignore").symlink_to("LICENSE")
+        before = _snapshot(root)
+        arguments = ("packages/renamed",) if command == "mv" else ()
+        _run(root, command, "packages/example", *arguments, code=1)
+        _expect(_snapshot(root) == before, "failed resource change left partial state")
+
+
+def test_removal_can_delete_a_package_with_invalid_test_source() -> None:
+    """Validate the remaining metadata without requiring removed tests to parse."""
+    with _fresh_repository() as root:
+        _run(root, "add", "packages/example", "python")
+        (root / "packages/example/test_main.py").write_text(
+            "def test_example(): pass\n",
+        )
+        _run(root, "fix")
+        _fixture_git(root, "commit", "-qm", "Resource")
+        (root / "packages/example/test_main.py").write_text("def test_broken(:\n")
+        _run(root, "rm", "packages/example", "--force")
+        _expect(
+            not (root / "packages/example").exists(),
+            "broken package was not removed",
+        )
+
+
 @pytest.mark.parametrize("kind", ["python", "host"])
 def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
     """Restore distinct staged and working whitelist contents after Git add fails."""
