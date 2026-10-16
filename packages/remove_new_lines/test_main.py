@@ -11,6 +11,16 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
+def _read_error(path: Path) -> str:
+    """Capture the native error for an unreadable fixture."""
+    try:
+        path.read_bytes()
+    except OSError as error:
+        return str(error)
+    message = f"expected an unreadable path: {path}"
+    raise AssertionError(message)
+
+
 def test_cli_cleans_selected_files_and_preserves_protected_inputs(
     tmp_path: Path,
 ) -> None:
@@ -61,12 +71,7 @@ def test_cli_reports_filesystem_errors_and_processes_other_files(
     directory.mkdir()
     selected = tmp_path / "selected.txt"
     selected.write_bytes(b"first\r\nlast\n")
-    expected_errors = []
-    for path in (missing, directory):
-        try:
-            path.read_bytes()
-        except OSError as error:  # noqa: PERF203
-            expected_errors.append(str(error))
+    expected_errors = [_read_error(path) for path in (missing, directory)]
     result = subprocess.run(  # noqa: S603
         [
             os.environ["PACKAGE_E2E_EXECUTABLE"],

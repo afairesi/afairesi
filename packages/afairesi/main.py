@@ -16,12 +16,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
+import libcst as cst
 import nix_syntax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-    import libcst as cst
     from tree_sitter import Node
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 KIND_MARKERS = {
@@ -40,6 +40,8 @@ ROOT_FILES = {
 }
 PRM_NAME = "prm"
 TMP_NAME = "tmp"
+MINIMUM_REMOTE_COMPONENTS = 3
+RESOURCE_PATH_COMPONENTS = 2
 SOURCE_SUFFIXES = {
     ".nix",
     ".py",
@@ -137,7 +139,6 @@ def make_test_report_plugin(  # noqa: C901, PLR0915 - Keep reporting independent
     @pytest.hookimpl(wrapper=True)
     def pytest_runtest_protocol(
         item: pytest.Item,
-        nextitem: pytest.Item | None,  # noqa: ARG001 - pytest hook signature.
     ) -> Generator[None, object, object]:
         previous = os.environ.get("AFAIRESI_TEST_CONTEXT", "")
         context = node_id(item) if owner == str(os.getpid()) else previous
@@ -182,7 +183,6 @@ def make_test_report_plugin(  # noqa: C901, PLR0915 - Keep reporting independent
     @pytest.hookimpl(wrapper=True, tryfirst=True)
     def pytest_runtest_makereport(
         item: pytest.Item,
-        call: pytest.CallInfo[None],  # noqa: ARG001 - pytest hook signature.
     ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
         report = yield
         row = record(item)
@@ -203,7 +203,6 @@ def make_test_report_plugin(  # noqa: C901, PLR0915 - Keep reporting independent
         return report
 
     def pytest_sessionfinish(
-        session: pytest.Session,  # noqa: ARG001 - pytest hook signature.
         exitstatus: int,
     ) -> None:
         if owner != str(os.getpid()):
@@ -357,9 +356,9 @@ def run(
     )
     if check and completed.returncode != 0:
         if completed.stdout:
-            print(completed.stdout, end="")  # noqa: T201
+            sys.stdout.write(completed.stdout)
         if completed.stderr:
-            print(completed.stderr, end="", file=sys.stderr)  # noqa: T201
+            sys.stderr.write(completed.stderr)
         raise SystemExit(completed.returncode)
     return completed
 
@@ -446,7 +445,7 @@ def read_regular(path: Path) -> str | None:
 
 def report_change(message: str, *, dry_run: bool) -> None:
     """Report one deterministic convergence action."""
-    print(("would " if dry_run else "") + message)  # noqa: T201
+    sys.stdout.write((("would " if dry_run else "") + message) + "\n")
 
 
 def write_managed(
@@ -523,7 +522,7 @@ def canonical_remote_path(remote: str) -> Path:
     host, remote_path = hosted_remote(remote)
     remote_path = remote_path.removesuffix(".git")
     components = [host, *remote_path.split("/")]
-    if len(components) < 3 or any(  # noqa: PLR2004
+    if len(components) < MINIMUM_REMOTE_COMPONENTS or any(
         not re.fullmatch(r"[A-Za-z0-9._-]+", component) or component in {".", ".."}
         for component in components
     ):
@@ -1431,7 +1430,7 @@ def _canonical_python_default(package: Package, source: str) -> str:
     ).decode()
 
 
-def canonical_package_default(package: Package) -> str | None:  # noqa: C901, PLR0912
+def canonical_package_default(package: Package) -> str | None:
     """Render a package definition while retaining package-specific fields."""
     if package.kind == "nix":
         return None
@@ -1497,6 +1496,24 @@ def canonical_package_default(package: Package) -> str | None:  # noqa: C901, PL
                 overwrite=name not in defaults,
             ),
         )
+    bindings = _canonical_template_bindings(package, document, template)
+    if scope is None:
+        declarations = " ".join(f"{name} = {value};" for name, value in bindings)
+        edits.append(
+            (body.start_byte, body.start_byte, f"let {declarations} in ".encode()),
+        )
+    else:
+        for name, value in bindings:
+            edits.extend(_nix_binding_edits(document, scope, (name,), value))
+    return cast("bytes", nix_syntax.apply_edits(source.encode(), edits)).decode()
+
+
+def _canonical_template_bindings(
+    package: Package,
+    document: nix_syntax.Document,
+    template: nix_syntax.Document,
+) -> list[tuple[str, str]]:
+    """Collect required local names while preserving existing site bindings."""
     pname = _template_binding(template, "pname")
     if pname is None:
         msg = "Package scaffold omitted its name"
@@ -1509,15 +1526,7 @@ def canonical_package_default(package: Package) -> str | None:  # noqa: C901, PL
             raise AssertionError(msg)
         if _template_binding(document, "site") is None:
             bindings.append(("site", template.text(site)))
-    if scope is None:
-        declarations = " ".join(f"{name} = {value};" for name, value in bindings)
-        edits.append(
-            (body.start_byte, body.start_byte, f"let {declarations} in ".encode()),
-        )
-    else:
-        for name, value in bindings:
-            edits.extend(_nix_binding_edits(document, scope, (name,), value))
-    return cast("bytes", nix_syntax.apply_edits(source.encode(), edits)).decode()
+    return bindings
 
 
 def _write_managed_nix(
@@ -1536,7 +1545,7 @@ def _write_managed_nix(
     return write_managed(root, relative, source, dry_run=dry_run)
 
 
-def _converge_packages(root: Path, packages: list[Package], dry_run: bool) -> bool:  # noqa: FBT001
+def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) -> bool:
     """Converge package templates and required source files."""
     changed = False
     for package in packages:
@@ -1571,7 +1580,7 @@ def _converge_packages(root: Path, packages: list[Package], dry_run: bool) -> bo
     return changed
 
 
-def _converge_checks(root: Path, packages: list[Package], dry_run: bool) -> bool:  # noqa: FBT001
+def _converge_checks(root: Path, packages: list[Package], *, dry_run: bool) -> bool:
     """Generate every check derived from a canonical package or host."""
     changed = False
     for relative, source in canonical_checks(root, packages).items():
@@ -1661,7 +1670,7 @@ def _remove_unsupported_tracked(
     return changed
 
 
-def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool:  # noqa: FBT001
+def _cleanup_flake(root: Path, packages: list[Package], *, dry_run: bool) -> bool:
     """Remove undeclared files while preserving permitted tmp trees."""
     allowed = allowed_paths(root, packages)
     prm = prm_directories(root)
@@ -1700,7 +1709,7 @@ def _cleanup_flake(root: Path, packages: list[Package], dry_run: bool) -> bool: 
                 clean_arguments.extend(("-e", f"/{relative.as_posix()}"))
     clean = git(root, clean_arguments)
     if clean.stdout:
-        print(clean.stdout, end="")  # noqa: T201
+        sys.stdout.write(clean.stdout)
         changed = True
     return changed
 
@@ -1821,8 +1830,8 @@ def _flake_resource_issues(root: Path) -> list[str]:
 
 def converge_flake(
     root: Path,
-    dry_run: bool,  # noqa: FBT001
     *,
+    dry_run: bool,
     fail_on_changes: bool = True,
 ) -> list[Package]:
     """Converge required files, structure, templates, and root whitelist."""
@@ -1841,7 +1850,7 @@ def converge_flake(
         canonical_package_default(package)
     if issues:
         raise CommandError("\n".join(issues))
-    changed = _converge_packages(root, packages, dry_run)
+    changed = _converge_packages(root, packages, dry_run=dry_run)
     expected = render_gitignore(allowed_paths(root, packages), prm_directories(root))
     actual = read_regular(root / ".gitignore")
     if actual != expected:
@@ -1851,8 +1860,8 @@ def converge_flake(
             expected,
             dry_run=dry_run,
         )
-    changed |= _converge_checks(root, packages, dry_run)
-    changed |= _cleanup_flake(root, packages, dry_run)
+    changed |= _converge_checks(root, packages, dry_run=dry_run)
+    changed |= _cleanup_flake(root, packages, dry_run=dry_run)
     if dry_run and changed:
         if fail_on_changes:
             msg = "flake repository would change"
@@ -1861,7 +1870,7 @@ def converge_flake(
     return validate_flake_source(root)
 
 
-def validate_flake_source(root: Path) -> list[Package]:  # noqa: C901
+def validate_flake_source(root: Path) -> list[Package]:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     packages, issues = inspect_structure(root)
     issues.extend(_flake_resource_issues(root))
@@ -1881,6 +1890,12 @@ def validate_flake_source(root: Path) -> list[Package]:  # noqa: C901
         formatted_issues = "\n".join(f"  - {issue}" for issue in issues)
         msg = f"repository layout validation failed:\n{formatted_issues}"
         raise CommandError(msg)
+    _validate_nix_sources(root, packages)
+    return packages
+
+
+def _validate_nix_sources(root: Path, packages: list[Package]) -> None:
+    """Parse package and check definitions after validating repository structure."""
     for package in packages:
         default = package.root / "default.nix"
         if default.is_file():
@@ -1893,7 +1908,6 @@ def validate_flake_source(root: Path) -> list[Package]:  # noqa: C901
             default = check / "default.nix"
             if default.is_file():
                 nix_syntax.parse(default.read_bytes(), str(default))
-    return packages
 
 
 def _generated_check_issues(root: Path, packages: list[Package]) -> list[str]:
@@ -2280,7 +2294,7 @@ def remove_resource(
     if dry_run:
         arguments.append("--dry-run")
     removal = git(root, [*arguments, "--", *target_relatives])
-    print(removal.stdout, end="")  # noqa: T201
+    sys.stdout.write(removal.stdout)
     report_change("update '.gitignore'", dry_run=dry_run)
     if not dry_run:
         _refresh_gitignore(root)
@@ -2290,7 +2304,7 @@ def remove_resource(
 def _parse_resource_path(value: str) -> tuple[str, str, Path]:
     """Parse a canonical package or host resource path."""
     path = Path(value)
-    if path.is_absolute() or len(path.parts) != 2:  # noqa: PLR2004
+    if path.is_absolute() or len(path.parts) != RESOURCE_PATH_COMPONENTS:
         msg = f"resource path must be packages/NAME or hosts/NAME: {value}"
         raise CommandError(msg)
     parent, name = path.parts
@@ -2311,8 +2325,6 @@ def _renamed_runtime_expression(
     repository: Path | None,
 ) -> cst.BaseExpression:
     """Change only the package component of a declared literal runtime path."""
-    import libcst as cst  # noqa: PLC0415
-
     code = cst.Module([]).code_for_node(expression)
     path = _runtime_path(ast.parse(code, mode="eval").body)
     if path is None or path.parts[-3:] != (*old.parts, "tmp"):
@@ -2356,8 +2368,6 @@ def _renamed_runtime_source(
     repository: Path | None,
 ) -> str:
     """Use LibCST to edit module declarations without rewriting their formatting."""
-    import libcst as cst  # noqa: PLC0415
-
     try:
         module = cst.parse_module(source)
     except cst.ParserSyntaxError as error:
@@ -2472,7 +2482,13 @@ def _apply_runtime_updates(
             git(root, ["update-index", "--cacheinfo", mode, blob, str(relative)])
 
 
-def rename_resource(root: Path, source: str, destination: str, dry_run: bool) -> None:  # noqa: FBT001
+def rename_resource(
+    root: Path,
+    source: str,
+    destination: str,
+    *,
+    dry_run: bool,
+) -> None:
     """Rename one canonical package or host and stage its related metadata."""
     source_kind, source_name, source_relative = _parse_resource_path(source)
     destination_kind, _, destination_relative = _parse_resource_path(destination)
@@ -2573,7 +2589,7 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
     )
     run([executable, "flake", "lock"], cwd=root)
     packages = detect_packages(root)
-    _converge_checks(root, packages, False)  # noqa: FBT003
+    _converge_checks(root, packages, dry_run=False)
     (root / ".gitignore").write_text(
         render_gitignore(
             allowed_paths(root, packages) | {Path(".gitignore")},
@@ -2875,7 +2891,7 @@ def _move_home_whitelist(
     return write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
 
-def converge_home(root: Path, dry_run: bool) -> list[dict[str, str]]:  # noqa: FBT001
+def converge_home(root: Path, *, dry_run: bool) -> list[dict[str, str]]:
     """Converge a canonical home repository."""
     repositories = home_submodules(root)
     actual_paths = [Path(repository["path"]) for repository in repositories]
@@ -2948,9 +2964,9 @@ def remove_home_submodule(
         ["git", *arguments, "--", f":(literal){relative.as_posix()}"],
         cwd=root,
     )
-    print(removal.stdout, end="")  # noqa: T201
+    sys.stdout.write(removal.stdout)
     if removal.stderr:
-        print(removal.stderr, end="", file=sys.stderr)  # noqa: T201
+        sys.stderr.write(removal.stderr)
     write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
 
 
@@ -2999,9 +3015,9 @@ def initialize_submodule(remote: str) -> None:
                 cwd=home,
             )
             if completed.stdout:
-                print(completed.stdout, end="")  # noqa: T201
+                sys.stdout.write(completed.stdout)
             if completed.stderr:
-                print(completed.stderr, end="", file=sys.stderr)  # noqa: T201
+                sys.stderr.write(completed.stderr)
     except BaseException:
         remove_empty_directories(directories)
         raise
@@ -3123,7 +3139,7 @@ def _dispatch_home(options: argparse.Namespace) -> None:
     elif options.command == "create":
         create_home_repo(options.remote)
     elif options.command == "fix":
-        converge_home(_require_home_repository(), options.dry_run)
+        converge_home(_require_home_repository(), dry_run=options.dry_run)
     elif options.command == "rm":
         root = _require_home_repository()
         remove_home_submodule(
@@ -3207,6 +3223,14 @@ def _validate_resource_arguments(
             cli.error("package creation requires TYPE")
 
 
+def _require_flake_repository(message: str) -> Path:
+    """Select the current repository and require flake lifecycle commands."""
+    root = repository_root()
+    if repository_type(root) != "flake":
+        raise CommandError(message)
+    return root
+
+
 def formatter_main() -> None:
     """Repair a flake repository before formatting; called internally by nix fmt."""
     cli = argparse.ArgumentParser(description="Repair the flake formatting inputs.")
@@ -3221,11 +3245,10 @@ def formatter_main() -> None:
         if options.source is not None:
             validate_flake_source(resolve_repository_path(options.source))
             return
-        root = repository_root()
-        if repository_type(root) != "flake":
-            msg = "nix fmt requires a flake repository; run afairesi home fix for home"
-            raise CommandError(msg)  # noqa: TRY301
-        converge_flake(root, options.dry_run)
+        root = _require_flake_repository(
+            "nix fmt requires a flake repository; run afairesi home fix for home",
+        )
+        converge_flake(root, dry_run=options.dry_run)
     except (
         CommandError,
         OSError,
@@ -3234,7 +3257,7 @@ def formatter_main() -> None:
         ValueError,
         nix_syntax.NixSyntaxError,
     ) as error:
-        print(f"error: {error}", file=sys.stderr)  # noqa: T201
+        sys.stderr.write((f"error: {error}") + "\n")
         raise SystemExit(1) from error
 
 
@@ -3250,13 +3273,10 @@ def main() -> None:
         if options.scope == "home":
             _dispatch_home(options)
             return
-        root = repository_root()
-        if repository_type(root) != "flake":
-            msg = (
-                "afairesi repo commands require a flake repository; use "
-                "afairesi home for home"
-            )
-            raise CommandError(msg)  # noqa: TRY301
+        root = _require_flake_repository(
+            "afairesi repo commands require a flake repository; use "
+            "afairesi home for home",
+        )
         if options.command == "add":
             _dispatch_create(root, options)
         elif options.command == "rm":
@@ -3267,9 +3287,14 @@ def main() -> None:
                 force=options.force,
             )
         elif options.command == "mv":
-            rename_resource(root, options.source, options.destination, options.dry_run)
+            rename_resource(
+                root,
+                options.source,
+                options.destination,
+                dry_run=options.dry_run,
+            )
         elif options.command == "fix":
-            converge_flake(root, options.dry_run, fail_on_changes=False)
+            converge_flake(root, dry_run=options.dry_run, fail_on_changes=False)
     except (
         CommandError,
         OSError,
@@ -3278,7 +3303,7 @@ def main() -> None:
         ValueError,
         nix_syntax.NixSyntaxError,
     ) as error:
-        print(f"error: {error}", file=sys.stderr)  # noqa: T201
+        sys.stderr.write((f"error: {error}") + "\n")
         raise SystemExit(1) from error
 
 

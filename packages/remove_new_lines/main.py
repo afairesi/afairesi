@@ -26,6 +26,16 @@ def process_file(path: Path) -> None:
         path.write_bytes(updated_contents)
 
 
+def _try_process_file(path: Path) -> bool:
+    """Report a file error and allow the remaining selected files to be processed."""
+    try:
+        process_file(path)
+    except OSError as error:
+        sys.stderr.write(str(error) + "\n")
+        return False
+    return True
+
+
 def main() -> None:
     """Remove CR and LF bytes from selected text files in place."""
     parser = argparse.ArgumentParser(
@@ -40,11 +50,7 @@ def main() -> None:
     )
     failed = False
     for path in map(Path, parser.parse_args().files):
-        try:
-            process_file(path)
-        except OSError as error:  # noqa: PERF203
-            print(error, file=sys.stderr)  # noqa: T201
-            failed = True
+        failed |= not _try_process_file(path)
     if failed:
         raise SystemExit(1)
 

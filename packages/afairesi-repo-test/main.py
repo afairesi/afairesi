@@ -1009,7 +1009,7 @@ def main() -> None:
             error.returncode if error.returncode >= 0 else 128 - error.returncode,
         ) from error
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-        print(f"error: {error}", file=sys.stderr)  # noqa: T201
+        sys.stderr.write((f"error: {error}") + "\n")
         raise SystemExit(1) from error
     except KeyboardInterrupt:
         sys.exit(130)

@@ -59,19 +59,44 @@ def find_nix_files(root: Path) -> list[Path]:
     return sorted(result)
 
 
-def literal(document: nix_syntax.Document, node: Node) -> Literal:  # noqa: C901, PLR0911
+def _literal_attrset(document: nix_syntax.Document, node: Node) -> dict[str, Literal]:
+    """Decode a nonrecursive set containing distinct, literal attribute names."""
+    binding_set = next(
+        (child for child in node.named_children if child.type == "binding_set"),
+        None,
+    )
+    values: dict[str, Literal] = {}
+    for binding in [] if binding_set is None else binding_set.named_children:
+        attrpath = binding.child_by_field_name("attrpath")
+        expression = binding.child_by_field_name("expression")
+        path = (
+            None if attrpath is None else nix_syntax.static_attrpath(document, attrpath)
+        )
+        if path is None or len(path) != 1 or expression is None or path[0] in values:
+            msg = "not a literal set"
+            raise ValueError(msg)
+        values[path[0]] = literal(document, expression)
+    return values
+
+
+def _numeric_literal(text: str, node_type: str) -> int | float:
+    """Decode a finite numeric literal without changing integer precision."""
+    if node_type == "integer_expression":
+        return int(text)
+    value = float(text)
+    if not math.isfinite(value):
+        msg = "non-finite float"
+        raise ValueError(msg)
+    return value
+
+
+def literal(document: nix_syntax.Document, node: Node) -> Literal:
     """Decode a context-free Nix literal or raise ValueError."""
     text = document.text(node)
     if node.type == "variable_expression" and text in {"null", "true", "false"}:
         return {"null": None, "true": True, "false": False}[text]
-    if node.type == "integer_expression":
-        return int(text)
-    if node.type == "float_expression":
-        value = float(text)
-        if not math.isfinite(value):
-            msg = "non-finite float"
-            raise ValueError(msg)
-        return value
+    if node.type in {"integer_expression", "float_expression"}:
+        return _numeric_literal(text, node.type)
     if node.type == "string_expression":
         decoded = nix_syntax.string_value(document, node)
         if decoded is not None:
@@ -83,29 +108,7 @@ def literal(document: nix_syntax.Document, node: Node) -> Literal:  # noqa: C901
     if node.type == "list_expression":
         return [literal(document, child) for child in node.named_children]
     if node.type == "attrset_expression" and not text.lstrip().startswith("rec"):
-        binding_set = next(
-            (child for child in node.named_children if child.type == "binding_set"),
-            None,
-        )
-        values: dict[str, Literal] = {}
-        for binding in [] if binding_set is None else binding_set.named_children:
-            attrpath = binding.child_by_field_name("attrpath")
-            expression = binding.child_by_field_name("expression")
-            path = (
-                None
-                if attrpath is None
-                else nix_syntax.static_attrpath(document, attrpath)
-            )
-            if (
-                path is None
-                or len(path) != 1
-                or expression is None
-                or path[0] in values
-            ):
-                msg = "not a literal set"
-                raise ValueError(msg)
-            values[path[0]] = literal(document, expression)
-        return values
+        return _literal_attrset(document, node)
     msg = "not a literal"
     raise ValueError(msg)
 
@@ -198,7 +201,7 @@ def package_arguments(document: nix_syntax.Document) -> list[tuple[Node, str]]:
     return [] if builder is None else [(argument, builder)]
 
 
-def _run_nix(expression: str) -> Any:  # noqa: ANN401
+def _run_nix(expression: str) -> object:
     completed = subprocess.run(  # noqa: S603
         ["nix", "eval", "--impure", "--json", "--expr", expression],  # noqa: S607
         capture_output=True,
@@ -230,7 +233,10 @@ def treefmt_defaults(
         "then [{ inherit path; default = tried.value; }] else []; "
         "in builtins.concatMap one paths"
     )
-    return {tuple(record["path"]): record["default"] for record in _run_nix(expression)}
+    return {
+        tuple(record["path"]): record["default"]
+        for record in cast("list[dict[str, Any]]", _run_nix(expression))
+    }
 
 
 def package_defaults(
@@ -290,7 +296,10 @@ def package_defaults(
         "else []; "
         f"in builtins.concatMap one {paths}"
     )
-    return {tuple(record["path"]): record["default"] for record in _run_nix(expression)}
+    return {
+        tuple(record["path"]): record["default"]
+        for record in cast("list[dict[str, Any]]", _run_nix(expression))
+    }
 
 
 def nixos_removals(
@@ -331,7 +340,7 @@ def nixos_removals(
         "builtins.map one candidates"
     )
     removals: dict[Path, set[tuple[str, ...]]] = {}
-    for record in _run_nix(expression):
+    for record in cast("list[dict[str, Any]]", _run_nix(expression)):
         for source in record["files"]:
             marker = source.find("-source/")
             relative = source[marker + 8 :] if marker >= 0 else None
@@ -491,7 +500,9 @@ def main() -> None:
     )
     argument = Path(parser.parse_args().directory)
     if not argument.is_dir():
-        print(f"error: no such flake/repository directory: {argument}", file=sys.stderr)  # noqa: T201
+        sys.stderr.write(
+            (f"error: no such flake/repository directory: {argument}") + "\n",
+        )
         raise SystemExit(1)
     root = find_flake_root(argument)
     if root is None:
@@ -504,7 +515,7 @@ def main() -> None:
             error.returncode if error.returncode >= 0 else 128 - error.returncode,
         ) from error
     except (OSError, ValueError, RuntimeError) as error:
-        print(f"error: {error}", file=sys.stderr)  # noqa: T201
+        sys.stderr.write((f"error: {error}") + "\n")
         raise SystemExit(1) from error
 
 

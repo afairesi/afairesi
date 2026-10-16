@@ -213,7 +213,7 @@ def format_file(path: Path) -> bool:
         formatted = format_text(source, str(path))
         nix_syntax.write_if_changed(path, formatted)
     except (OSError, ValueError) as error:
-        print(f"error: {path}: {error}", file=sys.stderr)  # noqa: T201
+        sys.stderr.write((f"error: {path}: {error}") + "\n")
         return False
     return True
 
