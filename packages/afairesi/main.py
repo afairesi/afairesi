@@ -3173,7 +3173,7 @@ def _run_test_package(
     )
     label = {
         "mutation": "Mutation workspace and reports",
-        "hypothesis": "Hypothesis workspace and logs",
+        "property": "Property test workspace and logs",
         "performance": "Performance workspace and reports",
     }[command]
     sys.stdout.write(f"{label}: {workspace}\n")
@@ -3436,47 +3436,6 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     """Construct the test campaign command-line parser."""
     result.set_defaults(test_command=None, target=None)
     commands = result.add_subparsers(dest="test_command", metavar="COMMAND")
-    performance = commands.add_parser(
-        "performance",
-        help="profile existing tests and package CLI calls",
-        description=(
-            "Profile explicit test examples with cProfile and show slow test phases. "
-            "Save separate function profiles for pytest and package CLI processes."
-        ),
-        epilog=(
-            "Reports: flake tmp/. Timings include profiler overhead. Profiles cover "
-            "each process's main Python thread; external executables and arbitrary "
-            "Python subprocesses are not profiled. Skips packages without tests."
-        ),
-    )
-    performance.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=None,
-        metavar="PATH",
-        help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
-    performance.add_argument(
-        "--timeout",
-        type=float,
-        help="seconds per test run, excluding build (default: unlimited)",
-    )
-    performance.add_argument(
-        "-k",
-        dest="keywords",
-        default="",
-        help="pytest keyword expression",
-    )
-    performance.add_argument(
-        "-m",
-        dest="markers",
-        default="",
-        help="pytest marker expression",
-    )
     coverage = commands.add_parser(
         "coverage",
         help="measure coverage and print report paths",
@@ -3497,13 +3456,13 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "relative to Git root, or cwd outside Git"
         ),
     )
-    hypothesis = commands.add_parser(
-        "hypothesis",
-        help="run generated property tests",
-        description="Run generated property tests in isolated package copies.",
+    property_tests = commands.add_parser(
+        "property",
+        help="run property-based tests",
+        description="Run property-based tests in isolated package copies.",
         epilog=("Skip packages without test_main.py. Logs and reports: flake tmp/."),
     )
-    hypothesis.add_argument(
+    property_tests.add_argument(
         "target",
         type=Path,
         nargs="?",
@@ -3514,12 +3473,12 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "relative to Git root, or cwd outside Git"
         ),
     )
-    hypothesis.add_argument(
+    property_tests.add_argument(
         "--timeout",
         type=float,
         help=("seconds per test run, excluding build (default: unlimited)"),
     )
-    hypothesis.add_argument(
+    property_tests.add_argument(
         "--max-examples",
         type=int,
         default=100,
@@ -3548,13 +3507,13 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         default=300.0,
         help=("seconds per test run, excluding build (default: 300)"),
     )
-    hypothesis.add_argument(
+    property_tests.add_argument(
         "-k",
         dest="keywords",
         default="",
         help="pytest keyword expression",
     )
-    hypothesis.add_argument(
+    property_tests.add_argument(
         "-m",
         dest="markers",
         default="",
@@ -3603,6 +3562,47 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "relative to Git root, or cwd outside Git"
         ),
     )
+    performance = commands.add_parser(
+        "performance",
+        help="profile existing tests and package CLI calls",
+        description=(
+            "Profile explicit test examples with cProfile and show slow test phases. "
+            "Save separate function profiles for pytest and package CLI processes."
+        ),
+        epilog=(
+            "Reports: flake tmp/. Timings include profiler overhead. Profiles cover "
+            "each process's main Python thread; external executables and arbitrary "
+            "Python subprocesses are not profiled. Skips packages without tests."
+        ),
+    )
+    performance.add_argument(
+        "target",
+        type=Path,
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help=(
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
+        ),
+    )
+    performance.add_argument(
+        "--timeout",
+        type=float,
+        help="seconds per test run, excluding build (default: unlimited)",
+    )
+    performance.add_argument(
+        "-k",
+        dest="keywords",
+        default="",
+        help="pytest keyword expression",
+    )
+    performance.add_argument(
+        "-m",
+        dest="markers",
+        default="",
+        help="pytest marker expression",
+    )
 
 
 def _dispatch_test_command(
@@ -3617,7 +3617,7 @@ def _dispatch_test_command(
     if combined:
         campaigns = [
             cli.parse_args(["repo", "test", command, str(target)])
-            for command in ("coverage", "hypothesis", "mutation", "performance")
+            for command in ("coverage", "property", "mutation", "performance")
         ]
     else:
         campaigns = [options]
@@ -3964,29 +3964,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         title="commands",
         metavar="COMMAND",
     )
-    inspection = commands.add_parser(
-        "inspect",
-        help="inspect hosts, packages, CLI arguments, and tests",
-        description="Inspect repository sources without running package code or tests.",
-    )
-    inspection.add_argument(
-        "repository",
-        nargs="?",
-        metavar="PATH_OR_REMOTE",
-        help=(
-            "repository path or Git URL (default: current repository); "
-            "relative paths use the Git root, or cwd outside Git"
-        ),
-    )
-    testing = commands.add_parser(
-        "test",
-        help="run test campaigns and profile existing tests",
-        description=(
-            "Run coverage, property tests, mutation tests, and performance "
-            "profiling. Default: all four campaigns in the current flake."
-        ),
-    )
-    _configure_test_parser(testing)
     create = commands.add_parser(
         "add",
         usage="%(prog)s [-h] {packages/NAME TYPE | hosts/NAME}",
@@ -4008,18 +3985,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         metavar="TYPE",
         choices=PACKAGE_KINDS,
         help=f"required for packages, omitted for hosts ({', '.join(PACKAGE_KINDS)})",
-    )
-    fix = commands.add_parser(
-        "fix",
-        help="fix and stage the current repository structure",
-        description="Fix and stage flake structure; remove unsupported files.",
-        epilog="Use nix fmt to fix structure and also format code.",
-    )
-    fix.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview changes",
     )
     move = commands.add_parser(
         "mv",
@@ -4060,6 +4025,41 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         action="store_true",
         help="pass --force to git rm",
     )
+    fix = commands.add_parser(
+        "fix",
+        help="fix and stage the current repository structure",
+        description="Fix and stage flake structure; remove unsupported files.",
+        epilog="Use nix fmt to fix structure and also format code.",
+    )
+    fix.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="preview changes",
+    )
+    inspection = commands.add_parser(
+        "inspect",
+        help="inspect hosts, packages, CLI arguments, and tests",
+        description="Inspect repository sources without running package code or tests.",
+    )
+    inspection.add_argument(
+        "repository",
+        nargs="?",
+        metavar="PATH_OR_REMOTE",
+        help=(
+            "repository path or Git URL (default: current repository); "
+            "relative paths use the Git root, or cwd outside Git"
+        ),
+    )
+    testing = commands.add_parser(
+        "test",
+        help="run test campaigns and profile existing tests",
+        description=(
+            "Run coverage, property tests, mutation tests, and performance "
+            "profiling. Default: all four campaigns in the current flake."
+        ),
+    )
+    _configure_test_parser(testing)
 
 
 def home_submodules(
@@ -4395,6 +4395,11 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         title="commands",
         metavar="COMMAND",
     )
+    commands.add_parser(
+        "init",
+        help="initialize the home repository and stage its whitelist",
+        description="Initialize the repository at $HOME and stage its whitelist.",
+    )
     clone = commands.add_parser(
         "clone",
         help="clone and register a home submodule",
@@ -4428,11 +4433,6 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="preview changes",
-    )
-    commands.add_parser(
-        "init",
-        help="initialize the home repository and stage its whitelist",
-        description="Initialize the repository at $HOME and stage its whitelist.",
     )
     remove = commands.add_parser(
         "rm",

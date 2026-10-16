@@ -627,9 +627,12 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         _run(root, "unknown-command", code=2)
         _run(root, "add", code=2)
         help_output = _run(root, "--help").stdout
-        command_names = ["add", "fix", "mv", "rm"]
+        command_names = ["add", "mv", "rm", "fix", "inspect", "test"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
-        _expect(positions == sorted(positions), "help commands must be alphabetical")
+        _expect(
+            positions == sorted(positions),
+            "help commands must follow the repository workflow",
+        )
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
         _expect(not any(root.iterdir()), "invalid CLI request created state")
 
@@ -3709,7 +3712,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("clone", "create", "fix", "init", "rm")
+    commands = ("init", "clone", "create", "fix", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
     _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -4310,7 +4313,7 @@ def test_campaigns_route_targets_and_forward_test_selection(
         _campaign_expect(combined.value.code == 0 and observed == [root] * 4, observed)
         for path in (
             ("coverage",),
-            ("hypothesis",),
+            ("property",),
             ("mutation",),
             ("performance",),
         ):
@@ -4348,7 +4351,10 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
-        commands = ((), ("coverage",), ("hypothesis",), ("mutation",), ("performance",))
+        commands = ((), ("coverage",), ("property",), ("mutation",), ("performance",))
+        help_output = _campaign_run(root, "--help").stdout
+        positions = [help_output.index(f"    {path[0]} ") for path in commands[1:]]
+        _campaign_expect(positions == sorted(positions), help_output)
         for path in commands:
             option = _campaign_run(root, *path, "--help").stdout
             _campaign_expect(
@@ -4375,12 +4381,12 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
             "not inside a Git repository" in _campaign_run(root, code=1).stderr,
             "bare test must require a repository",
         )
-        for command in ("coverage", "hypothesis", "mutation", "performance"):
+        for command in ("coverage", "property", "mutation", "performance"):
             _campaign_run(root, command, code=1)
-        for command in ("hypothesis", "mutation", "performance"):
+        for command in ("property", "mutation", "performance"):
             for timeout in ("nan", "inf", "-inf", "0", "-1"):
                 _campaign_run(root, command, str(root), f"--timeout={timeout}", code=2)
-        _campaign_run(root, "hypothesis", str(root), "--max-examples", "0", code=2)
+        _campaign_run(root, "property", str(root), "--max-examples", "0", code=2)
         for arguments in (
             ("--max-mutations", "0"),
             ("--max-mutations", "-1"),
@@ -4469,7 +4475,7 @@ def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> No
             if layout == "untested":
                 target = root
         before = _campaign_snapshot(root)
-        for command in ("hypothesis", "mutation"):
+        for command in ("property", "mutation"):
             result = _campaign_run(
                 root,
                 command,
@@ -4498,7 +4504,7 @@ def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> No
 
 @pytest.mark.parametrize(
     "failure",
-    [None, "coverage", "hypothesis", "mutation", "performance"],
+    [None, "coverage", "property", "mutation", "performance"],
 )
 @pytest.mark.parametrize("failure_kind", ["policy", "process"])
 def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
@@ -4549,7 +4555,7 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
         campaign_subject.main()
     _campaign_expect(completed.value.code == (0 if failure is None else 1), completed)
     _campaign_expect(
-        observed == ["coverage", "hypothesis", "mutation", "performance"],
+        observed == ["coverage", "property", "mutation", "performance"],
         observed,
     )
     output = capsys.readouterr()
@@ -4756,7 +4762,7 @@ def test_coverage_rejects_missing_report_files(
 
 @pytest.mark.parametrize(
     "command",
-    ["coverage", "hypothesis", "mutation", "performance"],
+    ["coverage", "property", "mutation", "performance"],
 )
 @pytest.mark.parametrize("failure", ["missing-output", "invalid-flake"])
 def test_package_campaign_preserves_native_nix_errors(
@@ -4810,7 +4816,7 @@ def test_package_campaign_preserves_native_nix_errors(
 
 
 @pytest.mark.parametrize("failure", ["assertion", "collection", "selection", "usage"])
-def test_package_hypothesis_preserves_native_pytest_status(
+def test_package_property_preserves_native_pytest_status(
     tmp_path: Path,
     failure: str,
 ) -> None:
@@ -4855,7 +4861,7 @@ def test_package_hypothesis_preserves_native_pytest_status(
     before = _campaign_snapshot(root, exclude=("tmp",))
     actual = _campaign_run(
         root,
-        "hypothesis",
+        "property",
         str(package),
         *selectors,
         code=expected.returncode,
@@ -4915,7 +4921,7 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
 
 
 @pytest.mark.parametrize("failure", ["counterexample", "timeout"])
-def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
+def test_property_campaigns_continue_after_failures(failure: str) -> None:
     """Retain counterexamples and terminate stalled descendants before continuing."""
     with TemporaryDirectory(prefix="afairesi-failed-campaign-") as directory:
         root = Path(directory) / "source with spaces"
@@ -4948,7 +4954,7 @@ def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
         result = _campaign_campaign(
             root,
             environment,
-            "hypothesis",
+            "property",
             "--max-examples",
             "1",
             "--timeout",
@@ -4958,7 +4964,7 @@ def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
             result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
             result,
         )
-        (failed,) = (root / "tmp").glob("python-hypothesis-alpha-*")
+        (failed,) = (root / "tmp").glob("python-property-alpha-*")
         diagnostic = (
             "Falsifying example" if failure == "counterexample" else "timed out"
         )
@@ -4979,7 +4985,7 @@ def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
 @settings(deadline=None)
 @given(max_examples=st.integers(min_value=1, max_value=5))
 @example(max_examples=5)
-def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
+def test_property_campaigns_generate_cases_in_isolated_sources(
     max_examples: int,
 ) -> None:
     """Count generated cases and isolate copied Git commands and runtime state."""
@@ -5055,7 +5061,7 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
         result = _campaign_run_runner_cli(
             root,
             environment,
-            "hypothesis",
+            "property",
             "--max-examples",
             str(max_examples),
         )
@@ -5067,7 +5073,7 @@ def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
             _campaign_snapshot(root, exclude=("tmp",)) == before,
             "explicit campaign modified source",
         )
-        workspaces = list((root / "tmp").glob("python-hypothesis-git-example-*"))
+        workspaces = list((root / "tmp").glob("python-property-git-example-*"))
         _campaign_expect(len(workspaces) == 1, workspaces)
         expected_case_count = 2
         for workspace in workspaces:
@@ -5933,7 +5939,7 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
     _expect({"inspect", "test"} <= commands.keys(), commands)
     campaigns = commands["test"]["commands"]
     _expect(
-        set(campaigns) == {"coverage", "hypothesis", "mutation", "performance"},
+        set(campaigns) == {"coverage", "property", "mutation", "performance"},
         campaigns,
     )
     _expect(not report["warnings"], report["warnings"])
