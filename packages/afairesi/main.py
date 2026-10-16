@@ -423,7 +423,7 @@ def repository_type(root: Path, default: str | None = None) -> str:
     msg = (
         "cannot determine the repository type; run "
         "'afairesi home init' or "
-        "'afairesi home create REMOTE'"
+        "'afairesi repo init'"
     )
     raise CommandError(msg)
 
@@ -2535,18 +2535,18 @@ def require_nix_flakes() -> str:
             check=False,
         )
     except FileNotFoundError as error:
-        msg = f"Nix executable not found: {executable}; install Nix to use home create"
+        msg = f"Nix executable not found: {executable}; install Nix to use repo init"
         raise CommandError(msg) from error
     if completed.returncode != 0:
         msg = f"could not check Nix features: {completed.stderr.strip()}"
         raise CommandError(
-            msg + "\nhome create requires Nix with "
+            msg + "\nrepo init requires Nix with "
             "'experimental-features = nix-command flakes'",
         )
     missing = {"nix-command", "flakes"} - set(completed.stdout.split())
     if missing:
         msg = (
-            f"home create requires Nix features: {', '.join(sorted(missing))}; "
+            f"repo init requires Nix features: {', '.join(sorted(missing))}; "
             "enable them with 'experimental-features = nix-command flakes' "
             "in your Nix configuration"
         )
@@ -2562,6 +2562,7 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         "outputs = inputs: inputs.afairesi.blueprint { inherit inputs; }; }\n",
         encoding="utf-8",
     )
+    git(root, ["add", "--", "flake.nix"])
     run([executable, "flake", "lock"], cwd=root)
     packages = detect_packages(root)
     _converge_checks(root, packages, dry_run=False)
@@ -2572,7 +2573,52 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         ),
         encoding="utf-8",
     )
+    git(root, ["add", "--", ".gitignore", "flake.lock"])
     run([executable, "fmt"], cwd=root)
+    git(root, ["add", "--", ".gitignore", "flake.lock", "flake.nix"])
+
+
+def initialize_repository() -> None:
+    """Initialize an empty Git worktree transactionally and stage its files."""
+    root = repository_root()
+    if (
+        any(path.name != ".git" for path in root.iterdir())
+        or git(
+            root,
+            ["ls-files", "--cached"],
+        ).stdout
+    ):
+        msg = "repo init requires an empty Git worktree; existing files are preserved"
+        raise CommandError(msg)
+    executable = require_nix_flakes()
+    index = Path(
+        git(
+            root,
+            ["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        ).stdout.strip(),
+    )
+    original_index = (
+        (index.read_bytes(), stat.S_IMODE(index.stat().st_mode))
+        if index.exists()
+        else None
+    )
+    try:
+        initialize_flake(root, nix_executable=executable)
+    except BaseException:
+        for path in root.iterdir():
+            if path.name == ".git":
+                continue
+            if path.is_dir() and not path.is_symlink():
+                shutil.rmtree(path)
+            else:
+                path.unlink()
+        if original_index is None:
+            index.unlink(missing_ok=True)
+        else:
+            contents, mode = original_index
+            index.write_bytes(contents)
+            index.chmod(mode)
+        raise
 
 
 def _unittest_classes(module: ast.Module) -> set[str]:
@@ -3983,6 +4029,12 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         title="commands",
         metavar="COMMAND",
     )
+    commands.add_parser(
+        "init",
+        help="initialize and stage a flake in an empty local Git repository",
+        description="Initialize an empty Git worktree with Afairesi conventions.",
+        epilog="Stage generated files; use Git to configure remotes, commit, and push.",
+    )
     create = commands.add_parser(
         "add",
         usage="%(prog)s [-h] {packages/NAME TYPE | hosts/NAME}",
@@ -4371,42 +4423,6 @@ def initialize_submodule(remote: str) -> None:
         raise
 
 
-def _remote_is_empty(remote: str) -> bool:
-    """Return whether a hosted remote advertises no heads."""
-    completed = run(["git", "ls-remote", "--", remote])
-    return not completed.stdout.strip()
-
-
-def create_home_repo(remote: str) -> None:
-    """Create a canonical flake at its remote-derived home path."""
-    relative = canonical_remote_path(remote)
-    home = _require_home_repository()
-    _home_ignore_source(home)
-    home_submodules(home)
-    validate_managed_path(home, relative)
-    nix_executable = require_nix_flakes()
-    if not _remote_is_empty(remote):
-        msg = "home create requires an empty remote"
-        raise CommandError(msg)
-    directory = home / relative
-    run(["git", "clone", "--", remote, str(directory)])
-    initialize_flake(directory, nix_executable=nix_executable)
-    git(directory, ["add", "--all"])
-    git(directory, ["commit", "-m", "Initialize repository"])
-    _allow_home_submodule(home, relative)
-    git(
-        home,
-        [
-            "submodule",
-            "add",
-            "--",
-            remote,
-            str(relative),
-        ],
-    )
-    git(directory, ["push", "--set-upstream", "origin", "HEAD"])
-
-
 def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     """Construct the home repository command-line parser."""
     commands = result.add_subparsers(
@@ -4429,18 +4445,6 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         epilog="Stage registration; no commit or push.",
     )
     clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
-    create = commands.add_parser(
-        "create",
-        help="create, commit, and push a flake under HOME",
-        description=(
-            "Create a flake from an empty hosted remote at "
-            "$HOME/<remote-hostname>/<repository-path>."
-        ),
-        epilog=(
-            "Commit the initial branch, stage home submodule registration, and push."
-        ),
-    )
-    create.add_argument("remote", metavar="REMOTE", help="empty hosted Git remote")
     fix_home = commands.add_parser(
         "fix",
         help="fix and stage home structure",
@@ -4478,8 +4482,6 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         initialize_home()
     elif options.command == "clone":
         initialize_submodule(options.remote)
-    elif options.command == "create":
-        create_home_repo(options.remote)
     elif options.command == "fix":
         converge_home(_require_home_repository(), dry_run=options.dry_run)
     elif options.command == "rm":
@@ -4515,7 +4517,7 @@ def parser() -> argparse.ArgumentParser:
         "home",
         help="manage the home repository and its submodules",
         description=("Manage $HOME submodules at <remote-hostname>/<repository-path>."),
-        epilog=("Changes are staged. Only create commits and pushes."),
+        epilog="Changes are staged. Use Git to commit and push.",
     )
     _configure_repo_parser(repo)
     _configure_home_parser(home)
@@ -4610,6 +4612,9 @@ def _dispatch_workspace_command(
         return
     if options.scope == "home":
         _dispatch_home(options)
+        return
+    if options.command == "init":
+        initialize_repository()
         return
     if options.command == "inspect":
         _dispatch_inspect(options, cli)

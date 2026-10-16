@@ -655,6 +655,7 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         root = Path(directory)
         commands = (
             (),
+            ("init",),
             ("add",),
             ("mv",),
             ("fix",),
@@ -679,8 +680,10 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         )
         _run(root, "unknown-command", code=2)
         _run(root, "add", code=2)
+        initialization = _run(root, "init", code=1)
+        _expect("not inside a Git repository" in initialization.stderr, initialization)
         help_output = _run(root, "--help").stdout
-        command_names = ["add", "mv", "rm", "fix", "inspect", "test"]
+        command_names = ["init", "add", "mv", "rm", "fix", "inspect", "test"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(
             positions == sorted(positions),
@@ -2129,233 +2132,194 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
         raise AssertionError(message)
 
 
-def _home_test_create_tools(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-) -> None:
-    """Provide Git identity and a Nix stub with controllable creation failures."""
-    monkeypatch.setenv("GIT_AUTHOR_NAME", "Test")
-    monkeypatch.setenv("GIT_AUTHOR_EMAIL", "test@example.test")
-    monkeypatch.setenv("GIT_COMMITTER_NAME", "Test")
-    monkeypatch.setenv("GIT_COMMITTER_EMAIL", "test@example.test")
-    monkeypatch.setenv("AFAIRESI_TEST_CREATE_FAILURE", failure)
-    fake_nix = tmp_path / "nix"
-    fake_nix.write_text(
-        """#!/bin/sh
-if [ "$1" = config ]; then
-    printf 'nix-command flakes\\n'
-elif [ "$1" = flake ]; then
-    if [ "$AFAIRESI_TEST_CREATE_FAILURE" = nix ]; then
-        echo 'test Nix failure' >&2
-        exit 23
-    fi
-    printf '{}\\n' > flake.lock
-else
-    mkdir -p .git/hooks
-    if [ "$AFAIRESI_TEST_CREATE_FAILURE" = commit ]; then
-        cat > .git/hooks/pre-commit <<'HOOK'
-#!/bin/sh
-echo 'test commit rejection' >&2
-exit 1
-HOOK
-        chmod +x .git/hooks/pre-commit
-    fi
-    cat > .git/hooks/pre-push <<'HOOK'
-#!/bin/sh
-git -C "$HOME" config --file .gitmodules \\
-    --get-regexp '^submodule\\..*\\.path$' >/dev/null
-HOOK
-    chmod +x .git/hooks/pre-push
-fi
-""",
-        encoding="utf-8",
+def _local_init(root: Path, *, code: int = 0) -> subprocess.CompletedProcess[str]:
+    """Run source initialization with the caller's Nix tool configuration."""
+    return _run(
+        root,
+        "-c",
+        "from packages.afairesi.main import main; main()",
+        "repo",
+        "init",
+        code=code,
+        executable=sys.executable,
     )
-    fake_nix.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tmp_path) + os.pathsep + os.environ["PATH"])
 
 
 @pytest.mark.parametrize("branch", ["main", "trunk"])
-@pytest.mark.parametrize("failure", ["none", "nix", "commit", "remote", "clone"])
-def test_merged_create_flake_respects_git_branch_and_preserves_failures(
+def test_local_init_stages_files_without_committing_or_requiring_home(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     branch: str,
-    failure: str,
 ) -> None:
-    """Keep Git's initial branch and retain the checkout when creation fails."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    origin = tmp_path / "remote.git"
-    origin.mkdir()
-    _home_test_git(origin, "init", "--bare", "--quiet", f"--initial-branch={branch}")
-    remote = "https://example.test/team/new.git"
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    source = tmp_path / "missing" if failure == "remote" else origin
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source.as_uri()}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
-    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    _home_test_create_tools(tmp_path, monkeypatch, failure)
-    _home_test_run(tmp_path, "init")
-    _home_test_git(home, "commit", "--quiet", "-m", "Home policy")
-    home_head = _home_test_git(home, "rev-parse", "HEAD")
-    relative = "example.test/team/new"
-    checkout = home / relative
-    checkout.mkdir(parents=True)
-    if failure == "clone":
-        (checkout / "existing.txt").write_text("preserve existing content")
-    before_ignore = (home / ".gitignore").read_text()
-    before = _home_test_snapshot(home)
-    result = _home_test_run(
-        tmp_path,
-        "-c",
-        "from packages.afairesi.main import main; main()",
-        "home",
-        "create",
-        remote,
-        code={"none": 0, "nix": 23, "commit": 1, "remote": 128, "clone": 128}[failure],
-        executable=sys.executable,
+    """Initialize a local worktree, preserving Git configuration and formatted files."""
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    fake_nix = tools / "nix"
+    fake_nix.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = config ]; then\n'
+        "    printf 'nix-command flakes\\n'\n"
+        'elif [ "$1" = flake ]; then\n'
+        "    git ls-files --error-unmatch flake.nix >/dev/null || exit 7\n"
+        "    printf '{}\\n' > flake.lock\n"
+        "else\n"
+        "    git ls-files --error-unmatch .gitignore flake.lock >/dev/null || exit 8\n"
+        "    printf '\\n' >> flake.nix\n"
+        "fi\n",
     )
-    if failure in {"remote", "clone"}:
-        _home_test_expect("fatal:" in result.stderr, result)
-        _home_test_expect(
-            _home_test_snapshot(home) == before,
-            "Git failure changed home",
-        )
-        return
-    _home_test_expect(
-        _home_test_git(checkout, "branch", "--show-current").strip() == branch,
-        "create changed Git's selected branch",
+    fake_nix.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("HOME", str(tmp_path / "uninitialized-home"))
+    root = tmp_path / "project"
+    root.mkdir()
+    _git(root, "init", "--quiet", f"--initial-branch={branch}")
+    config = _git(root, "config", "--local", "--list")
+    _local_init(root)
+    files = {".gitignore", "flake.lock", "flake.nix"}
+    _expect(set(_git(root, "ls-files").splitlines()) == files, "wrong staged files")
+    for name in files:
+        _expect(_git(root, "show", f":{name}") == (root / name).read_text(), name)
+    _expect(_git(root, "symbolic-ref", "--short", "HEAD").strip() == branch, branch)
+    _expect(not _git(root, "for-each-ref"), "initialization created a commit")
+    _expect(_git(root, "config", "--local", "--list") == config, "Git config changed")
+    _expect(not Path.home().exists(), "initialization required home setup")
+    before = _snapshot(root)
+    _local_init(root, code=1)
+    _expect(_snapshot(root) == before, "repeated initialization changed files")
+
+
+@pytest.mark.parametrize("failure", ["lock", "format", "interrupt"])
+@pytest.mark.parametrize("index_exists", [False, True])
+def test_local_init_rolls_back_failed_nix_commands_and_can_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+    *,
+    index_exists: bool,
+) -> None:
+    """Restore the empty worktree and original index after errors or interruption."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _git(root, "init", "--quiet")
+    index = root / ".git/index"
+    if index_exists:
+        _git(root, "read-tree", "--empty")
+        index.chmod(0o640)
+    original_index = (
+        (index.read_bytes(), index.stat().st_mode) if index_exists else None
     )
-    if failure != "none":
-        _home_test_expect(
-            (checkout / "flake.nix").is_file(),
-            "failure deleted checkout",
-        )
-        _home_test_expect(
-            (home / ".gitignore").read_text() == before_ignore,
-            "failed creation changed home whitelist",
-        )
-        _home_test_expect(
-            not (home / ".gitmodules").exists(),
-            "failure registered repo",
-        )
-        _home_test_expect(
-            not _home_test_git(origin, "for-each-ref"),
-            "failure published",
-        )
-        _home_test_expect(
-            "test Nix failure" in result.stderr
-            if failure == "nix"
-            else "test commit rejection" in result.stderr,
-            result,
-        )
-        return
-    _home_test_expect(
-        _home_test_git(origin, "rev-parse", f"refs/heads/{branch}")
-        == _home_test_git(checkout, "rev-parse", "HEAD"),
-        "create did not publish its initial commit",
+    before = _snapshot(root)
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    fake_nix = tools / "nix"
+    fake_nix.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = config ]; then\n'
+        "    printf 'nix-command flakes\\n'\n"
+        "    exit 0\n"
+        "fi\n"
+        "printf '{}\\n' > flake.lock\n"
+        'if [ "$1" = flake ] && [ "$FAILURE" != lock ]; then exit 0; fi\n'
+        "mkdir -p tmp/cache\n"
+        "printf 'partial output' > tmp/cache/result\n"
+        "ln -s tmp/cache partial-link\n"
+        "git add --force flake.lock tmp/cache/result partial-link\n"
+        'if [ "$FAILURE" = interrupt ]; then kill -INT "$PPID"; exit 0; fi\n'
+        "echo 'test Nix failure' >&2\n"
+        "exit 23\n",
     )
-    _home_test_expect(
-        _home_test_git(home, "rev-parse", "HEAD") == home_head,
-        "create committed the home registration",
+    fake_nix.chmod(0o755)
+    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setenv("FAILURE", failure)
+    result = _local_init(root, code=130 if failure == "interrupt" else 23)
+    if failure != "interrupt":
+        _expect("test Nix failure" in result.stderr, result)
+    _expect(_snapshot(root) == before, "failed initialization changed repository state")
+    restored_index = (
+        (index.read_bytes(), index.stat().st_mode) if index.exists() else None
     )
-    _home_test_expect(
-        set(_home_test_git(checkout, "ls-files").splitlines())
+    _expect(restored_index == original_index, "original Git index was not restored")
+    fake_nix.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1" = config ]; then\n'
+        "    printf 'nix-command flakes\\n'\n"
+        'elif [ "$1" = flake ]; then\n'
+        "    printf '{}\\n' > flake.lock\n"
+        "fi\n",
+    )
+    _local_init(root)
+    _expect(
+        set(_git(root, "ls-files").splitlines())
         == {".gitignore", "flake.lock", "flake.nix"},
-        "create did not commit the canonical initial files",
+        "initialization could not be retried",
     )
-    _home_test_expect(
-        "inputs.afairesi.url" in (checkout / "flake.nix").read_text(),
-        "create did not scaffold the requested repository",
-    )
-    ignore = (home / ".gitignore").read_text(encoding="utf-8")
-    if f"!/{relative}" not in ignore.splitlines():
-        raise AssertionError(ignore)
-    if _home_test_git(home, "show", ":.gitignore") != ignore:
-        message = "create did not stage the home whitelist"
-        raise AssertionError(message)
-    if not _home_test_git(home, "ls-files", "--stage", "--", relative).startswith(
-        "160000 ",
-    ):
-        message = "create did not stage its submodule"
-        raise AssertionError(message)
+
+
+@pytest.mark.parametrize("existing", ["untracked", "staged", "deleted", "symlink"])
+def test_local_init_rejects_existing_content_without_changes(
+    tmp_path: Path,
+    existing: str,
+) -> None:
+    """Reject populated worktrees and retained index entries before mutation."""
+    _git(tmp_path, "init", "--quiet")
+    path = tmp_path / "personal-data"
+    if existing == "symlink":
+        path.symlink_to(tmp_path / "missing")
+    else:
+        path.write_text("preserve this")
+        if existing in {"staged", "deleted"}:
+            _git(tmp_path, "add", "personal-data")
+        if existing == "deleted":
+            path.unlink()
+    before = _snapshot(tmp_path)
+    result = _run(tmp_path, "init", code=1)
+    _expect("empty Git worktree" in result.stderr, result)
+    _expect(_snapshot(tmp_path) == before, "initialization changed existing content")
 
 
 @pytest.mark.parametrize("features", ["", "nix-command", "flakes"])
-def test_merged_create_flake_checks_nix_features_before_creating_state(
+def test_local_init_checks_nix_features_before_creating_state(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     features: str,
 ) -> None:
-    """Reject disabled features with instructions before cloning or staging."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
+    """Explain disabled Nix features before writing files or staging."""
+    _git(tmp_path, "init", "--quiet")
     monkeypatch.setenv(
         "NIX_CONFIG",
         f"experimental-features = {features}\nextra-experimental-features =\n",
     )
-    _home_test_run(tmp_path, "init")
-    before = _home_test_snapshot(home)
-    result = _home_test_run(
-        tmp_path,
-        "create",
-        "https://example.test/team/new.git",
-        code=1,
-    )
-    _home_test_expect(
-        "experimental-features = nix-command flakes" in result.stderr,
-        result,
-    )
-    _home_test_expect(
-        _home_test_snapshot(home) == before,
-        "Nix prerequisite failure changed home",
-    )
-    _home_test_expect(
-        not (home / "example.test").exists(),
-        "prerequisite check created paths",
-    )
+    before = _snapshot(tmp_path)
+    result = _run(tmp_path, "init", code=1)
+    _expect("experimental-features = nix-command flakes" in result.stderr, result)
+    _expect(_snapshot(tmp_path) == before, "Nix prerequisite failure changed state")
 
 
-def test_merged_create_flake_reports_missing_nix_before_creating_state(
+def test_local_init_reports_missing_nix_without_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Explain missing Nix without creating the checkout or changing the index."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    _home_test_run(tmp_path, "init")
-    before = _home_test_snapshot(home)
-    tools = tmp_path / "bin"
+    """Explain missing Nix before writing files or staging."""
+    root = tmp_path / "project"
+    root.mkdir()
+    _git(root, "init", "--quiet")
+    tools = tmp_path / "tools"
     tools.mkdir()
     git_executable = shutil.which("git")
     if git_executable is None:
         pytest.fail("Missing Git executable")
     (tools / "git").symlink_to(git_executable)
     monkeypatch.setenv("PATH", str(tools))
-    result = _home_test_run(
-        tmp_path,
-        "-c",
-        "from packages.afairesi.main import main; main()",
-        "home",
-        "create",
-        "https://example.test/team/new.git",
-        code=1,
-        executable=sys.executable,
-    )
-    _home_test_expect("Nix executable not found" in result.stderr, result)
-    _home_test_expect(_home_test_snapshot(home) == before, "missing Nix changed home")
+    before = _snapshot(root)
+    result = _local_init(root, code=1)
+    _expect("Nix executable not found" in result.stderr, result)
+    _expect(_snapshot(root) == before, "missing Nix changed state")
 
 
-@pytest.mark.parametrize("command", ["clone", "create"])
 @pytest.mark.parametrize("initialized_git", [False, True])
 def test_merged_home_prerequisites_explain_initialization_without_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    command: str,
     *,
     initialized_git: bool,
 ) -> None:
@@ -2368,7 +2332,7 @@ def test_merged_home_prerequisites_explain_initialization_without_changes(
     before = _home_test_snapshot(home) if initialized_git else None
     result = _home_test_run(
         tmp_path,
-        command,
+        "clone",
         "https://example.test/team/new.git",
         code=1,
     )
@@ -2932,42 +2896,6 @@ def test_merged_failed_clone_restores_home_whitelist_and_staging(
     _home_test_expect(
         _home_test_snapshot(home) == before,
         "failed clone changed the home repository",
-    )
-
-
-@pytest.mark.parametrize("case", ["whitelist", "registration", "symlink"])
-def test_merged_flake_initialization_validates_home_before_creating_or_publishing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case: str,
-) -> None:
-    """Reject invalid home state before creating a checkout or publishing a commit."""
-    home = _home_test_home_repository(tmp_path / "home")
-    origin = tmp_path / "remote.git"
-    origin.mkdir()
-    _home_test_git(origin, "init", "--bare", "--quiet")
-    remote = "https://example.test/team/new.git"
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin.as_uri()}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
-    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    if case == "whitelist":
-        ignore = home / ".gitignore"
-        ignore.write_text(ignore.read_text() + "invalid\n")
-    elif case == "registration":
-        (home / ".gitmodules").write_text("invalid registration\n")
-    else:
-        (home / "example.test").symlink_to(tmp_path, target_is_directory=True)
-    before = _home_test_snapshot(home)
-    _home_test_run(tmp_path, "create", remote, code=1)
-    _home_test_expect(
-        _home_test_snapshot(home) == before,
-        "failed initialization changed home state",
-    )
-    _home_test_expect(
-        not _home_test_git(origin, "for-each-ref"),
-        "failed initialization published a commit",
     )
 
 
@@ -3749,7 +3677,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("init", "clone", "create", "fix", "rm")
+    commands = ("init", "clone", "fix", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
     _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -3762,7 +3690,6 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     for arguments in (
         ("unknown-command",),
         ("clone",),
-        ("create",),
         ("init", "unexpected"),
         ("rm",),
     ):
@@ -3822,15 +3749,17 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
             _run(tmp_path, scope, executable=executable).stdout == scoped_help,
             scoped_help,
         )
+    arguments: tuple[str, ...]
     for arguments in (
         ("add", "packages/example", "python"),
         ("init",),
-        ("repo", "init"),
+        ("repo", "init", "unexpected"),
         ("home", "add", "packages/example", "python"),
         ("unknown-scope",),
     ):
         _run(tmp_path, *arguments, executable=executable, code=2)
     for arguments in (
+        ("repo", "init"),
         ("repo", "add", "packages/example", "python"),
         ("repo", "mv", "packages/example", "packages/renamed"),
         ("repo", "rm", "packages/example"),
