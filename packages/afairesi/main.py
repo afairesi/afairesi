@@ -25,12 +25,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
-import libcst as cst
 import nix_syntax
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
+    import libcst as cst
     from tree_sitter import Node
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 KIND_MARKERS = {
@@ -2316,6 +2316,8 @@ def _renamed_runtime_expression(
     repository: Path | None,
 ) -> cst.BaseExpression:
     """Change only the package component of a declared literal runtime path."""
+    import libcst as cst  # noqa: PLC0415 - Load the rewriter only for renames.
+
     code = cst.Module([]).code_for_node(expression)
     path = _runtime_path(ast.parse(code, mode="eval").body)
     if path is None or path.parts[-3:] != (*old.parts, "tmp"):
@@ -2359,6 +2361,8 @@ def _renamed_runtime_source(
     repository: Path | None,
 ) -> str:
     """Use LibCST to edit module declarations without rewriting their formatting."""
+    import libcst as cst  # noqa: PLC0415 - Load the rewriter only for renames.
+
     try:
         module = cst.parse_module(source)
     except cst.ParserSyntaxError as error:
@@ -2879,6 +2883,21 @@ def _prepare_test_profiling(
     bootstrap: Path,
 ) -> list[str]:
     """Profile pytest and the isolated package launcher in separate processes."""
+    _run_test_command(
+        [
+            environment.python,
+            "-B",
+            "-c",
+            (
+                "import compileall, pathlib, py_compile\n"
+                "for source in pathlib.Path('packages').glob('*/main.py'):\n"
+                "    compileall.compile_file(str(source), quiet=2, "
+                "invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)\n"
+            ),
+        ],
+        workspace,
+        workspace / "compile.log",
+    )
     reports = workspace / "profiles"
     reports.mkdir()
     wrapper = workspace / "profile-script.py"

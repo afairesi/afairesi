@@ -127,12 +127,25 @@ def _fixture_git(root: Path, *arguments: str) -> str:
     ).stdout
 
 
+def _fixture_add(root: Path, resource: str, kind: str | None = None) -> None:
+    """Prepare resources directly when the test exercises another operation."""
+    subject = import_module("packages.afairesi.main")
+    collection, name = Path(resource).parts
+    if collection == "hosts":
+        subject.add_host(root, name)
+    else:
+        if kind is None:
+            message = "package fixtures require a kind"
+            raise AssertionError(message)
+        subject.add_package(root, kind, name)
+
+
 def _check_excluded_trees(
     repository: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Skip excluded subtrees while still rejecting unmanaged files and symlinks."""
-    _run(repository, "add", "packages/example", "python")
+    _fixture_add(repository, "packages/example", "python")
     excluded = [
         repository / name
         for name in (
@@ -173,7 +186,7 @@ def _check_formatted_checks(
     repository: Path,
 ) -> None:
     """Preserve formatted generated checks through the full formatting pipeline."""
-    _run(repository, "add", "hosts/laptop")
+    _fixture_add(repository, "hosts/laptop")
     (repository / "packages/example/test_main.py").write_text(
         "def test_result(): pass\n",
     )
@@ -197,7 +210,7 @@ def _check_formatted_checks(
 
 def _check_host_repair(repository: Path) -> None:
     """Repair a changed check while preserving its host and resource inventory."""
-    _run(repository, "add", "hosts/laptop")
+    _fixture_add(repository, "hosts/laptop")
     host = repository / "hosts/laptop/configuration.nix"
     original_host = host.read_bytes()
     original_paths = _git(repository, "ls-files").splitlines()
@@ -248,6 +261,25 @@ def _fresh_repository(*, object_format: str = "sha1") -> Iterator[Path]:
         yield _repository(Path(directory), object_format=object_format)
 
 
+def _git_metadata_snapshot(root: Path) -> tuple[dict[str, bytes], str]:
+    """Read stored refs and local settings without launching Git for each field."""
+    directory = root / ".git"
+    if directory.is_file():
+        directory = root / directory.read_text().removeprefix("gitdir: ").strip()
+    common = directory
+    if (directory / "commondir").is_file():
+        common = directory / (directory / "commondir").read_text().strip()
+    refs = {
+        path.relative_to(common).as_posix(): path.read_bytes()
+        for path in (common / "refs").rglob("*")
+        if path.is_file()
+    }
+    if (common / "packed-refs").is_file():
+        refs["packed-refs"] = (common / "packed-refs").read_bytes()
+    refs["HEAD"] = (directory / "HEAD").read_bytes()
+    return refs, (common / "config").read_text()
+
+
 def _snapshot(root: Path, *, exclude: tuple[str, ...] = ()) -> tuple[object, ...]:
     """Observe paths, contents, modes, staged blobs, refs, and local Git settings."""
     files = {}
@@ -267,9 +299,29 @@ def _snapshot(root: Path, *, exclude: tuple[str, ...] = ()) -> tuple[object, ...
     return (
         files,
         _git(root, "ls-files", "--stage", "-z"),
-        _git(root, "for-each-ref", "--format=%(refname) %(objectname)"),
-        _git(root, "config", "--local", "--list"),
+        *_git_metadata_snapshot(root),
     )
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ("config", "fixture.changed", "true"),
+        ("update-ref", "refs/heads/other", "HEAD"),
+        ("pack-refs", "--all"),
+        ("symbolic-ref", "HEAD", "refs/heads/other"),
+    ],
+)
+def test_repository_snapshots_detect_git_metadata_changes(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+) -> None:
+    """Keep preservation assertions sensitive to refs, HEAD, and local settings."""
+    _repository(tmp_path)
+    _fixture_git(tmp_path, "commit", "--quiet", "-m", "initial")
+    before = _snapshot(tmp_path)
+    _git(tmp_path, *arguments)
+    _expect(_snapshot(tmp_path) != before, arguments)
 
 
 def _preview(root: Path, *arguments: str, code: int = 0) -> None:
@@ -302,6 +354,7 @@ def _nix_environment(root: Path) -> dict[str, str]:
         "build-users-group =\n"
         "sandbox = false\n"
         "eval-cache = false\n"
+        "substituters =\n"
     )
     return environment
 
@@ -556,7 +609,7 @@ def test_public_repo_repair_generates_checks_and_reaches_a_fixed_point(
     with _fresh_repository() as root:
         nested = root / "tmp/nested"
         nested.mkdir(parents=True)
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         (root / "packages/example/test_main.py").write_text(tests)
         before = _snapshot(root)
         result = _run(nested, "fix", "-n")
@@ -652,7 +705,7 @@ def test_resource_removal_uses_git_rules_and_preserves_untracked_data(
     """Let Git protect tracked edits and leave untracked and ignored files intact."""
     with _fresh_repository() as root:
         relative = "hosts/example" if kind == "host" else "packages/example"
-        _run(root, "add", relative, *(() if kind == "host" else (kind,)))
+        _fixture_add(root, relative, *(() if kind == "host" else (kind,)))
         if kind == "python":
             (root / relative / "test_main.py").write_text("def test_result(): pass\n")
             _repair_flake(root)
@@ -770,7 +823,7 @@ def test_repair_rejects_check_symlinks_before_changing_state(
     external = outside / "default.nix"
     external.write_text("{}\n")
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         (root / "packages/example/test_main.py").write_text(
             "def test_example(): pass\n",
         )
@@ -814,7 +867,7 @@ def test_resource_changes_validate_metadata_before_mutation(
 def test_removal_can_delete_a_package_with_invalid_test_source() -> None:
     """Validate the remaining metadata without requiring removed tests to parse."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         (root / "packages/example/test_main.py").write_text(
             "def test_example(): pass\n",
         )
@@ -858,7 +911,7 @@ def test_removal_validates_all_targets_before_deletion(
 ) -> None:
     """Reject unsupported related checks before deleting the package."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "nix")
+        _fixture_add(root, "packages/example", "nix")
         check = root / "checks/example"
         check.parent.mkdir()
         if case == "symlink":
@@ -878,7 +931,7 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
     with _fresh_repository() as root:
         _git(root, "remote", "add", "origin", "https://forge.example/team/repo.git")
         for name in ("old", "consumer"):
-            _run(root, "add", f"packages/{name}", "python")
+            _fixture_add(root, f"packages/{name}", "python")
         old_path = "forge.example/team/repo/packages/old/tmp"
         new_path = "forge.example/team/repo/packages/new/tmp"
         source = root / "packages/old/main.py"
@@ -963,7 +1016,7 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
 def test_convergence_preserves_formatted_checks() -> None:
     """Keep generated checks stable after the real formatting pipeline."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         _check_formatted_checks(root)
 
 
@@ -978,7 +1031,7 @@ def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
 ) -> None:
     """Repair generated state, retain resources and scratch, and respect formatting."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         source = root / "packages/example/main.py"
         original = source.read_bytes()
         for relative in (
@@ -1044,7 +1097,7 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
 ) -> None:
     """Reject embedded function and unittest definitions independently of paths."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         source = root / "packages/example/main.py"
         source.write_text(misplaced)
         before = _snapshot(root)
@@ -1171,8 +1224,8 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
 ) -> None:
     """Preserve files and Git state when an executable cannot call its entrypoint."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/a", "python")
-        _run(root, "add", "packages/z", "python")
+        _fixture_add(root, "packages/a", "python")
+        _fixture_add(root, "packages/z", "python")
         (root / "packages/a/default.nix").write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
         )
@@ -1193,8 +1246,8 @@ def test_convergence_rejects_invalid_entrypoints_before_repairs_and_cleanup(
 def test_convergence_rejects_invalid_test_sources_before_repairs(invalid: str) -> None:
     """Parse tests before repairing earlier packages or cleaning unsupported files."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/a", "python")
-        _run(root, "add", "packages/z", "python")
+        _fixture_add(root, "packages/a", "python")
+        _fixture_add(root, "packages/z", "python")
         (root / "packages/a/default.nix").write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
         )
@@ -1230,7 +1283,7 @@ def test_convergence_repairs_python_arguments_and_preserves_supported_entrypoint
 ) -> None:
     """Repair missing constructor arguments while retaining library and CLI sources."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         package = root / "packages/example"
         (package / "main.py").write_text(source)
         definition = package / "default.nix"
@@ -1552,7 +1605,7 @@ def test_implicit_runtime_paths_cannot_bypass_declarations(
 def test_python_packages_require_the_shared_constructor() -> None:
     """Reject unsupported builders before convergence changes repository state."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         definition = root / "packages/example/default.nix"
         definition.write_text(
             "{ pkgs, ... }: pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
@@ -1954,18 +2007,21 @@ def _home_test_home_repository(root: Path) -> Path:
     checkout.mkdir(parents=True)
     _home_test_git(root, "init", "--quiet")
     _home_test_git(checkout, "init", "--quiet")
-    _home_test_git(root, "config", "maintenance.auto", "false")
-    _home_test_git(checkout, "config", "maintenance.auto", "false")
-    _home_test_git(checkout, "config", "user.name", "Test")
-    _home_test_git(checkout, "config", "user.email", "test@example.org")
-    _home_test_git(checkout, "config", "commit.gpgSign", "false")
-    _home_test_git(checkout, "remote", "add", "origin", "git@forge.example:owner/demo")
+    with (root / ".git/config").open("a", encoding="utf-8") as config:
+        config.write("[maintenance]\n\tauto = false\n")
+    with (checkout / ".git/config").open("a", encoding="utf-8") as config:
+        config.write(
+            "[maintenance]\n\tauto = false\n"
+            "[user]\n\tname = Test\n\temail = test@example.org\n"
+            "[commit]\n\tgpgSign = false\n"
+            '[remote "origin"]\n\turl = git@forge.example:owner/demo\n'
+            "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        )
     source = checkout / "LICENSE"
     source.write_text("first", encoding="utf-8")
     _home_test_git(checkout, "add", "LICENSE")
     _home_test_git(checkout, "commit", "--quiet", "-m", "first")
-    first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
-    _home_test_git(checkout, "update-ref", "refs/remotes/origin/main", first)
+    _home_test_git(checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
     (root / ".gitmodules").write_text(
         f'[submodule "{relative}"]\npath = {relative}\n'
         "url = git@forge.example:owner/demo\n",
@@ -2499,27 +2555,8 @@ def _home_test_snapshot(
     *,
     exclude: tuple[str, ...] = (),
 ) -> tuple[object, ...]:
-    """Observe paths, contents, modes, staged blobs, refs, and local Git settings."""
-    files = {}
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts[0] in (".git", *exclude):
-            continue
-        mode = path.lstat().st_mode
-        value = (
-            str(path.readlink()).encode()
-            if stat.S_ISLNK(mode)
-            else path.read_bytes()
-            if stat.S_ISREG(mode)
-            else b""
-        )
-        files[relative.as_posix()] = (stat.S_IFMT(mode), stat.S_IMODE(mode), value)
-    return (
-        files,
-        _home_test_git(root, "ls-files", "--stage", "-z"),
-        _home_test_git(root, "for-each-ref", "--format=%(refname) %(objectname)"),
-        _home_test_git(root, "config", "--local", "--list"),
-    )
+    """Observe home state with the shared repository snapshot."""
+    return _snapshot(root, exclude=exclude)
 
 
 def _home_test_history_snapshot(root: Path) -> dict[Path, bytes]:
@@ -2736,7 +2773,7 @@ def test_repo_mv_matches_native_git(
     native = tmp_path / "native"
     native.mkdir()
     _repository(native)
-    _run(native, "add", "packages/old", "nix")
+    _fixture_add(native, "packages/old", "nix")
     _fixture_git(native, "commit", "-qm", "Resource snapshot")
     resource = native / "packages/old"
     if state in {"dirty", "staged"}:
@@ -3750,6 +3787,23 @@ def test_merged_home_commands_reject_flake_repositories_without_changes(
         )
 
 
+def test_cli_help_does_not_load_runtime_rewriter(tmp_path: Path) -> None:
+    """Keep the expensive runtime path rewriter out of help startup."""
+    result = _run(
+        tmp_path,
+        "-c",
+        "import sys\n"
+        "from packages.afairesi.main import main\n"
+        "sys.argv = ['afairesi', '--help']\n"
+        "try:\n"
+        "    main()\n"
+        "finally:\n"
+        "    assert 'libcst' not in sys.modules\n",
+        executable=sys.executable,
+    )
+    _expect("repo" in result.stdout and "home" in result.stdout, result)
+
+
 def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     tmp_path: Path,
 ) -> None:
@@ -3847,7 +3901,7 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
     with _fresh_repository() as root:
         upstream = root / "upstream.git"
         remote = str(upstream) if remote_kind == "path" else upstream.as_uri()
-        _run(root, "add", "packages/example", "python")
+        _fixture_add(root, "packages/example", "python")
         _git(root, "remote", "add", "origin", remote)
         _run(root, "mv", "packages/example", "packages/renamed")
         _run(root, "fix")
@@ -3858,7 +3912,7 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
 def test_web_formatting_preserves_literal_line_breaks() -> None:
     """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
     with _fresh_repository() as root:
-        _run(root, "add", "packages/site", "html")
+        _fixture_add(root, "packages/site", "html")
         script = root / "packages/site/script.js"
         script.write_text("document.body.dataset.value = `first\n\nsecond`;\n")
         html = root / "packages/site/index.html"
@@ -4033,8 +4087,6 @@ def _campaign_run_runner_cli(
 
 def _campaign_prepare_coverage_flake(
     root: Path,
-    *,
-    fail_build: bool = False,
 ) -> dict[str, str]:
     """Build generated checks and coverage variants with offline Nix inputs."""
     root.mkdir(parents=True)
@@ -4113,8 +4165,6 @@ def _campaign_prepare_coverage_flake(
             "    assert result.stdout == message + '\\n'\n"
             "    assert result.stderr == ''\n"
         )
-        if name == "example" and fail_build:
-            tests = "def test_failure(): assert False\n"
         (package / "main.py").write_text(source)
         (package / "test_main.py").write_text(tests)
         installed = root / "prm/installed" / name
@@ -4210,27 +4260,8 @@ def _campaign_snapshot(
     *,
     exclude: tuple[str, ...] = (),
 ) -> tuple[object, ...]:
-    """Observe paths, contents, modes, staged blobs, refs, and local Git settings."""
-    files = {}
-    for path in root.rglob("*"):
-        relative = path.relative_to(root)
-        if relative.parts[0] in (".git", *exclude):
-            continue
-        mode = path.lstat().st_mode
-        value = (
-            str(path.readlink()).encode()
-            if stat.S_ISLNK(mode)
-            else path.read_bytes()
-            if stat.S_ISREG(mode)
-            else b""
-        )
-        files[relative.as_posix()] = (stat.S_IFMT(mode), stat.S_IMODE(mode), value)
-    return (
-        files,
-        _campaign_git(root, "ls-files", "--stage", "-z"),
-        _campaign_git(root, "for-each-ref", "--format=%(refname) %(objectname)"),
-        _campaign_git(root, "config", "--local", "--list"),
-    )
+    """Observe campaign state with the shared repository snapshot."""
+    return _snapshot(root, exclude=exclude)
 
 
 def _campaign_runner_package(
@@ -4423,6 +4454,15 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
             "'hello world'], capture_output=True, text=True)\n"
             "    assert result.returncode == 0, result.stderr\n"
             "    assert result.stdout == 'hello world\\n'\n"
+            "    source = Path('packages/example/main.py')\n"
+            "    stamp = source.stat()\n"
+            "    source.write_text(source.read_text().replace('sys.argv[1]', "
+            "'sys.argv[2]'))\n"
+            "    os.utime(source, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))\n"
+            "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE'], "
+            "'stale', 'fresh'], capture_output=True, text=True)\n"
+            "    assert result.returncode == 0, result.stderr\n"
+            "    assert result.stdout == 'fresh\\n'\n"
             f"    assert {not failing!r}\n"
             "@given(st.integers())\n"
             "@example(7)\n"
@@ -4447,16 +4487,27 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
         _campaign_expect((workspace / "examples").read_text() == "7\n", workspace)
         profiles = workspace / "profiles"
         _campaign_expect(str(profiles) in result.stdout, result)
+        _campaign_expect(
+            (root / "packages/example/main.py").read_text() == source,
+            root,
+        )
+        (bytecode,) = (workspace / "packages/example/__pycache__").glob("main.*.pyc")
+        _campaign_expect(bytecode.is_file(), workspace)
         for script, function in (("run-tests", "test_cli"), ("package-entry", "work")):
-            (report,) = profiles.glob(f"{script}-*.prof")
-            stats = pstats.Stats(str(report))
-            functions = stats.get_stats_profile().func_profiles
-            _campaign_expect(function in functions, functions)
-            text = report.with_suffix(".txt").read_text()
+            reports = list(profiles.glob(f"{script}-*.prof"))
             _campaign_expect(
-                "cumulative time" in text and "internal time" in text,
-                text,
+                len(reports) == (1 if script == "run-tests" else 2),
+                reports,
             )
+            for report in reports:
+                stats = pstats.Stats(str(report))
+                functions = stats.get_stats_profile().func_profiles
+                _campaign_expect(function in functions, functions)
+                text = report.with_suffix(".txt").read_text()
+                _campaign_expect(
+                    "cumulative time" in text and "internal time" in text,
+                    text,
+                )
 
 
 @pytest.mark.parametrize(
@@ -4648,59 +4699,77 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
         )
 
 
-def test_coverage_continues_after_failed_nix_builds() -> None:
-    """Report each failure and still build later runnable packages."""
-    with TemporaryDirectory(prefix="afairesi-coverage-failure-") as directory:
-        root = Path(directory) / "source"
-        environment = _campaign_prepare_coverage_flake(root, fail_build=True)
-        untested = _campaign_make_runner_target(root, "", "", name="untested")
-        (untested / "test_main.py").unlink()
-        (root / "flake.nix").write_text(_campaign_git(root, "show", ":flake.nix"))
-        before = _campaign_snapshot(root)
-        result = _campaign_run_runner_cli(root, environment, "coverage")
-        _campaign_expect(
-            result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
-            result,
+def test_coverage_continues_after_failed_nix_builds(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Check build failures and continuation at the Nix process boundary."""
+    campaign_subject = import_module("packages.afairesi.main")
+    _campaign_repository(tmp_path)
+    failed = _campaign_make_source_package(
+        tmp_path,
+        "example",
+        "def test_ready(): pass\n",
+    )
+    _campaign_make_source_package(tmp_path, "z-last", "def test_ready(): pass\n")
+    untested = _campaign_make_source_package(tmp_path, "untested", "")
+    (untested / "test_main.py").unlink()
+    report = tmp_path / "tmp/report"
+    (report / "html").mkdir(parents=True)
+    (report / "html/index.html").touch()
+    (report / "tests.json").write_text(
+        json.dumps({"summary": {"selected_cases": 1, "unexecuted_properties": []}}),
+    )
+    builds: list[str] = []
+
+    def run(arguments: list[str], **_keywords: object) -> object:
+        if arguments[:2] != ["nix", "build"]:
+            return DEFAULT
+        builds.append(arguments[-1])
+        if arguments[-1].endswith("#example-coverage"):
+            raise subprocess.CalledProcessError(
+                17,
+                arguments,
+                stderr="error: coverage builder failed\n",
+            )
+        return subprocess.CompletedProcess(arguments, 0, str(report) + "\n")
+
+    monkeypatch.setattr(
+        campaign_subject.subprocess,
+        "run",
+        Mock(wraps=subprocess.run, side_effect=run),
+    )
+    before = _campaign_snapshot(tmp_path)
+    for target, status in ((tmp_path, 1), (failed, 17)):
+        monkeypatch.setattr(
+            sys,
+            "argv",
+            ["afairesi", "repo", "test", "coverage", str(target)],
         )
-        _campaign_expect(
-            "z-last:" in result.stdout
-            and "/html/index.html" in result.stdout
-            and "afairesi repo test coverage: example:" in result.stderr,
-            result,
-        )
-        _campaign_expect(
-            _campaign_snapshot(root) == before,
-            "failed coverage build changed repository state",
-        )
-        expected = subprocess.run(  # noqa: S603
-            [  # noqa: S607
-                "nix",
-                "build",
-                "--no-link",
-                "--no-update-lock-file",
-                "--print-out-paths",
-                f"git+{root.as_uri()}#example-coverage",
-            ],
-            cwd=root,
-            env=environment,
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=30,
-        )
-        single = _campaign_run(
-            root,
-            "coverage",
-            str(root / "packages/example"),
-            code=expected.returncode,
-            environment=environment,
-        )
-        for diagnostic in expected.stderr.splitlines():
-            if diagnostic.startswith("error:"):
-                _campaign_expect(
-                    diagnostic in single.stderr,
-                    (diagnostic, single.stderr),
-                )
+        with pytest.raises(SystemExit) as completed:
+            campaign_subject.main()
+        _campaign_expect(completed.value.code == status, completed)
+        output = capsys.readouterr()
+        _campaign_expect("error: coverage builder failed" in output.err, output)
+        if target == tmp_path:
+            _campaign_expect(
+                "1 passed, 1 failed, 1 skipped" in output.out
+                and "z-last:" in output.out
+                and str(report / "html/index.html") in output.out
+                and "afairesi repo test coverage: example:" in output.err,
+                output,
+            )
+        _campaign_expect(_campaign_snapshot(tmp_path) == before, target)
+    prefix = f"git+{tmp_path.as_uri()}#"
+    _campaign_expect(
+        builds
+        == [
+            prefix + name
+            for name in ("example-coverage", "z-last-coverage", "example-coverage")
+        ],
+        builds,
+    )
 
 
 @pytest.mark.parametrize("missing", ["html", "tests"])
@@ -4958,7 +5027,7 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
             "--max-examples",
             "1",
             "--timeout",
-            "20" if failure == "counterexample" else "10",
+            "20" if failure == "counterexample" else "2",
         )
         _campaign_expect(
             result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
@@ -5173,6 +5242,69 @@ def test_mutation_campaigns_report_empty_plans() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "problem",
+    [None, "timeout", "error", "pending", "skipped", "incompetent"],
+)
+def test_mutation_reports_preserve_mixed_outcomes_and_kill_attribution(
+    tmp_path: Path,
+    problem: str | None,
+) -> None:
+    """Check mixed results without running another mutation campaign."""
+    campaign_subject = import_module("packages.afairesi.main")
+    outcomes = ["killed", "survived", *([problem] if problem is not None else [])]
+    records = []
+    for outcome in outcomes:
+        item = {"job_id": outcome, "mutations": [{"operator_name": outcome}]}
+        attribution = {
+            "failed_tests": ["test_main.py::test_value"] if outcome == "killed" else [],
+            "collection_errors": [],
+        }
+        result = (
+            None
+            if outcome == "pending"
+            else {
+                "worker_outcome": "exception"
+                if outcome == "error"
+                else "skipped"
+                if outcome == "skipped"
+                else "normal",
+                "test_outcome": outcome
+                if outcome in {"killed", "survived", "incompetent"}
+                else "killed",
+                "output": "timeout"
+                if outcome == "timeout"
+                else "AFAIRESI_TEST_REPORT " + json.dumps(attribution),
+                "diff": f"diff for {outcome}",
+            }
+        )
+        records.append(json.dumps([item, result]))
+    (tmp_path / "results.jsonl").write_text("\n".join(records) + "\n")
+    succeeded = campaign_subject._summarize_mutations(tmp_path)  # noqa: SLF001 - Exercise reporting without an engine run.
+    _campaign_expect(
+        succeeded == (problem not in {"error", "pending", "incompetent"}),
+        problem,
+    )
+    summary = {"killed": 1, "survived": 1}
+    if problem is not None:
+        summary["error" if problem == "incompetent" else problem] = 1
+    _campaign_expect(
+        json.loads((tmp_path / "summary.json").read_text()) == summary,
+        problem,
+    )
+    report = json.loads((tmp_path / "mutation-results.json").read_text())
+    _campaign_expect(report["summary"] == summary, report)
+    killed = next(row for row in report["mutations"] if row["status"] == "killed")
+    _campaign_expect(
+        report["kills_by_test"] == {"test_main.py::test_value": [killed["id"]]},
+        report,
+    )
+    _campaign_expect(
+        all(row["status"] != "skipped" for row in report["mutations"]),
+        report,
+    )
+
+
 @settings(deadline=None)
 @given(value=st.integers(min_value=1, max_value=9))
 @example(value=1)
@@ -5213,23 +5345,6 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
             source,
             name="git-example",
         )
-        result = _campaign_campaign(
-            root,
-            environment,
-            "mutation",
-            "--timeout",
-            "10",
-            cwd=root / "packages/git-example",
-        )
-        _campaign_expect(not result.returncode, result)
-        (workspace,) = (root / "tmp").glob("python-mutation-git-example-*")
-        summary = json.loads((workspace / "summary.json").read_text())
-        _campaign_expect(
-            summary.get("killed", 0) > 0
-            and summary.get("survived", 0) > 0
-            and (workspace / "report.html").stat().st_size > 0,
-            summary,
-        )
         target_line = 2
         focused = _campaign_campaign(
             root,
@@ -5248,10 +5363,10 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
             cwd=root / "packages/git-example",
         )
         _campaign_expect(not focused.returncode, focused)
-        focused_workspace = next(
-            path
-            for path in (root / "tmp").glob("python-mutation-git-example-*")
-            if path != workspace
+        (focused_workspace,) = (root / "tmp").glob("python-mutation-git-example-*")
+        _campaign_expect(
+            (focused_workspace / "report.html").stat().st_size > 0,
+            focused,
         )
         plan_path = focused_workspace / "mutation-plan.json"
         plan = json.loads(plan_path.read_text())
@@ -5291,25 +5406,27 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
             and not weaker_defects["kills_by_test"],
             weaker_defects,
         )
-        package_source = root / "packages/git-example/main.py"
+        campaign_subject = import_module("packages.afairesi.main")
+        package_source = weaker_workspace / "packages/git-example/main.py"
         package_source.write_text(
             source.replace(f"return {value}\n", f"return {value + 10}\n"),
         )
-        mismatch = _campaign_campaign(
-            root,
-            environment,
-            "mutation",
-            "--timeout",
-            "10",
-            "-k",
-            "process_success",
-            "--mutation-plan",
-            str(plan_path),
-            cwd=root / "packages/git-example",
+        with pytest.raises(campaign_subject.CommandError, match="does not match"):
+            campaign_subject._select_mutations(  # noqa: SLF001 - Check validation without rerunning a campaign.
+                weaker_workspace,
+                "git-example",
+                campaign_subject.TestSelection(mutation_plan=plan_path),
+            )
+        campaign_subject._select_mutations(  # noqa: SLF001 - Check unfiltered selection without executing every mutant.
+            focused_workspace,
+            "git-example",
+            campaign_subject.TestSelection(),
         )
+        unfiltered = json.loads(plan_path.read_text())
         _campaign_expect(
-            mismatch.returncode == 1 and "does not match" in mismatch.stderr,
-            mismatch,
+            len(unfiltered["mutations"]) == sum(defects["summary"].values())
+            and len(unfiltered["mutations"]) > 1,
+            unfiltered,
         )
 
 
