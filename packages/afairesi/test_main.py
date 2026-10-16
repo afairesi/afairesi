@@ -3,9 +3,12 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import keyword
 import os
+import pstats
+import re
 import shutil
 import stat
 import subprocess
@@ -14,8 +17,10 @@ from contextlib import contextmanager
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
+from unittest.mock import DEFAULT, Mock
 
+import coverage
 import pytest
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
@@ -1946,6 +1951,8 @@ def _home_test_home_repository(root: Path) -> Path:
     checkout.mkdir(parents=True)
     _home_test_git(root, "init", "--quiet")
     _home_test_git(checkout, "init", "--quiet")
+    _home_test_git(root, "config", "maintenance.auto", "false")
+    _home_test_git(checkout, "config", "maintenance.auto", "false")
     _home_test_git(checkout, "config", "user.name", "Test")
     _home_test_git(checkout, "config", "user.email", "test@example.org")
     _home_test_git(checkout, "config", "commit.gpgSign", "false")
@@ -3864,3 +3871,2070 @@ def test_web_formatting_preserves_literal_line_breaks() -> None:
         )
         _expect("`first\n\nsecond`" in script.read_text(), script.read_text())
         _expect("first\n\nsecond" in html.read_text(), html.read_text())
+
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+
+def _campaign_run(
+    root: Path,
+    *arguments: str,
+    code: int = 0,
+    executable: str | None = None,
+    environment: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(  # noqa: S603
+        [
+            executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
+            *(["repo", "test"] if executable in (None, "afairesi") else []),
+            *arguments,
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    if result.returncode != code:
+        raise AssertionError(result.stdout + result.stderr)
+    return result
+
+
+def _campaign_repair_flake(
+    root: Path,
+    *arguments: str,
+    code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Exercise the private flake repair entry point used by the formatter."""
+    return _campaign_run(
+        root,
+        "-c",
+        "from packages.afairesi.main import formatter_main; formatter_main()",
+        *arguments,
+        code=code,
+        executable=sys.executable,
+    )
+
+
+def _campaign_git(root: Path, *arguments: str) -> str:
+    return subprocess.run(  # noqa: S603
+        ["git", *arguments],  # noqa: S607
+        cwd=root,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    ).stdout
+
+
+def _campaign_make_source_package(root: Path, name: str, source: str) -> Path:
+    """Create a canonical package fixture without executing its source."""
+    package = root / "packages" / name
+    package.mkdir(parents=True)
+    (root / "flake.nix").touch()
+    (package / "default.nix").touch()
+    (package / "main.py").touch()
+    (package / "test_main.py").write_text(source)
+    return package
+
+
+def _campaign_make_runner_target(
+    root: Path,
+    source: str,
+    tests: str,
+    *,
+    name: str = "example",
+) -> Path:
+    """Create a minimal canonical package for an isolated test."""
+    package = root / "packages" / name
+    package.mkdir(parents=True)
+    (root / "flake.nix").write_text("{}", encoding="utf-8")
+    (package / "default.nix").write_text("{}", encoding="utf-8")
+    (package / "main.py").write_text(source, encoding="utf-8")
+    (package / "test_main.py").write_text(tests, encoding="utf-8")
+    return package
+
+
+def _campaign_prepare_runner_flake(
+    root: Path,
+    tests: str,
+    source: str = "def main():\n    print('ready')\n",
+    *,
+    name: str = "example",
+) -> dict[str, str]:
+    """Provide an offline flake backed by this check's real Python environment."""
+    package = _campaign_make_runner_target(root, source, tests, name=name)
+    (package / "main.py").write_text(source, encoding="utf-8")
+    builders = root / "prm/builders"
+    shutil.copytree(Path(__file__).with_name("prm"), builders)
+    shutil.copyfile(Path(__file__).with_name("main.py"), builders.parent / "main.py")
+    environment = dict(os.environ)
+    store = root.parent / "nix"
+    environment["NIX_REMOTE"] = (
+        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
+    )
+    environment["NIX_CONFIG"] = (
+        "experimental-features = nix-command flakes\nbuild-users-group =\n"
+    )
+    system = subprocess.run(
+        ["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    (root / "flake.nix").write_text(
+        "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
+        "pkgs = { lib = { concatMap = f: xs: builtins.concatLists (map f xs); "
+        'makeBinPath = _: ""; }; writeText = builtins.toFile; }; '
+        f"packageDrv.python.withPackages = _ : {json.dumps(sys.prefix)}; "
+        "in { "
+        f"packages.{json.dumps(system)} = builtins.listToAttrs (map (name: {{ "
+        'name = "${name}-test-environment"; '
+        "value = (lib.mkTestEnvironment { inherit pkgs packageDrv; }).manifest; "
+        "}) (builtins.attrNames (builtins.readDir ./packages))); }; }",
+        encoding="utf-8",
+    )
+    for args in (["init", "--quiet"], ["add", "."]):
+        subprocess.run(  # noqa: S603
+            ["git", "-C", str(root), *args],  # noqa: S607
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    return environment
+
+
+def _campaign_run_runner_cli(
+    root: Path,
+    environment: dict[str, str],
+    command: str,
+    *arguments: str,
+) -> subprocess.CompletedProcess[str]:
+    """Exercise test runners through the public standalone command."""
+    environment = dict(environment)
+    executable_directory = str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
+    environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
+    return subprocess.run(  # noqa: S603
+        ["afairesi", "repo", "test", command, str(root), *arguments],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+
+
+def _campaign_prepare_coverage_flake(
+    root: Path,
+    *,
+    fail_build: bool = False,
+) -> dict[str, str]:
+    """Build generated checks and coverage variants with offline Nix inputs."""
+    root.mkdir(parents=True)
+    _campaign_git(root, "init", "--quiet")
+    for filename in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
+        (root / filename).write_text(
+            "{}" if filename.endswith((".nix", ".lock")) else "",
+        )
+    (root / "flake.lock").write_text(
+        json.dumps({"nodes": {"root": {}}, "root": "root", "version": 7}),
+    )
+    _campaign_git(root, "add", ".")
+    environment = dict(os.environ)
+    store = root.parent / "nix"
+    environment["NIX_REMOTE"] = (
+        f"local?store={store / 'store'}&state={store / 'state'}&log={store / 'log'}"
+    )
+    environment["NIX_CONFIG"] = (
+        "experimental-features = nix-command flakes\n"
+        "build-users-group =\n"
+        "sandbox = false\n"
+        "sandbox-build-dir = /coverage-build\n"
+        "eval-cache = false\n"
+    )
+    system = subprocess.run(
+        ["nix", "eval", "--impure", "--raw", "--expr", "builtins.currentSystem"],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    ).stdout
+    site_packages = (
+        f"lib/python{sys.version_info.major}.{sys.version_info.minor}/site-packages"
+    )
+    coverage_root = Path(coverage.__file__).resolve().parents[4]
+    bash = shutil.which("bash")
+    if bash is None:
+        message = "coverage fixtures require bash"
+        raise AssertionError(message)
+    packages = []
+    checks = []
+    reports = []
+    shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
+    shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/main.py")
+    for name in ("example", "z-last"):
+        _campaign_manage(root, "add", f"packages/{name}", "python")
+        package = root / "packages" / name
+        source = (
+            "import os\n"
+            "def main():\n"
+            "    if os.getenv('AFAIRESI_COVERAGE_CHOICE') == 'alternate':\n"
+            "        print('alternate')\n"
+            "    else:\n"
+            "        print('ready')\n"
+        )
+        tests = (
+            "import os, subprocess, pytest\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "@given(st.just(1))\n"
+            "@example(0)\n"
+            "def test_explicit(value):\n"
+            "    assert value == 0\n"
+            "@given(st.just(1))\n"
+            "def test_generated_only(value):\n"
+            "    assert value == 1\n"
+            "@pytest.mark.skip(reason='optional browser')\n"
+            "def test_optional_browser():\n"
+            "    assert False\n"
+            "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
+            "def test_cli(message, monkeypatch):\n"
+            "    monkeypatch.setenv('AFAIRESI_COVERAGE_CHOICE', message)\n"
+            "    result = "
+            "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
+            "        capture_output=True, text=True)\n"
+            "    assert result.stdout == message + '\\n'\n"
+            "    assert result.stderr == ''\n"
+        )
+        if name == "example" and fail_build:
+            tests = "def test_failure(): assert False\n"
+        (package / "main.py").write_text(source)
+        (package / "test_main.py").write_text(tests)
+        installed = root / "prm/installed" / name
+        module_name = name.replace("-", "_")
+        module = installed / site_packages / module_name
+        module.mkdir(parents=True)
+        (module / "__init__.py").write_text(source)
+        executable = installed / "bin" / name
+        executable.parent.mkdir()
+        executable.write_text(
+            f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
+            "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "
+            f"{site_packages!r}))\n"
+            f"from {module_name} import main\nmain()\n",
+        )
+        executable.chmod(0o755)
+        packages.append(
+            f"{json.dumps(name)} = {{ "
+            f"src = builtins.path {{ path = ./packages/{name}; "
+            f'name = "{name}-src"; }}; '
+            f"outPath = builtins.path {{ path = ./prm/installed/{name}; "
+            f'name = "{name}-installed"; }}; '
+            f"pname = {json.dumps(module_name)}; cliName = {json.dumps(name)}; "
+            f"meta.mainProgram = {json.dumps(name)}; "
+            "propagatedBuildInputs = []; python = { "
+            f"sitePackages = {json.dumps(site_packages)}; "
+            f"pkgs.coverage = {json.dumps(str(coverage_root))}; "
+            f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};",
+        )
+        expression = (
+            f"import ./checks/{name}/default.nix {{ inherit pkgs; "
+            "inputs.self = { inherit lib; packages.${system} = packages; }; }"
+        )
+        checks.append(f"{json.dumps(name)} = {expression};")
+        reports.append(
+            f"{json.dumps(name + '-coverage')} = lib.mkCoverage {{ "
+            f"packageName = {json.dumps(name)}; "
+            f"packageDrv = packages.{json.dumps(name)}; "
+            f"check = checks.{json.dumps(name)}; }};",
+        )
+    _campaign_repair_flake(root)
+    (root / "flake.nix").write_text(
+        "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
+        f"system = {json.dumps(system)}; "
+        "mkCheck = name: attrs: script: let build = current: (builtins.derivation { "
+        "inherit system; inherit (current) name src PACKAGE_E2E_EXECUTABLE; "
+        f"builder = {json.dumps(bash)}; "
+        f"PATH = {json.dumps(sys.prefix + '/bin:' + environment['PATH'])}; "
+        f"PYTHONPATH = {json.dumps(os.pathsep.join(sys.path))}; "
+        'args = [ "-e" (builtins.toFile "check-builder" current.buildCommand) ]; '
+        "}) // { overrideAttrs = f: build (current // f current); }; "
+        "in build (attrs // { inherit name; buildCommand = script; }); "
+        "pkgs = { stdenv.system = system; runCommand = mkCheck; lib = { "
+        "optionalAttrs = condition: attrs: if condition then attrs else {}; "
+        "concatMap = f: xs: builtins.concatLists (map f xs); "
+        'getExe = p: "${p}/bin/${p.cliName}"; }; }; '
+        "packages = { "
+        + " ".join(packages)
+        + " }; checks = { "
+        + " ".join(checks)
+        + " }; "
+        "in { packages.${system} = packages // { " + " ".join(reports) + " }; "
+        "checks.${system} = checks; }; }\n",
+    )
+    _campaign_git(root, "add", ".")
+    return environment
+
+
+def _campaign_expect(condition: bool, detail: object) -> None:  # noqa: FBT001
+    """Report an invariant failure with its observed state."""
+    if not condition:
+        raise AssertionError(detail)
+
+
+def _campaign_repository(root: Path, *, object_format: str = "sha1") -> Path:
+    """Index a minimal flake in an existing temporary directory."""
+    _campaign_git(root, "init", "--quiet", f"--object-format={object_format}")
+    for name in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
+        (root / name).write_text("", encoding="utf-8")
+    _campaign_git(root, "add", ".")
+    return root
+
+
+@contextmanager
+def _campaign_fresh_repository(*, object_format: str = "sha1") -> Iterator[Path]:
+    """Give every generated example its own repository and cleanup."""
+    with TemporaryDirectory(prefix="afairesi-contract-") as directory:
+        yield _campaign_repository(Path(directory), object_format=object_format)
+
+
+def _campaign_snapshot(
+    root: Path,
+    *,
+    exclude: tuple[str, ...] = (),
+) -> tuple[object, ...]:
+    """Observe paths, contents, modes, staged blobs, refs, and local Git settings."""
+    files = {}
+    for path in root.rglob("*"):
+        relative = path.relative_to(root)
+        if relative.parts[0] in (".git", *exclude):
+            continue
+        mode = path.lstat().st_mode
+        value = (
+            str(path.readlink()).encode()
+            if stat.S_ISLNK(mode)
+            else path.read_bytes()
+            if stat.S_ISREG(mode)
+            else b""
+        )
+        files[relative.as_posix()] = (stat.S_IFMT(mode), stat.S_IMODE(mode), value)
+    return (
+        files,
+        _campaign_git(root, "ls-files", "--stage", "-z"),
+        _campaign_git(root, "for-each-ref", "--format=%(refname) %(objectname)"),
+        _campaign_git(root, "config", "--local", "--list"),
+    )
+
+
+def _campaign_runner_package(
+    root: Path,
+    name: str,
+    tests: str,
+    source: str = "",
+) -> None:
+    """Add another offline runnable package without replacing the fixture flake."""
+    flake = (root / "flake.nix").read_text()
+    _campaign_make_runner_target(root, source, tests, name=name)
+    (root / "flake.nix").write_text(flake)
+    _campaign_git(root, "add", ".")
+
+
+def _campaign_campaign(
+    root: Path,
+    environment: dict[str, str],
+    command: str,
+    *arguments: str,
+    cwd: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run an omitted target and preserve original sources, settings, and refs."""
+    before = _campaign_snapshot(root, exclude=("tmp",))
+    result = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "test", command, *arguments],
+        cwd=cwd or root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=120,
+    )
+    _campaign_expect(
+        _campaign_snapshot(root, exclude=("tmp",)) == before,
+        "campaign changed original sources or Git state",
+    )
+    return result
+
+
+def _campaign_manage(
+    root: Path,
+    *arguments: str,
+    code: int = 0,
+) -> subprocess.CompletedProcess[str]:
+    """Set up repository fixtures through the management executable."""
+    return _run(root, *arguments, code=code)
+
+
+def test_campaigns_route_targets_and_forward_test_selection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route repository and package campaigns with their requested test filters."""
+    campaign_subject = import_module("packages.afairesi.main")
+    root = _campaign_repository(tmp_path)
+    package = _campaign_make_source_package(root, "alpha", "def test_alpha(): pass\n")
+    nested = package / "prm/nested"
+    nested.mkdir(parents=True)
+    observed: list[Path] = []
+    forwarded: list[tuple[object, ...]] = []
+
+    def run(target: Path, *arguments: object) -> bool:
+        observed.append(target)
+        forwarded.append(arguments)
+        return True
+
+    for runner in (
+        "_run_coverage",
+        "_run_test_package",
+        "_run_test_repository",
+    ):
+        monkeypatch.setattr(campaign_subject, runner, run)
+    for cwd in (package, nested):
+        monkeypatch.chdir(cwd)
+        observed.clear()
+        monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
+        with pytest.raises(SystemExit) as combined:
+            campaign_subject.main()
+        _campaign_expect(combined.value.code == 0 and observed == [root] * 4, observed)
+        for path in (
+            ("coverage",),
+            ("hypothesis",),
+            ("mutation",),
+            ("performance",),
+        ):
+            targets = (
+                ((), root),
+                ((".",), root),
+                (("packages/alpha",), package),
+                ((str(package),), package),
+            )
+            for arguments, expected in targets:
+                filters = (
+                    ["-k", "keyword", "-m", "marker"] if path != ("coverage",) else []
+                )
+                monkeypatch.setattr(
+                    sys,
+                    "argv",
+                    ["afairesi", "repo", "test", *path, *arguments, *filters],
+                )
+                with pytest.raises(SystemExit) as completed:
+                    campaign_subject.main()
+                _campaign_expect(completed.value.code == 0, path)
+                _campaign_expect(observed[-1] == expected, (path, arguments, observed))
+                if filters:
+                    _campaign_expect(
+                        forwarded[-1][-1]
+                        == campaign_subject.TestSelection(
+                            keywords="keyword",
+                            markers="marker",
+                        ),
+                        forwarded[-1],
+                    )
+
+
+def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
+    """Expose consistent commands and reject invalid requests before creating state."""
+    with TemporaryDirectory(prefix="afairesi-cli-") as directory:
+        root = Path(directory)
+        commands = ((), ("coverage",), ("hypothesis",), ("mutation",), ("performance",))
+        for path in commands:
+            option = _campaign_run(root, *path, "--help").stdout
+            _campaign_expect(
+                "usage:" in option,
+                path,
+            )
+        environment = dict(os.environ)
+        environment["PATH"] = (
+            str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
+            + os.pathsep
+            + environment["PATH"]
+        )
+        _campaign_expect(
+            _campaign_run(
+                root,
+                "--help",
+                executable="afairesi",
+                environment=environment,
+            ).stdout
+            == _campaign_run(root, "--help").stdout,
+            "standalone command unavailable through PATH",
+        )
+        _campaign_expect(
+            "not inside a Git repository" in _campaign_run(root, code=1).stderr,
+            "bare test must require a repository",
+        )
+        for command in ("coverage", "hypothesis", "mutation", "performance"):
+            _campaign_run(root, command, code=1)
+        for command in ("hypothesis", "mutation", "performance"):
+            for timeout in ("nan", "inf", "-inf", "0", "-1"):
+                _campaign_run(root, command, str(root), f"--timeout={timeout}", code=2)
+        _campaign_run(root, "hypothesis", str(root), "--max-examples", "0", code=2)
+        for arguments in (
+            ("--max-mutations", "0"),
+            ("--max-mutations", "-1"),
+            ("--lines", "0"),
+            ("--lines", "3:2"),
+            ("--lines", "bad"),
+            ("--operator", "["),
+        ):
+            _campaign_run(root, "mutation", str(root), *arguments, code=2)
+        _campaign_expect(not any(root.iterdir()), "invalid CLI request created state")
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_performance_profiles_tests_and_cli_without_changing_sources(
+    failing: bool,  # noqa: FBT001
+) -> None:
+    """Retain readable parent and CLI profiles, even when selected tests fail."""
+    with TemporaryDirectory(prefix="afairesi-profile-") as directory:
+        root = Path(directory) / "source with spaces"
+        source = (
+            "import sys\n"
+            "def work():\n"
+            "    return sum(range(10000))\n"
+            "def main():\n"
+            "    work()\n"
+            "    print(sys.argv[1])\n"
+        )
+        tests = (
+            "import os, subprocess\n"
+            "from pathlib import Path\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "def test_cli():\n"
+            "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE'], "
+            "'hello world'], capture_output=True, text=True)\n"
+            "    assert result.returncode == 0, result.stderr\n"
+            "    assert result.stdout == 'hello world\\n'\n"
+            f"    assert {not failing!r}\n"
+            "@given(st.integers())\n"
+            "@example(7)\n"
+            "def test_explicit(value):\n"
+            "    with Path('examples').open('a') as output:\n"
+            "        output.write(str(value) + '\\n')\n"
+            "def test_unselected():\n"
+            "    raise AssertionError('selection ignored')\n"
+        )
+        environment = _campaign_prepare_runner_flake(root, tests, source)
+        result = _campaign_campaign(
+            root,
+            environment,
+            "performance",
+            "-k",
+            "cli or explicit",
+        )
+        _campaign_expect(result.returncode == int(failing), result)
+        output = result.stdout + result.stderr
+        _campaign_expect("slowest" in output and "test_cli" in output, result)
+        (workspace,) = (root / "tmp").glob("python-performance-example-*")
+        _campaign_expect((workspace / "examples").read_text() == "7\n", workspace)
+        profiles = workspace / "profiles"
+        _campaign_expect(str(profiles) in result.stdout, result)
+        for script, function in (("run-tests", "test_cli"), ("package-entry", "work")):
+            (report,) = profiles.glob(f"{script}-*.prof")
+            stats = pstats.Stats(str(report))
+            functions = stats.get_stats_profile().func_profiles
+            _campaign_expect(function in functions, functions)
+            text = report.with_suffix(".txt").read_text()
+            _campaign_expect(
+                "cumulative time" in text and "internal time" in text,
+                text,
+            )
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["empty", "nonpython", "untested", "single_untested"],
+)
+def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> None:
+    """Skip untested repository packages and reject nonrunnable targets safely."""
+    with _campaign_fresh_repository() as root:
+        target = root
+        if layout == "nonpython":
+            _campaign_manage(root, "add", "packages/web", "html")
+        elif layout in {"untested", "single_untested"}:
+            target = _campaign_make_runner_target(root, "", "")
+            (target / "test_main.py").unlink()
+            if layout == "untested":
+                target = root
+        before = _campaign_snapshot(root)
+        for command in ("hypothesis", "mutation"):
+            result = _campaign_run(
+                root,
+                command,
+                str(target),
+                code=0 if layout == "untested" else 1,
+            )
+            if layout == "untested":
+                _campaign_expect(
+                    "Skipping example: no test_main.py" in result.stdout
+                    and "0 passed, 0 failed, 1 skipped" in result.stdout,
+                    result,
+                )
+            elif layout != "single_untested":
+                _campaign_expect("no Python packages found" in result.stderr, result)
+        if layout == "empty":
+            _campaign_expect(
+                "no Python packages found"
+                in _campaign_run(root, "coverage", code=1).stderr,
+                "coverage",
+            )
+        _campaign_expect(
+            _campaign_snapshot(root) == before,
+            "nonrunnable target created state",
+        )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [None, "coverage", "hypothesis", "mutation", "performance"],
+)
+@pytest.mark.parametrize("failure_kind", ["policy", "process"])
+def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: str | None,
+    failure_kind: str,
+) -> None:
+    """Execute every campaign in order even when an earlier campaign fails."""
+    campaign_subject = import_module("packages.afairesi.main")
+    _campaign_repository(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    observed: list[str] = []
+
+    def run(command: str) -> bool:
+        observed.append(command)
+        if command == failure and failure_kind == "process":
+            raise subprocess.CalledProcessError(
+                17,
+                ["native-tool"],
+                output="native campaign failure\n",
+            )
+        if command == failure and command != "mutation":
+            message = "campaign failed"
+            raise campaign_subject.CommandError(message)
+        return command != failure
+
+    def coverage_run(_target: Path) -> bool:
+        return run("coverage")
+
+    def runner(
+        _target: Path,
+        command: str,
+        *_arguments: object,
+    ) -> bool:
+        return run(command)
+
+    monkeypatch.setattr(campaign_subject, "_run_coverage", coverage_run)
+    monkeypatch.setattr(campaign_subject, "_run_test_repository", runner)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "--help"])
+    with pytest.raises(SystemExit) as help_status:
+        campaign_subject.main()
+    _campaign_expect(help_status.value.code == 0 and not observed, observed)
+    capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
+    with pytest.raises(SystemExit) as completed:
+        campaign_subject.main()
+    _campaign_expect(completed.value.code == (0 if failure is None else 1), completed)
+    _campaign_expect(
+        observed == ["coverage", "hypothesis", "mutation", "performance"],
+        observed,
+    )
+    output = capsys.readouterr()
+    _campaign_expect("Campaign summary:" in output.out, output)
+    for command in observed:
+        status = "failed" if command == failure else "passed"
+        _campaign_expect(f"  {command}: {status}\n" in output.out, output)
+    if failure is not None and failure_kind == "process":
+        _campaign_expect("native campaign failure" in output.err, output)
+
+
+def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None:
+    """Build real checks, measure CLI lines, and keep reports outside the checkout."""
+    with TemporaryDirectory(prefix="afairesi-coverage-") as directory:
+        root = Path(directory) / "source with spaces"
+        environment = _campaign_prepare_coverage_flake(root)
+        before = _campaign_snapshot(root)
+        expression = (
+            f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
+            "in f.checks.${builtins.currentSystem}.example"
+        )
+        plain = _campaign_run(
+            root,
+            "build",
+            "--no-link",
+            "--print-out-paths",
+            "--impure",
+            "--expr",
+            expression,
+            executable="nix",
+            environment=environment,
+        )
+        _campaign_expect(
+            not any(
+                path.name.startswith(".coverage")
+                or path.name in {"html", "coverage.json"}
+                for path in Path(plain.stdout.strip()).iterdir()
+            ),
+            "ordinary checks produced coverage artifacts",
+        )
+        result = _campaign_run_runner_cli(root, environment, "coverage")
+        _campaign_expect(not result.returncode, result)
+        reports = [
+            line
+            for line in result.stdout.splitlines()
+            if line.endswith("/html/index.html")
+        ]
+        expected_reports = 2
+        _campaign_expect(len(reports) == expected_reports, result)
+        for line in reports:
+            report = Path(line.split(": ", 1)[1]).parents[1]
+            files = json.loads((report / "coverage.json").read_text())["files"]
+            _campaign_expect(
+                len(files) == 1 and next(iter(files)).endswith("/main.py"),
+                files,
+            )
+            _campaign_expect(
+                set(next(iter(files.values()))["executed_lines"]) == {1, 2, 3, 4, 6},
+                files,
+            )
+            measured = next(iter(files.values()))
+            _campaign_expect(
+                {tuple(branch) for branch in measured["executed_branches"]}
+                == {(3, 4), (3, 6)}
+                and measured["contexts"]["4"] == ["test_main.py::test_cli[alternate]"]
+                and measured["contexts"]["6"] == ["test_main.py::test_cli[ready]"],
+                measured,
+            )
+            audit = json.loads((report / "tests.json").read_text())
+            rows = {row["nodeid"]: row for row in audit["tests"]}
+            expected_counts = {"collected_cases": 5, "functions": 4, "skipped": 2}
+            _campaign_expect(
+                audit["package"] in {"example", "z-last"}
+                and all(
+                    audit["summary"][key] == value
+                    for key, value in expected_counts.items()
+                )
+                and audit["summary"]["unexecuted_properties"]
+                == ["test_main.py::test_generated_only"]
+                and rows["test_main.py::test_generated_only"]["body_calls"] == 0
+                and rows["test_main.py::test_explicit"]["body_calls"] == 1
+                and rows["test_main.py::test_optional_browser"]["skip_reason"]
+                == "optional browser"
+                and all(row["duration"] >= 0 for row in audit["tests"]),
+                audit,
+            )
+        _campaign_expect(
+            _campaign_snapshot(root) == before and not (root / "tmp").exists(),
+            "coverage changed repository state",
+        )
+
+
+def test_coverage_continues_after_failed_nix_builds() -> None:
+    """Report each failure and still build later runnable packages."""
+    with TemporaryDirectory(prefix="afairesi-coverage-failure-") as directory:
+        root = Path(directory) / "source"
+        environment = _campaign_prepare_coverage_flake(root, fail_build=True)
+        untested = _campaign_make_runner_target(root, "", "", name="untested")
+        (untested / "test_main.py").unlink()
+        (root / "flake.nix").write_text(_campaign_git(root, "show", ":flake.nix"))
+        before = _campaign_snapshot(root)
+        result = _campaign_run_runner_cli(root, environment, "coverage")
+        _campaign_expect(
+            result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
+            result,
+        )
+        _campaign_expect(
+            "z-last:" in result.stdout
+            and "/html/index.html" in result.stdout
+            and "afairesi repo test coverage: example:" in result.stderr,
+            result,
+        )
+        _campaign_expect(
+            _campaign_snapshot(root) == before,
+            "failed coverage build changed repository state",
+        )
+        expected = subprocess.run(  # noqa: S603
+            [  # noqa: S607
+                "nix",
+                "build",
+                "--no-link",
+                "--no-update-lock-file",
+                "--print-out-paths",
+                f"git+{root.as_uri()}#example-coverage",
+            ],
+            cwd=root,
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30,
+        )
+        single = _campaign_run(
+            root,
+            "coverage",
+            str(root / "packages/example"),
+            code=expected.returncode,
+            environment=environment,
+        )
+        for diagnostic in expected.stderr.splitlines():
+            if diagnostic.startswith("error:"):
+                _campaign_expect(
+                    diagnostic in single.stderr,
+                    (diagnostic, single.stderr),
+                )
+
+
+@pytest.mark.parametrize("missing", ["html", "tests"])
+def test_coverage_rejects_missing_report_files(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    missing: str,
+) -> None:
+    """Validate coverage output guards without rebuilding a successful package."""
+    campaign_subject = import_module("packages.afairesi.main")
+    root = tmp_path / "source"
+    root.mkdir()
+    _campaign_repository(root)
+    package = _campaign_make_source_package(root, "example", "def test_ready(): pass\n")
+    report = tmp_path / "report"
+    report.mkdir()
+    if missing == "tests":
+        (report / "html").mkdir()
+        (report / "html/index.html").touch()
+    builds: list[list[str]] = []
+
+    def run(
+        arguments: list[str],
+        **_keywords: object,
+    ) -> object:
+        if arguments[:2] == ["nix", "build"]:
+            builds.append(arguments)
+            return subprocess.CompletedProcess(arguments, 0, str(report) + "\n")
+        return DEFAULT
+
+    monkeypatch.setattr(
+        campaign_subject.subprocess,
+        "run",
+        Mock(wraps=subprocess.run, side_effect=run),
+    )
+    before = _campaign_snapshot(root)
+    message = {
+        "html": "no HTML report",
+        "tests": "no test report",
+    }[missing]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["afairesi", "repo", "test", "coverage", str(package)],
+    )
+    with pytest.raises(SystemExit) as completed:
+        campaign_subject.main()
+    _campaign_expect(
+        completed.value.code == 1 and message in capsys.readouterr().err,
+        completed,
+    )
+    _campaign_expect(len(builds) == 1, builds)
+    _campaign_expect(
+        _campaign_snapshot(root) == before,
+        "coverage validation modified source state",
+    )
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["coverage", "hypothesis", "mutation", "performance"],
+)
+@pytest.mark.parametrize("failure", ["missing-output", "invalid-flake"])
+def test_package_campaign_preserves_native_nix_errors(
+    tmp_path: Path,
+    command: str,
+    failure: str,
+) -> None:
+    """Use Nix as the oracle rather than guessing whether a flake output exists."""
+    root = tmp_path / "source with spaces"
+    environment = _campaign_prepare_runner_flake(root, "def test_ready(): pass\n")
+    (root / "flake.nix").write_text(
+        "{ outputs = _: {}; }" if failure == "missing-output" else "{",
+    )
+    _campaign_git(root, "add", "flake.nix")
+    attribute = (
+        "example-coverage" if command == "coverage" else "example-test-environment"
+    )
+    expected = subprocess.run(  # noqa: S603
+        [  # noqa: S607
+            "nix",
+            "build",
+            "--no-link",
+            "--no-update-lock-file",
+            "--print-out-paths",
+            f"git+{root.as_uri()}#{attribute}",
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    _campaign_expect(expected.returncode != 0, expected)
+    before = _campaign_snapshot(root, exclude=("tmp",))
+    actual = _campaign_run(
+        root,
+        command,
+        str(root / "packages/example"),
+        code=expected.returncode,
+        environment=environment,
+    )
+    _campaign_expect(
+        expected.stderr.strip() in actual.stderr,
+        (expected.stderr, actual.stderr),
+    )
+    _campaign_expect(
+        _campaign_snapshot(root, exclude=("tmp",)) == before,
+        "failed campaign changed package sources or Git state",
+    )
+
+
+@pytest.mark.parametrize("failure", ["assertion", "collection", "selection", "usage"])
+def test_package_hypothesis_preserves_native_pytest_status(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    """Preserve pytest's distinct failures instead of collapsing them to exit one."""
+    root = tmp_path / "source"
+    tests = {
+        "assertion": "def test_failure(): assert False, 'native assertion failure'\n",
+        "collection": "def test_broken(:\n    pass\n",
+        "selection": "def test_ready(): pass\n",
+        "usage": "def test_ready(): pass\n",
+    }[failure]
+    environment = _campaign_prepare_runner_flake(root, tests)
+    environment["PYTEST_DISABLE_PLUGIN_AUTOLOAD"] = "1"
+    environment.pop("PYTEST_ADDOPTS", None)
+    selectors = {
+        "assertion": (),
+        "collection": (),
+        "selection": ("-k", "missing_test"),
+        "usage": ("-k", "("),
+    }[failure]
+    package = root / "packages/example"
+    expected = subprocess.run(  # noqa: S603
+        [
+            sys.executable,
+            "-B",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "-q",
+            *selectors,
+            str(package / "test_main.py"),
+        ],
+        cwd=root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    _campaign_expect(expected.returncode != 0, expected)
+    before = _campaign_snapshot(root, exclude=("tmp",))
+    actual = _campaign_run(
+        root,
+        "hypothesis",
+        str(package),
+        *selectors,
+        code=expected.returncode,
+        environment=environment,
+    )
+    diagnostics = [
+        line.strip()
+        for line in (expected.stdout + expected.stderr).splitlines()
+        if line.startswith("ERROR:") or "SyntaxError:" in line
+    ]
+    for diagnostic in diagnostics:
+        _campaign_expect(diagnostic in actual.stderr, (diagnostic, actual.stderr))
+    _campaign_expect(
+        _campaign_snapshot(root, exclude=("tmp",)) == before,
+        "pytest failure changed original package sources or Git state",
+    )
+
+
+def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Validate package eligibility and continuation separately from Nix builds."""
+    campaign_subject = import_module("packages.afairesi.main")
+    _campaign_repository(tmp_path)
+    _campaign_make_source_package(tmp_path, "alpha", "def invalid(")
+    untested = _campaign_make_source_package(tmp_path, "untested", "")
+    (untested / "test_main.py").unlink()
+    ready = _campaign_make_source_package(
+        tmp_path,
+        "z-last",
+        "def test_ready(): pass\n",
+    )
+    built: list[Path] = []
+    monkeypatch.setattr(campaign_subject, "_build_package_coverage", built.append)
+    before = _campaign_snapshot(tmp_path)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["afairesi", "repo", "test", "coverage", str(tmp_path)],
+    )
+    with pytest.raises(SystemExit) as completed:
+        campaign_subject.main()
+    _campaign_expect(completed.value.code == 1, "invalid source must fail coverage")
+    output = capsys.readouterr()
+    _campaign_expect(built == [ready], built)
+    _campaign_expect(
+        "1 passed, 1 failed, 1 skipped" in output.out
+        and "afairesi repo test coverage: alpha:" in output.err,
+        output,
+    )
+    _campaign_expect(
+        _campaign_snapshot(tmp_path) == before,
+        "coverage eligibility modified sources",
+    )
+
+
+@pytest.mark.parametrize("failure", ["counterexample", "timeout"])
+def test_hypothesis_campaigns_continue_after_failures(failure: str) -> None:
+    """Retain counterexamples and terminate stalled descendants before continuing."""
+    with TemporaryDirectory(prefix="afairesi-failed-campaign-") as directory:
+        root = Path(directory) / "source with spaces"
+        environment = _campaign_prepare_runner_flake(
+            root,
+            "def test_ready(): pass\n",
+            name="z-last",
+        )
+        bad_tests = (
+            (
+                "from hypothesis import given, strategies as st\n"
+                "@given(st.integers())\n"
+                "def test_failure(value):\n"
+                "    assert value != 0\n"
+            )
+            if failure == "counterexample"
+            else (
+                "import subprocess, sys, time\n"
+                "from pathlib import Path\n"
+                "def test_stalled():\n"
+                "    child = subprocess.Popen([sys.executable, '-c', 'import "
+                "time; time.sleep(30)'])\n"
+                "    Path('child.pid').write_text(str(child.pid))\n"
+                "    time.sleep(30)\n"
+            )
+        )
+        _campaign_runner_package(root, "alpha", bad_tests)
+        _campaign_runner_package(root, "untested", "")
+        (root / "packages/untested/test_main.py").unlink()
+        result = _campaign_campaign(
+            root,
+            environment,
+            "hypothesis",
+            "--max-examples",
+            "1",
+            "--timeout",
+            "20" if failure == "counterexample" else "10",
+        )
+        _campaign_expect(
+            result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
+            result,
+        )
+        (failed,) = (root / "tmp").glob("python-hypothesis-alpha-*")
+        diagnostic = (
+            "Falsifying example" if failure == "counterexample" else "timed out"
+        )
+        _campaign_expect(
+            diagnostic
+            in result.stdout + result.stderr + (failed / "tests.log").read_text(),
+            result,
+        )
+        if failure == "timeout":
+            pid = int((failed / "child.pid").read_text())
+            status = Path(f"/proc/{pid}/status")
+            _campaign_expect(
+                not status.exists() or "State:\tZ" in status.read_text(),
+                "timed-out suite left a running descendant",
+            )
+
+
+@settings(deadline=None)
+@given(max_examples=st.integers(min_value=1, max_value=5))
+@example(max_examples=5)
+def test_hypothesis_campaigns_generate_cases_in_isolated_sources(
+    max_examples: int,
+) -> None:
+    """Count generated cases and isolate copied Git commands and runtime state."""
+    with TemporaryDirectory(prefix="afairesi-campaign-") as directory:
+        root = Path(directory) / "source with spaces"
+        source = (
+            "import json, os\nfrom pathlib import Path\n"
+            "def main():\n"
+            "    assert not (Path.home() / 'sentinel').exists()\n"
+            "    Path('cli-environment.json').write_text(json.dumps("
+            "{name: os.environ[name] for name in "
+            "('HOME', 'XDG_CACHE_HOME', 'XDG_CONFIG_HOME', 'XDG_DATA_HOME', "
+            "'XDG_STATE_HOME', 'XDG_RUNTIME_DIR', 'TMPDIR')}))\n"
+            "    print('ready')\n"
+        )
+        tests = (
+            "import os, subprocess, sys\n"
+            "from pathlib import Path\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "@given(st.integers())\n"
+            "@example(0)\n"
+            "def test_property(value):\n"
+            "    with Path('examples').open('a') as output:\n"
+            "        output.write(str(value) + '\\n')\n"
+            "def test_cli():\n"
+            "    repository = subprocess.run(['git', 'rev-parse', "
+            "'--show-toplevel'], capture_output=True, text=True)\n"
+            "    assert repository.returncode != 0\n"
+            "    result = subprocess.run(['git', 'example'], "
+            "capture_output=True, text=True)\n"
+            "    assert result.returncode == 0 and result.stdout == "
+            "'ready\\n'\n"
+            "    import json\n"
+            "    directories = json.loads(Path('cli-environment.json').read_text())\n"
+            "    for name, directory in directories.items():\n"
+            "        assert directory == os.environ[name]\n"
+            "        assert Path(directory).is_relative_to(Path.cwd())\n"
+            "    assert not (Path.home() / 'sentinel').exists()\n"
+            "    child = subprocess.run([sys.executable, '-c', "
+            '"import importlib; '
+            "print(importlib.import_module('packages.git-example.main').__file__)\"], "
+            "cwd=Path.home(), capture_output=True, text=True)\n"
+            "    assert child.returncode == 0, child.stderr\n"
+            "    assert Path(child.stdout.strip()).is_relative_to("
+            "Path.cwd() / 'packages')\n"
+        )
+        environment = _campaign_prepare_runner_flake(
+            root,
+            tests,
+            source,
+            name="git-example",
+        )
+        caller_home = Path(directory) / "caller home"
+        caller_home.mkdir()
+        sentinel = caller_home / "sentinel"
+        sentinel.write_text("preserve")
+        environment.update(
+            AFAIRESI_TEST_REPORT=str(sentinel),
+            AFAIRESI_TEST_PACKAGE="unrelated-package",
+            AFAIRESI_MUTATION_REPORT="1",
+        )
+        for variable in (
+            "HOME",
+            "XDG_CACHE_HOME",
+            "XDG_CONFIG_HOME",
+            "XDG_DATA_HOME",
+            "XDG_STATE_HOME",
+            "XDG_RUNTIME_DIR",
+            "TMPDIR",
+        ):
+            environment[variable] = str(caller_home)
+        before = _campaign_snapshot(root, exclude=("tmp",))
+        result = _campaign_run_runner_cli(
+            root,
+            environment,
+            "hypothesis",
+            "--max-examples",
+            str(max_examples),
+        )
+        _campaign_expect(
+            not result.returncode and "1 passed, 0 failed, 0 skipped" in result.stdout,
+            result,
+        )
+        _campaign_expect(
+            _campaign_snapshot(root, exclude=("tmp",)) == before,
+            "explicit campaign modified source",
+        )
+        workspaces = list((root / "tmp").glob("python-hypothesis-git-example-*"))
+        _campaign_expect(len(workspaces) == 1, workspaces)
+        expected_case_count = 2
+        for workspace in workspaces:
+            _campaign_expect(
+                len((workspace / "examples").read_text().splitlines())
+                == max_examples + 1,
+                workspace,
+            )
+            _campaign_expect(
+                f"{max_examples} passing examples"
+                in (workspace / "tests.log").read_text(),
+                workspace,
+            )
+            report = json.loads((workspace / "tests.json").read_text())
+            rows = {row["nodeid"]: row for row in report["tests"]}
+            _campaign_expect(
+                report["package"] == "git-example"
+                and report["summary"]["selected_cases"] == expected_case_count
+                and rows["test_main.py::test_property"]["body_calls"]
+                == max_examples + 1
+                and rows["test_main.py::test_cli"]["body_calls"] == 1
+                and not report["summary"]["unexecuted_properties"]
+                and not list(workspace.glob("test-runtime-*")),
+                report,
+            )
+        _campaign_expect(
+            sentinel.read_text() == "preserve",
+            caller_home,
+        )
+
+
+def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
+    """Check fixed baseline failures once, independently of generated values."""
+    with TemporaryDirectory(prefix="afairesi-baselines-") as directory:
+        root = Path(directory) / "source with spaces"
+        environment = _campaign_prepare_runner_flake(
+            root,
+            "def test_ready(): pass\n",
+            name="git-example",
+        )
+        baselines = {
+            "alpha": "def test_failure():\n    assert False\n",
+            "beta": "",
+            "gamma": "raise ImportError('missing dependency')\n",
+            "delta": (
+                "import pytest\n@pytest.mark.skip(reason='disabled')\n"
+                "def test_skipped():\n    assert False\n"
+            ),
+        }
+        for name, baseline in baselines.items():
+            _campaign_runner_package(root, name, baseline)
+        _campaign_runner_package(root, "untested", "")
+        (root / "packages/untested/test_main.py").unlink()
+        result = _campaign_campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "--max-mutations",
+            "1",
+        )
+        _campaign_expect(
+            result.returncode == 1
+            and "1 passed, 4 failed, 1 skipped" in result.stdout
+            and "baseline.log" in result.stderr,
+            result,
+        )
+        for name in baselines:
+            (failed,) = (root / "tmp").glob(f"python-mutation-{name}-*")
+            _campaign_expect(
+                (failed / "baseline.log").is_file()
+                and not (failed / "summary.json").exists(),
+                failed,
+            )
+
+
+def test_mutation_campaigns_report_empty_plans() -> None:
+    """Accept an empty mutation plan when explicit baseline examples pass."""
+    with TemporaryDirectory(prefix="afairesi-empty-mutations-") as directory:
+        root = Path(directory) / "source"
+        tests = (
+            "from packages.example import main\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "@given(st.just(1))\n"
+            "@example(0)\n"
+            "def test_explicit(value):\n"
+            "    assert value == 0 and main is not None\n"
+        )
+        environment = _campaign_prepare_runner_flake(root, tests, "")
+        result = _campaign_campaign(root, environment, "mutation")
+        (workspace,) = (root / "tmp").glob("python-mutation-example-*")
+        _campaign_expect(
+            not result.returncode
+            and json.loads((workspace / "summary.json").read_text()) == {},
+            result,
+        )
+
+
+@settings(deadline=None)
+@given(value=st.integers(min_value=1, max_value=9))
+@example(value=1)
+def test_mutation_campaigns_report_outcomes_and_replay_plans(
+    value: int,
+) -> None:
+    """Report killed/surviving mutations and replay plans across generated values."""
+    with TemporaryDirectory(prefix="afairesi-mutations-") as directory:
+        root = Path(directory) / "source with spaces"
+        source = (
+            "def value():\n"
+            f"    return {value}\n"
+            "\n"
+            "def unused():\n"
+            "    return 2\n"
+            "\n"
+            "def main():\n"
+            "    print(value())\n"
+        )
+        tests = (
+            "import subprocess\nfrom pathlib import Path\n"
+            "def test_cli():\n"
+            "    marker = Path.home() / 'baseline-marker'\n"
+            "    assert not marker.exists()\n"
+            "    marker.write_text('created')\n"
+            "    result = subprocess.run(['git', 'example'], "
+            "capture_output=True, text=True)\n"
+            "    assert result.returncode == 0 "
+            f"and result.stdout == {str(value) + chr(10)!r}\n"
+            "def test_cli_process_success():\n"
+            "    result = subprocess.run(['git', 'example'], "
+            "capture_output=True, text=True)\n"
+            "    assert result.returncode == 0\n"
+        )
+        environment = _campaign_prepare_runner_flake(
+            root,
+            tests,
+            source,
+            name="git-example",
+        )
+        result = _campaign_campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            cwd=root / "packages/git-example",
+        )
+        _campaign_expect(not result.returncode, result)
+        (workspace,) = (root / "tmp").glob("python-mutation-git-example-*")
+        summary = json.loads((workspace / "summary.json").read_text())
+        _campaign_expect(
+            summary.get("killed", 0) > 0
+            and summary.get("survived", 0) > 0
+            and (workspace / "report.html").stat().st_size > 0,
+            summary,
+        )
+        target_line = 2
+        focused = _campaign_campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "-k",
+            "test_cli and not process_success",
+            "--lines",
+            str(target_line),
+            "--operator",
+            "NumberReplacer",
+            "--max-mutations",
+            "1",
+            cwd=root / "packages/git-example",
+        )
+        _campaign_expect(not focused.returncode, focused)
+        focused_workspace = next(
+            path
+            for path in (root / "tmp").glob("python-mutation-git-example-*")
+            if path != workspace
+        )
+        plan_path = focused_workspace / "mutation-plan.json"
+        plan = json.loads(plan_path.read_text())
+        defects = json.loads((focused_workspace / "mutation-results.json").read_text())
+        _campaign_expect(
+            len(plan["mutations"]) == len(defects["mutations"]) == 1
+            and defects["mutations"][0]["status"] == "killed"
+            and defects["mutations"][0]["mutations"][0]["start_pos"][0] == target_line
+            and defects["kills_by_test"]
+            == {
+                "test_main.py::test_cli": [plan["mutations"][0]["id"]],
+            },
+            defects,
+        )
+        existing_workspaces = set((root / "tmp").iterdir())
+        weaker = _campaign_campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "-k",
+            "process_success",
+            "--mutation-plan",
+            str(plan_path),
+            cwd=root / "packages/git-example",
+        )
+        _campaign_expect(not weaker.returncode, weaker)
+        (weaker_workspace,) = set((root / "tmp").iterdir()) - existing_workspaces
+        weaker_defects = json.loads(
+            (weaker_workspace / "mutation-results.json").read_text(),
+        )
+        _campaign_expect(
+            len(weaker_defects["mutations"]) == 1
+            and weaker_defects["mutations"][0]["id"] == defects["mutations"][0]["id"]
+            and weaker_defects["mutations"][0]["status"] == "survived"
+            and not weaker_defects["kills_by_test"],
+            weaker_defects,
+        )
+        package_source = root / "packages/git-example/main.py"
+        package_source.write_text(
+            source.replace(f"return {value}\n", f"return {value + 10}\n"),
+        )
+        mismatch = _campaign_campaign(
+            root,
+            environment,
+            "mutation",
+            "--timeout",
+            "10",
+            "-k",
+            "process_success",
+            "--mutation-plan",
+            str(plan_path),
+            cwd=root / "packages/git-example",
+        )
+        _campaign_expect(
+            mismatch.returncode == 1 and "does not match" in mismatch.stderr,
+            mismatch,
+        )
+
+
+def test_campaign_home_target_requires_native_git_traversal(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Reject home scope instead of silently traversing registered submodules."""
+    campaign_subject = import_module("packages.afairesi.main")
+    _campaign_git(tmp_path, "init", "--quiet")
+    (tmp_path / ".gitmodules").touch()
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
+    with pytest.raises(SystemExit) as completed:
+        campaign_subject.main()
+    _campaign_expect(completed.value.code == 1, completed)
+    _campaign_expect("git submodule foreach" in capsys.readouterr().err, completed)
+
+
+inspection_subject = import_module("packages.afairesi.main")
+
+
+def _inspection_expect(condition: bool, message: str) -> None:  # noqa: FBT001
+    if not condition:
+        raise AssertionError(message)
+
+
+def _inspection_discovery(source: str) -> dict[str, Any]:
+    return cast(
+        "dict[str, Any]",
+        inspection_subject.ArgumentDiscovery(ast.parse(source)).report(),
+    )
+
+
+def test_argparse_helpers_factories_and_subcommands() -> None:
+    """Resolve aliases, returned parsers, groups, and helper contexts."""
+    report = _inspection_discovery("""
+import argparse as ap
+def configure(cli):
+    group = cli.add_mutually_exclusive_group()
+    group.add_argument("--quiet", action="store_true")
+def parser():
+    cli = ap.ArgumentParser()
+    cli.add_argument("input", type=str)
+    subs = cli.add_subparsers(dest="command")
+    build = subs.add_parser("build")
+    build.add_argument("-j", "--jobs", type=int, default=2, choices=[1, 2])
+    configure(build)
+    return cli
+def main():
+    parser().parse_args()
+""")
+    _inspection_expect(list(report["commands"]) == ["build"], "lost subcommand")
+    _inspection_expect(
+        report["arguments"] == [{"names": ["input"], "options": {"type": "str"}}],
+        "wrong positional scope",
+    )
+    rows = {
+        tuple(row["names"]): row for row in report["commands"]["build"]["arguments"]
+    }
+    _inspection_expect(
+        rows[("-j", "--jobs")]["options"]
+        == {"type": "int", "default": 2, "choices": [1, 2]},
+        "lost metadata",
+    )
+    _inspection_expect(
+        rows[("--quiet",)]
+        == {"names": ["--quiet"], "options": {"action": "store_true"}},
+        "lost helper context",
+    )
+    _inspection_expect(
+        not report["warnings"],
+        "resolved declarations produced warnings",
+    )
+
+
+def test_nested_commands_and_commands_without_arguments() -> None:
+    """Keep empty commands and arguments with the same name in distinct scopes."""
+    report = _inspection_discovery("""
+import argparse
+cli = argparse.ArgumentParser()
+cli.add_argument("--verbose", action="store_true")
+commands = cli.add_subparsers()
+commands.add_parser("version")
+remote = commands.add_parser("remote")
+remote.add_argument("--verbose", action="count")
+subcommands = remote.add_subparsers()
+subcommands.add_parser("list")
+add = subcommands.add_parser("add")
+add.add_argument("url")
+""")
+    _inspection_expect(
+        report
+        == {
+            "status": "argparse",
+            "arguments": [
+                {"names": ["--verbose"], "options": {"action": "store_true"}},
+            ],
+            "commands": {
+                "version": {"arguments": [], "commands": {}},
+                "remote": {
+                    "arguments": [
+                        {"names": ["--verbose"], "options": {"action": "count"}},
+                    ],
+                    "commands": {
+                        "list": {"arguments": [], "commands": {}},
+                        "add": {
+                            "arguments": [{"names": ["url"], "options": {}}],
+                            "commands": {},
+                        },
+                    },
+                },
+            },
+            "warnings": [],
+        },
+        "command tree lost scope or empty commands",
+    )
+
+
+def test_unknown_declarations_are_explicit() -> None:
+    """Keep unresolved metadata and parser bindings visible."""
+    report = _inspection_discovery("""
+from argparse import ArgumentParser as Parser
+cli = Parser()
+cli.add_argument("--output", default=compute_default(), **options)
+other.add_argument("--external")
+""")
+    options = report["arguments"][0]["options"]
+    _inspection_expect(
+        options["default"] == {"unknown": "compute_default()"},
+        "default was guessed",
+    )
+    _inspection_expect(
+        options["**kwargs"] == {"unknown": "options"},
+        "unresolved kwargs were hidden",
+    )
+    _inspection_expect(bool(report["warnings"]), "unresolved parser was hidden")
+
+
+def test_factory_return_and_keyword_helper() -> None:
+    """Follow returned constructors and keyword helper arguments."""
+    report = _inspection_discovery("""
+from argparse import ArgumentParser
+def configure(target):
+    target.add_argument("--required", required=True)
+def parser():
+    return ArgumentParser()
+def main():
+    cli = parser()
+    configure(target=cli)
+""")
+    _inspection_expect(
+        report["arguments"]
+        == [{"names": ["--required"], "options": {"required": True}}],
+        "factory or keyword binding was lost",
+    )
+
+
+@pytest.mark.parametrize("entrypoint", ["parser().parse_args()", "parse(parser())"])
+def test_inspection_keeps_internal_parsers_out_of_the_public_cli(
+    entrypoint: str,
+) -> None:
+    """Select the parser consumed by main while retaining its configured helpers."""
+    source = """
+import argparse
+def configure(cli):
+    cli.add_argument("--shared")
+def formatter_main():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.add_argument("--source")
+    cli.add_subparsers().add_parser("internal")
+    cli.parse_args()
+def parser():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.add_argument("--public")
+    cli.add_subparsers().add_parser("repo")
+    return cli
+def main():
+    ENTRYPOINT
+def parse(cli):
+    cli.parse_args()
+"""
+    report = _inspection_discovery(source.replace("ENTRYPOINT", entrypoint))
+    _inspection_expect(
+        [row["names"] for row in report["arguments"]] == [["--shared"], ["--public"]],
+        "internal parser arguments leaked into the public CLI",
+    )
+    _inspection_expect(list(report["commands"]) == ["repo"], "internal command leaked")
+    _inspection_expect(
+        not report["warnings"],
+        "known internal parser produced warnings",
+    )
+
+
+def test_declared_test_identifiers() -> None:
+    """Retain sorted test identifiers and class context."""
+    module = ast.parse("""
+from unittest import TestCase as Case
+def test_default_output(): pass
+def helper():
+    def test_nested(): pass
+class TestArguments:
+    async def test_missing_input(self): pass
+class Arguments(Case):
+    def test_valid_input(self): pass
+class Derived(Arguments):
+    def test_other_input(self): pass
+class Helper:
+    def test_not_collected(self): pass
+""")
+    rows = inspection_subject.declared_tests(module)
+    _inspection_expect(
+        rows
+        == [
+            "Arguments::test_valid_input",
+            "Derived::test_other_input",
+            "Derived::test_valid_input",
+            "TestArguments::test_missing_input",
+            "test_default_output",
+        ],
+        "wrong test identifiers or collection scope",
+    )
+
+
+def _inspection_repository(root: Path) -> None:
+    (root / "flake.nix").touch()
+    package = root / "packages" / "example"
+    package.mkdir(parents=True)
+    (package / "default.nix").write_text('{ meta.description = "Example"; }')
+    (package / "main.py").write_text("""
+import argparse
+raise RuntimeError("inspection must not execute this")
+def parser():
+    cli = argparse.ArgumentParser()
+    cli.add_argument("--output", default="result")
+    return cli
+""")
+    (package / "test_main.py").write_text("""
+raise RuntimeError("inspection must not collect or run tests")
+def test_default_output(): pass
+""")
+    host = root / "hosts" / "laptop"
+    host.mkdir(parents=True)
+    (host / "configuration.nix").touch()
+    library = root / "packages" / "library"
+    library.mkdir()
+    (library / "default.nix").write_text("{}")
+
+
+def test_inspection_is_read_only(tmp_path: Path) -> None:
+    """Inspect source containing failing statements without executing or writing."""
+    _inspection_repository(tmp_path)
+    before = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    report = inspection_subject.inspect_repository(tmp_path)
+    after = {
+        path.relative_to(tmp_path): path.read_bytes()
+        for path in tmp_path.rglob("*")
+        if path.is_file()
+    }
+    _inspection_expect(before == after, "inspection wrote to the repository")
+    _inspection_expect(
+        report["hosts"] == ["laptop"],
+        "wrong hosts",
+    )
+    _inspection_expect(
+        report["packages"]["library"]["cli"]["status"] == "not applicable",
+        "non-Python package has CLI metadata",
+    )
+    _inspection_expect(
+        report["packages"]["example"]["tests"] == ["test_default_output"],
+        "wrong test identifiers",
+    )
+    _inspection_expect(
+        report["packages"]["library"]["tests"] == [],
+        "wrong empty tests",
+    )
+
+
+@pytest.mark.parametrize("location", ["outside", "root", "nested"])
+def test_cli_inventory_resolves_repository_paths(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    """Return the same JSON inventory through supported paths inside and outside Git."""
+    _inspection_repository(tmp_path)
+    expected = inspection_subject.inspect_repository(tmp_path)
+    _inspection_expect(
+        "test_default_output" in expected["packages"]["example"]["tests"],
+        "inventory lost test identifier",
+    )
+    if location != "outside":
+        subprocess.run(  # noqa: S603
+            ["git", "init", "--quiet", str(tmp_path)],  # noqa: S607
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+    cwd = tmp_path / "packages/example" if location == "nested" else tmp_path
+    paths = [["."], [str(tmp_path)]]
+    if location != "outside":
+        paths.append([])
+    for arguments in paths:
+        completed = subprocess.run(  # noqa: S603
+            [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", *arguments],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=30,
+        )
+        _inspection_expect(
+            json.loads(completed.stdout) == expected,
+            "path resolution changed the CLI inventory",
+        )
+
+
+def test_invalid_repository_and_source(tmp_path: Path) -> None:
+    """Report invalid repositories and malformed source with useful errors."""
+    with pytest.raises(inspection_subject.CommandError, match=r"flake\.nix"):
+        inspection_subject.inspect_repository(tmp_path)
+    _inspection_repository(tmp_path)
+    (tmp_path / "packages" / "example" / "main.py").write_text("def invalid(")
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="could not parse Python source",
+    ):
+        inspection_subject.inspect_repository(tmp_path)
+
+
+def test_empty_repository(tmp_path: Path) -> None:
+    """Report missing hosts as a list and missing packages as an object."""
+    (tmp_path / "flake.nix").touch()
+    _inspection_expect(
+        inspection_subject.inspect_repository(tmp_path)
+        == {"hosts": [], "packages": {}},
+        "empty collections were omitted",
+    )
+
+
+def _inspection_remote_fixture(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Path, Path, str]:
+    """Serve a hosted URL from a local repository without network access."""
+    home, source = tmp_path / "home", tmp_path / "source"
+    home.mkdir()
+    source.mkdir()
+    _inspection_repository(source)
+    inspection_subject.git(source, ["init", "--quiet"])
+    inspection_subject.git(source, ["config", "user.name", "Test"])
+    inspection_subject.git(source, ["config", "user.email", "test@example.test"])
+    inspection_subject.git(source, ["add", "."])
+    inspection_subject.git(source, ["commit", "--quiet", "-m", "initial"])
+    remote = "https://example.test/team/repository.git"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source.as_uri()}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
+    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
+    return home, source, remote
+
+
+def _inspection_inspect_target(target: str) -> dict[str, Any]:
+    """Exercise the installed CLI with an unchanged path or Git URL."""
+    completed = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", target],
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=30,
+    )
+    return cast("dict[str, Any]", json.loads(completed.stdout))
+
+
+def _inspection_tree_snapshot(root: Path) -> dict[Path, tuple[int, bytes]]:
+    """Observe contents and modes, including Git metadata and symbolic links."""
+    return {
+        path.relative_to(root): (
+            path.lstat().st_mode,
+            os.fsencode(path.readlink())
+            if path.is_symlink()
+            else path.read_bytes()
+            if stat.S_ISREG(path.lstat().st_mode)
+            else b"",
+        )
+        for path in root.rglob("*")
+    }
+
+
+def _inspection_advance_remote(source: Path) -> None:
+    """Publish a fixture change that existing checkouts and cached refs lack."""
+    (source / "hosts/new").mkdir(parents=True)
+    (source / "hosts/new/configuration.nix").touch()
+    inspection_subject.git(source, ["add", "."])
+    inspection_subject.git(source, ["commit", "--quiet", "-m", "add host"])
+
+
+@pytest.mark.parametrize("initialized", [False, True])
+def test_remote_inspection_preserves_home_and_does_not_block_submodule_add(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    initialized: bool,
+) -> None:
+    """Inspect fresh remote contents without creating persistent home state."""
+    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    if initialized:
+        inspection_subject.initialize_home()
+    before = _inspection_tree_snapshot(home)
+    _inspection_expect(
+        _inspection_inspect_target(remote)
+        == inspection_subject.inspect_repository(source),
+        "wrong remote inventory",
+    )
+    _inspection_advance_remote(source)
+    _inspection_expect(
+        _inspection_inspect_target(remote)
+        == inspection_subject.inspect_repository(source),
+        "remote inspection was stale",
+    )
+    _inspection_expect(
+        _inspection_tree_snapshot(home) == before,
+        "remote inspection changed HOME",
+    )
+    if initialized:
+        inspection_subject.initialize_submodule(remote)
+        checkout = home / "example.test/team/repository"
+        _inspection_expect(
+            inspection_subject.git(checkout, ["rev-parse", "HEAD"]).stdout
+            == inspection_subject.git(source, ["rev-parse", "HEAD"]).stdout,
+            "inspection interfered with native submodule add",
+        )
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_remote_inspection_cleans_temporary_checkout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    malformed: bool,
+) -> None:
+    """Remove temporary clones after successful inspection and parser errors."""
+    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    if malformed:
+        (source / "packages/example/main.py").write_text("def invalid(")
+        inspection_subject.git(source, ["add", "."])
+        inspection_subject.git(source, ["commit", "--quiet", "-m", "malformed source"])
+        with (
+            pytest.raises(
+                inspection_subject.CommandError,
+                match="could not parse Python source",
+            ),
+            inspection_subject.inspection_remote_repository(remote) as checkout,
+        ):
+            inspection_subject.inspect_repository(checkout)
+    else:
+        with inspection_subject.inspection_remote_repository(remote) as checkout:
+            _inspection_expect(
+                inspection_subject.inspect_repository(checkout)
+                == inspection_subject.inspect_repository(source),
+                "wrong temporary checkout contents",
+            )
+    _inspection_expect(not checkout.exists(), "temporary checkout survived inspection")
+    _inspection_expect(not list(home.iterdir()), "temporary inspection changed HOME")
+
+
+def test_local_path_and_remote_url_inspect_the_requested_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Keep local dirty content visible only when explicitly inspecting its path."""
+    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    inspection_subject.initialize_home()
+    inspection_subject.initialize_submodule(remote)
+    checkout = home / "example.test/team/repository"
+    (checkout / "hosts/local").mkdir(parents=True)
+    (checkout / "hosts/local/configuration.nix").touch()
+    inspection_subject.git(
+        checkout,
+        ["remote", "set-url", "origin", "https://fork.test/team/repository"],
+    )
+    before = _inspection_tree_snapshot(home)
+    _inspection_expect(
+        _inspection_inspect_target(str(checkout))
+        == inspection_subject.inspect_repository(checkout),
+        "explicit local inspection ignored local content",
+    )
+    _inspection_expect(
+        _inspection_inspect_target(remote)
+        == inspection_subject.inspect_repository(source),
+        "remote URL inspected a local fork or untracked files",
+    )
+    _inspection_expect(
+        _inspection_tree_snapshot(home) == before,
+        "inspection changed local Git state",
+    )
+
+
+@pytest.mark.parametrize("state", ["checkout", "deinitialized", "cache", "placeholder"])
+def test_remote_inspection_ignores_existing_home_storage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    state: str,
+) -> None:
+    """Leave existing worktrees, retained Git data, and unrelated paths untouched."""
+    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    inspection_subject.initialize_home()
+    relative = Path("example.test/team/repository")
+    checkout = home / relative
+    if state == "cache":
+        modules = Path(
+            inspection_subject.git(
+                home,
+                ["rev-parse", "--path-format=absolute", "--git-path", "modules"],
+            ).stdout.strip(),
+        )
+        storage = modules / relative
+        storage.parent.mkdir(parents=True)
+        inspection_subject.git(
+            home,
+            ["clone", "--bare", "--", str(source), str(storage)],
+        )
+    elif state == "placeholder":
+        checkout.mkdir(parents=True)
+        (checkout / "personal-data").write_bytes(b"preserve data\\x00\\xff")
+    else:
+        inspection_subject.initialize_submodule(remote)
+        if state == "deinitialized":
+            inspection_subject.git(
+                home,
+                ["submodule", "deinit", "--force", "--", str(relative)],
+            )
+        else:
+            inspection_subject.git(checkout, ["remote", "remove", "origin"])
+            (checkout / "LICENSE").write_text("local changes")
+    _inspection_advance_remote(source)
+    before = _inspection_tree_snapshot(home)
+    _inspection_expect(
+        _inspection_inspect_target(remote)
+        == inspection_subject.inspect_repository(source),
+        "local state affected remote inspection",
+    )
+    _inspection_expect(
+        _inspection_tree_snapshot(home) == before,
+        "inspection changed existing Git storage",
+    )
+
+
+def test_remote_inspection_accepts_native_file_urls(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Let Git handle transports without imposing hosted repository conventions."""
+    home, source, _remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    _inspection_expect(
+        _inspection_inspect_target(source.as_uri())
+        == inspection_subject.inspect_repository(source),
+        "native file URL was rejected",
+    )
+    _inspection_expect(not list(home.iterdir()), "file URL inspection changed HOME")
+
+
+@pytest.mark.parametrize("remote_kind", ["missing", "unsupported", "invalid"])
+def test_remote_inspection_preserves_native_clone_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    remote_kind: str,
+) -> None:
+    """Compare failed remote inspection with Git's exit status and diagnostics."""
+    home, _source, _remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    remote = {
+        "missing": (tmp_path / "missing.git").as_uri(),
+        "unsupported": "unsupported://example.test/team/repository",
+        "invalid": "https://",
+    }[remote_kind]
+    scratch = tmp_path / "temporary"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    native_checkout = tmp_path / "native-checkout"
+    expected = subprocess.run(  # noqa: S603
+        ["git", "clone", "--", remote, str(native_checkout)],  # noqa: S607
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    actual = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", remote],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+    actual_error = re.sub(
+        re.escape(str(scratch)) + r"/afairesi-inspect-[^/]+/repository",
+        "<CHECKOUT>",
+        actual.stderr,
+    )
+    _inspection_expect(
+        (actual.returncode, actual.stdout, actual_error)
+        == (
+            expected.returncode,
+            expected.stdout,
+            expected.stderr.replace(str(native_checkout), "<CHECKOUT>"),
+        ),
+        f"native clone error changed: {expected.stderr!r}, {actual.stderr!r}",
+    )
+    _inspection_expect(not list(scratch.iterdir()), "failed clone left temporary files")
+    _inspection_expect(not list(home.iterdir()), "failed clone changed HOME")
+
+
+def test_inspection_discovers_the_merged_repository_commands() -> None:
+    """Inventory the public nested campaign CLI while excluding formatter internals."""
+    subject = import_module("packages.afairesi.main")
+    report = subject.ArgumentDiscovery(
+        ast.parse(Path(__file__).with_name("main.py").read_bytes()),
+    ).report()
+    _expect(set(report["commands"]) == {"repo", "home"}, report)
+    commands = report["commands"]["repo"]["commands"]
+    _expect({"inspect", "test"} <= commands.keys(), commands)
+    campaigns = commands["test"]["commands"]
+    _expect(
+        set(campaigns) == {"coverage", "hypothesis", "mutation", "performance"},
+        campaigns,
+    )
+    _expect(not report["warnings"], report["warnings"])
+    _expect(not report["arguments"], report["arguments"])

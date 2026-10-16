@@ -5,10 +5,6 @@
 !/.gitignore
 !/LICENSE
 !/checks/
-!/checks/afairesi-repo-inspect/
-!/checks/afairesi-repo-inspect/default.nix
-!/checks/afairesi-repo-test/
-!/checks/afairesi-repo-test/default.nix
 !/checks/afairesi/
 !/checks/afairesi/default.nix
 !/checks/nix_alphabetize/
@@ -25,14 +21,6 @@
 !/flake.nix
 !/formatter.nix
 !/packages/
-!/packages/afairesi-repo-inspect/
-!/packages/afairesi-repo-inspect/default.nix
-!/packages/afairesi-repo-inspect/main.py
-!/packages/afairesi-repo-inspect/test_main.py
-!/packages/afairesi-repo-test/
-!/packages/afairesi-repo-test/default.nix
-!/packages/afairesi-repo-test/main.py
-!/packages/afairesi-repo-test/test_main.py
 !/packages/afairesi/
 !/packages/afairesi/default.nix
 !/packages/afairesi/main.py
