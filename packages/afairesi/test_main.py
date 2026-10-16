@@ -887,12 +887,11 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
             "rename lost runtime data",
         )
         subject = import_module("packages.afairesi.main")
-        package = next(
-            item for item in subject.detect_packages(root) if item.name == "new"
-        )
+        _packages, issues = subject.inspect_structure(root)
+        issues = [issue for issue in issues if issue.startswith("packages/new/")]
         _expect(
-            not subject._python_source_issues(package),  # noqa: SLF001
-            "renamed runtime path is invalid",
+            not issues,
+            issues,
         )
 
 
@@ -1223,7 +1222,7 @@ def test_convergence_respects_excluded_trees() -> None:
 @example(kind="html", name="web-site", description="Δ report", library=False)
 @example(kind="latex", name="document", description="LaTeX\tresources", library=False)
 @example(kind="nix", name="my-package", description="é", library=False)
-def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(  # noqa: PLR0915
+def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(
     kind: str,
     name: str,
     description: str,
@@ -1317,116 +1316,146 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
         )
         output = Path(built.stdout.strip())
         if kind == "python":
-            _check_launcher_environment(root, name, environment, library=library)
-            module = name.replace("-", "_")
-            version = f"{sys.version_info.major}.{sys.version_info.minor}"
-            installed = output / f"lib/python{version}/site-packages"
-            _expect(
-                (installed / module / "prm/asset.bin").read_bytes()
-                == asset.read_bytes(),
-                "Python installation lost assets",
+            _check_installed_python_template(
+                package,
+                output,
+                environment,
+                actual,
+                library=library,
             )
-            environment["PYTHONPATH"] = (
-                str(installed) + os.pathsep + environment.get("PYTHONPATH", "")
-            )
-            if library:
-                _expect(
-                    "mainProgram" not in actual["meta"]
-                    and not (output / "bin").exists(),
-                    actual,
-                )
-                imported = _run(
-                    root,
-                    "-c",
-                    f"import {module}; print({module}.VALUE)",
-                    executable=sys.executable,
-                    environment=environment,
-                )
-                _expect(imported.stdout == "1\n", imported)
-                (package / "main.py").write_text(
-                    (
-                        "import argparse\n"
-                        "def main():\n"
-                        "    argparse.ArgumentParser().parse_args()\n"
-                    ),
-                )
-                _repair_flake(root)
-                restored = _evaluated_template(root, name, environment)
-                _expect(restored["meta"]["mainProgram"] == name, restored)
-            else:
-                _expect(
-                    actual["meta"]["mainProgram"] == name
-                    and (output / "bin" / name).is_file(),
-                    actual,
-                )
-                _expect(
-                    "--help"
-                    in _run(
-                        root,
-                        "--help",
-                        executable=str(output / "bin" / name),
-                        environment=environment,
-                    ).stdout,
-                    "installed help",
-                )
-                _run(
-                    root,
-                    "unexpected",
-                    executable=str(output / "bin" / name),
-                    environment=environment,
-                    code=2,
-                )
         else:
-            _expect(actual["dependencies"] == ["git", "curl", "server"], actual)
-            tools = root / "tmp/tools"
-            tools.mkdir(parents=True)
-            server = tools / "http-server"
-            server.write_text(
-                f"#!{sys.executable}\n"
-                "import json, sys\nprint(json.dumps(sys.argv[1:]))\n",
-            )
-            server.chmod(0o755)
-            environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
-            cases = (
-                ("", "", (), ()),
-                (":0", "", (), ("-o", "/")),
-                ("", "wayland-0", (), ("-o", "/")),
-                (":0", "wayland-0", ("--no-open",), ()),
-                ("", "", ("--no-open",), ()),
-                (":0", "", ("-o", "/prm/example.html"), ("-o", "/prm/example.html")),
-                ("", "", ("-o", "/"), ("-o", "/")),
-                (":0", "", ("--no-o",), ("--no-o",)),
-                (
-                    ":0",
-                    "",
-                    ("--no-open", "-p", "8761", "two words"),
-                    ("-p", "8761", "two words"),
-                ),
-                (":0", "", ("--o=/prm/example.html",), ("--o=/prm/example.html",)),
-            )
-            for display, wayland, arguments, expected in cases:
-                environment.update(DISPLAY=display, WAYLAND_DISPLAY=wayland)
-                result = _run(
-                    root,
-                    *arguments,
-                    executable=str(output / "bin" / name.replace("-", "_")),
-                    environment=environment,
-                )
-                site, *options = json.loads(result.stdout)
-                _expect(options == list(expected), result)
-                _expect(
-                    (Path(site) / "prm/asset.bin").read_bytes() == asset.read_bytes(),
-                    site,
-                )
-                _expect(
-                    (Path(site) / "prm/copied.bin").read_bytes() == b"copied resource",
-                    site,
-                )
-                _expect(
-                    (Path(site) / "script.js").is_file()
-                    and (Path(site) / "style.css").is_file(),
-                    site,
-                )
+            _check_installed_html_template(package, output, environment, actual)
+
+
+def _check_installed_python_template(
+    package: Path,
+    output: Path,
+    environment: dict[str, str],
+    actual: dict[str, Any],
+    *,
+    library: bool,
+) -> None:
+    """Check installed assets, imports, and executable behavior."""
+    root = package.parent.parent
+    name = package.name
+    asset = package / "prm/asset.bin"
+    _check_launcher_environment(root, name, environment, library=library)
+    module = name.replace("-", "_")
+    version = f"{sys.version_info.major}.{sys.version_info.minor}"
+    installed = output / f"lib/python{version}/site-packages"
+    _expect(
+        (installed / module / "prm/asset.bin").read_bytes() == asset.read_bytes(),
+        "Python installation lost assets",
+    )
+    environment["PYTHONPATH"] = (
+        str(installed) + os.pathsep + environment.get("PYTHONPATH", "")
+    )
+    if library:
+        _expect(
+            "mainProgram" not in actual["meta"] and not (output / "bin").exists(),
+            actual,
+        )
+        imported = _run(
+            root,
+            "-c",
+            f"import {module}; print({module}.VALUE)",
+            executable=sys.executable,
+            environment=environment,
+        )
+        _expect(imported.stdout == "1\n", imported)
+        (package / "main.py").write_text(
+            (
+                "import argparse\n"
+                "def main():\n"
+                "    argparse.ArgumentParser().parse_args()\n"
+            ),
+        )
+        _repair_flake(root)
+        restored = _evaluated_template(root, name, environment)
+        _expect(restored["meta"]["mainProgram"] == name, restored)
+    else:
+        _expect(
+            actual["meta"]["mainProgram"] == name and (output / "bin" / name).is_file(),
+            actual,
+        )
+        _expect(
+            "--help"
+            in _run(
+                root,
+                "--help",
+                executable=str(output / "bin" / name),
+                environment=environment,
+            ).stdout,
+            "installed help",
+        )
+        _run(
+            root,
+            "unexpected",
+            executable=str(output / "bin" / name),
+            environment=environment,
+            code=2,
+        )
+
+
+def _check_installed_html_template(
+    package: Path,
+    output: Path,
+    environment: dict[str, str],
+    actual: dict[str, Any],
+) -> None:
+    """Check browser options and resources through the installed launcher."""
+    root = package.parent.parent
+    name = package.name
+    asset = package / "prm/asset.bin"
+    _expect(actual["dependencies"] == ["git", "curl", "server"], actual)
+    tools = root / "tmp/tools"
+    tools.mkdir(parents=True)
+    server = tools / "http-server"
+    server.write_text(
+        f"#!{sys.executable}\nimport json, sys\nprint(json.dumps(sys.argv[1:]))\n",
+    )
+    server.chmod(0o755)
+    environment["PATH"] = str(tools) + os.pathsep + environment["PATH"]
+    cases = (
+        ("", "", (), ()),
+        (":0", "", (), ("-o", "/")),
+        ("", "wayland-0", (), ("-o", "/")),
+        (":0", "wayland-0", ("--no-open",), ()),
+        ("", "", ("--no-open",), ()),
+        (":0", "", ("-o", "/prm/example.html"), ("-o", "/prm/example.html")),
+        ("", "", ("-o", "/"), ("-o", "/")),
+        (":0", "", ("--no-o",), ("--no-o",)),
+        (
+            ":0",
+            "",
+            ("--no-open", "-p", "8761", "two words"),
+            ("-p", "8761", "two words"),
+        ),
+        (":0", "", ("--o=/prm/example.html",), ("--o=/prm/example.html",)),
+    )
+    for display, wayland, arguments, expected in cases:
+        environment.update(DISPLAY=display, WAYLAND_DISPLAY=wayland)
+        result = _run(
+            root,
+            *arguments,
+            executable=str(output / "bin" / name.replace("-", "_")),
+            environment=environment,
+        )
+        site, *options = json.loads(result.stdout)
+        _expect(options == list(expected), result)
+        _expect(
+            (Path(site) / "prm/asset.bin").read_bytes() == asset.read_bytes(),
+            site,
+        )
+        _expect(
+            (Path(site) / "prm/copied.bin").read_bytes() == b"copied resource",
+            site,
+        )
+        _expect(
+            (Path(site) / "script.js").is_file()
+            and (Path(site) / "style.css").is_file(),
+            site,
+        )
 
 
 @pytest.mark.parametrize(
@@ -1501,6 +1530,22 @@ def test_rejected_operations_preserve_contents_modes_index_and_refs(
         _expect(bool(rejected.stderr) and _snapshot(root) == before, rejected)
 
 
+def _stage_resource_edits(
+    root: Path,
+    tracked: list[str],
+) -> tuple[dict[str, bytes], dict[str, bytes]]:
+    """Create distinct indexed and working versions for rename checks."""
+    staged, working = {}, {}
+    for relative in tracked:
+        path = root / relative
+        staged[relative] = path.read_bytes() + b"\n"
+        working[relative] = staged[relative] + b"\n"
+        path.write_bytes(staged[relative])
+        _git(root, "add", "--", relative)
+        path.write_bytes(working[relative])
+    return staged, working
+
+
 @settings(deadline=None)
 @given(
     kind=st.sampled_from(("python", "html", "latex", "nix", "host", "untracked")),
@@ -1513,7 +1558,7 @@ def test_rejected_operations_preserve_contents_modes_index_and_refs(
 @example(kind="nix", name="value", payload=b"Nix")
 @example(kind="host", name="laptop", payload=b"host")
 @example(kind="untracked", name="untracked", payload=b"untracked")
-def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR0915
+def test_resource_lifecycle_preserves_files_checks_and_git_state(
     kind: str,
     name: str,
     payload: bytes,
@@ -1556,14 +1601,7 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(  # noqa: PLR09
         expected_check = kind in {"host", "python"}
         _expect((root / check / "default.nix").is_file() == expected_check, check)
         tracked = _git(root, "ls-files", "--", original, check).splitlines()
-        staged, working = {}, {}
-        for relative in tracked:
-            path = root / relative
-            staged[relative] = path.read_bytes() + b"\n"
-            working[relative] = staged[relative] + b"\n"
-            path.write_bytes(staged[relative])
-            _git(root, "add", "--", relative)
-            path.write_bytes(working[relative])
+        staged, working = _stage_resource_edits(root, tracked)
         untracked = package / "prm/untracked.bin"
         untracked.write_bytes(payload)
         if kind == "untracked":

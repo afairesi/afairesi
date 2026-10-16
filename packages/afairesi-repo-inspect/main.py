@@ -140,7 +140,7 @@ class ArgumentDiscovery:
             return f"{self._qualified(node.value)}.{node.attr}"
         return ""
 
-    def _resolve(  # noqa: PLR0911
+    def _resolve(
         self,
         scope: str,
         node: ast.expr,
@@ -160,6 +160,14 @@ class ArgumentDiscovery:
             )
         if not isinstance(node, ast.Call):
             return set()
+        return self._resolve_call(scope, node, seen)
+
+    def _resolve_call(
+        self,
+        scope: str,
+        node: ast.Call,
+        seen: frozenset[tuple[str, int]],
+    ) -> set[tuple[str, ...]]:
         if self._qualified(node.func) == "argparse.ArgumentParser":
             return {()}
         if isinstance(node.func, ast.Name):

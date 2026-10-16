@@ -14,6 +14,7 @@ from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING
+from unittest.mock import DEFAULT, Mock
 
 import coverage
 import pytest
@@ -22,7 +23,6 @@ from hypothesis import strategies as st
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from typing import Any
 import afairesi
 
 
@@ -477,7 +477,7 @@ def test_campaigns_route_targets_and_forward_test_selection(
                     )
 
 
-def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  # noqa: C901, PLR0912
+def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
@@ -524,38 +524,45 @@ def test_cli_contracts_validate_help_interfaces_budgets_and_targets() -> None:  
         ):
             _run(root, "mutation", str(root), *arguments, code=2)
         _expect(not any(root.iterdir()), "invalid CLI request created state")
-    for layout in ("empty", "nonpython", "untested", "single_untested"):
-        with _fresh_repository() as root:
-            target = root
-            if layout == "nonpython":
-                _manage(root, "add", "packages/web", "html")
-            elif layout in {"untested", "single_untested"}:
-                target = _make_runner_target(root, "", "")
-                (target / "test_main.py").unlink()
-                if layout == "untested":
-                    target = root
-            before = _snapshot(root)
-            for command in ("hypothesis", "mutation"):
-                result = _run(
-                    root,
-                    command,
-                    str(target),
-                    code=0 if layout == "untested" else 1,
-                )
-                if layout == "untested":
-                    _expect(
-                        "Skipping example: no test_main.py" in result.stdout
-                        and "0 passed, 0 failed, 1 skipped" in result.stdout,
-                        result,
-                    )
-                elif layout != "single_untested":
-                    _expect("no Python packages found" in result.stderr, result)
-            if layout == "empty":
+
+
+@pytest.mark.parametrize(
+    "layout",
+    ["empty", "nonpython", "untested", "single_untested"],
+)
+def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> None:
+    """Skip untested repository packages and reject nonrunnable targets safely."""
+    with _fresh_repository() as root:
+        target = root
+        if layout == "nonpython":
+            _manage(root, "add", "packages/web", "html")
+        elif layout in {"untested", "single_untested"}:
+            target = _make_runner_target(root, "", "")
+            (target / "test_main.py").unlink()
+            if layout == "untested":
+                target = root
+        before = _snapshot(root)
+        for command in ("hypothesis", "mutation"):
+            result = _run(
+                root,
+                command,
+                str(target),
+                code=0 if layout == "untested" else 1,
+            )
+            if layout == "untested":
                 _expect(
-                    "no Python packages found" in _run(root, "coverage", code=1).stderr,
-                    "coverage",
+                    "Skipping example: no test_main.py" in result.stdout
+                    and "0 passed, 0 failed, 1 skipped" in result.stdout,
+                    result,
                 )
-            _expect(_snapshot(root) == before, "nonrunnable target created state")
+            elif layout != "single_untested":
+                _expect("no Python packages found" in result.stderr, result)
+        if layout == "empty":
+            _expect(
+                "no Python packages found" in _run(root, "coverage", code=1).stderr,
+                "coverage",
+            )
+        _expect(_snapshot(root) == before, "nonrunnable target created state")
 
 
 @pytest.mark.parametrize("failure", [None, "coverage", "hypothesis", "mutation"])
@@ -768,19 +775,22 @@ def test_coverage_rejects_missing_report_files(
     if missing == "tests":
         (report / "html").mkdir()
         (report / "html/index.html").touch()
-    original_run = subprocess.run
     builds: list[list[str]] = []
 
     def run(
         arguments: list[str],
-        **keywords: Any,  # noqa: ANN401 - forward subprocess's keyword arguments
-    ) -> subprocess.CompletedProcess[str]:
+        **_keywords: object,
+    ) -> object:
         if arguments[:2] == ["nix", "build"]:
             builds.append(arguments)
             return subprocess.CompletedProcess(arguments, 0, str(report) + "\n")
-        return original_run(arguments, **keywords)
+        return DEFAULT
 
-    monkeypatch.setattr(subject.subprocess, "run", run)
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        Mock(wraps=subprocess.run, side_effect=run),
+    )
     before = _snapshot(root)
     message = {
         "html": "no HTML report",
