@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import pstats
 import shutil
 import stat
 import subprocess
@@ -448,6 +449,7 @@ def test_campaigns_route_targets_and_forward_test_selection(
             ("coverage",),
             ("hypothesis",),
             ("mutation",),
+            ("performance",),
         ):
             targets = (
                 ((), root),
@@ -480,7 +482,7 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
-        commands = ((), ("coverage",), ("hypothesis",), ("mutation",))
+        commands = ((), ("coverage",), ("hypothesis",), ("mutation",), ("performance",))
         for path in commands:
             option = _run(root, *path, "--help").stdout
             _expect(
@@ -507,9 +509,9 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
             "not inside a Git repository" in _run(root, code=1).stderr,
             "bare test must require a repository",
         )
-        for command in ("coverage", "hypothesis", "mutation"):
+        for command in ("coverage", "hypothesis", "mutation", "performance"):
             _run(root, command, code=1)
-        for command in ("hypothesis", "mutation"):
+        for command in ("hypothesis", "mutation", "performance"):
             for timeout in ("nan", "inf", "-inf", "0", "-1"):
                 _run(root, command, str(root), f"--timeout={timeout}", code=2)
         _run(root, "hypothesis", str(root), "--max-examples", "0", code=2)
@@ -523,6 +525,63 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
         ):
             _run(root, "mutation", str(root), *arguments, code=2)
         _expect(not any(root.iterdir()), "invalid CLI request created state")
+
+
+@pytest.mark.parametrize("failing", [False, True])
+def test_performance_profiles_tests_and_cli_without_changing_sources(
+    failing: bool,  # noqa: FBT001
+) -> None:
+    """Retain readable parent and CLI profiles, even when selected tests fail."""
+    with TemporaryDirectory(prefix="afairesi-profile-") as directory:
+        root = Path(directory) / "source with spaces"
+        source = (
+            "import sys\n"
+            "def work():\n"
+            "    return sum(range(10000))\n"
+            "def main():\n"
+            "    work()\n"
+            "    print(sys.argv[1])\n"
+        )
+        tests = (
+            "import os, subprocess\n"
+            "from pathlib import Path\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "def test_cli():\n"
+            "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE'], "
+            "'hello world'], capture_output=True, text=True)\n"
+            "    assert result.returncode == 0, result.stderr\n"
+            "    assert result.stdout == 'hello world\\n'\n"
+            f"    assert {not failing!r}\n"
+            "@given(st.integers())\n"
+            "@example(7)\n"
+            "def test_explicit(value):\n"
+            "    with Path('examples').open('a') as output:\n"
+            "        output.write(str(value) + '\\n')\n"
+            "def test_unselected():\n"
+            "    raise AssertionError('selection ignored')\n"
+        )
+        environment = _prepare_runner_flake(root, tests, source)
+        result = _campaign(
+            root,
+            environment,
+            "performance",
+            "-k",
+            "cli or explicit",
+        )
+        _expect(result.returncode == int(failing), result)
+        output = result.stdout + result.stderr
+        _expect("slowest" in output and "test_cli" in output, result)
+        (workspace,) = (root / "tmp").glob("python-performance-example-*")
+        _expect((workspace / "examples").read_text() == "7\n", workspace)
+        profiles = workspace / "profiles"
+        _expect(str(profiles) in result.stdout, result)
+        for script, function in (("run-tests", "test_cli"), ("package-entry", "work")):
+            (report,) = profiles.glob(f"{script}-*.prof")
+            stats = pstats.Stats(str(report))
+            functions = stats.get_stats_profile().func_profiles
+            _expect(function in functions, functions)
+            text = report.with_suffix(".txt").read_text()
+            _expect("cumulative time" in text and "internal time" in text, text)
 
 
 @pytest.mark.parametrize(

@@ -45,7 +45,7 @@ in
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
-  meta.description = "Run coverage, property tests, and mutation tests for Afairesi packages";
+  meta.description = "Run test campaigns and profile existing tests for Afairesi packages";
   passthru.checkInputs = [ python.pkgs.coverage ];
   propagatedBuildInputs = [
     cosmicRay

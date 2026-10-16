@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Run coverage, property tests, and mutation tests for Afairesi packages."""
+"""Run test campaigns and profile existing tests for Afairesi packages."""
 
 from __future__ import annotations
 
@@ -201,13 +201,14 @@ def _test_report_source() -> str:
     return afairesi.python_test_support_source()
 
 
-def _prepare_package_tests(
+def _prepare_package_tests(  # noqa: PLR0913
     workspace: Path,
     name: str,
     environment: TestEnvironment,
     max_examples: int | None = None,
     *,
     selection: TestSelection | None = None,
+    performance: bool = False,
 ) -> list[str]:
     """Run pytest and package executables against the same isolated source copy."""
     selection = selection or TestSelection()
@@ -256,6 +257,8 @@ def _prepare_package_tests(
         pytest_arguments.extend(
             ["--hypothesis-show-statistics"],
         )
+    if performance:
+        pytest_arguments.extend(["--durations=20", "--durations-min=0"])
     pytest_arguments.extend(
         ["--import-mode=importlib", "-q", f"packages/{name}/test_main.py"],
     )
@@ -296,7 +299,54 @@ def _prepare_package_tests(
         "    runtime.cleanup()\n",
         encoding="utf-8",
     )
+    if performance:
+        return _prepare_test_profiling(workspace, environment, launcher, bootstrap)
     return [environment.python, "-B", str(bootstrap)]
+
+
+def _prepare_test_profiling(
+    workspace: Path,
+    environment: TestEnvironment,
+    launcher: Path,
+    bootstrap: Path,
+) -> list[str]:
+    """Profile pytest and the isolated package launcher in separate processes."""
+    reports = workspace / "profiles"
+    reports.mkdir()
+    wrapper = workspace / "profile-script.py"
+    wrapper.write_text(
+        "import cProfile, os, pstats, runpy, sys\n"
+        "from pathlib import Path\n"
+        "sys.argv.pop(0)\n"
+        f"reports = Path({str(reports)!r})\n"
+        "report = reports / (Path(sys.argv[0]).stem + '-' + str(os.getpid()))\n"
+        "profiler = cProfile.Profile()\n"
+        "try:\n"
+        "    profiler.runcall(runpy.run_path, sys.argv[0], run_name='__main__')\n"
+        "finally:\n"
+        "    profiler.dump_stats(str(report.with_suffix('.prof')))\n"
+        "    with report.with_suffix('.txt').open('w') as output:\n"
+        "        stats = pstats.Stats(profiler, stream=output)\n"
+        "        stats.sort_stats('cumulative').print_stats(40)\n"
+        "        stats.sort_stats('time').print_stats(40)\n",
+        encoding="utf-8",
+    )
+    launcher.write_text(
+        "#!/bin/sh\nexec "
+        + shlex.join(
+            [
+                environment.python,
+                "-B",
+                str(wrapper),
+                str(workspace / "package-entry.py"),
+            ],
+        )
+        + ' "$@"\n',
+        encoding="utf-8",
+    )
+    sys.stdout.write(f"Function profiles (.prof) and text reports: {reports}\n")
+    sys.stdout.flush()
+    return [environment.python, "-B", str(wrapper), str(bootstrap)]
 
 
 def _mutation_id(mutations: list[dict[str, Any]]) -> str:
@@ -553,11 +603,11 @@ def _run_test_package(
     workspace = Path(
         tempfile.mkdtemp(prefix=f"python-{command}-{package.name}-", dir=tmp),
     )
-    label = (
-        "Mutation workspace and reports"
-        if command == "mutation"
-        else "Hypothesis workspace and logs"
-    )
+    label = {
+        "mutation": "Mutation workspace and reports",
+        "hypothesis": "Hypothesis workspace and logs",
+        "performance": "Performance workspace and reports",
+    }[command]
     sys.stdout.write(f"{label}: {workspace}\n")
     sys.stdout.flush()
     _copy_test_sources(root, workspace)
@@ -579,6 +629,7 @@ def _run_test_package(
         environment,
         max_examples,
         selection=selection,
+        performance=command == "performance",
     )
     log = workspace / "tests.log"
     try:
@@ -818,12 +869,53 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="afairesi-repo-test",
         description=(
-            "Run coverage, property tests, and mutation tests. "
-            "Default: all three in the current flake."
+            "Run coverage, property tests, mutation tests, or performance profiling. "
+            "Default: coverage, hypothesis, and mutation in the current flake."
         ),
     )
     result.set_defaults(test_command=None, target=None)
     commands = result.add_subparsers(dest="test_command", metavar="COMMAND")
+    performance = commands.add_parser(
+        "performance",
+        help="profile existing tests and package CLI calls",
+        description=(
+            "Profile explicit test examples with cProfile and show slow test phases. "
+            "Save separate function profiles for pytest and package CLI processes."
+        ),
+        epilog=(
+            "Reports: flake tmp/. Timings include profiler overhead. Profiles cover "
+            "each process's main Python thread; external executables and arbitrary "
+            "Python subprocesses are not profiled. Skips packages without tests."
+        ),
+    )
+    performance.add_argument(
+        "target",
+        type=Path,
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help=(
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
+        ),
+    )
+    performance.add_argument(
+        "--timeout",
+        type=float,
+        help="seconds per test run, excluding build (default: unlimited)",
+    )
+    performance.add_argument(
+        "-k",
+        dest="keywords",
+        default="",
+        help="pytest keyword expression",
+    )
+    performance.add_argument(
+        "-m",
+        dest="markers",
+        default="",
+        help="pytest marker expression",
+    )
     coverage = commands.add_parser(
         "coverage",
         help="measure coverage and print report paths",
