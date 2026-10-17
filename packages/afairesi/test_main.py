@@ -22,6 +22,9 @@ from unittest.mock import DEFAULT, Mock
 
 import coverage
 import pytest
+from cosmic_ray.work_db import WorkDB, use_db
+from cosmic_ray.work_item import TestOutcome as MutationTestOutcome
+from cosmic_ray.work_item import WorkerOutcome, WorkItem, WorkResult
 from hypothesis import example, given, settings
 from hypothesis import strategies as st
 
@@ -4418,8 +4421,6 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
             (root / "packages/example/main.py").read_text() == source,
             root,
         )
-        (bytecode,) = (workspace / "packages/example/__pycache__").glob("main.*.pyc")
-        _campaign_expect(bytecode.is_file(), workspace)
         for script, function in (("run-tests", "test_cli"), ("package-entry", "work")):
             reports = list(profiles.glob(f"{script}-*.prof"))
             _campaign_expect(
@@ -5060,6 +5061,52 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
         )
 
 
+@pytest.mark.parametrize(
+    ("command", "override"),
+    [("property", None), ("property", 2), ("performance", None)],
+)
+def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
+    command: str,
+    override: int | None,
+) -> None:
+    """Respect package plugins, pytest options, and the active example budget."""
+    with TemporaryDirectory(prefix="afairesi-native-pytest-") as directory:
+        root = Path(directory) / "source"
+        tests = (
+            "from datetime import timedelta\n"
+            "from pathlib import Path\n"
+            "from hypothesis import given, settings, strategies as st\n"
+            "@given(st.integers())\n"
+            "def test_property(value):\n"
+            "    assert settings.default.deadline == timedelta(milliseconds=1234)\n"
+            f"    assert settings.default.max_examples == {override or 3}\n"
+            "    with Path('examples').open('a') as output:\n"
+            "        output.write(str(value) + '\\n')\n"
+        )
+        environment = _campaign_prepare_runner_flake(root, tests)
+        plugin = root / "packages/example/prm/native_plugin.py"
+        plugin.parent.mkdir()
+        plugin.write_text(
+            "from hypothesis import settings\n"
+            "settings.register_profile('package', max_examples=3, deadline=1234)\n"
+            "settings.load_profile('package')\n"
+            "def pytest_addoption(parser):\n"
+            "    parser.addoption('--native-option', action='store_true')\n"
+            "def pytest_configure(config):\n"
+            "    assert config.getoption('--native-option')\n",
+        )
+        environment["PYTEST_PLUGINS"] = "packages.example.prm.native_plugin"
+        environment["PYTEST_ADDOPTS"] = "--native-option"
+        arguments = ["--max-examples", str(override)] if override is not None else []
+        result = _campaign_campaign(root, environment, command, *arguments)
+        _campaign_expect(result.returncode == 0, result)
+        (workspace,) = (root / "tmp").glob(f"python-{command}-example-*")
+        _campaign_expect(
+            len((workspace / "examples").read_text().splitlines()) == (override or 3),
+            workspace,
+        )
+
+
 def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
     """Check fixed baseline failures once, independently of generated values."""
     with TemporaryDirectory(prefix="afairesi-baselines-") as directory:
@@ -5106,8 +5153,8 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
             )
 
 
-def test_mutation_campaigns_report_empty_plans() -> None:
-    """Accept an empty mutation plan when the baseline suite passes."""
+def test_mutation_campaigns_report_empty_sessions() -> None:
+    """Accept an empty native session when the baseline suite passes."""
     with TemporaryDirectory(prefix="afairesi-empty-mutations-") as directory:
         root = Path(directory) / "source"
         tests = (
@@ -5121,11 +5168,11 @@ def test_mutation_campaigns_report_empty_plans() -> None:
         environment = _campaign_prepare_runner_flake(root, tests, "")
         result = _campaign_campaign(root, environment, "mutation")
         (workspace,) = (root / "tmp").glob("python-mutation-example-*")
-        _campaign_expect(
-            not result.returncode
-            and not (workspace / "results.jsonl").read_text().strip(),
-            result,
-        )
+        with use_db(workspace / "session.sqlite", WorkDB.Mode.open) as database:
+            _campaign_expect(
+                not result.returncode and database.num_work_items == 0,
+                result,
+            )
 
 
 @pytest.mark.parametrize(
@@ -5139,25 +5186,27 @@ def test_mutation_runs_preserve_engine_failure_status(
     """Check mixed results without running another mutation campaign."""
     campaign_subject = import_module("packages.afairesi.main")
     outcomes = ["killed", "survived", *([problem] if problem is not None else [])]
-    records = []
-    for outcome in outcomes:
-        result = (
-            None
-            if outcome == "pending"
-            else {
-                "worker_outcome": "exception"
-                if outcome == "error"
-                else "skipped"
-                if outcome == "skipped"
-                else "normal",
-                "test_outcome": outcome
-                if outcome in {"killed", "survived", "incompetent"}
-                else "killed",
-                "output": "timeout" if outcome == "timeout" else "native pytest output",
-            }
-        )
-        records.append(json.dumps([{}, result]))
-    (tmp_path / "results.jsonl").write_text("\n".join(records) + "\n")
+    with use_db(tmp_path / "session.sqlite", WorkDB.Mode.create) as database:
+        for outcome in outcomes:
+            database.add_work_item(WorkItem(outcome, ()))
+            if outcome == "pending":
+                continue
+            database.set_result(
+                outcome,
+                WorkResult(
+                    worker_outcome=WorkerOutcome.EXCEPTION
+                    if outcome == "error"
+                    else WorkerOutcome.SKIPPED
+                    if outcome == "skipped"
+                    else WorkerOutcome.NORMAL,
+                    test_outcome=MutationTestOutcome(outcome)
+                    if outcome in {"killed", "survived", "incompetent"}
+                    else MutationTestOutcome.KILLED,
+                    output="timeout"
+                    if outcome == "timeout"
+                    else "native pytest output",
+                ),
+            )
     succeeded = campaign_subject._mutation_run_succeeded(tmp_path)  # noqa: SLF001 - Check engine status without running mutations.
     _campaign_expect(
         succeeded == (problem not in {"error", "pending", "incompetent"}),
@@ -5168,10 +5217,10 @@ def test_mutation_runs_preserve_engine_failure_status(
 @settings(deadline=None)
 @given(value=st.integers(min_value=1, max_value=9))
 @example(value=1)
-def test_mutation_campaigns_report_outcomes_and_replay_plans(
+def test_mutation_campaigns_report_outcomes_and_filter_mutations(
     value: int,
 ) -> None:
-    """Report killed/surviving mutations and replay plans across generated values."""
+    """Report killed/surviving mutations with native session filters."""
     with TemporaryDirectory(prefix="afairesi-mutations-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
@@ -5228,21 +5277,16 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
             (focused_workspace / "report.html").stat().st_size > 0,
             focused,
         )
-        plan_path = focused_workspace / "mutation-plan.json"
-        plan = json.loads(plan_path.read_text())
-        defects = [
-            json.loads(line)
-            for line in (focused_workspace / "results.jsonl").read_text().splitlines()
-        ]
-        selected = [
-            (item, result)
-            for item, result in defects
-            if result["worker_outcome"] != "skipped"
-        ]
+        with use_db(focused_workspace / "session.sqlite", WorkDB.Mode.open) as database:
+            selected = [
+                (item, result)
+                for item, result in database.completed_work_items
+                if result.worker_outcome != WorkerOutcome.SKIPPED
+            ]
         _campaign_expect(
-            len(plan["mutations"]) == len(selected) == 1
-            and selected[0][1]["test_outcome"] == "killed"
-            and selected[0][0]["mutations"][0]["start_pos"][0] == target_line,
+            len(selected) == 1
+            and selected[0][1].test_outcome == MutationTestOutcome.KILLED
+            and selected[0][0].mutations[0].start_pos[0] == target_line,
             selected,
         )
         existing_workspaces = set((root / "tmp").iterdir())
@@ -5254,48 +5298,28 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
             "10",
             "-k",
             "process_success",
-            "--mutation-plan",
-            str(plan_path),
+            "--lines",
+            str(target_line),
+            "--operator",
+            "NumberReplacer",
+            "--max-mutations",
+            "1",
             cwd=root / "packages/git-example",
         )
         _campaign_expect(not weaker.returncode, weaker)
         (weaker_workspace,) = set((root / "tmp").iterdir()) - existing_workspaces
-        weaker_defects = [
-            json.loads(line)
-            for line in (weaker_workspace / "results.jsonl").read_text().splitlines()
-        ]
-        weaker_selected = [
-            (item, result)
-            for item, result in weaker_defects
-            if result["worker_outcome"] != "skipped"
-        ]
+        with use_db(weaker_workspace / "session.sqlite", WorkDB.Mode.open) as database:
+            weaker_selected = [
+                (item, result)
+                for item, result in database.completed_work_items
+                if result.worker_outcome != WorkerOutcome.SKIPPED
+            ]
         _campaign_expect(
             len(weaker_selected) == 1
-            and weaker_selected[0][0]["mutations"] == selected[0][0]["mutations"]
-            and weaker_selected[0][1]["test_outcome"] == "survived",
+            and weaker_selected[0][0].mutations[0].start_pos[0] == target_line
+            and "NumberReplacer" in weaker_selected[0][0].mutations[0].operator_name
+            and weaker_selected[0][1].test_outcome == MutationTestOutcome.SURVIVED,
             weaker_selected,
-        )
-        campaign_subject = import_module("packages.afairesi.main")
-        package_source = weaker_workspace / "packages/git-example/main.py"
-        package_source.write_text(
-            source.replace(f"return {value}\n", f"return {value + 10}\n"),
-        )
-        with pytest.raises(campaign_subject.CommandError, match="does not match"):
-            campaign_subject._select_mutations(  # noqa: SLF001 - Check validation without rerunning a campaign.
-                weaker_workspace,
-                "git-example",
-                campaign_subject.TestSelection(mutation_plan=plan_path),
-            )
-        campaign_subject._select_mutations(  # noqa: SLF001 - Check unfiltered selection without executing every mutant.
-            focused_workspace,
-            "git-example",
-            campaign_subject.TestSelection(),
-        )
-        unfiltered = json.loads(plan_path.read_text())
-        _campaign_expect(
-            len(unfiltered["mutations"]) == len(defects)
-            and len(unfiltered["mutations"]) > 1,
-            unfiltered,
         )
 
 

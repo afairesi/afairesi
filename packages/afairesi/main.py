@@ -7,7 +7,6 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
-import hashlib
 import json
 import keyword
 import math
@@ -2529,14 +2528,13 @@ def _build_test_environment(root: Path, name: str, workspace: Path) -> TestEnvir
 
 @dataclass(frozen=True)
 class TestSelection:
-    """Select pytest cases and a reproducible subset of source mutations."""
+    """Select pytest cases and a subset of source mutations."""
 
     keywords: str = ""
     markers: str = ""
     lines: tuple[tuple[int, int], ...] = ()
     operators: tuple[str, ...] = ()
     max_mutations: int | None = None
-    mutation_plan: Path | None = None
 
     def pytest_arguments(self) -> list[str]:
         """Render selectors without passing them through a shell."""
@@ -2576,18 +2574,15 @@ def _prepare_package_tests(  # noqa: PLR0913
     profile = (
         ""
         if max_examples is None
-        else "    from hypothesis import settings\n"
-        f'    settings.register_profile("ondemand", max_examples={max_examples},'
-        " deadline=None)\n"
-        '    settings.load_profile("ondemand")\n'
+        else "    class ExampleBudget:\n"
+        "        def pytest_sessionstart(self):\n"
+        "            from hypothesis import settings\n"
+        '            settings.register_profile("ondemand", '
+        f"max_examples={max_examples})\n"
+        '            settings.load_profile("ondemand")\n'
     )
-    pytest_arguments = [
-        "-p",
-        "no:cacheprovider",
-        "-p",
-        "_hypothesis_pytestplugin",
-        *selection.pytest_arguments(),
-    ]
+    plugins = ", plugins=[ExampleBudget()]" if max_examples is not None else ""
+    pytest_arguments = selection.pytest_arguments()
     if max_examples is not None:
         pytest_arguments.extend(
             ["--hypothesis-show-statistics"],
@@ -2608,9 +2603,6 @@ def _prepare_package_tests(  # noqa: PLR0913
         "os.environ['PYTHONDONTWRITEBYTECODE'] = '1'\n"
         f"os.environ['GIT_CEILING_DIRECTORIES'] = {str(workspace.parent)!r}\n"
         f"os.environ['PYTHONPATH'] = {str(workspace)!r}\n"
-        "os.environ.pop('PYTEST_ADDOPTS', None)\n"
-        "os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'\n"
-        "os.environ.pop('PYTEST_PLUGINS', None)\n"
         "os.environ['HYPOTHESIS_STORAGE_DIRECTORY'] = "
         f"{str(workspace / 'hypothesis')!r}\n"
         "runtime = TemporaryDirectory(prefix='test-runtime-', "
@@ -2624,8 +2616,9 @@ def _prepare_package_tests(  # noqa: PLR0913
         "    os.environ[variable] = str(directory)\n"
         "pid = Path('active-test-pgid')\n"
         "pid.write_text(str(os.getpgrp()))\n"
-        "try:\n" + profile + "    import pytest\n"
-        f"    sys.exit(pytest.main({pytest_arguments!r} + sys.argv[1:]))\n"
+        "try:\n    import pytest\n"
+        + profile
+        + f"    sys.exit(pytest.main({pytest_arguments!r} + sys.argv[1:]{plugins}))\n"
         "finally:\n"
         "    pid.unlink(missing_ok=True)\n"
         "    runtime.cleanup()\n",
@@ -2643,21 +2636,6 @@ def _prepare_test_profiling(
     bootstrap: Path,
 ) -> list[str]:
     """Profile pytest and the isolated package launcher in separate processes."""
-    _run_test_command(
-        [
-            environment.python,
-            "-B",
-            "-c",
-            (
-                "import compileall, pathlib, py_compile\n"
-                "for source in pathlib.Path('packages').glob('*/main.py'):\n"
-                "    compileall.compile_file(str(source), quiet=2, "
-                "invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)\n"
-            ),
-        ],
-        workspace,
-        workspace / "compile.log",
-    )
     reports = workspace / "profiles"
     reports.mkdir()
     wrapper = workspace / "profile-script.py"
@@ -2692,45 +2670,15 @@ def _prepare_test_profiling(
     return [environment.python, "-B", str(wrapper), str(bootstrap)]
 
 
-def _mutation_id(mutations: list[dict[str, Any]]) -> str:
-    """Identify a source mutation independently of Cosmic Ray's random job ID."""
-    encoded = json.dumps(mutations, sort_keys=True).encode()
-    return hashlib.sha256(encoded).hexdigest()
-
-
-def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> None:
-    """Filter the initialized session and retain a plan reusable with another suite."""
-    from attrs import asdict  # noqa: PLC0415 - only mutation campaigns need the engine
+def _select_mutations(workspace: Path, selection: TestSelection) -> None:
+    """Filter the native session in its initialized order."""
     from cosmic_ray.work_db import WorkDB, use_db  # noqa: PLC0415
     from cosmic_ray.work_item import WorkerOutcome, WorkResult  # noqa: PLC0415
 
-    source_hash = hashlib.sha256(
-        (workspace / "packages" / name / "main.py").read_bytes(),
-    ).hexdigest()
-    replay_ids: set[str] | None = None
-    if selection.mutation_plan is not None:
-        try:
-            plan = json.loads(selection.mutation_plan.read_text(encoding="utf-8"))
-            if (
-                plan["schema"] != "afairesi.mutation-plan"
-                or plan["schema_version"] != 1
-                or plan["package"] != name
-                or plan["source_sha256"] != source_hash
-            ):
-                message = "mutation plan does not match the package source"
-                raise CommandError(message)
-            replay_ids = {entry["id"] for entry in plan["mutations"]}
-        except (OSError, ValueError, KeyError, TypeError) as error:
-            message = f"invalid mutation plan: {selection.mutation_plan}: {error}"
-            raise CommandError(message) from error
     operators = [re.compile(pattern) for pattern in selection.operators]
     with use_db(workspace / "session.sqlite", WorkDB.Mode.open) as database:
         candidates = []
         for item in database.work_items:
-            mutations = [asdict(mutation) for mutation in item.mutations]
-            for mutation in mutations:
-                mutation["module_path"] = str(mutation["module_path"])
-            identity = _mutation_id(mutations)
             matches = all(
                 (
                     not selection.lines
@@ -2747,18 +2695,11 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
                 )
                 for mutation in item.mutations
             )
-            if matches and (replay_ids is None or identity in replay_ids):
-                candidates.append((identity, item, mutations))
-        candidates.sort(key=lambda candidate: candidate[0])
-        if replay_ids is not None and replay_ids != {row[0] for row in candidates}:
-            message = (
-                "mutation plan contains mutations unavailable "
-                "with these filters or engine"
-            )
-            raise CommandError(message)
+            if matches:
+                candidates.append(item)
         if selection.max_mutations is not None:
             candidates = candidates[: selection.max_mutations]
-        selected_jobs = {item.job_id for _, item, _ in candidates}
+        selected_jobs = {item.job_id for item in candidates}
         if database.num_work_items and not selected_jobs:
             message = "no mutations matched the selection"
             raise CommandError(message)
@@ -2770,20 +2711,6 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
             ],
             WorkResult(worker_outcome=WorkerOutcome.SKIPPED, output="not selected"),
         )
-        manifest = {
-            "schema": "afairesi.mutation-plan",
-            "schema_version": 1,
-            "package": name,
-            "source_sha256": source_hash,
-            "mutations": [
-                {"id": identity, "job_id": item.job_id, "mutations": mutations}
-                for identity, item, mutations in candidates
-            ],
-        }
-        (workspace / "mutation-plan.json").write_text(
-            json.dumps(manifest, indent=2) + "\n",
-            encoding="utf-8",
-        )
         sys.stdout.write(
             f"Selected {len(selected_jobs)} of {database.num_work_items} mutations.\n",
         )
@@ -2791,18 +2718,20 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
 
 def _mutation_run_succeeded(workspace: Path) -> bool:
     """Preserve engine failures without imposing a mutation score threshold."""
-    for line in (workspace / "results.jsonl").read_text(encoding="utf-8").splitlines():
-        _, result = json.loads(line)
-        if result is None:
+    from cosmic_ray.work_db import WorkDB, use_db  # noqa: PLC0415
+    from cosmic_ray.work_item import TestOutcome, WorkerOutcome  # noqa: PLC0415
+
+    with use_db(workspace / "session.sqlite", WorkDB.Mode.open) as database:
+        if database.num_results != database.num_work_items:
             return False
-        if result["worker_outcome"] == "skipped":
-            continue
-        if (
-            result["worker_outcome"] != "normal"
-            or result["test_outcome"] == "incompetent"
-        ):
-            return False
-    return True
+        return all(
+            result.worker_outcome == WorkerOutcome.SKIPPED
+            or (
+                result.worker_outcome == WorkerOutcome.NORMAL
+                and result.test_outcome != TestOutcome.INCOMPETENT
+            )
+            for _, result in database.results
+        )
 
 
 def _run_mutation_campaign(
@@ -2851,18 +2780,13 @@ def _run_mutation_campaign(
         workspace,
         workspace / "init.log",
     )
-    _select_mutations(workspace, name, selection)
+    _select_mutations(workspace, selection)
     sys.stdout.write("Running mutations...\n")
     sys.stdout.flush()
     _run_test_command(
         [*engine, "exec", str(config), session],
         workspace,
         workspace / "engine.log",
-    )
-    _run_test_command(
-        [*engine, "dump", session],
-        workspace,
-        workspace / "results.jsonl",
     )
     _run_test_command(
         ["cr-html", session],
@@ -3018,7 +2942,6 @@ def _dispatch_test_runner(
         lines=tuple(getattr(options, "lines", ())),
         operators=tuple(operators),
         max_mutations=mutation_limit,
-        mutation_plan=getattr(options, "mutation_plan", None),
     )
     target = _command_target(options.target)
     runner = (
@@ -3187,8 +3110,8 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     property_tests.add_argument(
         "--max-examples",
         type=int,
-        default=100,
-        help="successful generated examples per property (default: 100)",
+        default=None,
+        help="override the active Hypothesis profile example budget",
     )
     mutation = commands.add_parser(
         "mutation",
@@ -3259,15 +3182,6 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         metavar="N",
         help="maximum mutations to test",
     )
-    mutation.add_argument(
-        "--mutation-plan",
-        type=Path,
-        metavar="PATH",
-        help=(
-            "reuse a plan with unchanged source and new tests; "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
     performance = commands.add_parser(
         "performance",
         help="profile existing tests and package CLI calls",
@@ -3317,8 +3231,6 @@ def _dispatch_test_command(
 ) -> None:
     """Run selected campaigns, continuing after failures and returning one status."""
     combined = options.test_command is None
-    if getattr(options, "mutation_plan", None) is not None:
-        options.mutation_plan = resolve_repository_path(options.mutation_plan)
     target = _command_target(options.target)
     if combined:
         campaigns = [
