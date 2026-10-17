@@ -4343,14 +4343,9 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
         for command in ("property", "mutation", "performance"):
             for timeout in ("nan", "inf", "-inf", "0", "-1"):
                 _campaign_run(root, command, str(root), f"--timeout={timeout}", code=2)
-        _campaign_run(root, "property", str(root), "--max-examples", "0", code=2)
         for arguments in (
             ("--max-mutations", "0"),
             ("--max-mutations", "-1"),
-            ("--lines", "0"),
-            ("--lines", "3:2"),
-            ("--lines", "bad"),
-            ("--operator", "["),
         ):
             _campaign_run(root, "mutation", str(root), *arguments, code=2)
         _campaign_expect(not any(root.iterdir()), "invalid CLI request created state")
@@ -4924,8 +4919,6 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
             root,
             environment,
             "property",
-            "--max-examples",
-            "1",
             "--timeout",
             "20" if failure == "counterexample" else "2",
         )
@@ -4973,7 +4966,9 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
         tests = (
             "import os, subprocess, sys\n"
             "from pathlib import Path\n"
-            "from hypothesis import given, example, strategies as st\n"
+            "from hypothesis import given, example, settings, strategies as st\n"
+            f"settings.register_profile('package', max_examples={max_examples})\n"
+            "settings.load_profile('package')\n"
             "@given(st.integers())\n"
             "@example(0)\n"
             "def test_property(value):\n"
@@ -5007,6 +5002,7 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
             source,
             name="git-example",
         )
+        environment["PYTEST_ADDOPTS"] = "--hypothesis-show-statistics"
         caller_home = Path(directory) / "caller home"
         caller_home.mkdir()
         sentinel = caller_home / "sentinel"
@@ -5026,8 +5022,6 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
             root,
             environment,
             "property",
-            "--max-examples",
-            str(max_examples),
         )
         _campaign_expect(
             not result.returncode and "1 passed, 0 failed, 0 skipped" in result.stdout,
@@ -5061,13 +5055,9 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
         )
 
 
-@pytest.mark.parametrize(
-    ("command", "override"),
-    [("property", None), ("property", 2), ("performance", None)],
-)
+@pytest.mark.parametrize("command", ["property", "performance"])
 def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
     command: str,
-    override: int | None,
 ) -> None:
     """Respect package plugins, pytest options, and the active example budget."""
     with TemporaryDirectory(prefix="afairesi-native-pytest-") as directory:
@@ -5079,7 +5069,7 @@ def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
             "@given(st.integers())\n"
             "def test_property(value):\n"
             "    assert settings.default.deadline == timedelta(milliseconds=1234)\n"
-            f"    assert settings.default.max_examples == {override or 3}\n"
+            "    assert settings.default.max_examples == 3\n"
             "    with Path('examples').open('a') as output:\n"
             "        output.write(str(value) + '\\n')\n"
         )
@@ -5089,20 +5079,19 @@ def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
         plugin.write_text(
             "from hypothesis import settings\n"
             "settings.register_profile('package', max_examples=3, deadline=1234)\n"
-            "settings.load_profile('package')\n"
             "def pytest_addoption(parser):\n"
             "    parser.addoption('--native-option', action='store_true')\n"
             "def pytest_configure(config):\n"
             "    assert config.getoption('--native-option')\n",
         )
         environment["PYTEST_PLUGINS"] = "packages.example.prm.native_plugin"
-        environment["PYTEST_ADDOPTS"] = "--native-option"
-        arguments = ["--max-examples", str(override)] if override is not None else []
-        result = _campaign_campaign(root, environment, command, *arguments)
+        environment["PYTEST_ADDOPTS"] = "--native-option --hypothesis-profile=package"
+        result = _campaign_campaign(root, environment, command)
         _campaign_expect(result.returncode == 0, result)
         (workspace,) = (root / "tmp").glob(f"python-{command}-example-*")
+        expected_examples = 3
         _campaign_expect(
-            len((workspace / "examples").read_text().splitlines()) == (override or 3),
+            len((workspace / "examples").read_text().splitlines()) == expected_examples,
             workspace,
         )
 
@@ -5264,9 +5253,9 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations(
             "-k",
             "test_cli and not process_success",
             "--lines",
-            str(target_line),
-            "--operator",
-            "NumberReplacer",
+            f"{target_line}-{target_line}",
+            "--exclude-operator",
+            "^(?!.*NumberReplacer)",
             "--max-mutations",
             "1",
             cwd=root / "packages/git-example",
@@ -5299,9 +5288,9 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations(
             "-k",
             "process_success",
             "--lines",
-            str(target_line),
-            "--operator",
-            "NumberReplacer",
+            f"{target_line}-{target_line}",
+            "--exclude-operator",
+            "^(?!.*NumberReplacer)",
             "--max-mutations",
             "1",
             cwd=root / "packages/git-example",

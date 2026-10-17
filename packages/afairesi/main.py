@@ -2532,8 +2532,8 @@ class TestSelection:
 
     keywords: str = ""
     markers: str = ""
-    lines: tuple[tuple[int, int], ...] = ()
-    operators: tuple[str, ...] = ()
+    lines: tuple[str, ...] = ()
+    exclude_operators: tuple[str, ...] = ()
     max_mutations: int | None = None
 
     def pytest_arguments(self) -> list[str]:
@@ -2545,11 +2545,10 @@ class TestSelection:
         return arguments
 
 
-def _prepare_package_tests(  # noqa: PLR0913
+def _prepare_package_tests(
     workspace: Path,
     name: str,
     environment: TestEnvironment,
-    max_examples: int | None = None,
     *,
     selection: TestSelection | None = None,
     performance: bool = False,
@@ -2571,22 +2570,7 @@ def _prepare_package_tests(  # noqa: PLR0913
         f"importlib.import_module({'packages.' + name + '.main'!r}).main()\n",
         encoding="utf-8",
     )
-    profile = (
-        ""
-        if max_examples is None
-        else "    class ExampleBudget:\n"
-        "        def pytest_sessionstart(self):\n"
-        "            from hypothesis import settings\n"
-        '            settings.register_profile("ondemand", '
-        f"max_examples={max_examples})\n"
-        '            settings.load_profile("ondemand")\n'
-    )
-    plugins = ", plugins=[ExampleBudget()]" if max_examples is not None else ""
     pytest_arguments = selection.pytest_arguments()
-    if max_examples is not None:
-        pytest_arguments.extend(
-            ["--hypothesis-show-statistics"],
-        )
     if performance:
         pytest_arguments.extend(["--durations=20", "--durations-min=0"])
     pytest_arguments.extend(
@@ -2617,8 +2601,7 @@ def _prepare_package_tests(  # noqa: PLR0913
         "pid = Path('active-test-pgid')\n"
         "pid.write_text(str(os.getpgrp()))\n"
         "try:\n    import pytest\n"
-        + profile
-        + f"    sys.exit(pytest.main({pytest_arguments!r} + sys.argv[1:]{plugins}))\n"
+        f"    sys.exit(pytest.main({pytest_arguments!r} + sys.argv[1:]))\n"
         "finally:\n"
         "    pid.unlink(missing_ok=True)\n"
         "    runtime.cleanup()\n",
@@ -2670,49 +2653,19 @@ def _prepare_test_profiling(
     return [environment.python, "-B", str(wrapper), str(bootstrap)]
 
 
-def _select_mutations(workspace: Path, selection: TestSelection) -> None:
-    """Filter the native session in its initialized order."""
+def _limit_mutations(workspace: Path, limit: int) -> None:
+    """Apply the requested run budget after native filtering."""
     from cosmic_ray.work_db import WorkDB, use_db  # noqa: PLC0415
     from cosmic_ray.work_item import WorkerOutcome, WorkResult  # noqa: PLC0415
 
-    operators = [re.compile(pattern) for pattern in selection.operators]
     with use_db(workspace / "session.sqlite", WorkDB.Mode.open) as database:
-        candidates = []
-        for item in database.work_items:
-            matches = all(
-                (
-                    not selection.lines
-                    or any(
-                        start <= mutation.start_pos[0] <= end
-                        for start, end in selection.lines
-                    )
-                )
-                and (
-                    not operators
-                    or any(
-                        pattern.search(mutation.operator_name) for pattern in operators
-                    )
-                )
-                for mutation in item.mutations
-            )
-            if matches:
-                candidates.append(item)
-        if selection.max_mutations is not None:
-            candidates = candidates[: selection.max_mutations]
-        selected_jobs = {item.job_id for item in candidates}
-        if database.num_work_items and not selected_jobs:
-            message = "no mutations matched the selection"
-            raise CommandError(message)
+        pending = database.pending_work_items
         database.set_multiple_results(
-            [
-                item.job_id
-                for item in database.work_items
-                if item.job_id not in selected_jobs
-            ],
-            WorkResult(worker_outcome=WorkerOutcome.SKIPPED, output="not selected"),
+            [item.job_id for item in pending[limit:]],
+            WorkResult(worker_outcome=WorkerOutcome.SKIPPED, output="run budget"),
         )
         sys.stdout.write(
-            f"Selected {len(selected_jobs)} of {database.num_work_items} mutations.\n",
+            f"Selected {min(limit, len(pending))} of {len(pending)} mutations.\n",
         )
 
 
@@ -2763,14 +2716,26 @@ def _run_mutation_campaign(
     ):
         message = "selected baseline has no passing tests; see baseline.xml"
         raise CommandError(message)
+    module_path = f"packages/{name}/main.py"
+    filters = ""
+    if selection.lines:
+        filters += (
+            "\n[cosmic-ray.filters.line-filter.lines]\n"
+            f"{json.dumps(module_path)} = {json.dumps(selection.lines)}\n"
+        )
+    if selection.exclude_operators:
+        filters += (
+            "\n[cosmic-ray.filters.operators-filter]\n"
+            f"exclude-operators = {json.dumps(selection.exclude_operators)}\n"
+        )
     config = workspace / "cosmic-ray.toml"
     config.write_text(
         "[cosmic-ray]\n"
-        f"module-path = {json.dumps('packages/' + name + '/main.py')}\n"
+        f"module-path = {json.dumps(module_path)}\n"
         f"timeout = {timeout}\n"
         "excluded-modules = []\n"
         f"test-command = {json.dumps(shlex.join(command))}\n"
-        '[cosmic-ray.distributor]\nname = "local"\n',
+        '[cosmic-ray.distributor]\nname = "local"\n' + filters,
         encoding="utf-8",
     )
     engine = ["cosmic-ray"]
@@ -2780,7 +2745,20 @@ def _run_mutation_campaign(
         workspace,
         workspace / "init.log",
     )
-    _select_mutations(workspace, selection)
+    if selection.lines:
+        _run_test_command(
+            ["cr-filter-lines", "--config", str(config), session],
+            workspace,
+            workspace / "line-filter.log",
+        )
+    if selection.exclude_operators:
+        _run_test_command(
+            ["cr-filter-operators", session, str(config)],
+            workspace,
+            workspace / "operator-filter.log",
+        )
+    if selection.max_mutations is not None:
+        _limit_mutations(workspace, selection.max_mutations)
     sys.stdout.write("Running mutations...\n")
     sys.stdout.flush()
     _run_test_command(
@@ -2806,7 +2784,6 @@ def _run_test_package(
     package: Path,
     command: str,
     timeout: float | None,
-    max_examples: int | None,
     selection: TestSelection,
 ) -> bool:
     """Run one isolated package and retain its logs and reports."""
@@ -2840,7 +2817,6 @@ def _run_test_package(
         workspace,
         package.name,
         environment,
-        max_examples,
         selection=selection,
         performance=command == "performance",
     )
@@ -2859,7 +2835,6 @@ def _run_test_repository(
     root: Path,
     command: str,
     timeout: float | None,
-    max_examples: int | None,
     selection: TestSelection,
 ) -> bool:
     """Run each Python package, continuing after failures and summarizing results."""
@@ -2887,7 +2862,7 @@ def _run_test_repository(
         try:
             outcomes[package.name] = (
                 "passed"
-                if _run_test_package(package, command, timeout, max_examples, selection)
+                if _run_test_package(package, command, timeout, selection)
                 else "failed"
             )
         except (
@@ -2920,9 +2895,6 @@ def _dispatch_test_runner(
     cli: argparse.ArgumentParser,
 ) -> bool:
     """Validate budgets and run an explicitly requested test campaign."""
-    max_examples = getattr(options, "max_examples", None)
-    if max_examples is not None and max_examples <= 0:
-        cli.error("--max-examples must be positive")
     if options.timeout is not None and (
         not math.isfinite(options.timeout) or options.timeout <= 0
     ):
@@ -2930,17 +2902,11 @@ def _dispatch_test_runner(
     mutation_limit = getattr(options, "max_mutations", None)
     if mutation_limit is not None and mutation_limit <= 0:
         cli.error("--max-mutations must be positive")
-    operators = getattr(options, "operators", ())
-    try:
-        for pattern in operators:
-            re.compile(pattern)
-    except re.error as error:
-        cli.error(f"invalid --operator expression: {error}")
     selection = TestSelection(
         keywords=options.keywords,
         markers=options.markers,
         lines=tuple(getattr(options, "lines", ())),
-        operators=tuple(operators),
+        exclude_operators=tuple(getattr(options, "exclude_operators", ())),
         max_mutations=mutation_limit,
     )
     target = _command_target(options.target)
@@ -2951,7 +2917,6 @@ def _dispatch_test_runner(
         target,
         options.test_command,
         options.timeout,
-        max_examples,
         selection,
     )
 
@@ -3048,19 +3013,6 @@ def _run_coverage(target: Path) -> bool:
     return "failed" not in outcomes.values()
 
 
-def _mutation_lines(value: str) -> tuple[int, int]:
-    """Validate inclusive source line ranges before a campaign creates state."""
-    if not re.fullmatch(r"[0-9]+(?::[0-9]+)?", value):
-        message = "expected a positive line number or START:END"
-        raise argparse.ArgumentTypeError(message)
-    first, _, last = value.partition(":")
-    start, end = int(first), int(last or first)
-    if not 0 < start <= end:
-        message = "expected 0 < START <= END"
-        raise argparse.ArgumentTypeError(message)
-    return start, end
-
-
 def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     """Construct the test campaign command-line parser."""
     result.set_defaults(test_command=None, target=None)
@@ -3089,7 +3041,10 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         "property",
         help="run property-based tests",
         description="Run property-based tests in isolated package copies.",
-        epilog=("Skip packages without test_main.py. Logs and reports: flake tmp/."),
+        epilog=(
+            "Skip packages without test_main.py. Logs and reports: flake tmp/. "
+            'Select profiles with PYTEST_ADDOPTS="--hypothesis-profile=NAME".'
+        ),
     )
     property_tests.add_argument(
         "target",
@@ -3106,12 +3061,6 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         "--timeout",
         type=float,
         help=("seconds per test run, excluding build (default: unlimited)"),
-    )
-    property_tests.add_argument(
-        "--max-examples",
-        type=int,
-        default=None,
-        help="override the active Hypothesis profile example budget",
     )
     mutation = commands.add_parser(
         "mutation",
@@ -3162,19 +3111,18 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     )
     mutation.add_argument(
         "--lines",
-        type=_mutation_lines,
         action="append",
         default=[],
-        metavar="START:END",
-        help=("inclusive main.py range for mutation starts (repeatable)"),
+        metavar="N_OR_START-END",
+        help="native line ranges; include overlapping mutations (repeatable)",
     )
     mutation.add_argument(
-        "--operator",
-        dest="operators",
+        "--exclude-operator",
+        dest="exclude_operators",
         action="append",
         default=[],
         metavar="REGEX",
-        help="mutation operator regex (repeatable)",
+        help="native operator exclusion regex, matched from the start (repeatable)",
     )
     mutation.add_argument(
         "--max-mutations",
