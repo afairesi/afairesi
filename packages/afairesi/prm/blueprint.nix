@@ -78,7 +78,6 @@ in
           ++ nixlib.optional (builtins.pathExists (source + "/checks/${name}/default.nix")) {
             name = "${name}-coverage";
             value = builders.mkCoverage {
-              packageName = name;
               packageDrv = repositoryInputs.self.packages.${system}.${name};
               check = repositoryInputs.self.checks.${system}.${name};
             };

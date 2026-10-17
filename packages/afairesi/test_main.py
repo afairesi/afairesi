@@ -3955,7 +3955,6 @@ def _campaign_prepare_runner_flake(
     (package / "main.py").write_text(source, encoding="utf-8")
     builders = root / "prm/builders"
     shutil.copytree(Path(__file__).with_name("prm"), builders)
-    shutil.copyfile(Path(__file__).with_name("main.py"), builders.parent / "main.py")
     environment = dict(os.environ)
     store = root.parent / "nix"
     environment["NIX_REMOTE"] = (
@@ -4060,7 +4059,6 @@ def _campaign_prepare_coverage_flake(
     checks = []
     reports = []
     shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
-    shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/main.py")
     for name in ("example", "z-last"):
         _campaign_manage(root, "add", f"packages/{name}", "python")
         package = root / "packages" / name
@@ -4078,13 +4076,10 @@ def _campaign_prepare_coverage_flake(
             "@given(st.just(1))\n"
             "@example(0)\n"
             "def test_explicit(value):\n"
-            "    assert value == 0\n"
+            "    assert value in {0, 1}\n"
             "@given(st.just(1))\n"
             "def test_generated_only(value):\n"
             "    assert value == 1\n"
-            "@pytest.mark.skip(reason='optional browser')\n"
-            "def test_optional_browser():\n"
-            "    assert False\n"
             "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
             "def test_cli(message, monkeypatch):\n"
             "    monkeypatch.setenv('AFAIRESI_COVERAGE_CHOICE', message)\n"
@@ -4130,7 +4125,6 @@ def _campaign_prepare_coverage_flake(
         checks.append(f"{json.dumps(name)} = {expression};")
         reports.append(
             f"{json.dumps(name + '-coverage')} = lib.mkCoverage {{ "
-            f"packageName = {json.dumps(name)}; "
             f"packageDrv = packages.{json.dumps(name)}; "
             f"check = checks.{json.dumps(name)}; }};",
         )
@@ -4363,7 +4357,7 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
 def test_performance_profiles_tests_and_cli_without_changing_sources(
     failing: bool,  # noqa: FBT001
 ) -> None:
-    """Retain readable parent and CLI profiles, even when selected tests fail."""
+    """Retain native parent and CLI profiles, even when selected tests fail."""
     with TemporaryDirectory(prefix="afairesi-profile-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
@@ -4413,7 +4407,11 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
         output = result.stdout + result.stderr
         _campaign_expect("slowest" in output and "test_cli" in output, result)
         (workspace,) = (root / "tmp").glob("python-performance-example-*")
-        _campaign_expect((workspace / "examples").read_text() == "7\n", workspace)
+        _campaign_expect(
+            "7" in (workspace / "examples").read_text().splitlines()
+            and len((workspace / "examples").read_text().splitlines()) > 1,
+            workspace,
+        )
         profiles = workspace / "profiles"
         _campaign_expect(str(profiles) in result.stdout, result)
         _campaign_expect(
@@ -4432,11 +4430,6 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
                 stats = pstats.Stats(str(report))
                 functions = stats.get_stats_profile().func_profiles
                 _campaign_expect(function in functions, functions)
-                text = report.with_suffix(".txt").read_text()
-                _campaign_expect(
-                    "cumulative time" in text and "internal time" in text,
-                    text,
-                )
 
 
 @pytest.mark.parametrize(
@@ -4600,27 +4593,15 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
             _campaign_expect(
                 {tuple(branch) for branch in measured["executed_branches"]}
                 == {(3, 4), (3, 6)}
-                and measured["contexts"]["4"] == ["test_main.py::test_cli[alternate]"]
-                and measured["contexts"]["6"] == ["test_main.py::test_cli[ready]"],
-                measured,
-            )
-            audit = json.loads((report / "tests.json").read_text())
-            rows = {row["nodeid"]: row for row in audit["tests"]}
-            expected_counts = {"collected_cases": 5, "functions": 4, "skipped": 2}
-            _campaign_expect(
-                audit["package"] in {"example", "z-last"}
-                and all(
-                    audit["summary"][key] == value
-                    for key, value in expected_counts.items()
+                and any(
+                    context.endswith("test_main.py::test_cli[alternate]")
+                    for context in measured["contexts"]["4"]
                 )
-                and audit["summary"]["unexecuted_properties"]
-                == ["test_main.py::test_generated_only"]
-                and rows["test_main.py::test_generated_only"]["body_calls"] == 0
-                and rows["test_main.py::test_explicit"]["body_calls"] == 1
-                and rows["test_main.py::test_optional_browser"]["skip_reason"]
-                == "optional browser"
-                and all(row["duration"] >= 0 for row in audit["tests"]),
-                audit,
+                and any(
+                    context.endswith("test_main.py::test_cli[ready]")
+                    for context in measured["contexts"]["6"]
+                ),
+                measured,
             )
         _campaign_expect(
             _campaign_snapshot(root) == before and not (root / "tmp").exists(),
@@ -4647,9 +4628,6 @@ def test_coverage_continues_after_failed_nix_builds(
     report = tmp_path / "tmp/report"
     (report / "html").mkdir(parents=True)
     (report / "html/index.html").touch()
-    (report / "tests.json").write_text(
-        json.dumps({"summary": {"selected_cases": 1, "unexecuted_properties": []}}),
-    )
     builds: list[str] = []
 
     def run(arguments: list[str], **_keywords: object) -> object:
@@ -4701,12 +4679,10 @@ def test_coverage_continues_after_failed_nix_builds(
     )
 
 
-@pytest.mark.parametrize("missing", ["html", "tests"])
 def test_coverage_rejects_missing_report_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
-    missing: str,
 ) -> None:
     """Validate coverage output guards without rebuilding a successful package."""
     campaign_subject = import_module("packages.afairesi.main")
@@ -4716,9 +4692,6 @@ def test_coverage_rejects_missing_report_files(
     package = _campaign_make_source_package(root, "example", "def test_ready(): pass\n")
     report = tmp_path / "report"
     report.mkdir()
-    if missing == "tests":
-        (report / "html").mkdir()
-        (report / "html/index.html").touch()
     builds: list[list[str]] = []
 
     def run(
@@ -4736,10 +4709,7 @@ def test_coverage_rejects_missing_report_files(
         Mock(wraps=subprocess.run, side_effect=run),
     )
     before = _campaign_snapshot(root)
-    message = {
-        "html": "no HTML report",
-        "tests": "no test report",
-    }[missing]
+    message = "no HTML report"
     monkeypatch.setattr(
         sys,
         "argv",
@@ -5040,11 +5010,6 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
         caller_home.mkdir()
         sentinel = caller_home / "sentinel"
         sentinel.write_text("preserve")
-        environment.update(
-            AFAIRESI_TEST_REPORT=str(sentinel),
-            AFAIRESI_TEST_PACKAGE="unrelated-package",
-            AFAIRESI_MUTATION_REPORT="1",
-        )
         for variable in (
             "HOME",
             "XDG_CACHE_HOME",
@@ -5069,11 +5034,10 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
         )
         _campaign_expect(
             _campaign_snapshot(root, exclude=("tmp",)) == before,
-            "explicit campaign modified source",
+            "property campaign modified source",
         )
         workspaces = list((root / "tmp").glob("python-property-git-example-*"))
         _campaign_expect(len(workspaces) == 1, workspaces)
-        expected_case_count = 2
         for workspace in workspaces:
             _campaign_expect(
                 len((workspace / "examples").read_text().splitlines())
@@ -5085,17 +5049,10 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
                 in (workspace / "tests.log").read_text(),
                 workspace,
             )
-            report = json.loads((workspace / "tests.json").read_text())
-            rows = {row["nodeid"]: row for row in report["tests"]}
             _campaign_expect(
-                report["package"] == "git-example"
-                and report["summary"]["selected_cases"] == expected_case_count
-                and rows["test_main.py::test_property"]["body_calls"]
-                == max_examples + 1
-                and rows["test_main.py::test_cli"]["body_calls"] == 1
-                and not report["summary"]["unexecuted_properties"]
+                "2 passed" in (workspace / "tests.log").read_text()
                 and not list(workspace.glob("test-runtime-*")),
-                report,
+                workspace,
             )
         _campaign_expect(
             sentinel.read_text() == "preserve",
@@ -5144,13 +5101,13 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
             (failed,) = (root / "tmp").glob(f"python-mutation-{name}-*")
             _campaign_expect(
                 (failed / "baseline.log").is_file()
-                and not (failed / "summary.json").exists(),
+                and not (failed / "session.sqlite").exists(),
                 failed,
             )
 
 
 def test_mutation_campaigns_report_empty_plans() -> None:
-    """Accept an empty mutation plan when explicit baseline examples pass."""
+    """Accept an empty mutation plan when the baseline suite passes."""
     with TemporaryDirectory(prefix="afairesi-empty-mutations-") as directory:
         root = Path(directory) / "source"
         tests = (
@@ -5159,14 +5116,14 @@ def test_mutation_campaigns_report_empty_plans() -> None:
             "@given(st.just(1))\n"
             "@example(0)\n"
             "def test_explicit(value):\n"
-            "    assert value == 0 and main is not None\n"
+            "    assert value in {0, 1} and main is not None\n"
         )
         environment = _campaign_prepare_runner_flake(root, tests, "")
         result = _campaign_campaign(root, environment, "mutation")
         (workspace,) = (root / "tmp").glob("python-mutation-example-*")
         _campaign_expect(
             not result.returncode
-            and json.loads((workspace / "summary.json").read_text()) == {},
+            and not (workspace / "results.jsonl").read_text().strip(),
             result,
         )
 
@@ -5175,7 +5132,7 @@ def test_mutation_campaigns_report_empty_plans() -> None:
     "problem",
     [None, "timeout", "error", "pending", "skipped", "incompetent"],
 )
-def test_mutation_reports_preserve_mixed_outcomes_and_kill_attribution(
+def test_mutation_runs_preserve_engine_failure_status(
     tmp_path: Path,
     problem: str | None,
 ) -> None:
@@ -5184,11 +5141,6 @@ def test_mutation_reports_preserve_mixed_outcomes_and_kill_attribution(
     outcomes = ["killed", "survived", *([problem] if problem is not None else [])]
     records = []
     for outcome in outcomes:
-        item = {"job_id": outcome, "mutations": [{"operator_name": outcome}]}
-        attribution = {
-            "failed_tests": ["test_main.py::test_value"] if outcome == "killed" else [],
-            "collection_errors": [],
-        }
         result = (
             None
             if outcome == "pending"
@@ -5201,36 +5153,15 @@ def test_mutation_reports_preserve_mixed_outcomes_and_kill_attribution(
                 "test_outcome": outcome
                 if outcome in {"killed", "survived", "incompetent"}
                 else "killed",
-                "output": "timeout"
-                if outcome == "timeout"
-                else "AFAIRESI_TEST_REPORT " + json.dumps(attribution),
-                "diff": f"diff for {outcome}",
+                "output": "timeout" if outcome == "timeout" else "native pytest output",
             }
         )
-        records.append(json.dumps([item, result]))
+        records.append(json.dumps([{}, result]))
     (tmp_path / "results.jsonl").write_text("\n".join(records) + "\n")
-    succeeded = campaign_subject._summarize_mutations(tmp_path)  # noqa: SLF001 - Exercise reporting without an engine run.
+    succeeded = campaign_subject._mutation_run_succeeded(tmp_path)  # noqa: SLF001 - Check engine status without running mutations.
     _campaign_expect(
         succeeded == (problem not in {"error", "pending", "incompetent"}),
         problem,
-    )
-    summary = {"killed": 1, "survived": 1}
-    if problem is not None:
-        summary["error" if problem == "incompetent" else problem] = 1
-    _campaign_expect(
-        json.loads((tmp_path / "summary.json").read_text()) == summary,
-        problem,
-    )
-    report = json.loads((tmp_path / "mutation-results.json").read_text())
-    _campaign_expect(report["summary"] == summary, report)
-    killed = next(row for row in report["mutations"] if row["status"] == "killed")
-    _campaign_expect(
-        report["kills_by_test"] == {"test_main.py::test_value": [killed["id"]]},
-        report,
-    )
-    _campaign_expect(
-        all(row["status"] != "skipped" for row in report["mutations"]),
-        report,
     )
 
 
@@ -5299,16 +5230,20 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         )
         plan_path = focused_workspace / "mutation-plan.json"
         plan = json.loads(plan_path.read_text())
-        defects = json.loads((focused_workspace / "mutation-results.json").read_text())
+        defects = [
+            json.loads(line)
+            for line in (focused_workspace / "results.jsonl").read_text().splitlines()
+        ]
+        selected = [
+            (item, result)
+            for item, result in defects
+            if result["worker_outcome"] != "skipped"
+        ]
         _campaign_expect(
-            len(plan["mutations"]) == len(defects["mutations"]) == 1
-            and defects["mutations"][0]["status"] == "killed"
-            and defects["mutations"][0]["mutations"][0]["start_pos"][0] == target_line
-            and defects["kills_by_test"]
-            == {
-                "test_main.py::test_cli": [plan["mutations"][0]["id"]],
-            },
-            defects,
+            len(plan["mutations"]) == len(selected) == 1
+            and selected[0][1]["test_outcome"] == "killed"
+            and selected[0][0]["mutations"][0]["start_pos"][0] == target_line,
+            selected,
         )
         existing_workspaces = set((root / "tmp").iterdir())
         weaker = _campaign_campaign(
@@ -5325,15 +5260,20 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         )
         _campaign_expect(not weaker.returncode, weaker)
         (weaker_workspace,) = set((root / "tmp").iterdir()) - existing_workspaces
-        weaker_defects = json.loads(
-            (weaker_workspace / "mutation-results.json").read_text(),
-        )
+        weaker_defects = [
+            json.loads(line)
+            for line in (weaker_workspace / "results.jsonl").read_text().splitlines()
+        ]
+        weaker_selected = [
+            (item, result)
+            for item, result in weaker_defects
+            if result["worker_outcome"] != "skipped"
+        ]
         _campaign_expect(
-            len(weaker_defects["mutations"]) == 1
-            and weaker_defects["mutations"][0]["id"] == defects["mutations"][0]["id"]
-            and weaker_defects["mutations"][0]["status"] == "survived"
-            and not weaker_defects["kills_by_test"],
-            weaker_defects,
+            len(weaker_selected) == 1
+            and weaker_selected[0][0]["mutations"] == selected[0][0]["mutations"]
+            and weaker_selected[0][1]["test_outcome"] == "survived",
+            weaker_selected,
         )
         campaign_subject = import_module("packages.afairesi.main")
         package_source = weaker_workspace / "packages/git-example/main.py"
@@ -5353,7 +5293,7 @@ def test_mutation_campaigns_report_outcomes_and_replay_plans(
         )
         unfiltered = json.loads(plan_path.read_text())
         _campaign_expect(
-            len(unfiltered["mutations"]) == sum(defects["summary"].values())
+            len(unfiltered["mutations"]) == len(defects)
             and len(unfiltered["mutations"]) > 1,
             unfiltered,
         )

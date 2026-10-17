@@ -20,10 +20,10 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
+from xml.etree import ElementTree as ET
 
 import nix_syntax
 
@@ -64,273 +64,6 @@ SOURCE_SUFFIXES = {
     ".tsx",
     ".jsx",
 }
-
-
-def make_test_report_plugin(  # noqa: C901, PLR0915 - Keep reporting independently serializable.
-    package_name: str,
-    *,
-    mutation_report: bool = False,
-) -> object:
-    """Create the standalone pytest reporter used by all test campaigns."""
-    import functools  # noqa: PLC0415 - Standalone test helper.
-    import json  # noqa: PLC0415 - Standalone test helper.
-    import os  # noqa: PLC0415 - Standalone test helper.
-    import sys  # noqa: PLC0415 - Standalone test helper.
-    from collections import Counter  # noqa: PLC0415 - Standalone test helper.
-    from pathlib import Path  # noqa: PLC0415 - Standalone test helper.
-    from types import SimpleNamespace  # noqa: PLC0415 - Standalone test helper.
-    from typing import (  # noqa: PLC0415 - Standalone test helper.
-        TYPE_CHECKING,
-        cast,
-    )
-
-    import pytest  # noqa: PLC0415 - Standalone test helper.
-
-    if TYPE_CHECKING:
-        from collections.abc import Generator  # noqa: PLC0415 - Standalone test helper.
-    from hypothesis import (  # noqa: PLC0415 - Standalone test helper.
-        Phase,
-        is_hypothesis_test,
-        settings,
-    )
-
-    tests: dict[str, dict[str, Any]] = {}
-    collection_errors: list[str] = []
-    owner = os.environ.setdefault("AFAIRESI_TEST_REPORT_OWNER", str(os.getpid()))
-
-    def node_id(item: pytest.Item) -> str:
-        path, separator, name = item.nodeid.partition("::")
-        return Path(path).name + separator + name
-
-    def record(item: pytest.Item) -> dict[str, Any]:
-        key = node_id(item)
-        if key not in tests:
-            function = getattr(item, "obj", None)
-            property_test = is_hypothesis_test(function)
-            instance = getattr(function, "__self__", None)
-            profile = cast(
-                "settings",
-                getattr(
-                    function,
-                    "_hypothesis_internal_use_settings",
-                    getattr(instance, "settings", settings.default),
-                ),
-            )
-            examples = getattr(function, "hypothesis_explicit_examples", ())
-            handle = getattr(function, "hypothesis", None)
-            measured = not property_test or hasattr(handle, "inner_test")
-            tests[key] = {
-                "nodeid": key,
-                "function": key.split("[", 1)[0],
-                "outcome": "not_run",
-                "duration": 0.0,
-                "body_calls": 0 if measured else None,
-                "is_property": property_test,
-                "explicit_examples": len(examples),
-                "generation_enabled": property_test
-                and Phase.generate in profile.phases,
-            }
-        return tests[key]
-
-    def pytest_collection_finish(session: pytest.Session) -> None:
-        for item in session.items:
-            record(item)
-
-    def pytest_deselected(items: list[pytest.Item]) -> None:
-        for item in items:
-            record(item)["outcome"] = "deselected"
-
-    def pytest_collectreport(report: pytest.CollectReport) -> None:
-        if report.failed:
-            collection_errors.append(str(report.longrepr))
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_protocol(
-        item: pytest.Item,
-    ) -> Generator[None, object, object]:
-        previous = os.environ.get("AFAIRESI_TEST_CONTEXT", "")
-        context = node_id(item) if owner == str(os.getpid()) else previous
-        os.environ["AFAIRESI_TEST_CONTEXT"] = context
-        try:
-            import coverage  # noqa: PLC0415 - Standalone test helper.
-
-            tracer = coverage.Coverage.current()
-        except ImportError:
-            tracer = None
-        if tracer is not None:
-            tracer.switch_context(context)
-        try:
-            return (yield)
-        finally:
-            os.environ["AFAIRESI_TEST_CONTEXT"] = previous
-            if tracer is not None:
-                tracer.switch_context(previous)
-
-    @pytest.hookimpl(wrapper=True)
-    def pytest_runtest_call(item: pytest.Item) -> Generator[None, object, object]:
-        row = record(item)
-        handle = getattr(getattr(item, "obj", None), "hypothesis", None)
-        original = getattr(handle, "inner_test", None)
-        if original is None or handle is None:
-            if not row["is_property"]:
-                row["body_calls"] += 1
-        else:
-
-            @functools.wraps(original)
-            def counted(*args: object, **kwargs: object) -> object:
-                row["body_calls"] += 1
-                return cast("object", original(*args, **kwargs))
-
-            handle.inner_test = counted
-        try:
-            return (yield)
-        finally:
-            if original is not None and handle is not None:
-                handle.inner_test = original
-
-    @pytest.hookimpl(wrapper=True, tryfirst=True)
-    def pytest_runtest_makereport(
-        item: pytest.Item,
-    ) -> Generator[None, pytest.TestReport, pytest.TestReport]:
-        report = yield
-        row = record(item)
-        row["duration"] += report.duration
-        if (report.failed or row["outcome"] != "failed") and (
-            report.failed or report.skipped or report.when == "call"
-        ):
-            row["outcome"] = report.outcome
-        if report.skipped:
-            reason = report.longrepr
-            reason_text = str(reason[-1] if isinstance(reason, tuple) else reason)
-            row["skip_reason"] = reason_text.removeprefix("Skipped: ")
-        if hasattr(report, "wasxfail"):
-            row["xfail_reason"] = report.wasxfail
-        statistics = getattr(item, "hypothesis_statistics", None)
-        if statistics:
-            row["hypothesis_statistics"] = statistics
-        return report
-
-    def pytest_sessionfinish(
-        exitstatus: int,
-    ) -> None:
-        if owner != str(os.getpid()):
-            return
-        rows = sorted(tests.values(), key=lambda row: row["nodeid"])
-        selected = [row for row in rows if row["outcome"] != "deselected"]
-        unexecuted = [
-            row["nodeid"]
-            for row in selected
-            if row["is_property"] and row["body_calls"] == 0
-        ]
-        summary = dict(Counter(row["outcome"] for row in rows))
-        summary.update(
-            {
-                "collected_cases": len(rows),
-                "selected_cases": len(selected),
-                "functions": len({row["function"] for row in rows}),
-                "properties": sum(row["is_property"] for row in selected),
-                "unexecuted_properties": unexecuted,
-                "unmeasured_properties": [
-                    row["nodeid"] for row in selected if row["body_calls"] is None
-                ],
-                "body_calls": sum(row["body_calls"] or 0 for row in selected),
-                "duration": sum(row["duration"] for row in selected),
-            },
-        )
-        document = {
-            "schema": "afairesi.tests",
-            "schema_version": 1,
-            "package": package_name,
-            "exit_code": int(exitstatus),
-            "summary": summary,
-            "tests": rows,
-            "collection_errors": collection_errors,
-        }
-        Path("tests.json").write_text(json.dumps(document, indent=2) + "\n")
-        if mutation_report:
-            attribution = {
-                "failed_tests": [
-                    row["nodeid"] for row in rows if row["outcome"] == "failed"
-                ],
-                "collection_errors": collection_errors,
-            }
-            sys.stdout.write("\nAFAIRESI_TEST_REPORT " + json.dumps(attribution) + "\n")
-
-    return SimpleNamespace(
-        pytest_collection_finish=pytest_collection_finish,
-        pytest_deselected=pytest_deselected,
-        pytest_collectreport=pytest_collectreport,
-        pytest_runtest_protocol=pytest_runtest_protocol,
-        pytest_runtest_call=pytest_runtest_call,
-        pytest_runtest_makereport=pytest_runtest_makereport,
-        pytest_sessionfinish=pytest_sessionfinish,
-    )
-
-
-def start_subprocess_coverage() -> None:
-    """Start coverage in child interpreters and inherit the active test context."""
-    import os  # noqa: PLC0415 - Standalone test helper.
-
-    import coverage  # noqa: PLC0415 - Standalone test helper.
-
-    tracer = coverage.Coverage.current() or coverage.process_startup()
-    if tracer is not None:
-        tracer.switch_context(os.environ.get("AFAIRESI_TEST_CONTEXT", ""))
-
-
-def remap_coverage_paths(installed_path: str) -> None:
-    """Combine installed-module coverage with the corresponding source file."""
-    import os  # noqa: PLC0415 - Standalone test helper.
-    from pathlib import Path  # noqa: PLC0415 - Standalone test helper.
-
-    import coverage  # noqa: PLC0415 - Standalone test helper.
-
-    data = coverage.CoverageData()
-    data.read()
-    mapped = coverage.CoverageData(basename=".coverage-mapped")
-    mapped.update(
-        data,
-        map_path=lambda path: (
-            os.environ["src"] + "/main.py"  # noqa: SIM112 - Nix build environment.
-            if path == installed_path
-            else path
-        ),
-    )
-    mapped.write()
-    Path(mapped.data_filename()).replace(data.data_filename())
-
-
-def run_python_check() -> None:
-    """Run a Nix package check using only explicit Hypothesis examples."""
-    import os  # noqa: PLC0415 - Standalone test helper.
-    import sys  # noqa: PLC0415 - Standalone test helper.
-
-    import pytest  # noqa: PLC0415 - Standalone test helper.
-    from hypothesis import Phase, settings  # noqa: PLC0415 - Standalone test helper.
-
-    settings.register_profile("explicit", phases=[Phase.explicit])
-    settings.load_profile("explicit")
-    raise SystemExit(
-        pytest.main(
-            [
-                "-p",
-                "no:cacheprovider",
-                "--import-mode=importlib",
-                os.environ["src"] + "/test_main.py",  # noqa: SIM112 - Nix build environment.
-                *sys.argv[1:],
-            ],
-        ),
-    )
-
-
-def python_test_support_source() -> str:
-    """Copy standalone test helpers without importing Afairesi in target runtimes."""
-    source = Path(__file__).read_text(encoding="utf-8")
-    helpers = source.split("\ndef make_test_report_plugin", 1)[1].split(
-        "\ndef python_test_support_source",
-        1,
-    )[0]
-    return "from __future__ import annotations\n\ndef make_test_report_plugin" + helpers
 
 
 class CommandError(RuntimeError):
@@ -2814,11 +2547,6 @@ class TestSelection:
         return arguments
 
 
-def _test_report_source() -> str:
-    """Read the pytest plugin shared by coverage and on-demand campaigns."""
-    return python_test_support_source()
-
-
 def _prepare_package_tests(  # noqa: PLR0913
     workspace: Path,
     name: str,
@@ -2846,27 +2574,16 @@ def _prepare_package_tests(  # noqa: PLR0913
         encoding="utf-8",
     )
     profile = (
-        "    from hypothesis import Phase, settings\n"
-        '    settings.register_profile("coverage", phases=[Phase.explicit])\n'
-        '    settings.load_profile("coverage")\n'
+        ""
         if max_examples is None
         else "    from hypothesis import settings\n"
         f'    settings.register_profile("ondemand", max_examples={max_examples},'
         " deadline=None)\n"
         '    settings.load_profile("ondemand")\n'
     )
-    (workspace / "_afairesi_test_report.py").write_text(
-        _test_report_source()
-        + "\nglobals().update(vars(make_test_report_plugin(\n"
-        + f"    {name!r}, mutation_report={max_examples is None!r},\n"
-        + ")))\n",
-        encoding="utf-8",
-    )
     pytest_arguments = [
         "-p",
         "no:cacheprovider",
-        "-p",
-        "_afairesi_test_report",
         "-p",
         "_hypothesis_pytestplugin",
         *selection.pytest_arguments(),
@@ -2885,7 +2602,6 @@ def _prepare_package_tests(  # noqa: PLR0913
         "import os, sys\n"
         "from pathlib import Path\n"
         "from tempfile import TemporaryDirectory\n"
-        "os.dup2(1, 2)\n"
         f"os.environ['PACKAGE_E2E_EXECUTABLE'] = {str(launcher)!r}\n"
         f"tools = {str(launcher.parent) + os.pathsep + environment.path!r}\n"
         "os.environ['PATH'] = tools + os.pathsep + os.environ.get('PATH', '')\n"
@@ -2895,8 +2611,6 @@ def _prepare_package_tests(  # noqa: PLR0913
         "os.environ.pop('PYTEST_ADDOPTS', None)\n"
         "os.environ['PYTEST_DISABLE_PLUGIN_AUTOLOAD'] = '1'\n"
         "os.environ.pop('PYTEST_PLUGINS', None)\n"
-        "os.environ.pop('AFAIRESI_TEST_REPORT_OWNER', None)\n"
-        "os.environ.pop('AFAIRESI_TEST_CONTEXT', None)\n"
         "os.environ['HYPOTHESIS_STORAGE_DIRECTORY'] = "
         f"{str(workspace / 'hypothesis')!r}\n"
         "runtime = TemporaryDirectory(prefix='test-runtime-', "
@@ -2911,7 +2625,7 @@ def _prepare_package_tests(  # noqa: PLR0913
         "pid = Path('active-test-pgid')\n"
         "pid.write_text(str(os.getpgrp()))\n"
         "try:\n" + profile + "    import pytest\n"
-        f"    sys.exit(pytest.main({pytest_arguments!r}))\n"
+        f"    sys.exit(pytest.main({pytest_arguments!r} + sys.argv[1:]))\n"
         "finally:\n"
         "    pid.unlink(missing_ok=True)\n"
         "    runtime.cleanup()\n",
@@ -2948,7 +2662,7 @@ def _prepare_test_profiling(
     reports.mkdir()
     wrapper = workspace / "profile-script.py"
     wrapper.write_text(
-        "import cProfile, os, pstats, runpy, sys\n"
+        "import cProfile, os, runpy, sys\n"
         "from pathlib import Path\n"
         "sys.argv.pop(0)\n"
         f"reports = Path({str(reports)!r})\n"
@@ -2957,11 +2671,7 @@ def _prepare_test_profiling(
         "try:\n"
         "    profiler.runcall(runpy.run_path, sys.argv[0], run_name='__main__')\n"
         "finally:\n"
-        "    profiler.dump_stats(str(report.with_suffix('.prof')))\n"
-        "    with report.with_suffix('.txt').open('w') as output:\n"
-        "        stats = pstats.Stats(profiler, stream=output)\n"
-        "        stats.sort_stats('cumulative').print_stats(40)\n"
-        "        stats.sort_stats('time').print_stats(40)\n",
+        "    profiler.dump_stats(str(report.with_suffix('.prof')))\n",
         encoding="utf-8",
     )
     launcher.write_text(
@@ -2977,7 +2687,7 @@ def _prepare_test_profiling(
         + ' "$@"\n',
         encoding="utf-8",
     )
-    sys.stdout.write(f"Function profiles (.prof) and text reports: {reports}\n")
+    sys.stdout.write(f"Function profiles (.prof): {reports}\n")
     sys.stdout.flush()
     return [environment.python, "-B", str(wrapper), str(bootstrap)]
 
@@ -3079,87 +2789,20 @@ def _select_mutations(workspace: Path, name: str, selection: TestSelection) -> N
         )
 
 
-def _mutation_status(result: dict[str, Any] | None) -> str:
-    """Keep filtered jobs, timeouts, and engine errors out of assertion kills."""
-    if result is None:
-        return "pending"
-    if result["worker_outcome"] == "skipped":
-        return "skipped"
-    if result["worker_outcome"] != "normal" or result["test_outcome"] == "incompetent":
-        return "error"
-    if result["output"] == "timeout":
-        return "timeout"
-    return str(result["test_outcome"])
-
-
-def _mutation_attribution(result: dict[str, Any] | None) -> dict[str, Any]:
-    """Read the pytest report captured in an individual worker's output."""
-    if result is not None:
-        prefix = "AFAIRESI_TEST_REPORT "
-        for line in reversed((result["output"] or "").splitlines()):
-            if line.startswith(prefix):
-                return cast("dict[str, Any]", json.loads(line.removeprefix(prefix)))
-    return {}
-
-
-def _summarize_mutations(workspace: Path) -> bool:
-    """Report engine outcomes without treating survivors as command failures."""
-    counts: Counter[str] = Counter()
-    survivors: list[str] = []
-    mutations = []
-    kills: dict[str, list[str]] = {}
+def _mutation_run_succeeded(workspace: Path) -> bool:
+    """Preserve engine failures without imposing a mutation score threshold."""
     for line in (workspace / "results.jsonl").read_text(encoding="utf-8").splitlines():
-        item, result = json.loads(line)
-        status = _mutation_status(result)
-        counts[status] += 1
-        attribution = _mutation_attribution(result)
-        identity = _mutation_id(item["mutations"])
-        failed_tests = attribution.get("failed_tests", [])
-        if status == "killed":
-            for nodeid in failed_tests:
-                kills.setdefault(nodeid, []).append(identity)
-        if status != "skipped":
-            mutations.append(
-                {
-                    "id": identity,
-                    "status": status,
-                    "mutations": item["mutations"],
-                    "failed_tests": failed_tests,
-                    "collection_errors": attribution.get("collection_errors", []),
-                    "diff": result["diff"] if result is not None else None,
-                },
-            )
-        if status == "survived":
-            survivors.append(f"Survived {item['job_id']}:\n{result['diff']}")
-    summary = dict(counts)
-    (workspace / "summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    (workspace / "mutation-results.json").write_text(
-        json.dumps(
-            {
-                "schema": "afairesi.mutations",
-                "schema_version": 1,
-                "summary": summary,
-                "mutations": sorted(mutations, key=lambda mutation: mutation["id"]),
-                "kills_by_test": {
-                    nodeid: sorted(ids) for nodeid, ids in sorted(kills.items())
-                },
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    if not counts:
-        sys.stdout.write("No mutations generated.\n")
-    else:
-        statuses = ("killed", "survived", "timeout", "error", "pending", "skipped")
-        sys.stdout.write(", ".join(f"{key}: {counts[key]}" for key in statuses) + "\n")
-    if survivors:
-        sys.stdout.write("\n".join(survivors) + "\n")
-    return not (counts["error"] or counts["pending"])
+        _, result = json.loads(line)
+        if result is None:
+            return False
+        if result["worker_outcome"] == "skipped":
+            continue
+        if (
+            result["worker_outcome"] != "normal"
+            or result["test_outcome"] == "incompetent"
+        ):
+            return False
+    return True
 
 
 def _run_mutation_campaign(
@@ -3178,11 +2821,18 @@ def _run_mutation_campaign(
     )
     sys.stdout.write("Running baseline tests...\n")
     sys.stdout.flush()
-    _run_test_command(command, workspace, workspace / "baseline.log", timeout=timeout)
-    shutil.copyfile(workspace / "tests.json", workspace / "baseline-tests.json")
-    baseline = json.loads((workspace / "baseline-tests.json").read_text())
-    if not baseline["summary"].get("passed", 0):
-        message = "selected baseline has no passing tests; see baseline-tests.json"
+    _run_test_command(
+        [*command, "--junitxml=baseline.xml"],
+        workspace,
+        workspace / "baseline.log",
+        timeout=timeout,
+    )
+    baseline = ET.parse(workspace / "baseline.xml").getroot()  # noqa: S314 - Locally generated pytest output.
+    if not any(
+        not any(child.tag in {"failure", "error", "skipped"} for child in case)
+        for case in baseline.iter("testcase")
+    ):
+        message = "selected baseline has no passing tests; see baseline.xml"
         raise CommandError(message)
     config = workspace / "cosmic-ray.toml"
     config.write_text(
@@ -3219,7 +2869,13 @@ def _run_mutation_campaign(
         workspace,
         workspace / "report.html",
     )
-    return _summarize_mutations(workspace)
+    _run_test_command(
+        ["cr-report", session],
+        workspace,
+        workspace / "report.log",
+    )
+    sys.stdout.write((workspace / "report.log").read_text(encoding="utf-8"))
+    return _mutation_run_succeeded(workspace)
 
 
 def _run_test_package(
@@ -3412,21 +3068,6 @@ def _build_package_coverage(package: Path) -> None:
         )
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
-    test_report = Path(outputs[0]) / "tests.json"
-    if not test_report.is_file():
-        message = f"coverage check produced no test report for {package.name}"
-        raise CommandError(message)
-    summary = json.loads(test_report.read_text(encoding="utf-8"))["summary"]
-    sys.stdout.write(
-        f"{package.name}: {summary['selected_cases']} cases, "
-        f"{summary.get('skipped', 0)} skipped; {test_report}\n",
-    )
-    if summary["unexecuted_properties"]:
-        sys.stdout.write(
-            f"{package.name}: properties with no body executions: "
-            + ", ".join(summary["unexecuted_properties"])
-            + "\n",
-        )
 
 
 def _run_coverage(target: Path) -> bool:
@@ -3504,7 +3145,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     coverage = commands.add_parser(
         "coverage",
         help="measure coverage and print report paths",
-        description="Measure coverage from explicit test examples.",
+        description="Measure coverage from the package test suite.",
         epilog=(
             "Skip packages without tests. HTML reports: Nix store. "
             "Update checks with nix fmt."
@@ -3631,7 +3272,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         "performance",
         help="profile existing tests and package CLI calls",
         description=(
-            "Profile explicit test examples with cProfile and show slow test phases. "
+            "Profile tests with cProfile and show slow test phases. "
             "Save separate function profiles for pytest and package CLI processes."
         ),
         epilog=(
