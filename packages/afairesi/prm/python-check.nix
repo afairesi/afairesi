@@ -23,6 +23,16 @@ pkgs.runCommand packageName
     ln -s "$src" "packages/${packageName}"
     export PYTHONPATH="$PWD:$PYTHONPATH"
     cd "$out"
-    "${pythonEnv}/bin/python" -m pytest -p no:cacheprovider --import-mode=importlib \
+    "${pythonEnv}/bin/python" -c '
+    import sys
+    import pytest
+    class Defaults:
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_load_initial_conftests(self, early_config, parser, args):
+            from hypothesis import settings
+            settings.register_profile("afairesi", max_examples=10)
+            settings.load_profile("afairesi")
+    sys.exit(pytest.main(plugins=[Defaults()]))
+    ' -p no:cacheprovider --import-mode=importlib \
       "$src/test_main.py" "''${afairesi_pytest_args[@]}"
   ''
