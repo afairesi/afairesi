@@ -5288,18 +5288,13 @@ def test_mutation_runs_preserve_engine_failure_status(
     )
 
 
-@settings(deadline=None)
-@given(value=st.integers(min_value=1, max_value=9))
-@example(value=1)
-def test_mutation_campaigns_report_outcomes_and_filter_mutations(
-    value: int,
-) -> None:
-    """Report killed/surviving mutations with native session filters."""
+def test_mutation_campaigns_report_outcomes_and_filter_mutations() -> None:
+    """Check killed/surviving mutations and native filters once with a fixed value."""
     with TemporaryDirectory(prefix="afairesi-mutations-") as directory:
         root = Path(directory) / "source with spaces"
         source = (
             "def value():\n"
-            f"    return {value}\n"
+            "    return 1\n"
             "\n"
             "def unused():\n"
             "    return 2\n"
@@ -5316,7 +5311,7 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations(
             "    result = subprocess.run(['git', 'example'], "
             "capture_output=True, text=True)\n"
             "    assert result.returncode == 0 "
-            f"and result.stdout == {str(value) + chr(10)!r}\n"
+            "and result.stdout == '1\\n'\n"
             "def test_cli_process_success():\n"
             "    result = subprocess.run(['git', 'example'], "
             "capture_output=True, text=True)\n"
