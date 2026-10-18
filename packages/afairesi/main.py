@@ -2291,8 +2291,18 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
     """Scaffold and format a new flake in an existing repository directory."""
     executable = nix_executable or require_nix_flakes()
     (root / "flake.nix").write_text(
-        '{ inputs.afairesi.url = "github:afairesi/afairesi"; '
-        "outputs = inputs: inputs.afairesi.blueprint { inherit inputs; }; }\n",
+        "{\n"
+        '  inputs.afairesi.url = "github:afairesi/afairesi";\n'
+        "  outputs =\n"
+        "    inputs:\n"
+        "    inputs.afairesi.blueprint {\n"
+        "      inherit inputs;\n"
+        "    }\n"
+        "    // {\n"
+        "      formatter = inputs.afairesi.lib.mkFormatter "
+        "{ inherit (inputs) self; };\n"
+        "    };\n"
+        "}\n",
         encoding="utf-8",
     )
     git(root, ["add", "--", "flake.nix"])
@@ -4193,6 +4203,7 @@ def parser() -> argparse.ArgumentParser:
             "Structural changes are staged for review."
         ),
         epilog=(
+            "Only compliant paths persist; nix fmt and repo fix delete the rest. "
             "Keep prm/ minimal: only necessary supporting files. "
             "Use nix fmt to fix and format; afairesi repo inspect to inspect; "
             "afairesi repo test to test."

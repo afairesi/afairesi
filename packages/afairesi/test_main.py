@@ -2155,6 +2155,8 @@ def test_local_init_stages_files_without_committing_or_requiring_home(
     branch: str,
 ) -> None:
     """Initialize a local worktree, preserving Git configuration and formatted files."""
+    nix_executable = shutil.which("nix")
+    _expect(nix_executable is not None, "initialization fixtures require Nix")
     tools = tmp_path / "tools"
     tools.mkdir()
     fake_nix = tools / "nix"
@@ -2178,6 +2180,25 @@ def test_local_init_stages_files_without_committing_or_requiring_home(
     _git(root, "init", "--quiet", f"--initial-branch={branch}")
     config = _git(root, "config", "--local", "--list")
     _local_init(root)
+    outputs = _run(
+        root,
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        f"(import {json.dumps(str(root / 'flake.nix'))}).outputs {{ "
+        'self = "consumer"; afairesi = { '
+        'blueprint = _: { packages = "preserved"; formatter = "plain"; }; '
+        'lib.mkFormatter = { self }: "repair-${self}"; }; }',
+        executable=nix_executable,
+        environment=_nix_environment(root)
+        | {"HOME": str(root / "tmp/evaluation-home")},
+    )
+    _expect(
+        json.loads(outputs.stdout)
+        == {"packages": "preserved", "formatter": "repair-consumer"},
+        outputs,
+    )
     files = {".gitignore", "flake.lock", "flake.nix"}
     _expect(set(_git(root, "ls-files").splitlines()) == files, "wrong staged files")
     for name in files:
