@@ -15,6 +15,10 @@ let
   };
   system = pkgs.stdenv.hostPlatform.system;
   package = consumer.packages.${system}.example;
+  vmCoverage = inputs.self.lib.mkCoverage {
+    check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
+    packageDrv = package;
+  };
   descriptionless = inputs.self.blueprint {
     inputs = {
       self = {
@@ -49,6 +53,9 @@ assert package.meta.mainProgram == "example";
 assert consumer.checks.${system} ? example;
 assert consumer.legacyPackages.${system} ? example-test-environment;
 assert consumer.legacyPackages.${system} ? example-coverage;
+assert vmCoverage.requiredSystemFeatures == [ "kvm" ];
+assert vmCoverage.origBuilder == consumer.checks.${system}.example.builder;
+assert vmCoverage.drvPath != consumer.legacyPackages.${system}.example-coverage.drvPath;
 assert consumer.devShells.${system} ? example-test;
 assert consumer.apps.${system}.example.type == "app";
 assert consumer.apps.${system}.example.meta == package.meta;

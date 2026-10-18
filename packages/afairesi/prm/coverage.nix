@@ -3,6 +3,8 @@
   packageDrv,
 }:
 let
+  # VM wrappers retain derivation attributes but do not expose overrideAttrs.
+  overrideCheck = check.overrideAttrs or (update: builtins.derivation (check.drvAttrs // update check));
   # Extract standalone helpers without importing the CLI or its dependencies.
   runtime = builtins.toFile "coverage_support.py" (
     "from __future__ import annotations\n"
@@ -17,7 +19,7 @@ let
     + "start_subprocess_coverage()\n"
   );
 in
-check.overrideAttrs (previous: {
+overrideCheck (previous: {
   name = "${previous.name}-coverage";
   buildCommand = ''
     mkdir -p "$out/html" "$TMPDIR/coverage-startup"

@@ -3098,6 +3098,22 @@ def _build_package_coverage(package: Path) -> None:
         )
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
+    data = report.parents[1] / "coverage.json"
+    if data.is_file():
+        coverage = json.loads(data.read_text(encoding="utf-8"))
+        totals = coverage["totals"]
+        sys.stdout.write(
+            f"  {totals['percent_covered']:.1f}% coverage; "
+            f"{totals['missing_lines']} missing lines, "
+            f"{totals['missing_branches']} missing branches\n",
+        )
+        for filename, measured in sorted(coverage["files"].items()):
+            if measured["missing_branches"]:
+                branches = ", ".join(
+                    f"{start} -> {end if end > 0 else 'exit'}"
+                    for start, end in measured["missing_branches"]
+                )
+                sys.stdout.write(f"  {filename}: missing branches {branches}\n")
 
 
 def _run_coverage(target: Path) -> bool:
@@ -3157,7 +3173,7 @@ def _run_coverage(target: Path) -> bool:
 
 def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     """Construct the test campaign command-line parser."""
-    result.set_defaults(test_command=None, target=None)
+    result.set_defaults(test_command=None, target=None, test_parser=result)
     commands = result.add_subparsers(dest="test_command", metavar="COMMAND")
     coverage = commands.add_parser(
         "coverage",
@@ -3363,42 +3379,23 @@ def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
 ) -> None:
-    """Run selected campaigns, continuing after failures and returning one status."""
-    combined = options.test_command is None
+    """Show campaign help or run one explicitly selected campaign."""
+    if options.test_command is None:
+        options.test_parser.print_help()
+        return
     target = _command_target(options.target)
-    if combined:
-        campaigns = [
-            cli.parse_args(["repo", "test", command, str(target)])
-            for command in ("coverage", "property", "fuzz", "mutation", "performance")
-        ]
-    else:
-        campaigns = [options]
-    outcomes: dict[str, bool] = {}
-    for campaign in campaigns:
-        command = campaign.test_command
-        if combined:
-            sys.stdout.write(f"\nRunning {command} campaign...\n")
-            sys.stdout.flush()
-        campaign.target = target
-        try:
-            outcomes[command] = (
-                _run_coverage(target)
-                if command == "coverage"
-                else _dispatch_test_runner(campaign, cli)
-            )
-        except subprocess.CalledProcessError as error:
-            if not combined:
-                raise
-            outcomes[command] = False
-            _report_process_failure(error)
-        except (CommandError, OSError, subprocess.TimeoutExpired) as error:
-            outcomes[command] = False
-            sys.stderr.write(f"afairesi repo test {command}: {target}: {error}\n")
-    if combined:
-        sys.stdout.write("\nCampaign summary:\n")
-        for command, success in outcomes.items():
-            sys.stdout.write(f"  {command}: {'passed' if success else 'failed'}\n")
-    sys.exit(0 if all(outcomes.values()) else 1)
+    try:
+        success = (
+            _run_coverage(target)
+            if options.test_command == "coverage"
+            else _dispatch_test_runner(options, cli)
+        )
+    except (CommandError, OSError, subprocess.TimeoutExpired) as error:
+        sys.stderr.write(
+            f"afairesi repo test {options.test_command}: {target}: {error}\n",
+        )
+        sys.exit(1)
+    sys.exit(0 if success else 1)
 
 
 @contextlib.contextmanager
@@ -3814,7 +3811,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="run test campaigns and profile existing tests",
         description=(
             "Run coverage, property tests, fuzz tests, mutation tests, and performance "
-            "profiling. Default: all five campaigns in the current flake. "
+            "profiling. Choose a campaign explicitly; no campaign runs by default. "
             "Fuzz tests default to 10 generated examples per test."
         ),
     )

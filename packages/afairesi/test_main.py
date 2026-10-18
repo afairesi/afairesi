@@ -4239,129 +4239,181 @@ def _campaign_manage(
     return _run(root, *arguments, code=code)
 
 
+@pytest.mark.parametrize("nested", [False, True])
+@pytest.mark.parametrize(
+    "command",
+    ["coverage", "property", "fuzz", "mutation", "performance"],
+)
+@pytest.mark.parametrize("target", ["omitted", "root", "relative", "absolute"])
 def test_campaigns_route_targets_and_forward_test_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    target: str,
+    *,
+    nested: bool,
 ) -> None:
-    """Route repository and package campaigns with their requested test filters."""
-    campaign_subject = import_module("packages.afairesi.main")
+    """Resolve one target and forward its selectors without shell interpretation."""
+    subject = import_module("packages.afairesi.main")
     root = _campaign_repository(tmp_path)
     package = _campaign_make_source_package(root, "alpha", "def test_alpha(): pass\n")
-    nested = package / "prm/nested"
-    nested.mkdir(parents=True)
-    observed: list[Path] = []
-    forwarded: list[tuple[object, ...]] = []
-
-    def run(target: Path, *arguments: object) -> bool:
-        observed.append(target)
-        forwarded.append(arguments)
-        return True
-
-    for runner in (
-        "_run_coverage",
-        "_run_test_package",
-        "_run_test_repository",
+    directory = package / "prm/nested" if nested else package
+    directory.mkdir(parents=True, exist_ok=True)
+    monkeypatch.chdir(directory)
+    arguments = {
+        "omitted": [],
+        "root": ["."],
+        "relative": ["packages/alpha"],
+        "absolute": [str(package)],
+    }[target]
+    expected = root if target in {"omitted", "root"} else package
+    runner = Mock(return_value=True)
+    route = "_run_test_repository" if expected == root else "_run_test_package"
+    route = "_run_coverage" if command == "coverage" else route
+    monkeypatch.setattr(subject, route, runner)
+    selectors = [] if command == "coverage" else ["-k", "keyword", "-m", "marker"]
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["afairesi", "repo", "test", command, *arguments, *selectors],
+    )
+    with pytest.raises(SystemExit) as completed:
+        subject.main()
+    if completed.value.code != 0:
+        raise AssertionError((completed.value.code, 0))
+    if runner.call_count != 1:
+        raise AssertionError((runner.call_count, 1))
+    if runner.call_args.args[0] != expected:
+        raise AssertionError((runner.call_args.args[0], expected))
+    if command != "coverage" and runner.call_args.args[-1] != subject.TestSelection(
+        keywords="keyword",
+        markers="marker",
+        max_examples=10 if command == "fuzz" else None,
     ):
-        monkeypatch.setattr(campaign_subject, runner, run)
-    for cwd in (package, nested):
-        monkeypatch.chdir(cwd)
-        observed.clear()
-        monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
-        with pytest.raises(SystemExit) as combined:
-            campaign_subject.main()
-        _campaign_expect(combined.value.code == 0 and observed == [root] * 5, observed)
-        for path in (
-            ("coverage",),
-            ("property",),
-            ("fuzz",),
-            ("mutation",),
-            ("performance",),
-        ):
-            targets = (
-                ((), root),
-                ((".",), root),
-                (("packages/alpha",), package),
-                ((str(package),), package),
-            )
-            for arguments, expected in targets:
-                filters = (
-                    ["-k", "keyword", "-m", "marker"] if path != ("coverage",) else []
-                )
-                monkeypatch.setattr(
-                    sys,
-                    "argv",
-                    ["afairesi", "repo", "test", *path, *arguments, *filters],
-                )
-                with pytest.raises(SystemExit) as completed:
-                    campaign_subject.main()
-                _campaign_expect(completed.value.code == 0, path)
-                _campaign_expect(observed[-1] == expected, (path, arguments, observed))
-                if filters:
-                    _campaign_expect(
-                        forwarded[-1][-1]
-                        == campaign_subject.TestSelection(
-                            keywords="keyword",
-                            markers="marker",
-                            max_examples=10 if path == ("fuzz",) else None,
-                        ),
-                        forwarded[-1],
-                    )
+        raise AssertionError(
+            (
+                runner.call_args.args[-1],
+                subject.TestSelection(
+                    keywords="keyword",
+                    markers="marker",
+                    max_examples=10 if command == "fuzz" else None,
+                ),
+            ),
+        )
 
 
-def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
-    """Expose consistent commands and reject invalid requests before creating state."""
-    with TemporaryDirectory(prefix="afairesi-cli-") as directory:
-        root = Path(directory)
-        commands = (
-            (),
-            ("coverage",),
-            ("property",),
-            ("fuzz",),
-            ("mutation",),
-            ("performance",),
-        )
-        help_output = _campaign_run(root, "--help").stdout
-        positions = [help_output.index(f"    {path[0]} ") for path in commands[1:]]
-        _campaign_expect(positions == sorted(positions), help_output)
-        for path in commands:
-            option = _campaign_run(root, *path, "--help").stdout
-            _campaign_expect(
-                "usage:" in option,
-                path,
-            )
-        environment = dict(os.environ)
-        environment["PATH"] = (
-            str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
-            + os.pathsep
-            + environment["PATH"]
-        )
-        _campaign_expect(
-            _campaign_run(
-                root,
-                "--help",
-                executable="afairesi",
-                environment=environment,
-            ).stdout
-            == _campaign_run(root, "--help").stdout,
-            "standalone command unavailable through PATH",
-        )
-        _campaign_expect(
-            "not inside a Git repository" in _campaign_run(root, code=1).stderr,
-            "bare test must require a repository",
-        )
-        for command in ("coverage", "property", "fuzz", "mutation", "performance"):
-            _campaign_run(root, command, code=1)
-        for command in ("property", "fuzz", "mutation", "performance"):
-            for timeout in ("nan", "inf", "-inf", "0", "-1"):
-                _campaign_run(root, command, str(root), f"--timeout={timeout}", code=2)
-        for arguments in (
-            ("--max-mutations", "0"),
-            ("--max-mutations", "-1"),
-        ):
-            _campaign_run(root, "mutation", str(root), *arguments, code=2)
-        for limit in ("0", "-1"):
-            _campaign_run(root, "fuzz", str(root), "--max-examples", limit, code=2)
-        _campaign_expect(not any(root.iterdir()), "invalid CLI request created state")
+@pytest.mark.parametrize("location", ["outside", "root", "nested"])
+def test_bare_test_command_shows_help_without_running_campaigns(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    location: str,
+) -> None:
+    """Show the same help inside and outside Git without creating state."""
+    subject = import_module("packages.afairesi.main")
+    root = tmp_path / "repository"
+    root.mkdir()
+    _campaign_repository(root)
+    nested = root / "packages/example/prm/nested"
+    nested.mkdir(parents=True)
+    monkeypatch.chdir({"outside": tmp_path, "root": root, "nested": nested}[location])
+    coverage_run = Mock(side_effect=AssertionError("unexpected coverage run"))
+    other_campaigns = Mock(side_effect=AssertionError("unexpected campaign"))
+    monkeypatch.setattr(subject, "_run_coverage", coverage_run)
+    monkeypatch.setattr(subject, "_dispatch_test_runner", other_campaigns)
+    before = _campaign_snapshot(root)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "--help"])
+    with pytest.raises(SystemExit) as completed:
+        subject.main()
+    if completed.value.code != 0:
+        raise AssertionError((completed.value.code, 0))
+    expected = capsys.readouterr()
+    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
+    subject.main()
+    actual = capsys.readouterr()
+    if actual.out != expected.out:
+        raise AssertionError((actual.out, expected.out))
+    if actual.err != "":
+        raise AssertionError((actual.err, ""))
+    if coverage_run.call_count != 0:
+        raise AssertionError((coverage_run.call_count, 0))
+    if other_campaigns.call_count != 0:
+        raise AssertionError((other_campaigns.call_count, 0))
+    if _campaign_snapshot(root) != before:
+        raise AssertionError((_campaign_snapshot(root), before))
+
+    if list(tmp_path.iterdir()) != [root]:
+        raise AssertionError(list(tmp_path.iterdir()))
+
+
+@pytest.mark.parametrize(
+    "command",
+    [None, "coverage", "property", "fuzz", "mutation", "performance"],
+)
+def test_campaign_help_is_available_outside_git(
+    tmp_path: Path,
+    command: str | None,
+) -> None:
+    """Describe each campaign without requiring repository or build state."""
+    arguments = [] if command is None else [command]
+    result = _campaign_run(tmp_path, *arguments, "--help")
+    if "usage: afairesi repo test" not in result.stdout:
+        raise AssertionError(result)
+    if list(tmp_path.iterdir()) != []:
+        raise AssertionError(list(tmp_path.iterdir()))
+
+
+@pytest.mark.parametrize(
+    "command",
+    ["coverage", "property", "fuzz", "mutation", "performance"],
+)
+def test_explicit_campaign_requires_repository(tmp_path: Path, command: str) -> None:
+    """Keep explicit execution errors distinct from the bare help command."""
+    result = _campaign_run(tmp_path, command, code=1)
+    if "not inside a Git repository" not in result.stderr:
+        raise AssertionError(result)
+    if list(tmp_path.iterdir()) != []:
+        raise AssertionError(list(tmp_path.iterdir()))
+
+
+@pytest.mark.parametrize("command", ["property", "fuzz", "mutation", "performance"])
+@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf", "0", "-1"])
+def test_campaign_rejects_invalid_timeout_without_changes(
+    tmp_path: Path,
+    command: str,
+    timeout: str,
+) -> None:
+    """Reject invalid budgets before creating build or test state."""
+    result = _campaign_run(
+        tmp_path,
+        command,
+        str(tmp_path),
+        f"--timeout={timeout}",
+        code=2,
+    )
+    if "--timeout must be positive and finite" not in result.stderr:
+        raise AssertionError(result)
+    if list(tmp_path.iterdir()) != []:
+        raise AssertionError(list(tmp_path.iterdir()))
+
+
+@pytest.mark.parametrize(
+    ("command", "option"),
+    [("mutation", "--max-mutations"), ("fuzz", "--max-examples")],
+)
+@pytest.mark.parametrize("limit", ["0", "-1"])
+def test_campaign_rejects_invalid_count_without_changes(
+    tmp_path: Path,
+    command: str,
+    option: str,
+    limit: str,
+) -> None:
+    """Require a positive generation or mutation count."""
+    result = _campaign_run(tmp_path, command, str(tmp_path), option, limit, code=2)
+    if f"{option} must be positive" not in result.stderr:
+        raise AssertionError(result)
+    if list(tmp_path.iterdir()) != []:
+        raise AssertionError(list(tmp_path.iterdir()))
 
 
 @pytest.mark.parametrize("limit", [None, 3])
@@ -4556,71 +4608,6 @@ def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> No
         )
 
 
-@pytest.mark.parametrize(
-    "failure",
-    [None, "coverage", "property", "fuzz", "mutation", "performance"],
-)
-@pytest.mark.parametrize("failure_kind", ["policy", "process"])
-def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    failure: str | None,
-    failure_kind: str,
-) -> None:
-    """Execute every campaign in order even when an earlier campaign fails."""
-    campaign_subject = import_module("packages.afairesi.main")
-    _campaign_repository(tmp_path)
-    monkeypatch.chdir(tmp_path)
-    observed: list[str] = []
-
-    def run(command: str) -> bool:
-        observed.append(command)
-        if command == failure and failure_kind == "process":
-            raise subprocess.CalledProcessError(
-                17,
-                ["native-tool"],
-                output="native campaign failure\n",
-            )
-        if command == failure and command != "mutation":
-            message = "campaign failed"
-            raise campaign_subject.CommandError(message)
-        return command != failure
-
-    def coverage_run(_target: Path) -> bool:
-        return run("coverage")
-
-    def runner(
-        _target: Path,
-        command: str,
-        *_arguments: object,
-    ) -> bool:
-        return run(command)
-
-    monkeypatch.setattr(campaign_subject, "_run_coverage", coverage_run)
-    monkeypatch.setattr(campaign_subject, "_run_test_repository", runner)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "--help"])
-    with pytest.raises(SystemExit) as help_status:
-        campaign_subject.main()
-    _campaign_expect(help_status.value.code == 0 and not observed, observed)
-    capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
-    with pytest.raises(SystemExit) as completed:
-        campaign_subject.main()
-    _campaign_expect(completed.value.code == (0 if failure is None else 1), completed)
-    _campaign_expect(
-        observed == ["coverage", "property", "fuzz", "mutation", "performance"],
-        observed,
-    )
-    output = capsys.readouterr()
-    _campaign_expect("Campaign summary:" in output.out, output)
-    for command in observed:
-        status = "failed" if command == failure else "passed"
-        _campaign_expect(f"  {command}: {status}\n" in output.out, output)
-    if failure is not None and failure_kind == "process":
-        _campaign_expect("native campaign failure" in output.err, output)
-
-
 def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None:
     """Build real checks, measure CLI lines, and keep reports outside the checkout."""
     with TemporaryDirectory(prefix="afairesi-coverage-") as directory:
@@ -4758,6 +4745,60 @@ def test_coverage_continues_after_failed_nix_builds(
         ],
         builds,
     )
+
+
+@pytest.mark.parametrize(
+    ("missing", "expected"),
+    [
+        ([], ""),
+        ([[3, 6]], "  main.py: missing branches 3 -> 6\n"),
+        ([[3, -1]], "  main.py: missing branches 3 -> exit\n"),
+    ],
+)
+def test_coverage_describes_uncovered_branches(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    missing: list[list[int]],
+    expected: str,
+) -> None:
+    """Print branch destinations alongside the retained HTML report."""
+    subject = import_module("packages.afairesi.main")
+    root = tmp_path / "source"
+    root.mkdir()
+    package = _campaign_make_runner_target(root, "", "")
+    report = tmp_path / "report"
+    (report / "html").mkdir(parents=True)
+    (report / "html/index.html").touch()
+    (report / "coverage.json").write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "percent_covered": 60,
+                    "missing_lines": 2,
+                    "missing_branches": len(missing),
+                },
+                "files": {"main.py": {"missing_branches": missing}},
+            },
+        ),
+    )
+    monkeypatch.setattr(
+        subject.subprocess,
+        "run",
+        Mock(return_value=subprocess.CompletedProcess([], 0, str(report) + "\n")),
+    )
+    subject._build_package_coverage(package)  # noqa: SLF001 - Exercise report rendering without building Nix outputs.
+    actual = capsys.readouterr()
+    summary = f"  60.0% coverage; 2 missing lines, {len(missing)} missing branches\n"
+    expected_output = (
+        f"Building coverage for example...\nexample: {report}/html/index.html\n"
+        + summary
+        + expected
+    )
+    if actual.out != expected_output:
+        raise AssertionError((actual.out, expected_output))
+    if actual.err != "":
+        raise AssertionError(actual.err)
 
 
 def test_coverage_rejects_missing_report_files(
@@ -5402,7 +5443,7 @@ def test_campaign_home_target_requires_native_git_traversal(
     _campaign_git(tmp_path, "init", "--quiet")
     (tmp_path / ".gitmodules").touch()
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
+    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "property"])
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
     _campaign_expect(completed.value.code == 1, completed)
