@@ -185,63 +185,6 @@ def _check_excluded_trees(
         raise AssertionError(issues)
 
 
-def _check_formatted_checks(
-    repository: Path,
-) -> None:
-    """Preserve formatted generated checks through the full formatting pipeline."""
-    _fixture_add(repository, "hosts/laptop")
-    (repository / "packages/example/test_main.py").write_text(
-        "def test_result(): pass\n",
-    )
-    _repair_flake(repository)
-    for relative in (
-        "checks/laptopVmWithDisko/default.nix",
-        "checks/example/default.nix",
-    ):
-        check = repository / relative
-        _run(repository, "--no-cache", relative, executable="treefmt")
-        formatted = check.read_text(encoding="utf-8")
-        _git(repository, "add", "--", relative)
-        index = _git(repository, "ls-files", "--stage")
-        _repair_flake(repository)
-        _expect(
-            check.read_text(encoding="utf-8") == formatted
-            and _git(repository, "ls-files", "--stage") == index,
-            f"convergence regenerated formatted {relative}",
-        )
-
-
-def _check_host_repair(repository: Path) -> None:
-    """Repair a changed check while preserving its host and resource inventory."""
-    _fixture_add(repository, "hosts/laptop")
-    host = repository / "hosts/laptop/configuration.nix"
-    original_host = host.read_bytes()
-    original_paths = _git(repository, "ls-files").splitlines()
-    relative = "checks/laptopVmWithDisko/default.nix"
-    check = repository / relative
-    current = check.read_bytes()
-    changed = current.replace(b'"VmWithDisko"', b'"Changed"')
-    check.write_bytes(changed)
-    _git(repository, "add", "--", relative)
-    _repair_flake(repository, "--dry-run", code=1)
-    if check.read_bytes() != changed:
-        message = "dry-run changed the generated check"
-        raise AssertionError(message)
-    _repair_flake(repository)
-    if check.read_bytes() != current:
-        message = "convergence did not repair the generated check"
-        raise AssertionError(message)
-    if host.read_bytes() != original_host:
-        message = "check repair changed the host configuration"
-        raise AssertionError(message)
-    if _git(repository, "ls-files").splitlines() != original_paths:
-        message = "check repair added consumer files"
-        raise AssertionError(message)
-    if _repair_flake(repository, "--dry-run").stdout:
-        message = "check repair did not converge"
-        raise AssertionError(message)
-
-
 def _expect(condition: bool, detail: object) -> None:  # noqa: FBT001
     """Report an invariant failure with its observed state."""
     if not condition:
@@ -456,11 +399,12 @@ def _check_launcher_environment(
         "python = python // { withPackages = select: { selected = select { "
         'hypothesis = "hypothesis"; pytest = "pytest"; }; }; }; '
         f"meta = {metadata}; }}; "
-        f"in import {root / 'checks' / name / 'default.nix'} {{ pkgs = checkPkgs; "
-        "inputs.self = { "
         f"lib = import {Path(__file__).with_name('prm') / 'builders.nix'}; "
-        "packages.${builtins.currentSystem}."
-        f"{json.dumps(name)} = packageDrv; }}; }}"
+        f"in import {Path(__file__).with_name('prm') / 'python-check.nix'} {{ "
+        "pkgs = checkPkgs; inherit packageDrv; "
+        "testEnvironment = lib.mkTestEnvironment { "
+        "pkgs = checkPkgs; inherit packageDrv; }; "
+        f"packageName = {json.dumps(name)}; }}"
     )
     result = _run(
         root,
@@ -510,9 +454,8 @@ def test_create_stages_the_requested_resource_and_whitelist(
             "wrong resource files",
         )
         staged = {f"{relative}/{name}" for name in filenames} | {".gitignore"}
-        if kind == "host":
-            staged.add("checks/exampleVmWithDisko/default.nix")
-        else:
+        _expect(not (root / "checks").exists(), "creation wrote check wrappers")
+        if kind != "host":
             descriptions = {
                 "python": "A Python package.",
                 "html": "An HTML package.",
@@ -605,7 +548,7 @@ def test_add_targets_repository_root_and_rejects_existing_resources(kind: str) -
         ),
     ],
 )
-def test_public_repo_repair_generates_checks_and_reaches_a_fixed_point(
+def test_public_repo_repair_keeps_python_checks_implicit_and_reaches_a_fixed_point(
     tests: str,
 ) -> None:
     """Repair from nested directories and preview without changing Git state."""
@@ -616,12 +559,12 @@ def test_public_repo_repair_generates_checks_and_reaches_a_fixed_point(
         (root / "packages/example/test_main.py").write_text(tests)
         before = _snapshot(root)
         result = _run(nested, "fix", "-n")
-        _expect("checks/example/default.nix" in result.stdout, result.stdout)
+        _expect("checks/example/default.nix" not in result.stdout, result.stdout)
         _expect(_snapshot(root) == before, "repair preview changed state")
         _run(nested, "fix")
         _expect(
-            (root / "checks/example/default.nix").is_file(),
-            "repair omitted the check",
+            not (root / "checks").exists(),
+            "repair created an unnecessary check directory",
         )
         after = _snapshot(root)
         _run(nested, "fix", "--dry-run")
@@ -837,8 +780,9 @@ def test_repair_rejects_check_symlinks_before_changing_state(
         path = root / relative
         if path.is_dir():
             shutil.rmtree(path)
-        else:
+        elif path.exists():
             path.unlink()
+        path.parent.mkdir(parents=True, exist_ok=True)
         path.symlink_to(external if path.suffix else outside)
         before = _snapshot(root)
         rejected = _run(root, "fix", *(("--dry-run",) if dry_run else ()), code=1)
@@ -908,25 +852,6 @@ def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
         )
         _expect("index.lock" in failed.stderr, failed)
         _expect(_snapshot(root) == before, "failed creation left structural changes")
-
-
-@pytest.mark.parametrize("case", ["symlink", "file"])
-def test_removal_validates_all_targets_before_deletion(
-    tmp_path: Path,
-    case: str,
-) -> None:
-    """Reject unsupported related checks before deleting the package."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "packages/example", "nix")
-        check = root / "checks/example"
-        check.parent.mkdir()
-        if case == "symlink":
-            check.symlink_to(tmp_path, target_is_directory=True)
-        else:
-            check.write_text("preserve check contents")
-        before = _snapshot(root)
-        _run(root, "rm", "packages/example", "--force", code=1)
-        _expect(_snapshot(root) == before, "rejected removal deleted local files")
 
 
 @pytest.mark.parametrize("style", ["literal", "split", "annotated", "concatenated"])
@@ -1019,11 +944,22 @@ def test_rename_updates_runtime_paths_without_staging_unrelated_changes(
         )
 
 
-def test_convergence_preserves_formatted_checks() -> None:
-    """Keep generated checks stable after the real formatting pipeline."""
+@pytest.mark.parametrize("tracked", [False, True])
+def test_convergence_removes_check_directories(*, tracked: bool) -> None:
+    """Discard unsupported check files instead of preserving overrides."""
     with _fresh_repository() as root:
-        _fixture_add(root, "packages/example", "python")
-        _check_formatted_checks(root)
+        _fixture_add(root, "hosts/laptop")
+        check = root / "checks/laptopVmWithDisko/default.nix"
+        check.parent.mkdir(parents=True)
+        check.write_text("{}\n")
+        if tracked:
+            _git(root, "add", "--force", "--", str(check.relative_to(root)))
+        before = _snapshot(root)
+        _repair_flake(root, "--dry-run", code=1)
+        _expect(_snapshot(root) == before, "preview changed unsupported checks")
+        _repair_flake(root)
+        _expect(not (root / "checks").exists(), "cleanup preserved check files")
+        _preview_flake_repair(root)
 
 
 @settings(deadline=None)
@@ -1124,7 +1060,6 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
         'pkgs.stdenv.mkDerivation { name = "parallel"; src = ./prm; }',
         'pkgs.python3.pkgs.buildPythonPackage { pname = "parallel"; src = ./prm; }',
         "inputs.afairesi.lib.mkPythonPackage { inherit pkgs; src = ./prm; }",
-        "inputs.afairesi.lib.mkPythonCheck { inherit pkgs; packageDrv = base.foo; }",
         "inputs.nixpkgs.lib.nixosSystem { modules = [ ./prm/host.nix ]; }",
         'builtins.derivation { name = "parallel"; builder = "/bin/sh"; }',
         '(let build = pkgs.runCommand; in build "parallel" {} "touch $out")',
@@ -1264,10 +1199,18 @@ def test_convergence_rejects_invalid_test_sources_before_repairs(invalid: str) -
         _expect(_snapshot(root) == before, "invalid tests changed state")
 
 
-def test_convergence_repairs_host_checks() -> None:
-    """Repair generated host checks without rewriting host sources."""
+def test_convergence_keeps_host_checks_implicit() -> None:
+    """Converge hosts without creating check files or rewriting host sources."""
     with _fresh_repository() as root:
-        _check_host_repair(root)
+        _fixture_add(root, "hosts/laptop")
+        host = root / "hosts/laptop/configuration.nix"
+        host.write_text(host.read_text() + "# Keep host customizations.\n")
+        _git(root, "add", "--", str(host.relative_to(root)))
+        before = _snapshot(root)
+        _repair_flake(root)
+        _preview_flake_repair(root)
+        _expect(_snapshot(root) == before, "convergence changed the host")
+        _expect(not (root / "checks").exists(), "convergence created check wrappers")
 
 
 @pytest.mark.parametrize(
@@ -1682,7 +1625,7 @@ def _stage_resource_edits(
 @example(kind="nix", name="value", payload=b"Nix")
 @example(kind="host", name="laptop", payload=b"host")
 @example(kind="untracked", name="untracked", payload=b"untracked")
-def test_resource_lifecycle_preserves_files_checks_and_git_state(
+def test_resource_lifecycle_preserves_files_and_git_state(
     kind: str,
     name: str,
     payload: bytes,
@@ -1699,10 +1642,9 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
             (package / "default.nix").write_text("{}\n")
         else:
             _run(root, "add", original, *(() if kind == "host" else (kind,)))
-        check = f"checks/a{name}" + ("VmWithDisko" if kind == "host" else "")
         if kind == "python":
             _expect(
-                not (package / "test_main.py").exists() and not (root / check).exists(),
+                not (package / "test_main.py").exists(),
                 "new packages must be untested",
             )
             (package / "test_main.py").write_text(
@@ -1722,9 +1664,8 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
                 in _git(root, "ls-files").splitlines(),
                 "resources must be indexed",
             )
-        expected_check = kind in {"host", "python"}
-        _expect((root / check / "default.nix").is_file() == expected_check, check)
-        tracked = _git(root, "ls-files", "--", original, check).splitlines()
+        _expect(not (root / "checks").exists(), "convergence created check files")
+        tracked = _git(root, "ls-files", "--", original).splitlines()
         staged, working = _stage_resource_edits(root, tracked)
         untracked = package / "prm/untracked.bin"
         untracked.write_bytes(payload)
@@ -1735,9 +1676,8 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
             _expect(_snapshot(root) == before, "failed move changed untracked data")
             return
         _run(root, "mv", original, destination)
-        new_check = check.replace(f"a{name}", f"b{name}")
         for relative in tracked:
-            renamed = relative.replace(original, destination).replace(check, new_check)
+            renamed = relative.replace(original, destination)
             _expect(
                 subprocess.run(  # noqa: S603
                     ["git", "show", f":{renamed}"],  # noqa: S607
@@ -1759,23 +1699,19 @@ def test_resource_lifecycle_preserves_files_checks_and_git_state(
             "rename must not stage untracked assets",
         )
         _expect(
-            not package.exists() and not (root / check).exists(),
+            not package.exists(),
             "rename left old paths",
-        )
-        _expect(
-            (root / new_check / "default.nix").is_file() == expected_check,
-            new_check,
         )
         _repair_flake(root)
         survivor = root / destination / "prm/survivor.bin"
         survivor.write_bytes(payload)
         _run(root, "rm", destination, "--force")
         _expect(
-            survivor.read_bytes() == payload and not (root / new_check).exists(),
-            "remove lost untracked data or left tracked check",
+            survivor.read_bytes() == payload,
+            "remove lost untracked data",
         )
         _expect(
-            not _git(root, "ls-files", "--", original, destination, check, new_check),
+            not _git(root, "ls-files", "--", original, destination),
             "remove left indexed paths",
         )
 
@@ -4157,8 +4093,11 @@ def _campaign_prepare_coverage_flake(
             f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};",
         )
         expression = (
-            f"import ./checks/{name}/default.nix {{ inherit pkgs; "
-            "inputs.self = { inherit lib; packages.${system} = packages; }; }"
+            "import ./prm/builders/python-check.nix { inherit pkgs; "
+            f"packageName = {json.dumps(name)}; "
+            f"packageDrv = packages.{json.dumps(name)}; "
+            "testEnvironment = lib.mkTestEnvironment { inherit pkgs; "
+            f"packageDrv = packages.{json.dumps(name)}; }}; }}"
         )
         checks.append(f"{json.dumps(name)} = {expression};")
         reports.append(

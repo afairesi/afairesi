@@ -15,6 +15,9 @@ let
     ) (if builtins.pathExists packagePath then builtins.readDir packagePath else { })
   );
   systems = builtins.attrNames base.packages;
+  testedNames = builtins.filter (
+    name: builtins.pathExists (packagePath + "/${name}/test_main.py")
+  ) names;
   moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) names;
   environments = nixlib.genAttrs systems (
     system:
@@ -36,6 +39,36 @@ in
     ) "Afairesi Python packages have colliding installed module names";
     packages
   ) base.packages;
+  checks = nixlib.genAttrs systems (
+    system:
+    nixlib.genAttrs testedNames (
+      name:
+      import ./python-check.nix {
+        pkgs = (repositoryInputs.nixpkgs or inputs.nixpkgs).legacyPackages.${system};
+        packageDrv = repositoryInputs.self.packages.${system}.${name};
+        packageName = name;
+        testEnvironment = environments.${system}.${name};
+      }
+    )
+    //
+      nixlib.mapAttrs'
+        (
+          host: _:
+          nixlib.nameValuePair "${host}VmWithDisko" (
+            import ./host-check.nix {
+              inputs = repositoryInputs;
+              pkgs = (repositoryInputs.nixpkgs or inputs.nixpkgs).legacyPackages.${system};
+              inherit host;
+            }
+          )
+        )
+        (
+          nixlib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
+            repositoryInputs.self.nixosConfigurations or { }
+          )
+        )
+    // (base.checks.${system} or { })
+  );
   apps = nixlib.genAttrs systems (
     system:
     let
@@ -75,7 +108,7 @@ in
               value = environments.${system}.${name}.manifest;
             }
           ]
-          ++ nixlib.optional (builtins.pathExists (source + "/checks/${name}/default.nix")) {
+          ++ nixlib.optional (builtins.elem name testedNames) {
             name = "${name}-coverage";
             value = builders.mkCoverage {
               packageDrv = repositoryInputs.self.packages.${system}.${name};

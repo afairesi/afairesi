@@ -1,15 +1,6 @@
 let
-  lib = rec {
+  lib = {
     mkPythonPackage = import ./python-package.nix;
-    mkPythonCheck =
-      arguments@{ pkgs, packageDrv, ... }:
-      import ./python-check.nix (
-        arguments
-        // {
-          testEnvironment = mkTestEnvironment { inherit pkgs packageDrv; };
-        }
-      );
-    mkHostCheck = import ./host-check.nix;
     mkCoverage = import ./coverage.nix;
     mkTestEnvironment =
       { pkgs, packageDrv }:

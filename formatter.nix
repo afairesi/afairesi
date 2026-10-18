@@ -37,7 +37,6 @@ let
           "flake.nix"
           "formatter.nix"
           "packages/*/default.nix"
-          "checks/*/default.nix"
           "hosts/*/configuration.nix"
           "hosts/*/hardware-configuration.nix"
         ];
@@ -73,7 +72,6 @@ let
           "flake.nix"
           "formatter.nix"
           "packages/*/default.nix"
-          "checks/*/default.nix"
           "hosts/*/configuration.nix"
           "hosts/*/hardware-configuration.nix"
         ];
@@ -113,7 +111,6 @@ let
           "flake.nix"
           "formatter.nix"
           "packages/*/default.nix"
-          "checks/*/default.nix"
           "hosts/*/configuration.nix"
           "hosts/*/hardware-configuration.nix"
         ];
@@ -155,7 +152,6 @@ let
             "flake.nix"
             "formatter.nix"
             "packages/*/default.nix"
-            "checks/*/default.nix"
             "hosts/*/configuration.nix"
             "hosts/*/hardware-configuration.nix"
           ];
@@ -195,7 +191,6 @@ let
             "flake.nix"
             "formatter.nix"
             "packages/*/default.nix"
-            "checks/*/default.nix"
             "hosts/*/configuration.nix"
             "hosts/*/hardware-configuration.nix"
             "packages/*/main.py"

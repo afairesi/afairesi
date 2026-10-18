@@ -169,7 +169,7 @@ def _repository_type_markers(root: Path) -> tuple[bool, bool]:
     """Recognize home and flake layouts for lifecycle commands."""
     flake = any(
         (root / marker).exists()
-        for marker in ("flake.nix", "flake.lock", "packages", "checks", "hosts")
+        for marker in ("flake.nix", "flake.lock", "packages", "hosts")
     )
     gitignore = read_regular(root / ".gitignore") or ""
     home = (root / ".gitmodules").exists() or "!/.gitmodules" in gitignore.splitlines()
@@ -385,37 +385,14 @@ def required_package_files(package: Package) -> set[Path]:
     return {path for path in package_files(package) if path.name not in optional}
 
 
-def canonical_checks(root: Path, packages: list[Package]) -> dict[Path, str]:
-    """Return generated checks derived from the repository's resources."""
-    checks = {
-        Path("checks") / package.name / "default.nix": (_current_python_test_source())
-        for package in packages
-        if package.kind == "python"
-        and (package.root / "test_main.py").is_file()
-        and has_python_tests(package.root / "test_main.py")
-    }
-    hosts = root / "hosts"
-    if hosts.is_dir():
-        for host in sorted(hosts.iterdir()):
-            check = Path("checks") / f"{host.name}VmWithDisko" / "default.nix"
-            if (
-                host.is_dir()
-                and not host.is_symlink()
-                and (host / "configuration.nix").is_file()
-            ):
-                validate_host_name(host.name)
-                checks[check] = _current_host_check_source()
-    return checks
-
-
 def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
     """Compute the repository whitelist represented by .gitignore."""
     allowed = {Path(item) for item in ROOT_FILES if (root / item).exists()}
-    allowed.update(canonical_checks(root, packages))
     hosts = root / "hosts"
     if hosts.is_dir():
         for host in hosts.iterdir():
             if host.is_dir() and (host / "configuration.nix").exists():
+                validate_host_name(host.name)
                 allowed.add(Path("hosts") / host.name / "configuration.nix")
                 hardware = Path("hosts") / host.name / "hardware-configuration.nix"
                 if (root / hardware).exists():
@@ -506,7 +483,7 @@ def validate_flake_layout(root: Path, *, removing: Path | None = None) -> None:
     for path in _structure_paths(root, excluded):
         relative = path.relative_to(root)
         directory = (
-            relative.parts[0] in {"packages", "checks", "hosts"}
+            relative.parts[0] in {"packages", "hosts"}
             and len(relative.parts) <= RESOURCE_PATH_COMPONENTS
         )
         if path.is_symlink() or (directory and not path.is_dir()):
@@ -551,7 +528,7 @@ def inspect_structure(root: Path) -> tuple[list[Package], list[str]]:
 
 
 def _python_test_placement_issue(package: Package) -> str | None:
-    """Reject embedded tests before convergence can remove their old checks."""
+    """Keep test definitions in test_main.py rather than the package entry point."""
     source = package.root / "main.py"
     if package.kind == "python" and source.is_file() and has_python_tests(source):
         return f"packages/{package.name}/main.py: move test definitions to test_main.py"
@@ -913,43 +890,6 @@ def _metadata_expression(
             )
     unique = {node.start_byte: node for node in matches}
     return document, next(iter(unique.values())) if len(unique) == 1 else None
-
-
-def _check_test_default(root: Path, package: Package) -> None:
-    """Ensure generated Python test checks retain their static definition."""
-    check = root / "checks" / package.name / "default.nix"
-    if not check.is_file():
-        return
-    actual = read_regular(check)
-    if not (actual is not None):
-        raise AssertionError
-    expected = _current_python_test_source()
-    if nix_syntax.compact(actual) != nix_syntax.compact(expected):
-        msg = (
-            f"{check.relative_to(root)}: differs from the canonical test check template"
-        )
-        raise CommandError(msg)
-
-
-def _current_python_test_source() -> str:
-    """Render a check using the repository's pinned shared builder."""
-    return """{ inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkPythonCheck {
-  inherit pkgs;
-  packageDrv = inputs.self.packages.${pkgs.stdenv.system}.${baseNameOf ./.};
-  packageName = baseNameOf ./.;
-}
-"""
-
-
-def _current_host_check_source() -> str:
-    """Render a host check using the repository's pinned shared builder."""
-    return """{ inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkHostCheck {
-  inherit inputs pkgs;
-  host = pkgs.lib.removeSuffix "VmWithDisko" (baseNameOf ./.);
-}
-"""
 
 
 def _python_static_template_issues(package: Package, source: str) -> list[str]:
@@ -1345,14 +1285,6 @@ def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) ->
     return changed
 
 
-def _converge_checks(root: Path, packages: list[Package], *, dry_run: bool) -> bool:
-    """Generate every check derived from a canonical package or host."""
-    changed = False
-    for relative, source in canonical_checks(root, packages).items():
-        changed |= _write_managed_nix(root, relative, source, dry_run=dry_run)
-    return changed
-
-
 def _converge_allowed_files(
     root: Path,
     allowed: set[Path],
@@ -1556,8 +1488,6 @@ def _flake_resource_issues(root: Path) -> list[str]:
         "derivation": (1, "packages/NAME/default.nix"),
         "mkDerivation": (1, "packages/NAME/default.nix"),
         "mkPythonPackage": (1, "packages/NAME/default.nix"),
-        "mkPythonCheck": (1, "the package testing structure"),
-        "mkHostCheck": (1, "the host testing structure"),
         "nixosSystem": (1, "hosts/NAME/configuration.nix"),
         "runNixOSTest": (1, "the host testing structure"),
         "runCommand": (3, "the package or host structure"),
@@ -1625,7 +1555,6 @@ def converge_flake(
             expected,
             dry_run=dry_run,
         )
-    changed |= _converge_checks(root, packages, dry_run=dry_run)
     changed |= _cleanup_flake(root, packages, dry_run=dry_run)
     if dry_run and changed:
         if fail_on_changes:
@@ -1650,45 +1579,24 @@ def validate_flake_source(root: Path) -> list[Package]:
         issues.append(".gitignore: does not match the canonical source whitelist")
     for package in packages:
         issues.extend(_source_package_issues(root, package))
-    issues.extend(_generated_check_issues(root, packages))
     if issues:
         formatted_issues = "\n".join(f"  - {issue}" for issue in issues)
         msg = f"repository layout validation failed:\n{formatted_issues}"
         raise CommandError(msg)
-    _validate_nix_sources(root, packages)
+    _validate_nix_sources(packages)
     return packages
 
 
-def _validate_nix_sources(root: Path, packages: list[Package]) -> None:
-    """Parse package and check definitions after validating repository structure."""
+def _validate_nix_sources(packages: list[Package]) -> None:
+    """Parse package definitions after validating repository structure."""
     for package in packages:
         default = package.root / "default.nix"
         if default.is_file():
             nix_syntax.parse(default.read_bytes(), str(default))
-        if package.kind == "python":
-            _check_test_default(root, package)
-    checks_root = root / "checks"
-    if checks_root.is_dir():
-        for check in checks_root.iterdir():
-            default = check / "default.nix"
-            if default.is_file():
-                nix_syntax.parse(default.read_bytes(), str(default))
-
-
-def _generated_check_issues(root: Path, packages: list[Package]) -> list[str]:
-    """Return missing or noncanonical generated-check issues."""
-    issues = []
-    for check, expected in canonical_checks(root, packages).items():
-        actual = read_regular(root / check)
-        if actual is None:
-            issues.append(f"{check}: missing generated check")
-        elif nix_syntax.compact(actual) != nix_syntax.compact(expected):
-            issues.append(f"{check}: differs from its canonical generated template")
-    return issues
 
 
 def _source_package_issues(root: Path, package: Package) -> list[str]:
-    """Return source-only package-template and generated-check issues."""
+    """Return source-only package-template issues."""
     issues: list[str] = []
     relative = Path("packages") / package.name / "default.nix"
     actual = read_regular(root / relative)
@@ -1939,8 +1847,8 @@ def add_package(
     validate_name(name)
     files = scaffold(kind, name, description)
     relative = Path("packages") / name
-    if (root / relative).exists() or (root / "checks" / name).exists():
-        msg = f"package or generated check already exists: {name}"
+    if (root / relative).exists():
+        msg = f"package already exists: {name}"
         raise CommandError(msg)
     validate_python_package_names(
         [*detect_packages(root), Package(name, kind, root / relative)],
@@ -1972,18 +1880,14 @@ def add_host(root: Path, name: str) -> None:
     validate_host_name(name)
     relative = Path("hosts") / name / "configuration.nix"
     path = root / relative
-    check_relative = Path("checks") / f"{name}VmWithDisko" / "default.nix"
-    check = root / check_relative
-    if path.parent.exists() or check.parent.exists():
-        msg = f"host or generated check already exists: {name}"
+    if path.parent.exists():
+        msg = f"host already exists: {name}"
         raise CommandError(msg)
-    directories = missing_directories(root, [relative.parent, check_relative.parent])
+    directories = missing_directories(root, [relative.parent])
     try:
         with preserve_whitelist_on_error(root):
             path.parent.mkdir(parents=True)
             path.write_text("{ ... }: { }\n", encoding="utf-8")
-            check.parent.mkdir(parents=True)
-            check.write_text(_current_host_check_source(), encoding="utf-8")
             _refresh_gitignore(root)
             git(
                 root,
@@ -1991,13 +1895,11 @@ def add_host(root: Path, name: str) -> None:
                     "add",
                     "--",
                     str(relative),
-                    str(check_relative),
                     ".gitignore",
                 ],
             )
     except BaseException:
         path.unlink(missing_ok=True)
-        check.unlink(missing_ok=True)
         remove_empty_directories(directories)
         raise
 
@@ -2015,16 +1917,10 @@ def remove_resource(
     if not resource_root.is_dir() or not (resource_root / marker).is_file():
         msg = f"{kind} does not exist: {name}"
         raise CommandError(msg)
-    check_root = root / "checks" / (name if kind == "package" else f"{name}VmWithDisko")
-    targets = [
-        resource_root,
-        *([check_root] if check_root.exists() else []),
-    ]
-    target_relatives = [str(target.relative_to(root)) for target in targets]
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
-    removal = git(root, [*arguments, "--", *target_relatives])
+    removal = git(root, [*arguments, "--", str(relative)])
     sys.stdout.write(removal.stdout)
     report_change("update '.gitignore'", dry_run=False)
     _refresh_gitignore(root)
@@ -2240,26 +2136,17 @@ def rename_resource(
             for package in packages
         ],
     )
-    moves = [(source_relative, destination_relative)]
-    check_suffix = "" if source_kind == "package" else "VmWithDisko"
-    source_check = Path("checks") / f"{source_name}{check_suffix}"
-    destination_name = destination_relative.name
-    destination_check = Path("checks") / f"{destination_name}{check_suffix}"
-    if (root / source_check).exists():
-        if (root / destination_check).exists():
-            msg = f"destination already exists: {destination_check}"
-            raise CommandError(msg)
-        moves.append((source_check, destination_check))
     updates = (
         _runtime_rename_updates(root, source_relative, destination_relative)
         if source_kind == "package"
         else []
     )
-    for old, new in moves:
-        report_change(f"move '{old}' to '{new}'", dry_run=False)
+    report_change(
+        f"move '{source_relative}' to '{destination_relative}'",
+        dry_run=False,
+    )
     report_change("update '.gitignore'", dry_run=False)
-    for old, new in moves:
-        git(root, ["mv", "--", str(old), str(new)])
+    git(root, ["mv", "--", str(source_relative), str(destination_relative)])
     _apply_runtime_updates(root, updates)
     _refresh_gitignore(root)
     git(root, ["add", "--", ".gitignore"])
@@ -2314,7 +2201,6 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
     git(root, ["add", "--", "flake.nix"])
     run([executable, "flake", "lock"], cwd=root)
     packages = detect_packages(root)
-    _converge_checks(root, packages, dry_run=False)
     (root / ".gitignore").write_text(
         render_gitignore(
             allowed_paths(root, packages) | {Path(".gitignore")},
@@ -3110,7 +2996,7 @@ def _build_package_coverage(package: Path) -> None:
     if not report.is_file():
         message = (
             f"coverage check produced no HTML report for {package.name}; "
-            "run nix fmt to update the test checks"
+            "check the package test suite and coverage output"
         )
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
@@ -3197,7 +3083,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         description="Measure coverage from the package test suite.",
         epilog=(
             "Skip packages without tests. HTML reports: Nix store. "
-            "Update checks with nix fmt."
+            "Python checks are generated from test_main.py."
         ),
     )
     coverage.add_argument(
@@ -3741,8 +3627,8 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="create a package or host",
         description="Create and stage a canonical package or host.",
         epilog=(
-            "Host checks are generated automatically. For Python checks, "
-            "add tests and run nix fmt."
+            "Python checks are generated from test_main.py. "
+            "Host checks are generated from host configurations."
         ),
     )
     create.add_argument(
@@ -3762,7 +3648,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="rename a package or host",
         description="Rename a canonical package or host and stage the result.",
         epilog=(
-            "Update checks, runtime paths, and package references. "
+            "Update runtime paths and package references. "
             "Move runtime data; preserve unstaged edits."
         ),
     )
