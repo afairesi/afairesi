@@ -34,8 +34,8 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 NIX_FMT_HELP = (
-    "nix fmt enforces all lint rules and applies unsafe fixes that can change "
-    "behavior. Review the diff and run tests."
+    "nix fmt also cleans up structure, enforces all lint rules, and applies unsafe "
+    "fixes that can change behavior. Review the diff and run tests."
 )
 KIND_MARKERS = {
     "html": "index.html",
@@ -3076,14 +3076,17 @@ def _run_coverage(target: Path) -> bool:
 def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     """Construct the test campaign command-line parser."""
     result.set_defaults(test_command=None, target=None, test_parser=result)
-    commands = result.add_subparsers(dest="test_command", metavar="COMMAND")
+    commands = result.add_subparsers(
+        dest="test_command",
+        title="commands",
+        metavar="COMMAND",
+    )
     coverage = commands.add_parser(
         "coverage",
         help="measure coverage and print report paths",
-        description="Measure coverage from the package test suite.",
-        epilog=(
-            "Skip packages without tests. HTML reports: Nix store. "
-            "Python checks are generated from test_main.py."
+        description=(
+            "Measure coverage from the package test suite; skip packages without "
+            "tests. Print HTML report paths in the Nix store."
         ),
     )
     coverage.add_argument(
@@ -3100,8 +3103,8 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     property_tests = commands.add_parser(
         "property",
         help="run property-based tests",
-        description="Run property-based tests in isolated package copies.",
-        epilog=(
+        description=(
+            "Run property-based tests in isolated package copies. "
             "Skip packages without test_main.py. Logs and reports: flake tmp/. "
             'Select profiles with PYTEST_ADDOPTS="--hypothesis-profile=NAME".'
         ),
@@ -3127,13 +3130,8 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         help="run a short generation-based fuzz campaign",
         description=(
             "Run Hypothesis tests named test_fuzz_* in isolated package copies. "
-            "Default: 10 generated examples per test; explicit test settings "
-            "and Hypothesis profiles can override this default."
-        ),
-        epilog=(
             "Skip packages without test_main.py or selected fuzz tests. "
-            "Logs and Hypothesis examples: flake tmp/. "
-            "Use --max-examples for longer campaigns."
+            "Logs and Hypothesis examples: flake tmp/."
         ),
     )
     fuzz.add_argument(
@@ -3157,7 +3155,10 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         type=int,
         default=10,
         metavar="N",
-        help="default generated examples per fuzz test (default: 10)",
+        help=(
+            "generated examples per fuzz test (default: 10); "
+            "explicit test settings and Hypothesis profiles can override this"
+        ),
     )
     fuzz.add_argument(
         "-k",
@@ -3169,8 +3170,10 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     mutation = commands.add_parser(
         "mutation",
         help="run mutation tests",
-        description="Run mutation tests in isolated package copies.",
-        epilog=("Skip packages without test_main.py. Logs and reports: flake tmp/."),
+        description=(
+            "Run mutation tests in isolated package copies. "
+            "Skip packages without test_main.py. Logs and reports: flake tmp/."
+        ),
     )
     mutation.add_argument(
         "target",
@@ -3238,13 +3241,11 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         "performance",
         help="profile existing tests and package CLI calls",
         description=(
-            "Profile tests with cProfile and show slow test phases. "
-            "Save separate function profiles for pytest and package CLI processes."
-        ),
-        epilog=(
-            "Reports: flake tmp/. Timings include profiler overhead. Profiles cover "
+            "Profile tests with cProfile and show slow test phases; skip packages "
+            "without tests. Save separate pytest and package CLI profiles in flake "
+            "tmp/. Timings include profiler overhead. Profiles cover "
             "each process's main Python thread; external executables and arbitrary "
-            "Python subprocesses are not profiled. Skips packages without tests."
+            "Python subprocesses are not profiled."
         ),
     )
     performance.add_argument(
@@ -3617,18 +3618,21 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     commands.add_parser(
         "init",
-        help="initialize and stage a flake in an empty local Git repository",
-        description="Initialize an empty Git worktree with Afairesi conventions.",
-        epilog="Stage generated files; use Git to configure remotes, commit, and push.",
+        help="initialize and stage a flake in an empty Git worktree",
+        description=(
+            "Initialize and stage a flake in an empty Git worktree. "
+            "Use Git to configure remotes, commit, and push."
+        ),
     )
     create = commands.add_parser(
         "add",
         usage="%(prog)s [-h] {packages/NAME TYPE | hosts/NAME}",
-        help="create a package or host",
-        description="Create and stage a canonical package or host.",
-        epilog=(
+        help="create and stage a package or host",
+        description=(
+            "Create and stage a canonical package or host. "
             "Python checks are generated from test_main.py. "
-            "Host checks are generated from host configurations."
+            "Host checks are generated from host configurations. "
+            "Keep only necessary supporting files under prm/."
         ),
     )
     create.add_argument(
@@ -3645,11 +3649,11 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     move = commands.add_parser(
         "mv",
-        help="rename a package or host",
-        description="Rename a canonical package or host and stage the result.",
-        epilog=(
-            "Update runtime paths and package references. "
-            "Move runtime data; preserve unstaged edits."
+        help="rename and stage a package or host",
+        description=(
+            "Rename and stage a canonical package or host. "
+            "Update runtime paths and package references, move runtime data, "
+            "and preserve unstaged edits."
         ),
     )
     move.add_argument(
@@ -3664,10 +3668,9 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     remove = commands.add_parser(
         "rm",
-        help="remove a package or host",
-        description="Remove and stage a canonical package or host.",
-        epilog=(
-            "Remove tracked resource and related check files with git rm. "
+        help="remove and stage a package or host",
+        description=(
+            "Remove a tracked package or host and related check files with git rm. "
             "Untracked and ignored files remain."
         ),
     )
@@ -3684,15 +3687,18 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     fix = commands.add_parser(
         "fix",
-        help="fix and stage the current repository structure",
-        description="Fix and stage flake structure; remove unsupported files.",
-        epilog=NIX_FMT_HELP,
+        help="fix and stage flake structure; remove unsupported files",
+        description=(
+            "Fix and stage flake structure; delete paths outside the source whitelist. "
+            "Keep only necessary supporting files under prm/. "
+            f"{NIX_FMT_HELP}"
+        ),
     )
     fix.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="preview changes",
+        help="preview structural changes without modifying files or staging",
     )
     inspection = commands.add_parser(
         "inspect",
@@ -3711,11 +3717,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     testing = commands.add_parser(
         "test",
         help="run test campaigns and profile existing tests",
-        description=(
-            "Run coverage, property tests, fuzz tests, mutation tests, and performance "
-            "profiling. Choose a campaign explicitly; no campaign runs by default. "
-            "Fuzz tests default to 10 generated examples per test."
-        ),
+        description="Run a test campaign or profile tests. Choose a command below.",
     )
     _configure_test_parser(testing)
 
@@ -4024,31 +4026,34 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     clone = commands.add_parser(
         "clone",
-        help="clone and register a home submodule",
+        help="clone and stage a home submodule registration",
         description=(
             "Clone a hosted remote at $HOME/<remote-hostname>/<repository-path> "
-            "and register it as a submodule."
+            "and stage its submodule registration."
         ),
-        epilog="Stage registration; no commit or push.",
     )
     clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
     fix_home = commands.add_parser(
         "fix",
         help="fix and stage home structure",
-        description="Fix and stage the $HOME whitelist and submodule layout.",
-        epilog=("Move submodules to <remote-hostname>/<repository-path>."),
+        description=(
+            "Fix and stage the $HOME whitelist and submodule layout. "
+            "Move submodules to <remote-hostname>/<repository-path>."
+        ),
     )
     fix_home.add_argument(
         "-n",
         "--dry-run",
         action="store_true",
-        help="preview changes",
+        help="preview structural changes without modifying files or staging",
     )
     remove = commands.add_parser(
         "rm",
-        help="remove a registered home submodule",
-        description="Remove a home submodule and stage its unregistration.",
-        epilog="Use git rm for removal and update the home whitelist.",
+        help="remove and stage a home submodule unregistration",
+        description=(
+            "Remove a home submodule with git rm, update the home whitelist, "
+            "and stage its unregistration."
+        ),
     )
     remove.add_argument(
         "resource",
@@ -4094,20 +4099,14 @@ def parser() -> argparse.ArgumentParser:
             "Manage Nix flake package, host, and check conventions. "
             "Structural changes are staged for review."
         ),
-        epilog=(
-            "Only compliant paths persist; nix fmt and repo fix delete the rest. "
-            "Preview structural cleanup with afairesi repo fix --dry-run. "
-            "Keep prm/ minimal: only necessary supporting files. "
-            f"{NIX_FMT_HELP} "
-            "Use afairesi repo inspect to inspect; "
-            "afairesi repo test to test."
-        ),
     )
     home = scopes.add_parser(
         "home",
         help="manage the home repository and its submodules",
-        description=("Manage $HOME submodules at <remote-hostname>/<repository-path>."),
-        epilog="Changes are staged. Use Git to commit and push.",
+        description=(
+            "Manage $HOME submodules at <remote-hostname>/<repository-path>. "
+            "Changes are staged; use Git to commit and push."
+        ),
     )
     _configure_repo_parser(repo)
     _configure_home_parser(home)
