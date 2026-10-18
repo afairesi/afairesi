@@ -9,11 +9,29 @@ import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
+from hypothesis import given
+from hypothesis import strategies as st
 
 from packages.nix_syntax import main as nix_syntax
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+
+@given(
+    st.one_of(
+        st.binary(max_size=4096),
+        st.sampled_from([b"{}", b"[ 1 2 ]", b"let a = 1; in a", b'"${toString 1}"']),
+    ),
+)
+def test_fuzz_parse(source: bytes) -> None:
+    """Arbitrary bytes produce a document or the documented syntax error."""
+    try:
+        document = nix_syntax.parse(source)
+    except nix_syntax.NixSyntaxError:
+        return
+    if document.source != source or document.tree.root_node.has_error:
+        raise AssertionError(document)
 
 
 @pytest.fixture(autouse=True)

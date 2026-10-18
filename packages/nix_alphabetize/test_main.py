@@ -5,12 +5,45 @@ from __future__ import annotations
 
 import os
 import subprocess
-from typing import TYPE_CHECKING
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
+from hypothesis import given, settings
+from hypothesis import strategies as st
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from packages.nix_alphabetize import main as alphabetize
+
+
+@settings(deadline=None)
+@given(
+    st.dictionaries(
+        st.text(alphabet="abcxyz_", min_size=1, max_size=8),
+        st.integers(min_value=-1000, max_value=1000),
+        max_size=12,
+    ),
+)
+def test_fuzz_preserves_values_and_converges(bindings: dict[str, int]) -> None:
+    """Generated bindings retain their Nix value and stabilize after one pass."""
+    source = (
+        "{ " + " ".join(f'"{key}" = {value};' for key, value in bindings.items()) + " }"
+    )
+    formatted = alphabetize.format_text(source)
+    if alphabetize.format_text(formatted) != formatted:
+        raise AssertionError(formatted)
+    with TemporaryDirectory(prefix="alphabetize-fuzz-") as directory:
+        root = Path(directory)
+        original = root / "original.nix"
+        rewritten = root / "rewritten.nix"
+        original.write_text(source)
+        rewritten.write_text(formatted)
+        environment = dict(os.environ)
+        environment["NIX_CONFIG"] = "build-users-group =\n"
+        environment["NIX_REMOTE"] = f"local?root={root / 'nix'}"
+        before = _evaluate(original, environment)
+        after = _evaluate(rewritten, environment)
+        if before.returncode or after.returncode or before.stdout != after.stdout:
+            raise AssertionError((source, formatted, before, after))
 
 
 @pytest.mark.parametrize(

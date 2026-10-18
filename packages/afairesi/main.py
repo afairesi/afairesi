@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import inspect
 import json
 import keyword
 import math
@@ -27,7 +28,7 @@ from xml.etree import ElementTree as ET
 import nix_syntax
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator
+    from collections.abc import Generator, Iterator
 
     import libcst as cst
     from tree_sitter import Node
@@ -2535,6 +2536,7 @@ class TestSelection:
     lines: tuple[str, ...] = ()
     exclude_operators: tuple[str, ...] = ()
     max_mutations: int | None = None
+    max_examples: int | None = None
 
     def pytest_arguments(self) -> list[str]:
         """Render selectors without passing them through a shell."""
@@ -2543,6 +2545,120 @@ class TestSelection:
             if value:
                 arguments.extend([option, value])
         return arguments
+
+
+COVERAGE_RUNTIME_START = None
+
+
+def start_subprocess_coverage() -> None:
+    """Start coverage in child interpreters and inherit the active test context."""
+    import os  # noqa: PLC0415
+
+    import coverage  # noqa: PLC0415
+
+    tracer = coverage.Coverage.current() or coverage.process_startup()
+    if tracer is not None:
+        tracer.switch_context(os.environ.get("AFAIRESI_TEST_CONTEXT", ""))
+
+
+def remap_coverage_paths(installed_path: str) -> None:
+    """Combine installed-module coverage with the corresponding source file."""
+    import os  # noqa: PLC0415
+    from pathlib import Path  # noqa: PLC0415
+
+    import coverage  # noqa: PLC0415
+
+    data = coverage.CoverageData()
+    data.read()
+    mapped = coverage.CoverageData(basename=".coverage-mapped")
+    mapped.update(
+        data,
+        map_path=lambda path: (
+            os.environ["src"] + "/main.py"  # noqa: SIM112 - Nix build environment.
+            if path == installed_path
+            else path
+        ),
+    )
+    mapped.write()
+    Path(mapped.data_filename()).replace(data.data_filename())
+
+
+def _coverage_context_plugin() -> object:
+    """Create a pytest hook that carries the current test into subprocesses."""
+    import os  # noqa: PLC0415
+
+    import coverage  # noqa: PLC0415
+    import pytest  # noqa: PLC0415
+
+    @pytest.hookimpl(wrapper=True)
+    def pytest_runtest_protocol(item: pytest.Item) -> Generator[None, object, object]:
+        """Attribute test setup, execution, teardown, and children to their test."""
+        previous = os.environ.get("AFAIRESI_TEST_CONTEXT", "")
+        os.environ["AFAIRESI_TEST_CONTEXT"] = item.nodeid
+        tracer = coverage.Coverage.current()
+        if tracer is not None:
+            tracer.switch_context(item.nodeid)
+        try:
+            return (yield)
+        finally:
+            os.environ["AFAIRESI_TEST_CONTEXT"] = previous
+            if tracer is not None:
+                tracer.switch_context(previous)
+
+    return pytest_runtest_protocol
+
+
+COVERAGE_RUNTIME_END = None
+
+
+def _fuzz_plugin(max_examples: int) -> object:
+    """Create the pytest fuzz plugin inside the target's test environment."""
+    import pytest  # noqa: PLC0415
+
+    class FuzzTests:
+        """Apply a small default budget and collect test_fuzz_* cases only."""
+
+        def __init__(self, max_examples: int) -> None:
+            """Set the example budget used when tests do not override settings."""
+            self.max_examples = max_examples
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_load_initial_conftests(self) -> None:
+            """Load defaults before package plugins and test modules are imported."""
+            from hypothesis import settings  # noqa: PLC0415
+
+            settings.register_profile(
+                "afairesi-fuzz",
+                max_examples=self.max_examples,
+                print_blob=True,
+            )
+            settings.load_profile("afairesi-fuzz")
+
+        @pytest.hookimpl(trylast=True)
+        def pytest_collection_modifyitems(
+            self,
+            config: pytest.Config,
+            items: list[pytest.Item],
+        ) -> None:
+            """Keep selected fuzz targets and reject accidental ordinary tests."""
+            from hypothesis import is_hypothesis_test  # noqa: PLC0415
+
+            selected = []
+            deselected = []
+            for item in items:
+                if not getattr(item, "originalname", item.name).startswith(
+                    "test_fuzz_",
+                ):
+                    deselected.append(item)
+                    continue
+                if not is_hypothesis_test(getattr(item, "obj", None)):
+                    message = f"{item.nodeid}: fuzz tests require @given"
+                    raise pytest.UsageError(message)
+                selected.append(item)
+            items[:] = selected
+            config.hook.pytest_deselected(items=deselected)
+
+    return FuzzTests(max_examples)
 
 
 def _prepare_package_tests(
@@ -2573,6 +2689,16 @@ def _prepare_package_tests(
     pytest_arguments = selection.pytest_arguments()
     if performance:
         pytest_arguments.extend(["--durations=20", "--durations-min=0"])
+    plugins = ""
+    if selection.max_examples is not None:
+        (workspace / "fuzz_support.py").write_text(
+            "from __future__ import annotations\n" + inspect.getsource(_fuzz_plugin),
+            encoding="utf-8",
+        )
+        plugins = (
+            "from fuzz_support import _fuzz_plugin\n"
+            f"fuzz = _fuzz_plugin({selection.max_examples})\n"
+        )
     pytest_arguments.extend(
         ["--import-mode=importlib", "-q", f"packages/{name}/test_main.py"],
     )
@@ -2601,8 +2727,19 @@ def _prepare_package_tests(
         "pid = Path('active-test-pgid')\n"
         "pid.write_text(str(os.getpgrp()))\n"
         "try:\n    import pytest\n"
-        f"    sys.exit(pytest.main({pytest_arguments!r} + sys.argv[1:]))\n"
-        "finally:\n"
+        + "".join("    " + line + "\n" for line in plugins.splitlines())
+        + f"    code = pytest.main({pytest_arguments!r} + sys.argv[1:]"
+        + (", plugins=[fuzz]" if plugins else "")
+        + ")\n"
+        + (
+            "    if code == pytest.ExitCode.NO_TESTS_COLLECTED:\n"
+            "        print('No fuzz tests selected; skipping.')\n"
+            "        code = 0\n"
+            if plugins
+            else ""
+        )
+        + "    sys.exit(code)\n"
+        + "finally:\n"
         "    pid.unlink(missing_ok=True)\n"
         "    runtime.cleanup()\n",
         encoding="utf-8",
@@ -2796,6 +2933,7 @@ def _run_test_package(
     label = {
         "mutation": "Mutation workspace and reports",
         "property": "Property test workspace and logs",
+        "fuzz": "Fuzz test workspace and logs",
         "performance": "Performance workspace and reports",
     }[command]
     sys.stdout.write(f"{label}: {workspace}\n")
@@ -2902,12 +3040,16 @@ def _dispatch_test_runner(
     mutation_limit = getattr(options, "max_mutations", None)
     if mutation_limit is not None and mutation_limit <= 0:
         cli.error("--max-mutations must be positive")
+    example_limit = getattr(options, "max_examples", None)
+    if example_limit is not None and example_limit <= 0:
+        cli.error("--max-examples must be positive")
     selection = TestSelection(
         keywords=options.keywords,
         markers=options.markers,
         lines=tuple(getattr(options, "lines", ())),
         exclude_operators=tuple(getattr(options, "exclude_operators", ())),
         max_mutations=mutation_limit,
+        max_examples=example_limit,
     )
     target = _command_target(options.target)
     runner = (
@@ -3062,6 +3204,50 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         type=float,
         help=("seconds per test run, excluding build (default: unlimited)"),
     )
+    fuzz = commands.add_parser(
+        "fuzz",
+        help="run a short generation-based fuzz campaign",
+        description=(
+            "Run Hypothesis tests named test_fuzz_* in isolated package copies. "
+            "Default: 10 generated examples per test; explicit test settings "
+            "and Hypothesis profiles can override this default."
+        ),
+        epilog=(
+            "Skip packages without test_main.py or selected fuzz tests. "
+            "Logs and Hypothesis examples: flake tmp/. "
+            "Use --max-examples for longer campaigns."
+        ),
+    )
+    fuzz.add_argument(
+        "target",
+        type=Path,
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help=(
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
+        ),
+    )
+    fuzz.add_argument(
+        "--timeout",
+        type=float,
+        help="seconds per test run, excluding build (default: unlimited)",
+    )
+    fuzz.add_argument(
+        "--max-examples",
+        type=int,
+        default=10,
+        metavar="N",
+        help="default generated examples per fuzz test (default: 10)",
+    )
+    fuzz.add_argument(
+        "-k",
+        dest="keywords",
+        default="",
+        help="pytest keyword expression",
+    )
+    fuzz.add_argument("-m", dest="markers", default="", help="pytest marker expression")
     mutation = commands.add_parser(
         "mutation",
         help="run mutation tests",
@@ -3183,7 +3369,7 @@ def _dispatch_test_command(
     if combined:
         campaigns = [
             cli.parse_args(["repo", "test", command, str(target)])
-            for command in ("coverage", "property", "mutation", "performance")
+            for command in ("coverage", "property", "fuzz", "mutation", "performance")
         ]
     else:
         campaigns = [options]
@@ -3627,8 +3813,9 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "test",
         help="run test campaigns and profile existing tests",
         description=(
-            "Run coverage, property tests, mutation tests, and performance "
-            "profiling. Default: all four campaigns in the current flake."
+            "Run coverage, property tests, fuzz tests, mutation tests, and performance "
+            "profiling. Default: all five campaigns in the current flake. "
+            "Fuzz tests default to 10 generated examples per test."
         ),
     )
     _configure_test_parser(testing)

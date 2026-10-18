@@ -3,6 +3,15 @@
   packageDrv,
 }:
 let
+  # Extract standalone helpers without importing the CLI or its dependencies.
+  runtime = builtins.toFile "coverage_support.py" (
+    "from __future__ import annotations\n"
+    + builtins.elemAt (builtins.split "COVERAGE_RUNTIME_(START|END) = None\n" (builtins.readFile ../main.py)) 2
+  );
+  context = builtins.toFile "coverage_context.py" (
+    "from _afairesi_coverage_support import _coverage_context_plugin\n"
+    + "pytest_runtest_protocol = _coverage_context_plugin()\n"
+  );
   startup = builtins.toFile "sitecustomize.py" (
     "from _afairesi_coverage_support import start_subprocess_coverage\n"
     + "start_subprocess_coverage()\n"
@@ -15,9 +24,9 @@ check.overrideAttrs (previous: {
     export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
     afairesi_pytest_args=(-p _afairesi_coverage_context)
     unset AFAIRESI_TEST_CONTEXT
-    cp "${./coverage_context.py}" "$TMPDIR/coverage-startup/_afairesi_coverage_context.py"
+    cp "${context}" "$TMPDIR/coverage-startup/_afairesi_coverage_context.py"
     cp "${startup}" "$TMPDIR/coverage-startup/sitecustomize.py"
-    cp "${./coverage_support.py}" "$TMPDIR/coverage-startup/_afairesi_coverage_support.py"
+    cp "${runtime}" "$TMPDIR/coverage-startup/_afairesi_coverage_support.py"
     cat > "$COVERAGE_PROCESS_START" <<EOF
     [run]
     core = ctrace

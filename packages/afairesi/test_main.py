@@ -3958,6 +3958,7 @@ def _campaign_prepare_runner_flake(
     (package / "main.py").write_text(source, encoding="utf-8")
     builders = root / "prm/builders"
     shutil.copytree(Path(__file__).with_name("prm"), builders)
+    shutil.copyfile(Path(__file__).with_name("main.py"), builders.parent / "main.py")
     environment = dict(os.environ)
     store = root.parent / "nix"
     environment["NIX_REMOTE"] = (
@@ -4062,6 +4063,7 @@ def _campaign_prepare_coverage_flake(
     checks = []
     reports = []
     shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
+    shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/main.py")
     for name in ("example", "z-last"):
         _campaign_manage(root, "add", f"packages/{name}", "python")
         package = root / "packages" / name
@@ -4267,10 +4269,11 @@ def test_campaigns_route_targets_and_forward_test_selection(
         monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
         with pytest.raises(SystemExit) as combined:
             campaign_subject.main()
-        _campaign_expect(combined.value.code == 0 and observed == [root] * 4, observed)
+        _campaign_expect(combined.value.code == 0 and observed == [root] * 5, observed)
         for path in (
             ("coverage",),
             ("property",),
+            ("fuzz",),
             ("mutation",),
             ("performance",),
         ):
@@ -4299,6 +4302,7 @@ def test_campaigns_route_targets_and_forward_test_selection(
                         == campaign_subject.TestSelection(
                             keywords="keyword",
                             markers="marker",
+                            max_examples=10 if path == ("fuzz",) else None,
                         ),
                         forwarded[-1],
                     )
@@ -4308,7 +4312,14 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
-        commands = ((), ("coverage",), ("property",), ("mutation",), ("performance",))
+        commands = (
+            (),
+            ("coverage",),
+            ("property",),
+            ("fuzz",),
+            ("mutation",),
+            ("performance",),
+        )
         help_output = _campaign_run(root, "--help").stdout
         positions = [help_output.index(f"    {path[0]} ") for path in commands[1:]]
         _campaign_expect(positions == sorted(positions), help_output)
@@ -4338,9 +4349,9 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
             "not inside a Git repository" in _campaign_run(root, code=1).stderr,
             "bare test must require a repository",
         )
-        for command in ("coverage", "property", "mutation", "performance"):
+        for command in ("coverage", "property", "fuzz", "mutation", "performance"):
             _campaign_run(root, command, code=1)
-        for command in ("property", "mutation", "performance"):
+        for command in ("property", "fuzz", "mutation", "performance"):
             for timeout in ("nan", "inf", "-inf", "0", "-1"):
                 _campaign_run(root, command, str(root), f"--timeout={timeout}", code=2)
         for arguments in (
@@ -4348,7 +4359,81 @@ def test_cli_contracts_validate_help_interfaces_and_budgets() -> None:
             ("--max-mutations", "-1"),
         ):
             _campaign_run(root, "mutation", str(root), *arguments, code=2)
+        for limit in ("0", "-1"):
+            _campaign_run(root, "fuzz", str(root), "--max-examples", limit, code=2)
         _campaign_expect(not any(root.iterdir()), "invalid CLI request created state")
+
+
+@pytest.mark.parametrize("limit", [None, 3])
+def test_campaign_fuzz_select_targets_and_apply_example_budgets(
+    tmp_path: Path,
+    limit: int | None,
+) -> None:
+    """Fuzz consumer packages with bounded generation and isolated CLI calls."""
+    root = tmp_path / "consumer with spaces"
+    tests = (
+        "import os, subprocess\nfrom pathlib import Path\n"
+        "from hypothesis import given, strategies as st\n"
+        "@given(st.integers())\n"
+        "def test_fuzz_cli(value):\n"
+        "    result = subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']], "
+        "capture_output=True, text=True)\n"
+        "    assert result.returncode == 0 and result.stdout == 'ready\\n'\n"
+        "    with Path('examples').open('a') as output:\n"
+        "        output.write(str(value) + '\\n')\n"
+        "def test_regular():\n"
+        "    raise AssertionError('ordinary test ran during fuzz campaign')\n"
+        "@given(st.integers())\n"
+        "def test_fuzz_unselected(value):\n"
+        "    raise AssertionError('pytest selection ignored')\n"
+    )
+    environment = _campaign_prepare_runner_flake(root, tests)
+    arguments = ["-k", "cli", "--timeout", "30"]
+    if limit is not None:
+        arguments.extend(["--max-examples", str(limit)])
+    result = _campaign_campaign(root, environment, "fuzz", *arguments)
+    _campaign_expect(result.returncode == 0 and "1 passed" in result.stdout, result)
+    (workspace,) = (root / "tmp").glob("python-fuzz-example-*")
+    _campaign_expect(
+        len((workspace / "examples").read_text().splitlines()) == (limit or 10),
+        workspace,
+    )
+    _campaign_expect((workspace / "hypothesis").is_dir(), workspace)
+    _campaign_expect(not list(workspace.glob("test-runtime-*")), workspace)
+
+
+def test_campaign_fuzz_skip_missing_targets_and_report_failures(
+    tmp_path: Path,
+) -> None:
+    """Continue across packages without hiding failures or invalid fuzz definitions."""
+    root = tmp_path / "consumer"
+    environment = _campaign_prepare_runner_flake(
+        root,
+        "def test_ordinary(): raise AssertionError('should be deselected')\n",
+    )
+    _campaign_runner_package(
+        root,
+        "broken",
+        "from hypothesis import given, strategies as st\n"
+        "@given(st.binary())\n"
+        "def test_fuzz_failure(value): assert False, value\n",
+    )
+    _campaign_runner_package(root, "invalid", "def test_fuzz_plain(): pass\n")
+    _campaign_runner_package(root, "last", "def test_regular(): pass\n")
+    _campaign_runner_package(
+        root,
+        "import_failure",
+        "raise ImportError('broken import')\n",
+    )
+    result = _campaign_campaign(root, environment, "fuzz")
+    _campaign_expect(result.returncode == 1, result)
+    _campaign_expect("2 passed, 3 failed" in result.stdout, result)
+    _campaign_expect("No fuzz tests selected; skipping." in result.stdout, result)
+    _campaign_expect("Falsifying example:" in result.stderr, result)
+    _campaign_expect("fuzz tests require @given" in result.stderr, result)
+    _campaign_expect("broken import" in result.stderr, result)
+    (workspace,) = (root / "tmp").glob("python-fuzz-broken-*")
+    _campaign_expect((workspace / "tests.log").is_file(), workspace)
 
 
 @pytest.mark.parametrize("failing", [False, True])
@@ -4473,7 +4558,7 @@ def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> No
 
 @pytest.mark.parametrize(
     "failure",
-    [None, "coverage", "property", "mutation", "performance"],
+    [None, "coverage", "property", "fuzz", "mutation", "performance"],
 )
 @pytest.mark.parametrize("failure_kind", ["policy", "process"])
 def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
@@ -4524,7 +4609,7 @@ def test_combined_campaigns_continue_after_failures_and_report_one_exit_status(
         campaign_subject.main()
     _campaign_expect(completed.value.code == (0 if failure is None else 1), completed)
     _campaign_expect(
-        observed == ["coverage", "property", "mutation", "performance"],
+        observed == ["coverage", "property", "fuzz", "mutation", "performance"],
         observed,
     )
     output = capsys.readouterr()
@@ -4726,7 +4811,7 @@ def test_coverage_rejects_missing_report_files(
 
 @pytest.mark.parametrize(
     "command",
-    ["coverage", "property", "mutation", "performance"],
+    ["coverage", "property", "fuzz", "mutation", "performance"],
 )
 @pytest.mark.parametrize("failure", ["missing-output", "invalid-flake"])
 def test_package_campaign_preserves_native_nix_errors(
@@ -5055,7 +5140,7 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
         )
 
 
-@pytest.mark.parametrize("command", ["property", "performance"])
+@pytest.mark.parametrize("command", ["property", "fuzz", "performance"])
 def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
     command: str,
 ) -> None:
@@ -5067,7 +5152,7 @@ def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
             "from pathlib import Path\n"
             "from hypothesis import given, settings, strategies as st\n"
             "@given(st.integers())\n"
-            "def test_property(value):\n"
+            "def test_fuzz_property(value):\n"
             "    assert settings.default.deadline == timedelta(milliseconds=1234)\n"
             "    assert settings.default.max_examples == 3\n"
             "    with Path('examples').open('a') as output:\n"
@@ -5938,7 +6023,7 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
     _expect({"inspect", "test"} <= commands.keys(), commands)
     campaigns = commands["test"]["commands"]
     _expect(
-        set(campaigns) == {"coverage", "property", "mutation", "performance"},
+        set(campaigns) == {"coverage", "property", "fuzz", "mutation", "performance"},
         campaigns,
     )
     _expect(not report["warnings"], report["warnings"])
