@@ -33,6 +33,10 @@ if TYPE_CHECKING:
     import libcst as cst
     from tree_sitter import Node
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
+NIX_FMT_HELP = (
+    "nix fmt enforces all lint rules and applies unsafe fixes that can change "
+    "behavior. Review the diff and run tests."
+)
 KIND_MARKERS = {
     "html": "index.html",
     "latex": "ms.tex",
@@ -3796,7 +3800,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "fix",
         help="fix and stage the current repository structure",
         description="Fix and stage flake structure; remove unsupported files.",
-        epilog="Use nix fmt to fix structure and also format code.",
+        epilog=NIX_FMT_HELP,
     )
     fix.add_argument(
         "-n",
@@ -4206,8 +4210,10 @@ def parser() -> argparse.ArgumentParser:
         ),
         epilog=(
             "Only compliant paths persist; nix fmt and repo fix delete the rest. "
+            "Preview structural cleanup with afairesi repo fix --dry-run. "
             "Keep prm/ minimal: only necessary supporting files. "
-            "Use nix fmt to fix and format; afairesi repo inspect to inspect; "
+            f"{NIX_FMT_HELP} "
+            "Use afairesi repo inspect to inspect; "
             "afairesi repo test to test."
         ),
     )
