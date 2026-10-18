@@ -1817,7 +1817,9 @@ pkgs.writeTextFile {
     files: dict[Path, str] = {root / "default.nix": default}
     if kind == "python":
         files[root / "main.py"] = (
-            f"#!/usr/bin/env python3\n{description!r}\n\nimport argparse\n\n\n"
+            "#!/usr/bin/env python3\n"
+            "# ruff: noqa: CPY001 - Set copyright ownership when publishing.\n"
+            f"{description!r}\n\nimport argparse\n\n\n"
             "def parser() -> argparse.ArgumentParser:\n"
             '    """Declare the command-line interface."""\n'
             f"    return argparse.ArgumentParser(description={description!r})\n\n\n"

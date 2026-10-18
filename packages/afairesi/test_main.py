@@ -3862,6 +3862,18 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
         _preview(root, "fix")
 
 
+def test_fresh_python_scaffold_passes_formatting() -> None:
+    """Accept generated Python under the bundled lint and formatting rules."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "packages/example", "python")
+        source = root / "packages/example/main.py"
+        _run(root, "--no-cache", "packages/example/main.py", executable="treefmt")
+        formatted = source.read_text()
+        _run(root, "--no-cache", "packages/example/main.py", executable="treefmt")
+        _expect(source.read_text() == formatted, "scaffold formatting did not converge")
+        _run(root, str(source), "--help", executable=sys.executable)
+
+
 def test_web_formatting_preserves_literal_line_breaks() -> None:
     """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
     with _fresh_repository() as root:
