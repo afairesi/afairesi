@@ -47,21 +47,16 @@ let
         directories = pkgs.lib.genAttrs pythonPackageNames (
           name:
           let
-            package = self.packages.${pkgs.stdenv.system}.${name};
+            environment = inputs.self.lib.mkTestEnvironment {
+              inherit pkgs;
+              packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+            };
           in
           {
             directory = "";
-            extraPythonPackages =
-              (package.propagatedBuildInputs or [ ])
-              ++ (package.buildInputs or [ ])
-              ++ (package.checkInputs or [ ])
-              ++ (package.nativeCheckInputs or [ ])
-              ++ [
-                pkgs.python3.pkgs.hypothesis
-                pkgs.python3.pkgs.pytest
-              ];
             modules = [ "packages/${name}" ];
             options = [
+              "--python-executable=${environment.python}/bin/python"
               "--cache-dir=packages/${name}/tmp/.mypy_cache"
               "--exclude=/(prm|tmp)/"
               "--explicit-package-bases"
