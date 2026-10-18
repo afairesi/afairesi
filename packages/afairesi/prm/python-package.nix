@@ -69,6 +69,7 @@ python.pkgs.buildPythonPackage (
   // {
     inherit pname src;
     installPhase = ''
+      runHook preInstall
       install -Dm644 main.py "$out/${python.sitePackages}/$pname/__init__.py"
       ${pkgs.lib.optionalString executable ''
         mkdir -p "$out/bin"
@@ -80,6 +81,7 @@ python.pkgs.buildPythonPackage (
       fi
       ${python.interpreter} -m compileall -q --invalidation-mode unchecked-hash \
         "$out/${python.sitePackages}/$pname/__init__.py"
+      runHook postInstall
     '';
     meta =
       builtins.removeAttrs (arguments.meta or { }) [ "mainProgram" ]

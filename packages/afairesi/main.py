@@ -3387,6 +3387,8 @@ class ArgumentDiscovery:
         self.bindings.setdefault((scope, name), []).append((source_scope, value))
 
     def _collect(self, node: ast.AST, scope: str) -> None:
+        if isinstance(node, ast.ClassDef):
+            return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = node.name
             self.functions[scope] = node

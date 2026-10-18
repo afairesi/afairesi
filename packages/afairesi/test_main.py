@@ -324,7 +324,9 @@ def _template_expression(root: Path, name: str) -> str:
         f"sitePackages = {json.dumps(site_packages)}; "
         f"withPackages = _: {json.dumps(sys.prefix)}; "
         "pkgs.buildPythonPackage = attrs: (mk attrs.pname "
-        '("pname=${attrs.pname}\\ncp -R ${attrs.src}/. .\\n" '
+        '("pname=${attrs.pname}\\nrunHook() {\\ncase \\"$1\\" in\\npreInstall)\\n" '
+        '+ (attrs.preInstall or ":") + "\\n;;\\npostInstall)\\n" '
+        '+ (attrs.postInstall or ":") + "\\n;;\\nesac\\n}\\ncp -R ${attrs.src}/. .\\n" '
         "+ attrs.installPhase)) // attrs; }; "
         'pkgs = { python3 = python; git = "git"; curl = "curl"; inner = "wrong-inner"; '
         'http-server = "server"; texliveFull = "tex"; '
@@ -1308,6 +1310,14 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
         source = definition.read_text()
         if kind == "python":
             (package / "test_main.py").write_text("def test_result(): pass\n")
+            source = source.replace(
+                "  meta.description =",
+                '  preInstall = \'\'mkdir -p "$out"; test ! -d "$out/lib"; '
+                "printf pre > \"$out/install-hooks\"'';\n"
+                "  postInstall = ''test -d \"$out/lib\"; "
+                "printf post >> \"$out/install-hooks\"'';\n"
+                "  meta.description =",
+            )
             if library:
                 (package / "main.py").write_text("VALUE = 1\n")
         elif kind in {"html", "latex"}:
@@ -1410,6 +1420,10 @@ def _check_installed_python_template(
     module = name.replace("-", "_")
     version = f"{sys.version_info.major}.{sys.version_info.minor}"
     installed = output / f"lib/python{version}/site-packages"
+    _expect(
+        (output / "install-hooks").read_text() == "prepost",
+        "Python install hooks did not run around installation",
+    )
     _expect(
         (installed / module / "prm/asset.bin").read_bytes() == asset.read_bytes(),
         "Python installation lost assets",
@@ -5568,6 +5582,11 @@ def test_inspection_keeps_internal_parsers_out_of_the_public_cli(
     """Select the parser consumed by main while retaining its configured helpers."""
     source = """
 import argparse
+class Internal:
+    def parser(self):
+        cli = argparse.ArgumentParser()
+        cli.add_argument("--class-internal")
+        return cli
 def configure(cli):
     cli.add_argument("--shared")
 def formatter_main():
