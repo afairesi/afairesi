@@ -2188,7 +2188,7 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         '  inputs.afairesi.url = "github:afairesi/afairesi";\n'
         "  outputs =\n"
         "    inputs:\n"
-        "    inputs.afairesi.blueprint {\n"
+        "    inputs.afairesi.lib.mkFlake {\n"
         "      inherit inputs;\n"
         "    }\n"
         "    // {\n"
@@ -3547,8 +3547,57 @@ def declared_tests(module: ast.Module) -> list[str]:
     )
 
 
+def behavioral_specification(
+    description: str | None,
+    tests: ast.Module | None,
+    path: str,
+) -> dict[str, Any]:
+    """Expose declared behavior with its complete, unexecuted test evidence.
+
+    Keep the whole test module so parameterization, fixtures, helpers, inherited
+    methods, and expected errors retain their context. Test descriptions are
+    claims made by the repository, not inferred guarantees of completeness.
+    """
+    behaviors = (
+        sorted(
+            (
+                {
+                    "test": f"{owner}::{definition.name}" if owner else definition.name,
+                    "description": ast.get_docstring(definition),
+                }
+                for owner, definition in python_test_definitions(tests)
+            ),
+            key=lambda behavior: behavior["test"] or "",
+        )
+        if tests is not None
+        else []
+    )
+    gaps = []
+    if not description:
+        gaps.append("No package behavior description is declared.")
+    if not behaviors:
+        gaps.append("No Python behavioral tests are declared.")
+    gaps.extend(
+        f"{behavior['test']}: no behavior description is declared."
+        for behavior in behaviors
+        if not behavior["description"]
+    )
+    return {
+        "description": description,
+        "basis": (
+            "Declared Python test behavior; static inspection does not establish "
+            "coverage or completeness."
+        ),
+        "behaviors": behaviors,
+        "evidence": (
+            {"path": path, "source": ast.unparse(tests)} if tests is not None else None
+        ),
+        "gaps": gaps,
+    }
+
+
 def inspect_repository(root: Path) -> dict[str, Any]:
-    """Build a deterministic inventory of an Afairesi flake repository."""
+    """Describe repository interfaces and the behavior specified by its tests."""
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
@@ -3564,9 +3613,10 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     )
     packages = {}
     for package in detect_packages(root):
+        module = _source(package.root / "main.py") if package.kind == "python" else None
         cli = (
-            ArgumentDiscovery(_source(package.root / "main.py")).report()
-            if package.kind == "python"
+            ArgumentDiscovery(module).report()
+            if module is not None
             else {
                 "status": "not applicable",
                 "arguments": [],
@@ -3575,11 +3625,19 @@ def inspect_repository(root: Path) -> dict[str, Any]:
             }
         )
         tests = package.root / "test_main.py"
+        test_module = _source(tests) if tests.is_file() else None
+        description = package_description(package)
         packages[package.name] = {
             "kind": package.kind,
-            "description": package_description(package),
+            "description": description,
             "cli": cli,
-            "tests": declared_tests(_source(tests)) if tests.is_file() else [],
+            "tests": declared_tests(test_module) if test_module is not None else [],
+            "specification": behavioral_specification(
+                (ast.get_docstring(module) if module is not None else None)
+                or description,
+                test_module,
+                str(tests.relative_to(root)),
+            ),
         }
     return {"hosts": host_names, "packages": packages}
 
@@ -3704,8 +3762,13 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     inspection = commands.add_parser(
         "inspect",
-        help="inspect hosts, packages, CLI arguments, and tests",
-        description="Inspect repository sources without running package code or tests.",
+        help="inspect interfaces and test-backed behavioral specifications",
+        description=(
+            "Describe hosts, packages, CLI arguments, and declared behavior with "
+            "complete test evidence and specification gaps. Test evidence includes "
+            "fixtures, parameterization, and assertions; it does not establish "
+            "complete behavioral coverage. No package code or tests are executed."
+        ),
     )
     inspection.add_argument(
         "repository",

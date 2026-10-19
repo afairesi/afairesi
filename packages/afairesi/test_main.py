@@ -1074,7 +1074,7 @@ def test_flake_resource_ownership_rejects_parallel_definitions(
     with _fresh_repository() as root:
         _repair_flake(root)
         (root / "flake.nix").write_text(
-            "{ outputs = inputs: let base = inputs.afairesi.blueprint "
+            "{ outputs = inputs: let base = inputs.afairesi.lib.mkFlake "
             "{ inherit inputs; }; pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux; "
             f"in base // {{ checks.x86_64-linux.parallel = {definition}; }}; }}",
         )
@@ -1102,7 +1102,7 @@ def test_flake_resource_ownership_rejects_parallel_definitions(
             "base // { packages = builtins.mapAttrs "
             "(_: packages: packages // { default = packages.foo; }) base.packages; }"
         ),
-        "base // { inherit (inputs.afairesi) blueprint lib; }",
+        "base // { inherit (inputs.afairesi) lib; }",
         (
             "base // { checks = base.checks // { x86_64-linux = "
             "base.checks.x86_64-linux // { foo = pkgs.vmTools.runInLinuxVM "
@@ -1134,7 +1134,7 @@ def test_flake_resource_ownership_preserves_composition(composition: str) -> Non
     """Preserve policies, output aliases, VM wrappers, imports, and lexical scopes."""
     with _fresh_repository() as root:
         source = (
-            "{ outputs = inputs: let base = inputs.afairesi.blueprint "
+            "{ outputs = inputs: let base = inputs.afairesi.lib.mkFlake "
             "{ inherit inputs; nixpkgs.config.allowUnfree = true; }; "
             f"pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux; in {composition}; }}"
         )
@@ -2138,7 +2138,7 @@ def test_local_init_stages_files_without_committing_or_requiring_home(
         "--expr",
         f"(import {json.dumps(str(root / 'flake.nix'))}).outputs {{ "
         'self = "consumer"; afairesi = { '
-        'blueprint = _: { packages = "preserved"; formatter = "plain"; }; '
+        'lib.mkFlake = _: { packages = "preserved"; formatter = "plain"; }; '
         'lib.mkFormatter = { self }: "repair-${self}"; }; }',
         executable=nix_executable,
         environment=_nix_environment(root)
@@ -5703,6 +5703,163 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
     _inspection_expect(
         report["packages"]["library"]["tests"] == [],
         "wrong empty tests",
+    )
+    specification = report["packages"]["example"]["specification"]
+    _expect(specification["description"] == "Example", specification)
+    _expect(
+        specification["behaviors"]
+        == [{"test": "test_default_output", "description": None}],
+        specification,
+    )
+    _expect(
+        specification["evidence"]["path"] == "packages/example/test_main.py",
+        specification,
+    )
+    _expect(
+        "raise RuntimeError" in specification["evidence"]["source"],
+        "test evidence was executed or omitted",
+    )
+    _expect(bool(specification["gaps"]), "undocumented behavior was hidden")
+
+
+def test_behavioral_specification_preserves_reimplementation_evidence() -> None:
+    """Keep examples, expected errors, fixtures, and inheritance in their context."""
+    source = '''
+"""Behavioral checks for cleanup."""
+import pytest
+from unittest import TestCase
+from example import cleanup
+
+SAMPLES = [(b"first\\n\\nlast", b"first\\nlast"), (b"\\x00\\n", b"\\x00\\n")]
+
+@pytest.fixture
+def selected(tmp_path):
+    path = tmp_path / "selected"
+    path.write_bytes(b"first\\n\\nlast")
+    return path
+
+@pytest.mark.parametrize(("contents", "expected"), SAMPLES)
+def test_cleanup(contents, expected):
+    """Remove blank lines while preserving binary input."""
+    assert cleanup(contents) == expected
+
+def test_missing(selected):
+    """Reject missing files with the native filesystem error."""
+    selected.unlink()
+    with pytest.raises(FileNotFoundError):
+        cleanup(selected)
+
+class Base(TestCase):
+    def setUp(self):
+        self.contents = b""
+
+    def test_empty(self):
+        """Leave empty input unchanged."""
+        self.assertEqual(cleanup(self.contents), b"")
+
+class Derived(Base):
+    async def test_async(self):
+        """Accept empty input asynchronously."""
+        assert await cleanup(b"") == b""
+'''
+    module = ast.parse(source)
+    report = inspection_subject.behavioral_specification(
+        "Clean selected inputs.",
+        module,
+        "packages/example/test_main.py",
+    )
+    _expect(report["description"] == "Clean selected inputs.", report)
+    _expect(not report["gaps"], report)
+    _expect(
+        [behavior["test"] for behavior in report["behaviors"]]
+        == inspection_subject.declared_tests(module),
+        report,
+    )
+    _expect(
+        all(behavior["description"] for behavior in report["behaviors"]),
+        report,
+    )
+    _expect(
+        ast.dump(ast.parse(report["evidence"]["source"])) == ast.dump(module),
+        "test evidence lost context needed to reimplement the behavior",
+    )
+    _expect(
+        json.loads(json.dumps(report)) == report,
+        "behavioral evidence is not JSON serializable",
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [None, "def helper(): pass", "def test_unknown(): pass"],
+)
+def test_behavioral_specification_reports_missing_contracts(source: str | None) -> None:
+    """Expose absent descriptions and tests without guessing behavior from names."""
+    report = inspection_subject.behavioral_specification(
+        None,
+        ast.parse(source) if source is not None else None,
+        "packages/example/test_main.py",
+    )
+    _expect(report["description"] is None, report)
+    _expect(bool(report["gaps"]), report)
+    if source is None:
+        _expect(report["evidence"] is None, report)
+    elif "test_unknown" in source:
+        _expect(
+            report["behaviors"] == [{"test": "test_unknown", "description": None}],
+            "test name was presented as an inferred behavioral guarantee",
+        )
+    else:
+        _expect(not report["behaviors"], report)
+
+
+def test_inspection_uses_package_behavior_and_preserves_test_evidence(
+    tmp_path: Path,
+) -> None:
+    """Prefer the source behavior description and return deterministic evidence."""
+    _inspection_repository(tmp_path)
+    source = tmp_path / "packages/example/main.py"
+    source.write_text(
+        '"""Write selected output; default to result."""\n' + source.read_text(),
+    )
+    first = inspection_subject.inspect_repository(tmp_path)
+    _expect(first == inspection_subject.inspect_repository(tmp_path), "unstable report")
+    package = first["packages"]["example"]
+    _expect(package["description"] == "Example", package)
+    _expect(
+        package["specification"]["description"]
+        == "Write selected output; default to result.",
+        package,
+    )
+    library = first["packages"]["library"]["specification"]
+    _expect(library["evidence"] is None and bool(library["gaps"]), library)
+
+
+def test_inspection_distinguishes_behavior_with_identical_interfaces(
+    tmp_path: Path,
+) -> None:
+    """Expose changed expected outputs even when test names and CLI stay identical."""
+    _inspection_repository(tmp_path)
+    tests = tmp_path / "packages/example/test_main.py"
+    source = '''
+from example import render
+def test_default_output():
+    """Render the default output."""
+    assert render() == "EXPECTED"
+'''
+    tests.write_text(source.replace("EXPECTED", "first"))
+    before = inspection_subject.inspect_repository(tmp_path)["packages"]["example"]
+    tests.write_text(source.replace("EXPECTED", "second"))
+    after = inspection_subject.inspect_repository(tmp_path)["packages"]["example"]
+    _expect(before["cli"] == after["cli"], "CLI changed unexpectedly")
+    _expect(before["tests"] == after["tests"], "test identifiers changed unexpectedly")
+    _expect(
+        before["specification"]["behaviors"] == after["specification"]["behaviors"],
+        "behavior descriptions changed unexpectedly",
+    )
+    _expect(
+        before["specification"]["evidence"] != after["specification"]["evidence"],
+        "changed expected behavior was absent from the specification",
     )
 
 

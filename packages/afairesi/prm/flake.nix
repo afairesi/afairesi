@@ -2,6 +2,7 @@
 let
   builders = import ./builders.nix;
   lib = builders // {
+    mkFlake = import ./mk-flake.nix { inherit inputs; };
     mkFormatter =
       { self }:
       inputs.nixpkgs.lib.genAttrs (builtins.attrNames self.packages) (

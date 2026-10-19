@@ -1,7 +1,7 @@
 { inputs, pkgs }:
 let
   consumerSource = ./consumer-contract;
-  consumer = inputs.self.blueprint {
+  consumer = inputs.self.lib.mkFlake {
     inputs = {
       self = consumer // {
         outPath = consumerSource;
@@ -16,6 +16,7 @@ let
       allowUnfree = true;
       cudaSupport = true;
     };
+    nixpkgs.overlays = [ (_: _: { afairesiContract = true; }) ];
   };
   system = pkgs.stdenv.hostPlatform.system;
   package = consumer.packages.${system}.example;
@@ -23,7 +24,7 @@ let
     check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
     packageDrv = package;
   };
-  descriptionless = inputs.self.blueprint {
+  descriptionless = inputs.self.lib.mkFlake {
     inputs = {
       self = {
         outPath = ./consumer-contract;
@@ -32,6 +33,12 @@ let
         });
       };
       afairesi = inputs.self;
+    };
+    systems = [ system ];
+  };
+  empty = inputs.self.lib.mkFlake {
+    inputs.self = empty // {
+      outPath = consumerSource + "/hosts";
     };
     systems = [ system ];
   };
@@ -50,20 +57,44 @@ let
 in
 assert
   package.consumerConfig == {
+    afairesiContract = true;
     allowUnfree = true;
     cudaSupport = true;
   };
 assert package.meta.mainProgram == "example";
 assert consumer.checks.${system} ? example;
+assert consumer.checks.${system}.pkgs-example == package;
+assert consumer.checks.${system}.pkgs-native == consumer.packages.${system}.native;
+assert
+  consumer.checks.${system}.pkgs-native-contract
+  == consumer.packages.${system}.native.passthru.tests.contract;
+assert consumer.checks.${system}.devshell-example-test == consumer.devShells.${system}.example-test;
+assert !(consumer.packages.${system} ? unavailable);
+assert consumer.packages.${system}.native.example == package;
+assert consumer.nixosConfigurations.example.pkgs.config.allowUnfree;
+assert consumer.nixosConfigurations.example.pkgs.config.cudaSupport;
+assert consumer.nixosConfigurations.example.pkgs.afairesiContract;
+assert consumer.nixosConfigurations.example.config.networking.hostName == "example";
+assert (consumer.checks.${system} ? nixos-example) == (system == "x86_64-linux");
+assert empty.packages.${system} == { };
+assert empty.checks.${system} == { };
+assert empty.apps.${system} == { };
+assert empty.devShells.${system} == { };
+assert empty.legacyPackages.${system} == { };
+assert empty.nixosConfigurations == { };
 assert !(builtins.pathExists (consumerSource + "/checks"));
 assert (consumer.checks.${system} ? exampleVmWithDisko) == (system == "x86_64-linux");
 assert
   system != "x86_64-linux" || builtins.isString consumer.checks.${system}.exampleVmWithDisko.drvPath;
 assert consumer.legacyPackages.${system} ? example-test-environment;
 assert consumer.legacyPackages.${system} ? example-coverage;
-assert vmCoverage.requiredSystemFeatures == [ "kvm" ];
-assert vmCoverage.origBuilder == consumer.checks.${system}.example.builder;
-assert vmCoverage.drvPath != consumer.legacyPackages.${system}.example-coverage.drvPath;
+assert !pkgs.stdenv.hostPlatform.isLinux || vmCoverage.requiredSystemFeatures == [ "kvm" ];
+assert
+  !pkgs.stdenv.hostPlatform.isLinux
+  || vmCoverage.origBuilder == consumer.checks.${system}.example.builder;
+assert
+  !pkgs.stdenv.hostPlatform.isLinux
+  || vmCoverage.drvPath != consumer.legacyPackages.${system}.example-coverage.drvPath;
 assert consumer.devShells.${system} ? example-test;
 assert consumer.apps.${system}.example.type == "app";
 assert consumer.apps.${system}.example.meta == package.meta;
@@ -82,7 +113,8 @@ assert
 assert !(inputs.self.apps.${system} ? afairesi);
 assert !(inputs.self.lib ? mkPythonCheck);
 assert !(inputs.self.lib ? mkHostCheck);
-assert !(inputs.self.lib ? mkFlake);
+assert inputs.self.lib ? mkFlake;
+assert !(inputs.self ? blueprint);
 assert !(inputs.self.lib ? blueprint);
 assert inputs.self.packages.${system}.default == inputs.self.packages.${system}.afairesi;
 pkgs.runCommand "afairesi-consumer-contract"
@@ -90,6 +122,8 @@ pkgs.runCommand "afairesi-consumer-contract"
     nativeBuildInputs = [
       consumer.checks.${system}.example
       consumer.legacyPackages.${system}.example-coverage
+      consumer.checks.${system}.pkgs-native
+      consumer.checks.${system}.pkgs-native-contract
     ];
   }
   ''

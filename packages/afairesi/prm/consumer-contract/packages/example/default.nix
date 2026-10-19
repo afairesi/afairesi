@@ -10,6 +10,7 @@ inputs.afairesi.lib.mkPythonPackage {
     export AFAIRESI_CONSUMER_HOOK=loaded
   '';
   passthru.consumerConfig = {
+    inherit (pkgs) afairesiContract;
     inherit (pkgs.config) allowUnfree cudaSupport;
   };
   src = ./.;
