@@ -5610,9 +5610,10 @@ def parse(cli):
     )
 
 
-def test_declared_test_identifiers() -> None:
+def test_declared_test_identifiers(tmp_path: Path) -> None:
     """Retain sorted test identifiers and class context."""
-    module = ast.parse("""
+    _inspection_repository(tmp_path)
+    (tmp_path / "example/test_main.py").write_text("""
 from unittest import TestCase as Case
 def test_default_output(): pass
 def helper():
@@ -5626,14 +5627,7 @@ class Derived(Arguments):
 class Helper:
     def test_not_collected(self): pass
 """)
-    rows = [
-        row["test"]
-        for row in inspection_subject.behavioral_specification(
-            None,
-            module,
-            "test_main.py",
-        )["behaviors"]
-    ]
+    rows = inspection_subject.inspect_repository(tmp_path)["example"]["tests"]
     _inspection_expect(
         rows
         == [
@@ -5689,7 +5683,10 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
     _inspection_expect(before == after, "inspection wrote to the repository")
     _expect(list(report) == ["example", "laptop", "library"], report)
     _expect(report["example"]["type"] == "package", report)
-    _expect("tests" not in report["example"], report)
+    _expect(
+        set(report["example"]) == {"type", "kind", "description", "cli", "tests"},
+        report,
+    )
     _expect("packages" not in report and "hosts" not in report, report)
     _inspection_expect(
         report["laptop"] == {"type": "host"},
@@ -5699,31 +5696,9 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         report["library"]["cli"]["status"] == "not applicable",
         "non-Python package has CLI metadata",
     )
-    _inspection_expect(
-        [row["test"] for row in report["example"]["specification"]["behaviors"]]
-        == ["test_default_output"],
-        "wrong test identifiers",
-    )
-    _inspection_expect(
-        report["library"]["specification"]["behaviors"] == [],
-        "wrong empty tests",
-    )
-    specification = report["example"]["specification"]
-    _expect(specification["description"] == "Example", specification)
-    _expect(
-        specification["behaviors"]
-        == [{"test": "test_default_output", "description": None}],
-        specification,
-    )
-    _expect(
-        specification["evidence"]["path"] == "example/test_main.py",
-        specification,
-    )
-    _expect(
-        "raise RuntimeError" in specification["evidence"]["source"],
-        "test evidence was executed or omitted",
-    )
-    _expect(bool(specification["gaps"]), "undocumented behavior was hidden")
+    _expect(report["example"]["tests"] == ["test_default_output"], report)
+    _expect(report["library"]["tests"] == [], report)
+    _expect(report["example"]["description"] == "Example", report)
 
 
 def test_inspection_preserves_package_and_host_in_one_directory(tmp_path: Path) -> None:
@@ -5735,150 +5710,26 @@ def test_inspection_preserves_package_and_host_in_one_directory(tmp_path: Path) 
     _expect(resource["kind"] == "python", resource)
 
 
-def test_behavioral_specification_preserves_reimplementation_evidence() -> None:
-    """Keep examples, expected errors, fixtures, and inheritance in their context."""
-    source = '''
-"""Behavioral checks for cleanup."""
-import pytest
-from unittest import TestCase
-from example import cleanup
-
-SAMPLES = [(b"first\\n\\nlast", b"first\\nlast"), (b"\\x00\\n", b"\\x00\\n")]
-
-@pytest.fixture
-def selected(tmp_path):
-    path = tmp_path / "selected"
-    path.write_bytes(b"first\\n\\nlast")
-    return path
-
-@pytest.mark.parametrize(("contents", "expected"), SAMPLES)
-def test_cleanup(contents, expected):
-    """Remove blank lines while preserving binary input."""
-    assert cleanup(contents) == expected
-
-def test_missing(selected):
-    """Reject missing files with the native filesystem error."""
-    selected.unlink()
-    with pytest.raises(FileNotFoundError):
-        cleanup(selected)
-
-class Base(TestCase):
-    def setUp(self):
-        self.contents = b""
-
-    def test_empty(self):
-        """Leave empty input unchanged."""
-        self.assertEqual(cleanup(self.contents), b"")
-
-class Derived(Base):
-    async def test_async(self):
-        """Accept empty input asynchronously."""
-        assert await cleanup(b"") == b""
-'''
-    module = ast.parse(source)
-    report = inspection_subject.behavioral_specification(
-        "Clean selected inputs.",
-        module,
-        "example/test_main.py",
-    )
-    _expect(report["description"] == "Clean selected inputs.", report)
-    _expect(not report["gaps"], report)
-    _expect(
-        [behavior["test"] for behavior in report["behaviors"]]
-        == [
-            "Base::test_empty",
-            "Derived::test_async",
-            "Derived::test_empty",
-            "test_cleanup",
-            "test_missing",
-        ],
-        report,
-    )
-    _expect(
-        all(behavior["description"] for behavior in report["behaviors"]),
-        report,
-    )
-    _expect(
-        ast.dump(ast.parse(report["evidence"]["source"])) == ast.dump(module),
-        "test evidence lost context needed to reimplement the behavior",
-    )
-    _expect(
-        json.loads(json.dumps(report)) == report,
-        "behavioral evidence is not JSON serializable",
-    )
-
-
-@pytest.mark.parametrize(
-    "source",
-    [None, "def helper(): pass", "def test_unknown(): pass"],
-)
-def test_behavioral_specification_reports_missing_contracts(source: str | None) -> None:
-    """Expose absent descriptions and tests without guessing behavior from names."""
-    report = inspection_subject.behavioral_specification(
-        None,
-        ast.parse(source) if source is not None else None,
-        "example/test_main.py",
-    )
-    _expect(report["description"] is None, report)
-    _expect(bool(report["gaps"]), report)
-    if source is None:
-        _expect(report["evidence"] is None, report)
-    elif "test_unknown" in source:
-        _expect(
-            report["behaviors"] == [{"test": "test_unknown", "description": None}],
-            "test name was presented as an inferred behavioral guarantee",
-        )
-    else:
-        _expect(not report["behaviors"], report)
-
-
-def test_inspection_uses_package_behavior_and_preserves_test_evidence(
-    tmp_path: Path,
-) -> None:
-    """Prefer the source behavior description and return deterministic evidence."""
+def test_inspection_omits_docstrings_and_test_implementation(tmp_path: Path) -> None:
+    """Return stable identifiers without test bodies or source docstrings."""
     _inspection_repository(tmp_path)
     source = tmp_path / "example/main.py"
-    source.write_text(
-        '"""Write selected output; default to result."""\n' + source.read_text(),
-    )
-    first = inspection_subject.inspect_repository(tmp_path)
-    _expect(first == inspection_subject.inspect_repository(tmp_path), "unstable report")
-    package = first["example"]
-    _expect(package["description"] == "Example", package)
-    _expect(
-        package["specification"]["description"]
-        == "Write selected output; default to result.",
-        package,
-    )
-    library = first["library"]["specification"]
-    _expect(library["evidence"] is None and bool(library["gaps"]), library)
-
-
-def test_inspection_distinguishes_behavior_with_identical_interfaces(
-    tmp_path: Path,
-) -> None:
-    """Expose changed expected outputs even when test names and CLI stay identical."""
-    _inspection_repository(tmp_path)
+    source.write_text('"""Source description."""\n' + source.read_text())
     tests = tmp_path / "example/test_main.py"
-    source = '''
-from example import render
-def test_default_output():
-    """Render the default output."""
-    assert render() == "EXPECTED"
-'''
-    tests.write_text(source.replace("EXPECTED", "first"))
-    before = inspection_subject.inspect_repository(tmp_path)["example"]
-    tests.write_text(source.replace("EXPECTED", "second"))
-    after = inspection_subject.inspect_repository(tmp_path)["example"]
-    _expect(before["cli"] == after["cli"], "CLI changed unexpectedly")
-    _expect(
-        before["specification"]["behaviors"] == after["specification"]["behaviors"],
-        "behavior descriptions changed unexpectedly",
+    template = (
+        "def test_default_output():\n"
+        '    """DOCUMENTATION"""\n'
+        '    assert render() == "EXPECTED"\n'
     )
-    _expect(
-        before["specification"]["evidence"] != after["specification"]["evidence"],
-        "changed expected behavior was absent from the specification",
+    tests.write_text(template)
+    before = inspection_subject.inspect_repository(tmp_path)
+    tests.write_text(
+        template.replace("DOCUMENTATION", "Changed").replace("EXPECTED", "second"),
     )
+    after = inspection_subject.inspect_repository(tmp_path)
+    _expect(before == after, "test implementation or docstrings leaked into inventory")
+    _expect(before["example"]["description"] == "Example", before)
+    _expect(before["example"]["tests"] == ["test_default_output"], before)
 
 
 @pytest.mark.parametrize("location", ["outside", "root", "nested"])
@@ -5890,8 +5741,7 @@ def test_cli_inventory_resolves_repository_paths(
     _inspection_repository(tmp_path)
     expected = inspection_subject.inspect_repository(tmp_path)
     _inspection_expect(
-        "test_default_output"
-        in [row["test"] for row in expected["example"]["specification"]["behaviors"]],
+        "test_default_output" in expected["example"]["tests"],
         "inventory lost test identifier",
     )
     if location != "outside":
