@@ -88,6 +88,15 @@ let
   );
 in
 {
+  formatter = lib.genAttrs systems (
+    system:
+    import ../../../formatter.nix {
+      inputs = afairesiInputs;
+      self = repositoryInputs.self;
+      flake = source;
+      pkgs = packageSets.${system};
+    }
+  );
   packages = lib.genAttrs systems (
     system:
     assert lib.assertMsg (
@@ -161,11 +170,11 @@ in
           )
         ) repositoryInputs.self.packages.${system}
       ))
-      (lib.optionalAttrs (repositoryInputs.self ? formatter) {
+      {
         formatter =
           repositoryInputs.self.formatter.${system}.passthru.tests.check
             or repositoryInputs.self.formatter.${system};
-      })
+      }
     ]
   );
   apps = lib.genAttrs systems (

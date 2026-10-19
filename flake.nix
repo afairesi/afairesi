@@ -15,7 +15,6 @@
     flake
     // {
       inherit lib;
-      formatter = lib.mkFormatter { inherit (inputs) self; };
       packages = builtins.mapAttrs (
         _: packages: packages // { default = packages.afairesi; }
       ) flake.packages;

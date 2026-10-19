@@ -2138,15 +2138,14 @@ def test_local_init_stages_files_without_committing_or_requiring_home(
         "--expr",
         f"(import {json.dumps(str(root / 'flake.nix'))}).outputs {{ "
         'self = "consumer"; afairesi = { '
-        'lib.mkFlake = _: { packages = "preserved"; formatter = "plain"; }; '
-        'lib.mkFormatter = { self }: "repair-${self}"; }; }',
+        'lib.mkFlake = _: { packages = "preserved"; formatter = "automatic"; }; }; }',
         executable=nix_executable,
         environment=_nix_environment(root)
         | {"HOME": str(root / "tmp/evaluation-home")},
     )
     _expect(
         json.loads(outputs.stdout)
-        == {"packages": "preserved", "formatter": "repair-consumer"},
+        == {"packages": "preserved", "formatter": "automatic"},
         outputs,
     )
     files = {".gitignore", "flake.lock", "flake.nix"}

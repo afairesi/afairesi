@@ -2190,10 +2190,6 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         "    inputs:\n"
         "    inputs.afairesi.lib.mkFlake {\n"
         "      inherit inputs;\n"
-        "    }\n"
-        "    // {\n"
-        "      formatter = inputs.afairesi.lib.mkFormatter "
-        "{ inherit (inputs) self; };\n"
         "    };\n"
         "}\n",
         encoding="utf-8",

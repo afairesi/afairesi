@@ -63,6 +63,8 @@ assert
   };
 assert package.meta.mainProgram == "example";
 assert consumer.checks.${system} ? example;
+assert builtins.attrNames consumer.formatter == builtins.attrNames consumer.packages;
+assert consumer.checks.${system}.formatter == consumer.formatter.${system}.passthru.tests.check;
 assert consumer.checks.${system}.pkgs-example == package;
 assert consumer.checks.${system}.pkgs-native == consumer.packages.${system}.native;
 assert
@@ -77,7 +79,8 @@ assert consumer.nixosConfigurations.example.pkgs.afairesiContract;
 assert consumer.nixosConfigurations.example.config.networking.hostName == "example";
 assert (consumer.checks.${system} ? nixos-example) == (system == "x86_64-linux");
 assert empty.packages.${system} == { };
-assert empty.checks.${system} == { };
+assert builtins.attrNames empty.formatter == [ system ];
+assert builtins.attrNames empty.checks.${system} == [ "formatter" ];
 assert empty.apps.${system} == { };
 assert empty.devShells.${system} == { };
 assert empty.legacyPackages.${system} == { };
