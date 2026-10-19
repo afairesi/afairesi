@@ -54,7 +54,7 @@ ROOT_FILES = {
 PRM_NAME = "prm"
 TMP_NAME = "tmp"
 MINIMUM_REMOTE_COMPONENTS = 3
-RESOURCE_PATH_COMPONENTS = 2
+RESOURCE_PATH_COMPONENTS = 1
 SOURCE_SUFFIXES = {
     ".nix",
     ".py",
@@ -167,10 +167,7 @@ def repository_type(root: Path, default: str | None = None) -> str:
 
 def _repository_type_markers(root: Path) -> tuple[bool, bool]:
     """Recognize home and flake layouts for lifecycle commands."""
-    flake = any(
-        (root / marker).exists()
-        for marker in ("flake.nix", "flake.lock", "packages", "hosts")
-    )
+    flake = any((root / marker).exists() for marker in ("flake.nix", "flake.lock"))
     gitignore = read_regular(root / ".gitignore") or ""
     home = (root / ".gitmodules").exists() or "!/.gitmodules" in gitignore.splitlines()
     return flake, home
@@ -236,7 +233,7 @@ def _flake_clean_arguments(*, dry_run: bool) -> list[str]:
     """Build the flake cleanup command."""
     return _clean_arguments(
         dry_run=dry_run,
-        exclusions=(f"/{TMP_NAME}/", f"/packages/*/{TMP_NAME}/"),
+        exclusions=(f"/{TMP_NAME}/", f"/*/{TMP_NAME}/"),
     )
 
 
@@ -294,21 +291,27 @@ def _package_kind(name: str, markers: set[str]) -> str:
     """Classify regular package markers consistently across source snapshots."""
     matches = [kind for kind, marker in KIND_MARKERS.items() if marker in markers]
     if len(matches) > 1:
-        msg = f"packages/{name}: has ambiguous project markers: {', '.join(matches)}"
+        msg = f"{name}: has ambiguous project markers: {', '.join(matches)}"
         raise CommandError(msg)
     return matches[0] if matches else "nix"
 
 
 def detect_packages(root: Path) -> list[Package]:
     """Detect supported packages from unambiguous marker files."""
-    packages_root = root / "packages"
+    packages_root = root
     if not packages_root.is_dir():
         return []
     result: list[Package] = []
     for package_root in sorted(
         path
         for path in packages_root.iterdir()
-        if path.is_dir() and not path.is_symlink()
+        if path.is_dir()
+        and not path.is_symlink()
+        and path.name not in {PRM_NAME, TMP_NAME}
+        and (
+            (path / "default.nix").is_file()
+            or any((path / marker).is_file() for marker in KIND_MARKERS.values())
+        )
     ):
         markers = {
             marker
@@ -342,13 +345,13 @@ def validate_python_package_names(packages: list[Package]) -> None:
         module = package.name.replace("-", "_")
         if not module.isidentifier() or keyword.iskeyword(module):
             msg = (
-                f"packages/{package.name}: installed Python module must be "
+                f"{package.name}: installed Python module must be "
                 "a valid non-keyword identifier"
             )
             raise CommandError(msg)
         if module in modules:
             msg = (
-                f"packages/{package.name} and packages/{modules[module]}: "
+                f"{package.name} and {modules[module]}: "
                 f"installed Python module names collide: {module}"
             )
             raise CommandError(msg)
@@ -364,7 +367,7 @@ def validate_host_name(name: str) -> None:
 
 def package_files(package: Package) -> set[Path]:
     """Return permitted regular files for a package kind."""
-    relative = Path("packages") / package.name
+    relative = Path() / package.name
     kind_files = {
         "python": {"main.py", "test_main.py"},
         "html": {"index.html", "script.js", "style.css"},
@@ -388,13 +391,13 @@ def required_package_files(package: Package) -> set[Path]:
 def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
     """Compute the repository whitelist represented by .gitignore."""
     allowed = {Path(item) for item in ROOT_FILES if (root / item).exists()}
-    hosts = root / "hosts"
+    hosts = root
     if hosts.is_dir():
         for host in hosts.iterdir():
             if host.is_dir() and (host / "configuration.nix").exists():
                 validate_host_name(host.name)
-                allowed.add(Path("hosts") / host.name / "configuration.nix")
-                hardware = Path("hosts") / host.name / "hardware-configuration.nix"
+                allowed.add(Path() / host.name / "configuration.nix")
+                hardware = Path() / host.name / "hardware-configuration.nix"
                 if (root / hardware).exists():
                     allowed.add(hardware)
     for package in packages:
@@ -406,26 +409,23 @@ def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
 
 def prm_directories(root: Path) -> set[Path]:
     """Return existing prm directories whose contents are unrestricted."""
-    candidates = {Path("prm")}
-    for parent in ("hosts", "packages"):
-        base = root / parent
-        if base.is_dir():
-            for child in base.iterdir():
-                if child.is_dir():
-                    candidates.add(Path(parent) / child.name / PRM_NAME)
+    candidates = {Path(PRM_NAME)}
+    candidates.update(
+        Path(child.name) / PRM_NAME
+        for child in root.iterdir()
+        if child.is_dir() and child.name not in {".git", PRM_NAME, TMP_NAME}
+    )
     return {path for path in candidates if (root / path).is_dir()}
 
 
 def tmp_directories(root: Path) -> set[Path]:
     """Return permitted untracked tmp trees."""
     candidates = {Path(TMP_NAME)}
-    packages = root / "packages"
-    if packages.is_dir():
-        candidates.update(
-            Path("packages") / child.name / TMP_NAME
-            for child in packages.iterdir()
-            if child.is_dir()
-        )
+    candidates.update(
+        Path(child.name) / TMP_NAME
+        for child in root.iterdir()
+        if child.is_dir() and child.name not in {".git", PRM_NAME, TMP_NAME}
+    )
     return {
         path
         for path in candidates
@@ -482,11 +482,7 @@ def validate_flake_layout(root: Path, *, removing: Path | None = None) -> None:
     excluded = prm_directories(root) | tmp_directories(root) | {Path(".git")}
     for path in _structure_paths(root, excluded):
         relative = path.relative_to(root)
-        directory = (
-            relative.parts[0] in {"packages", "hosts"}
-            and len(relative.parts) <= RESOURCE_PATH_COMPONENTS
-        )
-        if path.is_symlink() or (directory and not path.is_dir()):
+        if path.is_symlink():
             msg = f"{relative}: managed layout requires regular files and directories"
             raise CommandError(msg)
     for package in detect_packages(root):
@@ -531,7 +527,7 @@ def _python_test_placement_issue(package: Package) -> str | None:
     """Keep test definitions in test_main.py rather than the package entry point."""
     source = package.root / "main.py"
     if package.kind == "python" and source.is_file() and has_python_tests(source):
-        return f"packages/{package.name}/main.py: move test definitions to test_main.py"
+        return f"{package.name}/main.py: move test definitions to test_main.py"
     return None
 
 
@@ -735,11 +731,11 @@ def _runtime_directory_issues(
         )
     ]
     issues.extend(
-        f"packages/{package.name}/main.py:{node.lineno}: runtime paths "
+        f"{package.name}/main.py:{node.lineno}: runtime paths "
         "must derive from declared RUNTIME_DIR or INPUT_DIRS"
         for node in _implicit_runtime_paths(module, bindings)
     )
-    repository = package.root.parent.parent
+    repository = package.root.parent
     expected = None
     if check_repository and (repository / ".git").exists():
         expected = _repository_remote_path(repository)
@@ -761,18 +757,17 @@ def _runtime_directory_issues(
                 path = _runtime_path(expression) if expression is not None else None
                 valid = (
                     path is not None
-                    and len(path.parts[:-3]) >= len(("host", "repository"))
-                    and path.parts[-3] == "packages"
+                    and len(path.parts[:-2]) >= len(("host", "repository"))
                     and path.parts[-1] == "tmp"
                     and (name != "INPUT_DIRS" or isinstance(value, ast.Tuple))
                     and (name == "INPUT_DIRS" or path.parts[-2] == package.name)
-                    and (expected is None or Path(*path.parts[:-3]) == expected)
+                    and (expected is None or Path(*path.parts[:-2]) == expected)
                 )
                 if not valid:
                     issues.append(
-                        f"packages/{package.name}/main.py:{statement.lineno}: {name} "
+                        f"{package.name}/main.py:{statement.lineno}: {name} "
                         "must use Path.home() / "
-                        "'<host>/<repository>/packages/NAME/tmp'; "
+                        "'<host>/<repository>/NAME/tmp'; "
                         "RUNTIME_DIR must belong to this package "
                         "and INPUT_DIRS must be a tuple",
                     )
@@ -796,7 +791,7 @@ def _python_source_issues(package: Package) -> list[str]:
             if isinstance(binding, (ast.Assign, ast.AnnAssign))
             else binding
         )
-        prefix = f"packages/{package.name}/main.py: "
+        prefix = f"{package.name}/main.py: "
         if isinstance(entrypoint, ast.AsyncFunctionDef):
             issues.append(
                 prefix + "main must be synchronous; the executable calls main()",
@@ -1142,7 +1137,7 @@ def canonical_package_default(package: Package) -> str | None:
     source = read_regular(package.root / "default.nix")
     if source is None:
         rendered = scaffold(package.kind, package.name, None)[
-            Path("packages") / package.name / "default.nix"
+            Path() / package.name / "default.nix"
         ]
         return (
             _canonical_python_default(package, rendered)
@@ -1169,7 +1164,7 @@ def canonical_package_default(package: Package) -> str | None:
         msg = f"{package.kind} package must call {constructor} with an attribute set"
         raise CommandError(msg)
     rendered = scaffold(package.kind, package.name, package_description(package))[
-        Path("packages") / package.name / "default.nix"
+        Path() / package.name / "default.nix"
     ]
     template = nix_syntax.parse(rendered)
     _template_scope, template_body = _package_body(template)
@@ -1256,7 +1251,7 @@ def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) ->
     for package in packages:
         expected_default = canonical_package_default(package)
         if expected_default is not None:
-            relative = Path("packages") / package.name / "default.nix"
+            relative = Path() / package.name / "default.nix"
             changed |= _write_managed_nix(
                 root,
                 relative,
@@ -1374,7 +1369,7 @@ def _cleanup_flake(root: Path, packages: list[Package], *, dry_run: bool) -> boo
     tmp = tmp_directories(root)
     tracked = _tracked_paths(root)
     python_entrypoints = {
-        Path("packages") / package.name / "main.py"
+        Path() / package.name / "main.py"
         for package in packages
         if package.kind == "python"
     }
@@ -1483,12 +1478,12 @@ def _flake_resource_issues(root: Path) -> list[str]:
     document = nix_syntax.parse(source, "flake.nix")
     outputs = _attrset_expression(document, document.root, ("outputs",))
     constructors = {
-        "buildPythonPackage": (1, "packages/NAME/default.nix"),
-        "buildPythonApplication": (1, "packages/NAME/default.nix"),
-        "derivation": (1, "packages/NAME/default.nix"),
-        "mkDerivation": (1, "packages/NAME/default.nix"),
-        "mkPythonPackage": (1, "packages/NAME/default.nix"),
-        "nixosSystem": (1, "hosts/NAME/configuration.nix"),
+        "buildPythonPackage": (1, "NAME/default.nix"),
+        "buildPythonApplication": (1, "NAME/default.nix"),
+        "derivation": (1, "NAME/default.nix"),
+        "mkDerivation": (1, "NAME/default.nix"),
+        "mkPythonPackage": (1, "NAME/default.nix"),
+        "nixosSystem": (1, "NAME/configuration.nix"),
         "runNixOSTest": (1, "the host testing structure"),
         "runCommand": (3, "the package or host structure"),
         "runCommandLocal": (3, "the package or host structure"),
@@ -1598,7 +1593,7 @@ def _validate_nix_sources(packages: list[Package]) -> None:
 def _source_package_issues(root: Path, package: Package) -> list[str]:
     """Return source-only package-template issues."""
     issues: list[str] = []
-    relative = Path("packages") / package.name / "default.nix"
+    relative = Path() / package.name / "default.nix"
     actual = read_regular(root / relative)
     expected = canonical_package_default(package)
     if (
@@ -1631,7 +1626,7 @@ def scaffold(
         }[kind]
     )
     description_literal = nix_syntax.quote_string(description)
-    root = Path("packages") / name
+    root = Path() / name
     defaults = {
         "python": """{ inputs, pkgs, ... }:
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
@@ -1846,7 +1841,7 @@ def add_package(
         )
     validate_name(name)
     files = scaffold(kind, name, description)
-    relative = Path("packages") / name
+    relative = Path() / name
     if (root / relative).exists():
         msg = f"package already exists: {name}"
         raise CommandError(msg)
@@ -1878,7 +1873,7 @@ def add_package(
 def add_host(root: Path, name: str) -> None:
     """Create a host and stage its canonical configuration."""
     validate_host_name(name)
-    relative = Path("hosts") / name / "configuration.nix"
+    relative = Path() / name / "configuration.nix"
     path = root / relative
     if path.parent.exists():
         msg = f"host already exists: {name}"
@@ -1911,7 +1906,7 @@ def remove_resource(
     force: bool = False,
 ) -> None:
     """Remove a canonical package or host and stage its related metadata."""
-    kind, name, relative = _parse_resource_path(value)
+    kind, name, relative = _parse_resource_path(value, root)
     resource_root = root / relative
     marker = "default.nix" if kind == "package" else "configuration.nix"
     if not resource_root.is_dir() or not (resource_root / marker).is_file():
@@ -1927,21 +1922,36 @@ def remove_resource(
     git(root, ["add", "--", ".gitignore"])
 
 
-def _parse_resource_path(value: str) -> tuple[str, str, Path]:
-    """Parse a canonical package or host resource path."""
+def _parse_resource_path(
+    value: str,
+    root: Path | None = None,
+    *,
+    kind: str | None = None,
+) -> tuple[str, str, Path]:
+    """Parse one root resource name and infer existing resources from markers."""
     path = Path(value)
-    if path.is_absolute() or len(path.parts) != RESOURCE_PATH_COMPONENTS:
-        msg = f"resource path must be packages/NAME or hosts/NAME: {value}"
+    if (
+        path.is_absolute()
+        or len(path.parts) != RESOURCE_PATH_COMPONENTS
+        or value != path.name
+        or path.name in {PRM_NAME, TMP_NAME}
+    ):
+        msg = f"resource path must be a root directory name: {value}"
         raise CommandError(msg)
-    parent, name = path.parts
-    if parent == "packages":
-        validate_name(name)
-        return "package", name, path
-    if parent == "hosts":
+    name = path.name
+    if kind is None and root is not None:
+        kind = "package" if (root / path / "default.nix").is_file() else "host"
+    if kind == "host":
         validate_host_name(name)
-        return "host", name, path
-    msg = f"resource path must be packages/NAME or hosts/NAME: {value}"
-    raise CommandError(msg)
+    elif kind == "package":
+        validate_name(name)
+    elif not (
+        re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*|[a-z0-9]+(?:-[a-z0-9]+)*", name)
+        or re.fullmatch(r"[a-z][A-Za-z0-9]*", name)
+    ):
+        msg = f"invalid resource name: {name}"
+        raise CommandError(msg)
+    return kind or "package", name, path
 
 
 def _renamed_runtime_expression(
@@ -1955,9 +1965,9 @@ def _renamed_runtime_expression(
 
     code = cst.Module([]).code_for_node(expression)
     path = _runtime_path(ast.parse(code, mode="eval").body)
-    if path is None or path.parts[-3:] != (*old.parts, "tmp"):
+    if path is None or path.parts[-2:] != (*old.parts, "tmp"):
         return expression
-    if repository is not None and Path(*path.parts[:-3]) != repository:
+    if repository is not None and Path(*path.parts[:-2]) != repository:
         return expression
     literals: list[cst.SimpleString | cst.ConcatenatedString] = []
     current = expression
@@ -2056,7 +2066,7 @@ def _runtime_rename_updates(
     for package in detect_packages(root):
         if package.kind != "python":
             continue
-        relative = Path("packages") / package.name / "main.py"
+        relative = Path() / package.name / "main.py"
         source = read_regular(root / relative)
         if source is None:
             continue
@@ -2113,11 +2123,11 @@ def rename_resource(
     destination: str,
 ) -> None:
     """Rename one canonical package or host and stage its related metadata."""
-    source_kind, source_name, source_relative = _parse_resource_path(source)
-    destination_kind, _, destination_relative = _parse_resource_path(destination)
-    if source_kind != destination_kind:
-        msg = "cannot rename a package to a host or a host to a package"
-        raise CommandError(msg)
+    source_kind, source_name, source_relative = _parse_resource_path(source, root)
+    _, _, destination_relative = _parse_resource_path(
+        destination,
+        kind=source_kind,
+    )
     source_path = root / source_relative
     destination_path = root / destination_relative
     marker = "default.nix" if source_kind == "package" else "configuration.nix"
@@ -2299,17 +2309,13 @@ def _command_target(target: Path | None) -> Path:
 def _test_target_root(package: Path) -> Path:
     """Validate the canonical target and return its flake root."""
     validate_name(package.name)
-    root = package.parent.parent
-    if (
-        package.parent.name != "packages"
-        or not (root / "flake.nix").is_file()
-        or not all(
-            (package / name).is_file()
-            for name in ("default.nix", "main.py", "test_main.py")
-        )
+    root = package.parent
+    if not (root / "flake.nix").is_file() or not all(
+        (package / name).is_file()
+        for name in ("default.nix", "main.py", "test_main.py")
     ):
         message = (
-            "expected a canonical packages/NAME with default.nix, main.py "
+            "expected a canonical NAME with default.nix, main.py "
             "and test_main.py inside a flake"
         )
         raise CommandError(message)
@@ -2327,13 +2333,8 @@ def _copy_test_sources(root: Path, workspace: Path) -> None:
         ".ruff_cache",
         "*.pyc",
     )
-    for package in sorted((root / "packages").iterdir()):
-        if package.is_dir() and not package.is_symlink():
-            shutil.copytree(
-                package,
-                workspace / "packages" / package.name,
-                ignore=ignored,
-            )
+    for package in detect_packages(root):
+        shutil.copytree(package.root, workspace / package.name, ignore=ignored)
     if (root / "prm").is_dir():
         shutil.copytree(root / "prm", workspace / "prm", ignore=ignored)
 
@@ -2581,7 +2582,7 @@ def _prepare_package_tests(
     (workspace / "package-entry.py").write_text(
         "import importlib, sys\n"
         f"sys.argv[0] = {str(launcher)!r}\n"
-        f"importlib.import_module({'packages.' + name + '.main'!r}).main()\n",
+        f"importlib.import_module({name + '.main'!r}).main()\n",
         encoding="utf-8",
     )
     pytest_arguments = selection.pytest_arguments()
@@ -2598,7 +2599,7 @@ def _prepare_package_tests(
             f"fuzz = _fuzz_plugin({selection.max_examples})\n"
         )
     pytest_arguments.extend(
-        ["--import-mode=importlib", "-q", f"packages/{name}/test_main.py"],
+        ["--import-mode=importlib", "-q", f"{name}/test_main.py"],
     )
     bootstrap = workspace / "run-tests.py"
     bootstrap.write_text(
@@ -2751,7 +2752,7 @@ def _run_mutation_campaign(
     ):
         message = "selected baseline has no passing tests; see baseline.xml"
         raise CommandError(message)
-    module_path = f"packages/{name}/main.py"
+    module_path = f"{name}/main.py"
     filters = ""
     if selection.lines:
         filters += (
@@ -2874,16 +2875,10 @@ def _run_test_repository(
     selection: TestSelection,
 ) -> bool:
     """Run each Python package, continuing after failures and summarizing results."""
-    directory = root / "packages"
-    packages = (
-        sorted(
-            path
-            for path in directory.iterdir()
-            if path.is_dir() and not path.is_symlink() and (path / "main.py").is_file()
-        )
-        if directory.is_dir()
-        else []
-    )
+    directory = root
+    packages = [
+        package.root for package in detect_packages(root) if package.kind == "python"
+    ]
     if not packages:
         message = f"no Python packages found under {directory}"
         raise CommandError(message)
@@ -3018,18 +3013,12 @@ def _run_coverage(target: Path) -> bool:
     """Build package checks independently, preserving caching and reporting failures."""
     repository = (target / "flake.nix").is_file()
     if repository:
-        directory = target / "packages"
-        packages = (
-            sorted(
-                path
-                for path in directory.iterdir()
-                if path.is_dir()
-                and not path.is_symlink()
-                and (path / "main.py").is_file()
-            )
-            if directory.is_dir()
-            else []
-        )
+        directory = target
+        packages = [
+            package.root
+            for package in detect_packages(target)
+            if package.kind == "python"
+        ]
         if not packages:
             message = f"no Python packages found under {directory}"
             raise CommandError(message)
@@ -3597,12 +3586,14 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
-    hosts = root / "hosts"
+    hosts = root
     host_names = (
         [
             host.name
             for host in sorted(hosts.iterdir())
-            if host.is_dir() and not host.is_symlink()
+            if host.is_dir()
+            and not host.is_symlink()
+            and (host / "configuration.nix").is_file()
         ]
         if hosts.is_dir()
         else []
@@ -3682,7 +3673,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     create = commands.add_parser(
         "add",
-        usage="%(prog)s [-h] {packages/NAME TYPE | hosts/NAME}",
+        usage="%(prog)s [-h] {NAME TYPE | HOST}",
         help="create and stage a package or host",
         description=(
             "Create and stage a canonical package or host. "
@@ -3694,7 +3685,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     create.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="new packages/NAME or hosts/NAME",
+        help="new root directory name",
     )
     create.add_argument(
         "type",
@@ -3715,12 +3706,12 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     move.add_argument(
         "source",
         metavar="SOURCE",
-        help="existing packages/NAME or hosts/NAME",
+        help="existing root directory name",
     )
     move.add_argument(
         "destination",
         metavar="DESTINATION",
-        help="new path in the same collection",
+        help="new root directory name",
     )
     remove = commands.add_parser(
         "rm",
@@ -3733,7 +3724,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     remove.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="packages/NAME or hosts/NAME",
+        help="root directory name",
     )
     remove.add_argument(
         "-f",
@@ -4179,7 +4170,10 @@ def parser() -> argparse.ArgumentParser:
 
 def _dispatch_create(root: Path, options: argparse.Namespace) -> None:
     """Create the selected package or host resource."""
-    kind, name, _relative = _parse_resource_path(options.resource)
+    kind, name, _relative = _parse_resource_path(
+        options.resource,
+        kind="host" if options.type is None else "package",
+    )
     if kind == "host":
         add_host(root, name)
         return
@@ -4195,22 +4189,17 @@ def _validate_resource_arguments(
         return
     try:
         if options.command == "mv":
-            source_kind, _name, _relative = _parse_resource_path(options.source)
-            destination_kind, _name, _relative = _parse_resource_path(
-                options.destination,
-            )
+            _parse_resource_path(options.source)
+            _parse_resource_path(options.destination)
         else:
-            kind, _name, _relative = _parse_resource_path(options.resource)
+            _parse_resource_path(
+                options.resource,
+                kind=("host" if options.type is None else "package")
+                if options.command == "add"
+                else None,
+            )
     except CommandError as error:
         cli.error(str(error))
-    if options.command == "mv":
-        if source_kind != destination_kind:
-            cli.error("source and destination must be in the same resource collection")
-    elif options.command == "add":
-        if kind == "host" and options.type is not None:
-            cli.error("host creation does not accept TYPE")
-        if kind == "package" and options.type is None:
-            cli.error("package creation requires TYPE")
 
 
 def _require_flake_repository(message: str, *, removing: Path | None = None) -> Path:

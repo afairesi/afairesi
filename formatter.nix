@@ -10,12 +10,18 @@ let
   formatterPython = pkgs.python3.withPackages (_: [
     inputs.self.packages.${pkgs.stdenv.system}.afairesi
   ]);
-  packagesPath = self.outPath + "/packages";
+  packagesPath = self.outPath;
   pythonPackageNames =
     if enableMypy then
       builtins.attrNames (
         pkgs.lib.filterAttrs (
-          name: type: type == "directory" && builtins.pathExists (packagesPath + "/${name}/main.py")
+          name: type:
+          type == "directory"
+          && !(builtins.elem name [
+            "prm"
+            "tmp"
+          ])
+          && builtins.pathExists (packagesPath + "/${name}/main.py")
         ) (if builtins.pathExists packagesPath then builtins.readDir packagesPath else { })
       )
     else
@@ -36,9 +42,9 @@ let
         includes = [
           "flake.nix"
           "formatter.nix"
-          "packages/*/default.nix"
-          "hosts/*/configuration.nix"
-          "hosts/*/hardware-configuration.nix"
+          "*/default.nix"
+          "*/configuration.nix"
+          "*/hardware-configuration.nix"
         ];
         priority = 3;
       };
@@ -53,12 +59,12 @@ let
           in
           {
             directory = "";
-            modules = [ "packages/${name}" ];
+            modules = [ "${name}" ];
             options = [
               "--python-executable=${environment.python}/bin/python"
-              "--cache-dir=packages/${name}/tmp/.mypy_cache"
+              "--cache-dir=${name}/tmp/.mypy_cache"
               "--exclude=/(prm|tmp)/"
-              "--explicit-package-bases"
+              "--no-namespace-packages"
               "--ignore-missing-imports"
               "--strict"
             ];
@@ -71,9 +77,9 @@ let
         includes = [
           "flake.nix"
           "formatter.nix"
-          "packages/*/default.nix"
-          "hosts/*/configuration.nix"
-          "hosts/*/hardware-configuration.nix"
+          "*/default.nix"
+          "*/configuration.nix"
+          "*/hardware-configuration.nix"
         ];
         priority = 5;
       };
@@ -82,9 +88,9 @@ let
         includes = [
           ".github/workflows/workflow.yml"
           ".forgejo/workflows/workflow.yml"
-          "packages/*/style.css"
-          "packages/*/index.html"
-          "packages/*/script.js"
+          "*/style.css"
+          "*/index.html"
+          "*/script.js"
         ];
         priority = 5;
       };
@@ -92,16 +98,16 @@ let
         enable = true;
         extendSelect = [ "ALL" ];
         includes = [
-          "packages/*/main.py"
-          "packages/*/test_main.py"
+          "*/main.py"
+          "*/test_main.py"
         ];
         priority = 3;
       };
       ruff-format = {
         enable = true;
         includes = [
-          "packages/*/main.py"
-          "packages/*/test_main.py"
+          "*/main.py"
+          "*/test_main.py"
         ];
         priority = 5;
       };
@@ -110,15 +116,15 @@ let
         includes = [
           "flake.nix"
           "formatter.nix"
-          "packages/*/default.nix"
-          "hosts/*/configuration.nix"
-          "hosts/*/hardware-configuration.nix"
+          "*/default.nix"
+          "*/configuration.nix"
+          "*/hardware-configuration.nix"
         ];
         priority = 3;
       };
       texfmt = {
         enable = true;
-        includes = [ "packages/*/ms.tex" ];
+        includes = [ "*/ms.tex" ];
         priority = 5;
       };
       yamllint = {
@@ -135,7 +141,7 @@ let
       formatter = {
         bibtex-tidy = {
           command = pkgs.bibtex-tidy;
-          includes = [ "packages/*/ms.bib" ];
+          includes = [ "*/ms.bib" ];
           options = [
             "--duplicates"
             "--no-align"
@@ -151,15 +157,15 @@ let
           includes = [
             "flake.nix"
             "formatter.nix"
-            "packages/*/default.nix"
-            "hosts/*/configuration.nix"
-            "hosts/*/hardware-configuration.nix"
+            "*/default.nix"
+            "*/configuration.nix"
+            "*/hardware-configuration.nix"
           ];
           priority = 4;
         };
         oxlint = {
           command = pkgs.oxlint;
-          includes = [ "packages/*/script.js" ];
+          includes = [ "*/script.js" ];
           options = [
             "--fix-dangerously"
             "-D"
@@ -190,16 +196,16 @@ let
             "flake.lock"
             "flake.nix"
             "formatter.nix"
-            "packages/*/default.nix"
-            "hosts/*/configuration.nix"
-            "hosts/*/hardware-configuration.nix"
-            "packages/*/main.py"
-            "packages/*/test_main.py"
-            "packages/*/index.html"
-            "packages/*/script.js"
-            "packages/*/style.css"
-            "packages/*/ms.tex"
-            "packages/*/ms.bib"
+            "*/default.nix"
+            "*/configuration.nix"
+            "*/hardware-configuration.nix"
+            "*/main.py"
+            "*/test_main.py"
+            "*/index.html"
+            "*/script.js"
+            "*/style.css"
+            "*/ms.tex"
+            "*/ms.bib"
             ".github/workflows/workflow.yml"
             ".forgejo/workflows/workflow.yml"
           ];

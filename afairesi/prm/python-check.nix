@@ -19,8 +19,8 @@ pkgs.runCommand packageName
   )
   ''
     export HOME="$(mktemp -d)"
-    mkdir -p "$out" packages
-    ln -s "$src" "packages/${packageName}"
+    mkdir -p "$out"
+    ln -s "$src" "${packageName}"
     export PYTHONPATH="$PWD:$PYTHONPATH"
     cd "$out"
     "${pythonEnv}/bin/python" -c '

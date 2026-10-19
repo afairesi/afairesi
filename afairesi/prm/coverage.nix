@@ -4,7 +4,8 @@
 }:
 let
   # VM wrappers retain derivation attributes but do not expose overrideAttrs.
-  overrideCheck = check.overrideAttrs or (update: builtins.derivation (check.drvAttrs // update check));
+  overrideCheck =
+    check.overrideAttrs or (update: builtins.derivation (check.drvAttrs // update check));
   # Extract standalone helpers without importing the CLI or its dependencies.
   runtime = builtins.toFile "coverage_support.py" (
     "from __future__ import annotations\n"

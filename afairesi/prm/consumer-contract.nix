@@ -38,7 +38,7 @@ let
   };
   empty = inputs.self.lib.mkFlake {
     inputs.self = empty // {
-      outPath = consumerSource + "/hosts";
+      outPath = consumerSource + "/unavailable";
     };
     systems = [ system ];
   };
@@ -49,7 +49,7 @@ let
         {
           inherit pkgs;
           executable = true;
-          src = ./consumer-contract/packages/example;
+          src = ./consumer-contract/example;
         }
         // attributes
       )

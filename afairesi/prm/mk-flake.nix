@@ -3,7 +3,7 @@ let
   afairesiInputs = inputs;
   builders = import ./builders.nix;
 in
-# Assemble canonical packages/*/default.nix and hosts/*/configuration.nix.
+# Assemble canonical */default.nix and */configuration.nix.
 # Packages receive inputs (with a fallback nixpkgs), pkgs, system, and pname;
 # hosts receive inputs and hostName. One configured package set per system
 # supplies packages, test environments, checks, and runtime app wrappers.
@@ -23,12 +23,18 @@ let
   // inputs;
   lib = repositoryInputs.nixpkgs.lib;
   source = repositoryInputs.self.outPath;
-  packagePath = source + "/packages";
+  packagePath = source;
   discover =
     path: marker:
     builtins.attrNames (
       lib.filterAttrs (
-        name: type: type == "directory" && builtins.pathExists (path + "/${name}/${marker}")
+        name: type:
+        type == "directory"
+        && !(builtins.elem name [
+          "prm"
+          "tmp"
+        ])
+        && builtins.pathExists (path + "/${name}/${marker}")
       ) (if builtins.pathExists path then builtins.readDir path else { })
     );
   packageNames = discover packagePath "default.nix";
@@ -90,7 +96,7 @@ in
 {
   formatter = lib.genAttrs systems (
     system:
-    import ../../../formatter.nix {
+    import ../../formatter.nix {
       inputs = afairesiInputs;
       self = repositoryInputs.self;
       flake = source;
@@ -113,7 +119,7 @@ in
       )
     )
   );
-  nixosConfigurations = lib.genAttrs (discover (source + "/hosts") "configuration.nix") (
+  nixosConfigurations = lib.genAttrs (discover (source) "configuration.nix") (
     hostName:
     repositoryInputs.nixpkgs.lib.nixosSystem {
       specialArgs = {
@@ -121,7 +127,7 @@ in
         inherit hostName;
       };
       modules = [
-        (source + "/hosts/${hostName}/configuration.nix")
+        (source + "/${hostName}/configuration.nix")
         (
           { config, lib, ... }:
           lib.optionalAttrs ((nixpkgs.config or { }) != { } || (nixpkgs.overlays or [ ]) != [ ]) {

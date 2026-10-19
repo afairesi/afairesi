@@ -201,7 +201,7 @@ def main() -> None:
     """Parse selected Nix files and report syntax errors without changing them."""
     parser = argparse.ArgumentParser(
         description=__doc__,
-        epilog="Example: nix_syntax flake.nix packages/*/default.nix",
+        epilog="Example: nix_syntax flake.nix */default.nix",
     )
     parser.add_argument(
         "files",

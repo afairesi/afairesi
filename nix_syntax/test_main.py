@@ -12,7 +12,7 @@ import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from packages.nix_syntax import main as nix_syntax
+from nix_syntax import main as nix_syntax
 
 if TYPE_CHECKING:
     from pathlib import Path

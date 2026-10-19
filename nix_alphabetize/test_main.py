@@ -12,7 +12,7 @@ import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from packages.nix_alphabetize import main as alphabetize
+from nix_alphabetize import main as alphabetize
 
 
 @settings(deadline=None)

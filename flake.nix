@@ -10,7 +10,7 @@
     inputs:
     let
       flake = lib.mkFlake { inherit inputs; };
-      lib = import ./packages/afairesi/prm/flake.nix { inherit inputs; };
+      lib = import ./afairesi/prm/flake.nix { inherit inputs; };
     in
     flake
     // {
