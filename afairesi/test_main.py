@@ -1804,6 +1804,17 @@ def test_runtime_paths_can_derive_from_declared_directories(tmp_path: Path) -> N
     _expect(not issues, issues)
 
 
+def test_runtime_validation_handles_deep_unrelated_calls(tmp_path: Path) -> None:
+    """Inspect large call expressions without recursively rendering their source."""
+    subject = import_module("afairesi.main")
+    package = _make_source_package(tmp_path, "example", "")
+    (package / "main.py").write_text(
+        "service" + ".client" * 1500 + "()\n",
+    )
+    _, issues = subject.inspect_structure(tmp_path)
+    _expect(not issues, issues)
+
+
 @pytest.mark.parametrize(
     ("source", "expected"),
     [

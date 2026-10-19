@@ -515,14 +515,6 @@ def inspect_structure(root: Path) -> tuple[list[Package], list[str]]:
     return packages, issues
 
 
-def _python_test_placement_issue(package: Package) -> str | None:
-    """Keep test definitions in test_main.py rather than the package entry point."""
-    source = package.root / "main.py"
-    if package.kind == "python" and source.is_file() and has_python_tests(source):
-        return f"{package.name}/main.py: move test definitions to test_main.py"
-    return None
-
-
 def has_python_tests(path: Path) -> bool:
     """Detect static Python test definitions without executing the source."""
     try:
@@ -664,9 +656,15 @@ def _implicit_runtime_paths(
                 ):
                     return True
             if isinstance(node, ast.Call) and (
-                ast.unparse(node.func) in {"Path.home", "Path.cwd"}
+                (
+                    isinstance(node.func, ast.Attribute)
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "Path"
+                    and node.func.attr in {"home", "cwd"}
+                )
                 or (
-                    ast.unparse(node.func) == "Path"
+                    isinstance(node.func, ast.Name)
+                    and node.func.id == "Path"
                     and any(
                         isinstance(argument, ast.Constant)
                         or (
@@ -687,7 +685,8 @@ def _implicit_runtime_paths(
             if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Div)
             else node.args[0]
             if isinstance(node, ast.Call)
-            and ast.unparse(node.func) == "Path"
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "Path"
             and node.args
             else None
         )
@@ -727,7 +726,7 @@ def _runtime_directory_issues(
     )
     repository = package.root.parent
     expected = None
-    if (repository / ".git").exists():
+    if bindings and (repository / ".git").exists():
         expected = _repository_remote_path(repository)
     for statement in bindings:
         targets = (
@@ -769,11 +768,13 @@ def _python_source_issues(package: Package) -> list[str]:
     if package.kind != "python":
         return []
     issues = []
-    if issue := _python_test_placement_issue(package):
-        issues.append(issue)
     source = read_regular(package.root / "main.py")
     if source is not None:
         module = ast.parse(source, filename=str(package.root / "main.py"))
+        if python_test_definitions(module):
+            issues.append(
+                f"{package.name}/main.py: move test definitions to test_main.py",
+            )
         issues.extend(_runtime_directory_issues(package, module))
         binding = _module_main_binding(module)
         entrypoint = (
