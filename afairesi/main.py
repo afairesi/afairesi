@@ -3081,18 +3081,6 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     _configure_test_target(coverage)
-    property_tests = commands.add_parser(
-        "property",
-        help="run property-based tests",
-        description=(
-            "Run property-based tests in isolated package copies. "
-            "Skip packages without test_main.py. Logs and reports: flake tmp/. "
-            'Select profiles with PYTEST_ADDOPTS="--hypothesis-profile=NAME".'
-        ),
-    )
-    _configure_test_target(property_tests)
-    _configure_test_selection(property_tests)
-    _configure_test_timeout(property_tests)
     fuzz = commands.add_parser(
         "fuzz",
         help="run a short generation-based fuzz campaign",
@@ -3168,6 +3156,18 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     _configure_test_target(performance)
     _configure_test_selection(performance)
     _configure_test_timeout(performance)
+    property_tests = commands.add_parser(
+        "property",
+        help="run property-based tests",
+        description=(
+            "Run property-based tests in isolated package copies. "
+            "Skip packages without test_main.py. Logs and reports: flake tmp/. "
+            'Select profiles with PYTEST_ADDOPTS="--hypothesis-profile=NAME".'
+        ),
+    )
+    _configure_test_target(property_tests)
+    _configure_test_selection(property_tests)
+    _configure_test_timeout(property_tests)
 
 
 def _dispatch_test_command(
@@ -3510,14 +3510,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         title="commands",
         metavar="COMMAND",
     )
-    commands.add_parser(
-        "init",
-        help="initialize and stage a flake in an empty Git worktree",
-        description=(
-            "Initialize and stage a flake in an empty Git worktree. "
-            "Use Git to configure remotes, commit, and push."
-        ),
-    )
     create = commands.add_parser(
         "add",
         usage="%(prog)s [-h] {NAME TYPE | HOST}",
@@ -3540,6 +3532,46 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         metavar="TYPE",
         choices=PACKAGE_KINDS,
         help=f"required for packages, omitted for hosts ({', '.join(PACKAGE_KINDS)})",
+    )
+    fix = commands.add_parser(
+        "fix",
+        help="fix and stage flake structure; remove unsupported files",
+        description=(
+            "Fix and stage flake structure; delete paths outside the source whitelist. "
+            "Keep only necessary supporting files under prm/. "
+            f"{NIX_FMT_HELP}"
+        ),
+    )
+    fix.add_argument(
+        "-n",
+        "--dry-run",
+        action="store_true",
+        help="preview structural changes without modifying files or staging",
+    )
+    commands.add_parser(
+        "init",
+        help="initialize and stage a flake in an empty Git worktree",
+        description=(
+            "Initialize and stage a flake in an empty Git worktree. "
+            "Use Git to configure remotes, commit, and push."
+        ),
+    )
+    inspection = commands.add_parser(
+        "inspect",
+        help="inspect interfaces and test identifiers",
+        description=(
+            "Describe hosts, packages, CLI arguments, and declared test identifiers. "
+            "No package code or tests are executed."
+        ),
+    )
+    inspection.add_argument(
+        "repository",
+        nargs="?",
+        metavar="PATH_OR_REMOTE",
+        help=(
+            "repository path or Git URL (default: current repository); "
+            "relative paths use the Git root, or cwd outside Git"
+        ),
     )
     move = commands.add_parser(
         "mv",
@@ -3578,38 +3610,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "--force",
         action="store_true",
         help="pass --force to git rm",
-    )
-    fix = commands.add_parser(
-        "fix",
-        help="fix and stage flake structure; remove unsupported files",
-        description=(
-            "Fix and stage flake structure; delete paths outside the source whitelist. "
-            "Keep only necessary supporting files under prm/. "
-            f"{NIX_FMT_HELP}"
-        ),
-    )
-    fix.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview structural changes without modifying files or staging",
-    )
-    inspection = commands.add_parser(
-        "inspect",
-        help="inspect interfaces and test identifiers",
-        description=(
-            "Describe hosts, packages, CLI arguments, and declared test identifiers. "
-            "No package code or tests are executed."
-        ),
-    )
-    inspection.add_argument(
-        "repository",
-        nargs="?",
-        metavar="PATH_OR_REMOTE",
-        help=(
-            "repository path or Git URL (default: current repository); "
-            "relative paths use the Git root, or cwd outside Git"
-        ),
     )
     testing = commands.add_parser(
         "test",
@@ -3918,21 +3918,16 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         title="commands",
         metavar="COMMAND",
     )
-    commands.add_parser(
-        "init",
-        help="initialize the home repository and stage its whitelist",
-        description="Initialize the repository at $HOME and stage its whitelist.",
-    )
-    clone = commands.add_parser(
-        "clone",
-        help="clone and stage a home submodule registration",
+    add = commands.add_parser(
+        "add",
+        help="add a Git submodule at its canonical home path",
         description=(
-            "Clone a hosted remote at $HOME/<remote-hostname>/<repository-path> "
+            "Add a Git submodule at $HOME/<remote-hostname>/<repository-path> "
             "and stage its submodule registration."
         ),
     )
-    clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
-    clone.add_argument(
+    add.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
+    add.add_argument(
         "-f",
         "--force",
         action="store_true",
@@ -3951,6 +3946,11 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         "--dry-run",
         action="store_true",
         help="preview structural changes without modifying files or staging",
+    )
+    commands.add_parser(
+        "init",
+        help="initialize the home repository and stage its whitelist",
+        description="Initialize the repository at $HOME and stage its whitelist.",
     )
     remove = commands.add_parser(
         "rm",
@@ -3977,7 +3977,7 @@ def _dispatch_home(options: argparse.Namespace) -> None:
     """Dispatch lifecycle commands against the home repository."""
     if options.command == "init":
         initialize_home()
-    elif options.command == "clone":
+    elif options.command == "add":
         initialize_submodule(options.remote, force=options.force)
     elif options.command == "fix":
         converge_home(_require_home_repository(), dry_run=options.dry_run)
@@ -3997,20 +3997,20 @@ def parser() -> argparse.ArgumentParser:
         description="Afairesi aims to minimize the description of a software system.",
     )
     scopes = result.add_subparsers(dest="scope", title="commands", metavar="SCOPE")
-    repo = scopes.add_parser(
-        "repo",
-        help="manage the current repository",
-        description=(
-            "Manage Nix flake package, host, and check conventions. "
-            "Structural changes are staged for review."
-        ),
-    )
     home = scopes.add_parser(
         "home",
         help="manage the home repository and its submodules",
         description=(
             "Manage $HOME submodules at <remote-hostname>/<repository-path>. "
             "Changes are staged; use Git to commit and push."
+        ),
+    )
+    repo = scopes.add_parser(
+        "repo",
+        help="manage the current repository",
+        description=(
+            "Manage Nix flake package, host, and check conventions. "
+            "Structural changes are staged for review."
         ),
     )
     _configure_repo_parser(repo)

@@ -671,11 +671,11 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         initialization = _run(root, "init", code=1)
         _expect("not inside a Git repository" in initialization.stderr, initialization)
         help_output = _run(root, "--help").stdout
-        command_names = ["init", "add", "mv", "rm", "fix", "inspect", "test"]
+        command_names = ["add", "fix", "init", "inspect", "mv", "rm", "test"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(
             positions == sorted(positions),
-            "help commands must follow the repository workflow",
+            "help commands must be alphabetical",
         )
         _expect(_run(root).stdout == help_output, "bare afairesi must show help")
         _expect(not any(root.iterdir()), "invalid CLI request created state")
@@ -2037,7 +2037,7 @@ def _home_test_home_repository(root: Path) -> Path:
         "git@example.test:team/project.git",
     ],
 )
-def test_merged_clone_registers_existing_content_without_creating_commits(
+def test_merged_add_registers_existing_content_without_creating_commits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote: str,
@@ -2080,7 +2080,7 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
     )
     head = _home_test_git(home, "rev-parse", "HEAD")
     relative = "example.test/team/project"
-    result = _home_test_run(tmp_path, "clone", remote)
+    result = _home_test_run(tmp_path, "add", remote)
     checkout = home / relative
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     for pattern in (
@@ -2091,12 +2091,12 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
         if ignore.splitlines().count(pattern) != 1:
             raise AssertionError(ignore)
     if _home_test_git(home, "show", ":.gitignore") != ignore:
-        message = "clone REMOTE did not stage the home whitelist"
+        message = "add REMOTE did not stage the home whitelist"
         raise AssertionError(message)
     if (checkout / "LICENSE").read_text() != "existing repository":
         raise AssertionError(result.stdout + result.stderr)
     if _home_test_git(home, "rev-parse", "HEAD") != head:
-        message = "clone REMOTE created a home commit"
+        message = "add REMOTE created a home commit"
         raise AssertionError(message)
     if (
         _home_test_git(
@@ -2108,17 +2108,17 @@ def test_merged_clone_registers_existing_content_without_creating_commits(
         ).strip()
         != remote
     ):
-        message = "clone REMOTE changed the registered remote"
+        message = "add REMOTE changed the registered remote"
         raise AssertionError(message)
     if not _home_test_git(home, "ls-files", "--stage", "--", relative).startswith(
         "160000 ",
     ):
-        message = "clone REMOTE did not stage the submodule"
+        message = "add REMOTE did not stage the submodule"
         raise AssertionError(message)
-    repeated = _home_test_run(tmp_path, "clone", remote, code=128)
+    repeated = _home_test_run(tmp_path, "add", remote, code=128)
     _home_test_expect("already exists in the index" in repeated.stderr, repeated)
     if (home / ".gitignore").read_text(encoding="utf-8") != ignore:
-        message = "repeated clone changed the home whitelist"
+        message = "repeated add changed the home whitelist"
         raise AssertionError(message)
 
 
@@ -2136,7 +2136,7 @@ def _local_init(root: Path, *, code: int = 0) -> subprocess.CompletedProcess[str
 
 
 @pytest.mark.parametrize("force_flag", ["-f", "--force"])
-def test_home_clone_reuses_retained_history_only_with_force(
+def test_home_add_reuses_retained_history_only_with_force(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     force_flag: str,
@@ -2144,17 +2144,17 @@ def test_home_clone_reuses_retained_history_only_with_force(
     """Re-add removed submodules using Git's explicit force option."""
     home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
     _home_test_run(tmp_path, "init")
-    _home_test_run(tmp_path, "clone", remote)
+    _home_test_run(tmp_path, "add", remote)
     relative = "example.test/team/repository"
     _home_test_fixture_git(home, "commit", "-qm", "Register submodule")
     _home_test_run(tmp_path, "rm", relative)
     storage = home / ".git/modules" / relative
     history = _home_test_history_snapshot(storage)
     before = _home_test_snapshot(home)
-    failed = _home_test_run(tmp_path, "clone", remote, code=128)
+    failed = _home_test_run(tmp_path, "add", remote, code=128)
     _expect("--force" in failed.stderr, failed)
     _expect(_home_test_snapshot(home) == before, "failed re-add changed home state")
-    _home_test_run(tmp_path, "clone", force_flag, remote)
+    _home_test_run(tmp_path, "add", force_flag, remote)
     _expect(
         _home_test_git(home / relative, "rev-parse", "HEAD")
         == _home_test_git(source, "rev-parse", "HEAD"),
@@ -2177,7 +2177,7 @@ def test_home_clone_reuses_retained_history_only_with_force(
     )
 
 
-def test_home_clone_force_allows_path_ignored_by_nested_policy(
+def test_home_add_force_allows_path_ignored_by_nested_policy(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2188,11 +2188,11 @@ def test_home_clone_force_allows_path_ignored_by_nested_policy(
     parent.mkdir(parents=True)
     (parent / ".gitignore").write_text("repository\n")
     before = _home_test_snapshot(home)
-    failed = _home_test_run(tmp_path, "clone", remote, code=1)
+    failed = _home_test_run(tmp_path, "add", remote, code=1)
     _expect("ignored" in failed.stderr, failed)
-    _expect(_home_test_snapshot(home) == before, "failed clone changed home state")
-    _home_test_run(tmp_path, "clone", "--force", remote)
-    _expect((parent / "repository/.git").is_file(), "forced clone did not register")
+    _expect(_home_test_snapshot(home) == before, "failed add changed home state")
+    _home_test_run(tmp_path, "add", "--force", remote)
+    _expect((parent / "repository/.git").is_file(), "forced add did not register")
 
 
 @pytest.mark.parametrize("branch", ["main", "trunk"])
@@ -2402,7 +2402,7 @@ def test_merged_home_prerequisites_explain_initialization_without_changes(
     before = _home_test_snapshot(home) if initialized_git else None
     result = _home_test_run(
         tmp_path,
-        "clone",
+        "add",
         "https://example.test/team/new.git",
         code=1,
     )
@@ -2944,11 +2944,11 @@ def test_home_initialization_rejects_invalid_state_without_creating_files(
         _home_test_expect("fatal:" in result.stderr, result)
 
 
-def test_merged_failed_clone_restores_home_whitelist_and_staging(
+def test_merged_failed_add_restores_home_whitelist_and_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restore whitelist contents, staging, and directories after clone failure."""
+    """Restore whitelist, staging, and directories after submodule add failure."""
     home = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     remote = "https://example.test/team/missing.git"
@@ -2962,10 +2962,10 @@ def test_merged_failed_clone_restores_home_whitelist_and_staging(
     ignore = home / ".gitignore"
     ignore.write_text(ignore.read_text() + "!/working-only\n")
     before = _home_test_snapshot(home)
-    _home_test_run(tmp_path, "clone", remote, code=128)
+    _home_test_run(tmp_path, "add", remote, code=128)
     _home_test_expect(
         _home_test_snapshot(home) == before,
-        "failed clone changed the home repository",
+        "failed add changed the home repository",
     )
 
 
@@ -3747,7 +3747,7 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("init", "clone", "fix", "rm")
+    commands = ("add", "fix", "init", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
     _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
@@ -3759,7 +3759,8 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
         )
     for arguments in (
         ("unknown-command",),
-        ("clone",),
+        ("clone", "https://example.test/team/repository.git"),
+        ("add",),
         ("init", "unexpected"),
         ("rm",),
     ):
@@ -3812,6 +3813,10 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
         help_output,
     )
     _expect("    repo " in help_output and "    home " in help_output, help_output)
+    _expect(
+        help_output.index("    home ") < help_output.index("    repo "),
+        help_output,
+    )
     _expect(_run(tmp_path, executable=executable).stdout == help_output, help_output)
     for scope in ("repo", "home"):
         scoped_help = _run(tmp_path, scope, "--help", executable=executable).stdout
@@ -6179,7 +6184,7 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
     _expect({"inspect", "test"} <= commands.keys(), commands)
     campaigns = commands["test"]["commands"]
     _expect(
-        set(campaigns) == {"coverage", "property", "fuzz", "mutation", "performance"},
+        list(campaigns) == ["coverage", "fuzz", "mutation", "performance", "property"],
         campaigns,
     )
     for name, campaign in campaigns.items():
