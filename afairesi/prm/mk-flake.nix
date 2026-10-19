@@ -21,11 +21,11 @@ let
     inherit (afairesiInputs) nixpkgs;
   }
   // inputs;
+  inherit (repositoryInputs) self;
   lib = repositoryInputs.nixpkgs.lib;
-  source = repositoryInputs.self.outPath;
-  packagePath = source;
+  source = self.outPath;
   discover =
-    path: marker:
+    marker:
     builtins.attrNames (
       lib.filterAttrs (
         name: type:
@@ -34,12 +34,12 @@ let
           "prm"
           "tmp"
         ])
-        && builtins.pathExists (path + "/${name}/${marker}")
-      ) (if builtins.pathExists path then builtins.readDir path else { })
+        && builtins.pathExists (source + "/${name}/${marker}")
+      ) (if builtins.pathExists source then builtins.readDir source else { })
     );
-  packageNames = discover packagePath "default.nix";
+  packageNames = discover "default.nix";
   pythonNames = builtins.filter (
-    name: builtins.pathExists (packagePath + "/${name}/main.py")
+    name: builtins.pathExists (source + "/${name}/main.py")
   ) packageNames;
   moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) pythonNames;
   packageSets = lib.genAttrs systems (
@@ -61,17 +61,14 @@ let
       || lib.meta.availableOn packageSets.${system}.stdenv.hostPlatform package
     );
   namesFor =
-    system:
-    builtins.filter (name: builtins.hasAttr name repositoryInputs.self.packages.${system}) pythonNames;
+    system: builtins.filter (name: builtins.hasAttr name self.packages.${system}) pythonNames;
   testedNames =
     system:
-    builtins.filter (name: builtins.pathExists (packagePath + "/${name}/test_main.py")) (
-      namesFor system
-    );
+    builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.py")) (namesFor system);
   hostsFor =
     system:
     lib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
-      repositoryInputs.self.nixosConfigurations or { }
+      self.nixosConfigurations or { }
     );
   mergeChecks =
     groups:
@@ -88,7 +85,7 @@ let
       name:
       builders.mkTestEnvironment {
         pkgs = packageSets.${system};
-        packageDrv = repositoryInputs.self.packages.${system}.${name};
+        packageDrv = self.packages.${system}.${name};
       }
     )
   );
@@ -96,9 +93,9 @@ in
 {
   formatter = lib.genAttrs systems (
     system:
-    import ../../formatter.nix {
+    import ./formatter.nix {
       inputs = afairesiInputs;
-      self = repositoryInputs.self;
+      inherit self;
       flake = source;
       pkgs = packageSets.${system};
     }
@@ -115,11 +112,11 @@ in
           inputs = repositoryInputs;
           pkgs = packageSets.${system};
           inherit system pname;
-        } (packagePath + "/${pname}/default.nix") { }
+        } (source + "/${pname}/default.nix") { }
       )
     )
   );
-  nixosConfigurations = lib.genAttrs (discover (source) "configuration.nix") (
+  nixosConfigurations = lib.genAttrs (discover "configuration.nix") (
     hostName:
     repositoryInputs.nixpkgs.lib.nixosSystem {
       specialArgs = {
@@ -139,49 +136,45 @@ in
   );
   checks = lib.genAttrs systems (
     system:
-    mergeChecks [
-      (lib.genAttrs (testedNames system) (
-        name:
-        import ./python-check.nix {
-          pkgs = packageSets.${system};
-          packageDrv = repositoryInputs.self.packages.${system}.${name};
-          packageName = name;
-          testEnvironment = environments.${system}.${name};
-        }
-      ))
-      (lib.mapAttrs' (
-        host: _:
-        lib.nameValuePair "${host}VmWithDisko" (
-          import ./host-check.nix {
-            inputs = repositoryInputs;
+    mergeChecks (
+      [
+        (lib.genAttrs (testedNames system) (
+          name:
+          import ./python-check.nix {
             pkgs = packageSets.${system};
-            inherit host;
+            packageDrv = self.packages.${system}.${name};
+            packageName = name;
+            testEnvironment = environments.${system}.${name};
           }
-        )
-      ) (hostsFor system))
-      (lib.mapAttrs' (
-        name: configuration: lib.nameValuePair "nixos-${name}" configuration.config.system.build.toplevel
-      ) (hostsFor system))
-      (lib.mapAttrs' (
-        name: shell: lib.nameValuePair "devshell-${name}" shell
-      ) repositoryInputs.self.devShells.${system})
-      (mergeChecks (
-        lib.mapAttrsToList (
-          name: package:
-          {
-            "pkgs-${name}" = package;
-          }
-          // lib.mapAttrs' (testName: test: lib.nameValuePair "pkgs-${name}-${testName}" test) (
-            supported system (package.passthru.tests or { })
+        ))
+        (lib.mapAttrs' (
+          host: _:
+          lib.nameValuePair "${host}VmWithDisko" (
+            import ./host-check.nix {
+              inputs = repositoryInputs;
+              pkgs = packageSets.${system};
+              inherit host;
+            }
           )
-        ) repositoryInputs.self.packages.${system}
-      ))
-      {
-        formatter =
-          repositoryInputs.self.formatter.${system}.passthru.tests.check
-            or repositoryInputs.self.formatter.${system};
-      }
-    ]
+        ) (hostsFor system))
+        (lib.mapAttrs' (
+          name: configuration: lib.nameValuePair "nixos-${name}" configuration.config.system.build.toplevel
+        ) (hostsFor system))
+        (lib.mapAttrs' (name: shell: lib.nameValuePair "devshell-${name}" shell) self.devShells.${system})
+        {
+          formatter = self.formatter.${system}.passthru.tests.check or self.formatter.${system};
+        }
+      ]
+      ++ lib.mapAttrsToList (
+        name: package:
+        {
+          "pkgs-${name}" = package;
+        }
+        // lib.mapAttrs' (testName: test: lib.nameValuePair "pkgs-${name}-${testName}" test) (
+          supported system (package.passthru.tests or { })
+        )
+      ) self.packages.${system}
+    )
   );
   apps = lib.genAttrs systems (
     system:
@@ -203,28 +196,22 @@ in
       (
         lib.filterAttrs (
           _: package: package ? runtimeHook && package.runtimeHook != ""
-        ) repositoryInputs.self.packages.${system}
+        ) self.packages.${system}
       )
   );
   legacyPackages = lib.genAttrs systems (
     system:
-    lib.listToAttrs (
-      lib.concatMap (
-        name:
-        [
-          {
-            name = "${name}-test-environment";
-            value = environments.${system}.${name}.manifest;
-          }
-        ]
-        ++ lib.optional (builtins.elem name (testedNames system)) {
-          name = "${name}-coverage";
-          value = builders.mkCoverage {
-            packageDrv = repositoryInputs.self.packages.${system}.${name};
-            check = repositoryInputs.self.checks.${system}.${name};
-          };
+    lib.mapAttrs' (
+      name: environment: lib.nameValuePair "${name}-test-environment" environment.manifest
+    ) environments.${system}
+    // lib.genAttrs' (testedNames system) (
+      name:
+      lib.nameValuePair "${name}-coverage" (
+        builders.mkCoverage {
+          packageDrv = self.packages.${system}.${name};
+          check = self.checks.${system}.${name};
         }
-      ) (namesFor system)
+      )
     )
   );
   devShells = lib.genAttrs systems (

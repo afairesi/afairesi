@@ -12,7 +12,6 @@
 !/afairesi/test_main.py
 !/flake.lock
 !/flake.nix
-!/formatter.nix
 !/nix_alphabetize/
 !/nix_alphabetize/default.nix
 !/nix_alphabetize/main.py

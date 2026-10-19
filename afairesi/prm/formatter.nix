@@ -41,7 +41,6 @@ let
         enable = true;
         includes = [
           "flake.nix"
-          "formatter.nix"
           "*/default.nix"
           "*/configuration.nix"
           "*/hardware-configuration.nix"
@@ -76,7 +75,6 @@ let
         enable = true;
         includes = [
           "flake.nix"
-          "formatter.nix"
           "*/default.nix"
           "*/configuration.nix"
           "*/hardware-configuration.nix"
@@ -115,7 +113,6 @@ let
         enable = true;
         includes = [
           "flake.nix"
-          "formatter.nix"
           "*/default.nix"
           "*/configuration.nix"
           "*/hardware-configuration.nix"
@@ -156,7 +153,6 @@ let
           command = inputs.self.packages.${pkgs.stdenv.system}.nix_alphabetize;
           includes = [
             "flake.nix"
-            "formatter.nix"
             "*/default.nix"
             "*/configuration.nix"
             "*/hardware-configuration.nix"
@@ -195,7 +191,6 @@ let
             "LICENSE"
             "flake.lock"
             "flake.nix"
-            "formatter.nix"
             "*/default.nix"
             "*/configuration.nix"
             "*/hardware-configuration.nix"

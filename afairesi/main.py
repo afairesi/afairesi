@@ -49,7 +49,6 @@ ROOT_FILES = {
     "LICENSE",
     "flake.lock",
     "flake.nix",
-    "formatter.nix",
 }
 PRM_NAME = "prm"
 TMP_NAME = "tmp"

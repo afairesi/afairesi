@@ -49,7 +49,7 @@ in
   passthru = {
     checkInputs = [
       python.pkgs.coverage
-      (import ../formatter.nix {
+      (import ./prm/formatter.nix {
         inherit inputs pkgs;
         enableMypy = false;
         flake = inputs.self.outPath;
