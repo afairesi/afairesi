@@ -1,8 +1,4 @@
-{ inputs }:
-let
-  afairesiInputs = inputs;
-  builders = import ./builders.nix;
-in
+afairesiInputs:
 # Assemble canonical */default.nix and */configuration.nix.
 # Packages receive inputs (with a fallback nixpkgs), pkgs, system, and pname;
 # hosts receive inputs and hostName. One configured package set per system
@@ -17,6 +13,7 @@ in
   nixpkgs ? { },
 }:
 let
+  builders = import ./builders.nix;
   repositoryInputs = {
     inherit (afairesiInputs) nixpkgs;
   }
@@ -96,7 +93,6 @@ in
     import ./formatter.nix {
       inputs = afairesiInputs;
       inherit self;
-      flake = source;
       pkgs = packageSets.${system};
     }
   );

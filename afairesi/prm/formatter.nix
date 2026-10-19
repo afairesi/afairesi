@@ -1,16 +1,27 @@
 {
   enableMypy ? true,
-  flake,
   inputs,
   pkgs,
   self ? inputs.self,
-  ...
 }:
 let
+  nixFiles = [
+    "flake.nix"
+    "*/default.nix"
+    "*/configuration.nix"
+    "*/hardware-configuration.nix"
+  ];
+  pythonFiles = [
+    "*/main.py"
+    "*/test_main.py"
+  ];
+  workflowFiles = [
+    ".github/workflows/workflow.yml"
+    ".forgejo/workflows/workflow.yml"
+  ];
   formatterPython = pkgs.python3.withPackages (_: [
     inputs.self.packages.${pkgs.stdenv.system}.afairesi
   ]);
-  packagesPath = self.outPath;
   pythonPackageNames =
     if enableMypy then
       builtins.attrNames (
@@ -21,8 +32,8 @@ let
             "prm"
             "tmp"
           ])
-          && builtins.pathExists (packagesPath + "/${name}/main.py")
-        ) (if builtins.pathExists packagesPath then builtins.readDir packagesPath else { })
+          && builtins.pathExists (self.outPath + "/${name}/main.py")
+        ) (if builtins.pathExists self.outPath then builtins.readDir self.outPath else { })
       )
     else
       [ ];
@@ -31,20 +42,12 @@ let
     programs = {
       actionlint = {
         enable = true;
-        includes = [
-          ".github/workflows/workflow.yml"
-          ".forgejo/workflows/workflow.yml"
-        ];
+        includes = workflowFiles;
         priority = 6;
       };
       deadnix = {
         enable = true;
-        includes = [
-          "flake.nix"
-          "*/default.nix"
-          "*/configuration.nix"
-          "*/hardware-configuration.nix"
-        ];
+        includes = nixFiles;
         priority = 3;
       };
       mypy = {
@@ -73,19 +76,12 @@ let
       };
       nixfmt = {
         enable = true;
-        includes = [
-          "flake.nix"
-          "*/default.nix"
-          "*/configuration.nix"
-          "*/hardware-configuration.nix"
-        ];
+        includes = nixFiles;
         priority = 5;
       };
       oxfmt = {
         enable = true;
-        includes = [
-          ".github/workflows/workflow.yml"
-          ".forgejo/workflows/workflow.yml"
+        includes = workflowFiles ++ [
           "*/style.css"
           "*/index.html"
           "*/script.js"
@@ -95,28 +91,17 @@ let
       ruff-check = {
         enable = true;
         extendSelect = [ "ALL" ];
-        includes = [
-          "*/main.py"
-          "*/test_main.py"
-        ];
+        includes = pythonFiles;
         priority = 3;
       };
       ruff-format = {
         enable = true;
-        includes = [
-          "*/main.py"
-          "*/test_main.py"
-        ];
+        includes = pythonFiles;
         priority = 5;
       };
       statix = {
         enable = true;
-        includes = [
-          "flake.nix"
-          "*/default.nix"
-          "*/configuration.nix"
-          "*/hardware-configuration.nix"
-        ];
+        includes = nixFiles;
         priority = 3;
       };
       texfmt = {
@@ -126,10 +111,7 @@ let
       };
       yamllint = {
         enable = true;
-        includes = [
-          ".github/workflows/workflow.yml"
-          ".forgejo/workflows/workflow.yml"
-        ];
+        includes = workflowFiles;
         priority = 6;
       };
     };
@@ -151,12 +133,7 @@ let
         };
         nix-alphabetize = {
           command = inputs.self.packages.${pkgs.stdenv.system}.nix_alphabetize;
-          includes = [
-            "flake.nix"
-            "*/default.nix"
-            "*/configuration.nix"
-            "*/hardware-configuration.nix"
-          ];
+          includes = nixFiles;
           priority = 4;
         };
         oxlint = {
@@ -190,20 +167,17 @@ let
             ".gitignore"
             "LICENSE"
             "flake.lock"
-            "flake.nix"
-            "*/default.nix"
-            "*/configuration.nix"
-            "*/hardware-configuration.nix"
-            "*/main.py"
-            "*/test_main.py"
+          ]
+          ++ nixFiles
+          ++ pythonFiles
+          ++ [
             "*/index.html"
             "*/script.js"
             "*/style.css"
             "*/ms.tex"
             "*/ms.bib"
-            ".github/workflows/workflow.yml"
-            ".forgejo/workflows/workflow.yml"
-          ];
+          ]
+          ++ workflowFiles;
           priority = 1;
         };
       }
@@ -229,6 +203,6 @@ wrapper
 // {
   passthru = wrapper.passthru // {
     raw = rawFormatter;
-    tests.check = treefmtEval.config.build.check flake;
+    tests.check = treefmtEval.config.build.check self.outPath;
   };
 }

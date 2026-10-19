@@ -4,14 +4,11 @@
   packageName,
   testEnvironment,
 }:
-let
-  pythonEnv = testEnvironment.python;
-in
 pkgs.runCommand packageName
   (
     {
       inherit (packageDrv) src;
-      nativeBuildInputs = testEnvironment.dependencies ++ [ pythonEnv ];
+      nativeBuildInputs = testEnvironment.dependencies ++ [ testEnvironment.python ];
     }
     // pkgs.lib.optionalAttrs (packageDrv.meta ? mainProgram) {
       PACKAGE_E2E_EXECUTABLE = pkgs.lib.getExe packageDrv;
@@ -23,7 +20,7 @@ pkgs.runCommand packageName
     ln -s "$src" "${packageName}"
     export PYTHONPATH="$PWD:$PYTHONPATH"
     cd "$out"
-    "${pythonEnv}/bin/python" -c '
+    "${testEnvironment.python}/bin/python" -c '
     import sys
     import pytest
     class Defaults:

@@ -52,7 +52,6 @@ in
       (import ./prm/formatter.nix {
         inherit inputs pkgs;
         enableMypy = false;
-        flake = inputs.self.outPath;
       }).passthru.raw
     ];
     tests.consumer-contract = import ./prm/consumer-contract.nix { inherit inputs pkgs; };
