@@ -7,6 +7,10 @@ from __future__ import annotations
 import argparse
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable
 
 
 def remove_empty_lines(contents: bytes) -> bytes:
@@ -23,26 +27,35 @@ def _is_empty_utf8_line(line: bytes) -> bool:
         return False
 
 
-def process_file(path: Path) -> None:
+def process_file(path: Path, transform: Callable[[bytes], bytes]) -> None:
     """Rewrite one regular text file without following symbolic links."""
     if path.is_symlink():
         return
     contents = path.read_bytes()
     if b"\0" in contents:
         return
-    updated_contents = remove_empty_lines(contents)
+    updated_contents = transform(contents)
     if updated_contents != contents:
         path.write_bytes(updated_contents)
 
 
-def _try_process_file(path: Path) -> bool:
+def _try_process_file(path: Path, transform: Callable[[bytes], bytes]) -> bool:
     """Report a file error and allow the remaining selected files to be processed."""
     try:
-        process_file(path)
+        process_file(path, transform)
     except OSError as error:
         sys.stderr.write(str(error) + "\n")
         return False
     return True
+
+
+def process_files(paths: Iterable[Path], transform: Callable[[bytes], bytes]) -> None:
+    """Apply a byte transformation to selected files, reporting every file error."""
+    failed = False
+    for path in paths:
+        failed |= not _try_process_file(path, transform)
+    if failed:
+        raise SystemExit(1)
 
 
 def main() -> None:
@@ -57,11 +70,7 @@ def main() -> None:
         metavar="FILE",
         help="text files to rewrite in place",
     )
-    failed = False
-    for path in map(Path, parser.parse_args().files):
-        failed |= not _try_process_file(path)
-    if failed:
-        raise SystemExit(1)
+    process_files(map(Path, parser.parse_args().files), remove_empty_lines)
 
 
 if __name__ == "__main__":

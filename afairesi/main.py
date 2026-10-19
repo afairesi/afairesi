@@ -221,20 +221,12 @@ def _tracked_paths(root: Path) -> set[Path]:
     return {Path(item) for item in completed.stdout.split("\0") if item}
 
 
-def _clean_arguments(*, dry_run: bool, exclusions: tuple[str, ...]) -> list[str]:
-    """Build a native Git clean command with repository-specific exclusions."""
-    arguments = ["clean", "-ndx" if dry_run else "-fdx"]
-    for exclusion in exclusions:
-        arguments.extend(("-e", exclusion))
-    return arguments
-
-
 def _flake_clean_arguments(*, dry_run: bool) -> list[str]:
     """Build the flake cleanup command."""
-    return _clean_arguments(
-        dry_run=dry_run,
-        exclusions=(f"/{TMP_NAME}/", f"/*/{TMP_NAME}/"),
-    )
+    arguments = ["clean", "-ndx" if dry_run else "-fdx"]
+    for exclusion in (f"/{TMP_NAME}/", f"/*/{TMP_NAME}/"):
+        arguments.extend(("-e", exclusion))
+    return arguments
 
 
 def hosted_remote(remote: str) -> tuple[str, str]:
@@ -712,8 +704,6 @@ def _implicit_runtime_paths(
 def _runtime_directory_issues(
     package: Package,
     module: ast.Module,
-    *,
-    check_repository: bool = True,
 ) -> list[str]:
     """Validate declared output ownership and explicit input directories."""
     issues: list[str] = []
@@ -737,7 +727,7 @@ def _runtime_directory_issues(
     )
     repository = package.root.parent
     expected = None
-    if check_repository and (repository / ".git").exists():
+    if (repository / ".git").exists():
         expected = _repository_remote_path(repository)
     for statement in bindings:
         targets = (
@@ -887,15 +877,6 @@ def _metadata_expression(
     return document, next(iter(unique.values())) if len(unique) == 1 else None
 
 
-def _python_static_template_issues(package: Package, source: str) -> list[str]:
-    """Check only the stable interface required by Python package templates."""
-    return [
-        f"missing required {name} definition"
-        for name, edits in _python_required_edits(package, source).items()
-        if edits
-    ]
-
-
 def _template_binding(document: nix_syntax.Document, name: str) -> Node | None:
     """Find an outer template binding without interpreting comments or inner scopes."""
     container = document.root
@@ -1005,12 +986,7 @@ def source_python_has_main(source: str | None) -> bool:
     """Recognize the module-level main binding used by canonical wrappers."""
     if source is None:
         return True
-    return _module_has_main(ast.parse(source, filename="main.py"))
-
-
-def _module_has_main(module: ast.Module) -> bool:
-    """Recognize function, import, and assignment bindings for a module's main."""
-    return _module_main_binding(module) is not None
+    return _module_main_binding(ast.parse(source, filename="main.py")) is not None
 
 
 def _module_main_binding(module: ast.Module) -> ast.stmt | None:
@@ -1602,11 +1578,6 @@ def _source_package_issues(root: Path, package: Package) -> list[str]:
         and nix_syntax.compact(actual) != nix_syntax.compact(expected)
     ):
         issues.append(f"{relative}: differs from its canonical package template")
-    if package.kind == "python" and actual is not None:
-        issues.extend(
-            f"{relative}: {issue}"
-            for issue in _python_static_template_issues(package, actual)
-        )
     return issues
 
 
@@ -2868,6 +2839,31 @@ def _run_test_package(
     return True
 
 
+def _python_test_packages(root: Path) -> list[Path]:
+    """Find Python campaign targets or explain why none are available."""
+    packages = [
+        package.root for package in detect_packages(root) if package.kind == "python"
+    ]
+    if not packages:
+        message = f"no Python packages found under {root}"
+        raise CommandError(message)
+    return packages
+
+
+def _report_test_outcomes(outcomes: dict[str, str]) -> None:
+    """Print consistent package outcomes and campaign totals."""
+    sys.stdout.write("\nRepository summary:\n")
+    for package_name, status in outcomes.items():
+        sys.stdout.write(f"  {package_name}: {status}\n")
+    sys.stdout.write(
+        ", ".join(
+            f"{sum(value == status for value in outcomes.values())} {status}"
+            for status in ("passed", "failed", "skipped")
+        )
+        + "\n",
+    )
+
+
 def _run_test_repository(
     root: Path,
     command: str,
@@ -2875,13 +2871,7 @@ def _run_test_repository(
     selection: TestSelection,
 ) -> bool:
     """Run each Python package, continuing after failures and summarizing results."""
-    directory = root
-    packages = [
-        package.root for package in detect_packages(root) if package.kind == "python"
-    ]
-    if not packages:
-        message = f"no Python packages found under {directory}"
-        raise CommandError(message)
+    packages = _python_test_packages(root)
     outcomes: dict[str, str] = {}
     for package in packages:
         if not (package / "test_main.py").is_file():
@@ -2908,22 +2898,14 @@ def _run_test_repository(
             )
             if isinstance(error, subprocess.CalledProcessError):
                 _report_process_failure(error)
-    sys.stdout.write("\nRepository summary:\n")
-    for package_name, status in outcomes.items():
-        sys.stdout.write(f"  {package_name}: {status}\n")
-    sys.stdout.write(
-        ", ".join(
-            f"{sum(value == status for value in outcomes.values())} {status}"
-            for status in ("passed", "failed", "skipped")
-        )
-        + "\n",
-    )
+    _report_test_outcomes(outcomes)
     return "failed" not in outcomes.values()
 
 
 def _dispatch_test_runner(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
+    target: Path,
 ) -> bool:
     """Validate budgets and run an explicitly requested test campaign."""
     if options.timeout is not None and (
@@ -2944,7 +2926,6 @@ def _dispatch_test_runner(
         max_mutations=mutation_limit,
         max_examples=example_limit,
     )
-    target = _command_target(options.target)
     runner = (
         _run_test_repository if (target / "flake.nix").is_file() else _run_test_package
     )
@@ -3013,15 +2994,7 @@ def _run_coverage(target: Path) -> bool:
     """Build package checks independently, preserving caching and reporting failures."""
     repository = (target / "flake.nix").is_file()
     if repository:
-        directory = target
-        packages = [
-            package.root
-            for package in detect_packages(target)
-            if package.kind == "python"
-        ]
-        if not packages:
-            message = f"no Python packages found under {directory}"
-            raise CommandError(message)
+        packages = _python_test_packages(target)
     else:
         _test_target_root(target)
         packages = [target]
@@ -3045,17 +3018,48 @@ def _run_coverage(target: Path) -> bool:
             if isinstance(error, subprocess.CalledProcessError):
                 _report_process_failure(error)
     if repository:
-        sys.stdout.write("\nRepository summary:\n")
-        for name, status in outcomes.items():
-            sys.stdout.write(f"  {name}: {status}\n")
-        sys.stdout.write(
-            ", ".join(
-                f"{sum(value == status for value in outcomes.values())} {status}"
-                for status in ("passed", "failed", "skipped")
-            )
-            + "\n",
-        )
+        _report_test_outcomes(outcomes)
     return "failed" not in outcomes.values()
+
+
+def _configure_test_target(result: argparse.ArgumentParser) -> None:
+    """Declare the shared package-or-repository campaign target."""
+    result.add_argument(
+        "target",
+        type=Path,
+        nargs="?",
+        default=None,
+        metavar="PATH",
+        help=(
+            "package or flake (default: current flake); "
+            "relative to Git root, or cwd outside Git"
+        ),
+    )
+
+
+def _configure_test_selection(result: argparse.ArgumentParser) -> None:
+    """Declare pytest selectors shared by source test campaigns."""
+    result.add_argument(
+        "-k",
+        dest="keywords",
+        default="",
+        help="pytest keyword expression",
+    )
+    result.add_argument(
+        "-m",
+        dest="markers",
+        default="",
+        help="pytest marker expression",
+    )
+
+
+def _configure_test_timeout(result: argparse.ArgumentParser) -> None:
+    """Declare the optional time budget for a source test campaign."""
+    result.add_argument(
+        "--timeout",
+        type=float,
+        help="seconds per test run, excluding build (default: unlimited)",
+    )
 
 
 def _configure_test_parser(result: argparse.ArgumentParser) -> None:
@@ -3074,17 +3078,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "tests. Print HTML report paths in the Nix store."
         ),
     )
-    coverage.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=None,
-        metavar="PATH",
-        help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
+    _configure_test_target(coverage)
     property_tests = commands.add_parser(
         "property",
         help="run property-based tests",
@@ -3094,22 +3088,9 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             'Select profiles with PYTEST_ADDOPTS="--hypothesis-profile=NAME".'
         ),
     )
-    property_tests.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=None,
-        metavar="PATH",
-        help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
-    property_tests.add_argument(
-        "--timeout",
-        type=float,
-        help=("seconds per test run, excluding build (default: unlimited)"),
-    )
+    _configure_test_target(property_tests)
+    _configure_test_selection(property_tests)
+    _configure_test_timeout(property_tests)
     fuzz = commands.add_parser(
         "fuzz",
         help="run a short generation-based fuzz campaign",
@@ -3119,22 +3100,9 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "Logs and Hypothesis examples: flake tmp/."
         ),
     )
-    fuzz.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=None,
-        metavar="PATH",
-        help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
-    fuzz.add_argument(
-        "--timeout",
-        type=float,
-        help="seconds per test run, excluding build (default: unlimited)",
-    )
+    _configure_test_target(fuzz)
+    _configure_test_selection(fuzz)
+    _configure_test_timeout(fuzz)
     fuzz.add_argument(
         "--max-examples",
         type=int,
@@ -3145,13 +3113,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "explicit test settings and Hypothesis profiles can override this"
         ),
     )
-    fuzz.add_argument(
-        "-k",
-        dest="keywords",
-        default="",
-        help="pytest keyword expression",
-    )
-    fuzz.add_argument("-m", dest="markers", default="", help="pytest marker expression")
+
     mutation = commands.add_parser(
         "mutation",
         help="run mutation tests",
@@ -3160,47 +3122,15 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "Skip packages without test_main.py. Logs and reports: flake tmp/."
         ),
     )
-    mutation.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=None,
-        metavar="PATH",
-        help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
+    _configure_test_target(mutation)
+    _configure_test_selection(mutation)
     mutation.add_argument(
         "--timeout",
         type=float,
         default=300.0,
         help=("seconds per test run, excluding build (default: 300)"),
     )
-    property_tests.add_argument(
-        "-k",
-        dest="keywords",
-        default="",
-        help="pytest keyword expression",
-    )
-    property_tests.add_argument(
-        "-m",
-        dest="markers",
-        default="",
-        help="pytest marker expression",
-    )
-    mutation.add_argument(
-        "-k",
-        dest="keywords",
-        default="",
-        help="pytest keyword expression",
-    )
-    mutation.add_argument(
-        "-m",
-        dest="markers",
-        default="",
-        help="pytest marker expression",
-    )
+
     mutation.add_argument(
         "--lines",
         action="append",
@@ -3233,34 +3163,9 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
             "Python subprocesses are not profiled."
         ),
     )
-    performance.add_argument(
-        "target",
-        type=Path,
-        nargs="?",
-        default=None,
-        metavar="PATH",
-        help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
-        ),
-    )
-    performance.add_argument(
-        "--timeout",
-        type=float,
-        help="seconds per test run, excluding build (default: unlimited)",
-    )
-    performance.add_argument(
-        "-k",
-        dest="keywords",
-        default="",
-        help="pytest keyword expression",
-    )
-    performance.add_argument(
-        "-m",
-        dest="markers",
-        default="",
-        help="pytest marker expression",
-    )
+    _configure_test_target(performance)
+    _configure_test_selection(performance)
+    _configure_test_timeout(performance)
 
 
 def _dispatch_test_command(
@@ -3276,7 +3181,7 @@ def _dispatch_test_command(
         success = (
             _run_coverage(target)
             if options.test_command == "coverage"
-            else _dispatch_test_runner(options, cli)
+            else _dispatch_test_runner(options, cli, target)
         )
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
         sys.stderr.write(
@@ -3524,14 +3429,6 @@ class ArgumentDiscovery:
         return result
 
 
-def declared_tests(module: ast.Module) -> list[str]:
-    """List declared test identifiers in deterministic order."""
-    return sorted(
-        f"{owner}::{definition.name}" if owner else definition.name
-        for owner, definition in python_test_definitions(module)
-    )
-
-
 def behavioral_specification(
     description: str | None,
     tests: ast.Module | None,
@@ -3582,23 +3479,18 @@ def behavioral_specification(
 
 
 def inspect_repository(root: Path) -> dict[str, Any]:
-    """Describe repository interfaces and the behavior specified by its tests."""
+    """Describe root resources by name, with their types and declared behavior."""
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
-    hosts = root
-    host_names = (
-        [
-            host.name
-            for host in sorted(hosts.iterdir())
-            if host.is_dir()
-            and not host.is_symlink()
-            and (host / "configuration.nix").is_file()
-        ]
-        if hosts.is_dir()
-        else []
-    )
-    packages = {}
+    host_names = {
+        host.name
+        for host in root.iterdir()
+        if host.is_dir()
+        and not host.is_symlink()
+        and (host / "configuration.nix").is_file()
+    }
+    resources: dict[str, Any] = {name: {"type": "host"} for name in host_names}
     for package in detect_packages(root):
         module = _source(package.root / "main.py") if package.kind == "python" else None
         cli = (
@@ -3614,11 +3506,11 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         tests = package.root / "test_main.py"
         test_module = _source(tests) if tests.is_file() else None
         description = package_description(package)
-        packages[package.name] = {
+        resources[package.name] = {
+            "type": ["package", "host"] if package.name in resources else "package",
             "kind": package.kind,
             "description": description,
             "cli": cli,
-            "tests": declared_tests(test_module) if test_module is not None else [],
             "specification": behavioral_specification(
                 (ast.get_docstring(module) if module is not None else None)
                 or description,
@@ -3626,7 +3518,7 @@ def inspect_repository(root: Path) -> dict[str, Any]:
                 str(tests.relative_to(root)),
             ),
         }
-    return {"hosts": host_names, "packages": packages}
+    return dict(sorted(resources.items()))
 
 
 def _dispatch_inspect(

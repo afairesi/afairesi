@@ -5615,7 +5615,14 @@ class Derived(Arguments):
 class Helper:
     def test_not_collected(self): pass
 """)
-    rows = inspection_subject.declared_tests(module)
+    rows = [
+        row["test"]
+        for row in inspection_subject.behavioral_specification(
+            None,
+            module,
+            "test_main.py",
+        )["behaviors"]
+    ]
     _inspection_expect(
         rows
         == [
@@ -5669,23 +5676,28 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         if path.is_file()
     }
     _inspection_expect(before == after, "inspection wrote to the repository")
+    _expect(list(report) == ["example", "laptop", "library"], report)
+    _expect(report["example"]["type"] == "package", report)
+    _expect("tests" not in report["example"], report)
+    _expect("packages" not in report and "hosts" not in report, report)
     _inspection_expect(
-        report["hosts"] == ["laptop"],
+        report["laptop"] == {"type": "host"},
         "wrong hosts",
     )
     _inspection_expect(
-        report["packages"]["library"]["cli"]["status"] == "not applicable",
+        report["library"]["cli"]["status"] == "not applicable",
         "non-Python package has CLI metadata",
     )
     _inspection_expect(
-        report["packages"]["example"]["tests"] == ["test_default_output"],
+        [row["test"] for row in report["example"]["specification"]["behaviors"]]
+        == ["test_default_output"],
         "wrong test identifiers",
     )
     _inspection_expect(
-        report["packages"]["library"]["tests"] == [],
+        report["library"]["specification"]["behaviors"] == [],
         "wrong empty tests",
     )
-    specification = report["packages"]["example"]["specification"]
+    specification = report["example"]["specification"]
     _expect(specification["description"] == "Example", specification)
     _expect(
         specification["behaviors"]
@@ -5701,6 +5713,15 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         "test evidence was executed or omitted",
     )
     _expect(bool(specification["gaps"]), "undocumented behavior was hidden")
+
+
+def test_inspection_preserves_package_and_host_in_one_directory(tmp_path: Path) -> None:
+    """Retain both resource roles when their marker files share a directory."""
+    _inspection_repository(tmp_path)
+    (tmp_path / "example/configuration.nix").touch()
+    resource = inspection_subject.inspect_repository(tmp_path)["example"]
+    _expect(resource["type"] == ["package", "host"], resource)
+    _expect(resource["kind"] == "python", resource)
 
 
 def test_behavioral_specification_preserves_reimplementation_evidence() -> None:
@@ -5753,7 +5774,13 @@ class Derived(Base):
     _expect(not report["gaps"], report)
     _expect(
         [behavior["test"] for behavior in report["behaviors"]]
-        == inspection_subject.declared_tests(module),
+        == [
+            "Base::test_empty",
+            "Derived::test_async",
+            "Derived::test_empty",
+            "test_cleanup",
+            "test_missing",
+        ],
         report,
     )
     _expect(
@@ -5805,14 +5832,14 @@ def test_inspection_uses_package_behavior_and_preserves_test_evidence(
     )
     first = inspection_subject.inspect_repository(tmp_path)
     _expect(first == inspection_subject.inspect_repository(tmp_path), "unstable report")
-    package = first["packages"]["example"]
+    package = first["example"]
     _expect(package["description"] == "Example", package)
     _expect(
         package["specification"]["description"]
         == "Write selected output; default to result.",
         package,
     )
-    library = first["packages"]["library"]["specification"]
+    library = first["library"]["specification"]
     _expect(library["evidence"] is None and bool(library["gaps"]), library)
 
 
@@ -5829,11 +5856,10 @@ def test_default_output():
     assert render() == "EXPECTED"
 '''
     tests.write_text(source.replace("EXPECTED", "first"))
-    before = inspection_subject.inspect_repository(tmp_path)["packages"]["example"]
+    before = inspection_subject.inspect_repository(tmp_path)["example"]
     tests.write_text(source.replace("EXPECTED", "second"))
-    after = inspection_subject.inspect_repository(tmp_path)["packages"]["example"]
+    after = inspection_subject.inspect_repository(tmp_path)["example"]
     _expect(before["cli"] == after["cli"], "CLI changed unexpectedly")
-    _expect(before["tests"] == after["tests"], "test identifiers changed unexpectedly")
     _expect(
         before["specification"]["behaviors"] == after["specification"]["behaviors"],
         "behavior descriptions changed unexpectedly",
@@ -5853,7 +5879,8 @@ def test_cli_inventory_resolves_repository_paths(
     _inspection_repository(tmp_path)
     expected = inspection_subject.inspect_repository(tmp_path)
     _inspection_expect(
-        "test_default_output" in expected["packages"]["example"]["tests"],
+        "test_default_output"
+        in [row["test"] for row in expected["example"]["specification"]["behaviors"]],
         "inventory lost test identifier",
     )
     if location != "outside":
@@ -5896,11 +5923,10 @@ def test_invalid_repository_and_source(tmp_path: Path) -> None:
 
 
 def test_empty_repository(tmp_path: Path) -> None:
-    """Report missing hosts as a list and missing packages as an object."""
+    """Return an empty resource map for an empty repository."""
     (tmp_path / "flake.nix").touch()
     _inspection_expect(
-        inspection_subject.inspect_repository(tmp_path)
-        == {"hosts": [], "packages": {}},
+        inspection_subject.inspect_repository(tmp_path) == {},
         "empty collections were omitted",
     )
 
@@ -6191,5 +6217,10 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
         set(campaigns) == {"coverage", "property", "fuzz", "mutation", "performance"},
         campaigns,
     )
+    for name, campaign in campaigns.items():
+        arguments = [row["names"] for row in campaign["arguments"]]
+        _expect(arguments.count(["target"]) == 1, campaign)
+        for option in ("--timeout", "-k", "-m"):
+            _expect(arguments.count([option]) == (name != "coverage"), campaign)
     _expect(not report["warnings"], report["warnings"])
     _expect(not report["arguments"], report["arguments"])
