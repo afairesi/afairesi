@@ -3885,17 +3885,24 @@ def _require_home_repository() -> Path:
     return home
 
 
-def initialize_submodule(remote: str) -> None:
+def initialize_submodule(
+    remote: str,
+    *,
+    force: bool = False,
+) -> None:
     """Add a hosted repository at its canonical home-relative path."""
     relative = canonical_remote_path(remote)
     home = _require_home_repository()
     validate_managed_path(home, relative)
     directories = missing_directories(home, [relative.parent])
+    arguments = ["git", "submodule", "add"]
+    if force:
+        arguments.append("--force")
     try:
         with preserve_whitelist_on_error(home):
             _allow_home_submodule(home, relative)
             run(
-                ["git", "submodule", "add", "--", remote, relative.as_posix()],
+                [*arguments, "--", remote, relative.as_posix()],
                 cwd=home,
                 capture_output=False,
             )
@@ -3925,6 +3932,12 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     clone.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
+    clone.add_argument(
+        "-f",
+        "--force",
+        action="store_true",
+        help="pass --force to git submodule add, including reuse of retained Git data",
+    )
     fix_home = commands.add_parser(
         "fix",
         help="fix and stage home structure",
@@ -3965,7 +3978,7 @@ def _dispatch_home(options: argparse.Namespace) -> None:
     if options.command == "init":
         initialize_home()
     elif options.command == "clone":
-        initialize_submodule(options.remote)
+        initialize_submodule(options.remote, force=options.force)
     elif options.command == "fix":
         converge_home(_require_home_repository(), dry_run=options.dry_run)
     elif options.command == "rm":

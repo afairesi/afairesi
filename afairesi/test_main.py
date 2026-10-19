@@ -2135,6 +2135,66 @@ def _local_init(root: Path, *, code: int = 0) -> subprocess.CompletedProcess[str
     )
 
 
+@pytest.mark.parametrize("force_flag", ["-f", "--force"])
+def test_home_clone_reuses_retained_history_only_with_force(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    force_flag: str,
+) -> None:
+    """Re-add removed submodules using Git's explicit force option."""
+    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    _home_test_run(tmp_path, "init")
+    _home_test_run(tmp_path, "clone", remote)
+    relative = "example.test/team/repository"
+    _home_test_fixture_git(home, "commit", "-qm", "Register submodule")
+    _home_test_run(tmp_path, "rm", relative)
+    storage = home / ".git/modules" / relative
+    history = _home_test_history_snapshot(storage)
+    before = _home_test_snapshot(home)
+    failed = _home_test_run(tmp_path, "clone", remote, code=128)
+    _expect("--force" in failed.stderr, failed)
+    _expect(_home_test_snapshot(home) == before, "failed re-add changed home state")
+    _home_test_run(tmp_path, "clone", force_flag, remote)
+    _expect(
+        _home_test_git(home / relative, "rev-parse", "HEAD")
+        == _home_test_git(source, "rev-parse", "HEAD"),
+        "reused checkout has the wrong commit",
+    )
+    _expect(
+        _home_test_git(
+            home,
+            "config",
+            "-f",
+            ".gitmodules",
+            f"submodule.{relative}.path",
+        ).strip()
+        == relative,
+        "registration changed the canonical path",
+    )
+    _expect(
+        all((storage / path).read_bytes() == value for path, value in history.items()),
+        "reuse discarded retained history",
+    )
+
+
+def test_home_clone_force_allows_path_ignored_by_nested_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Let Git override a nested ignore rule only when explicitly forced."""
+    home, _, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    _home_test_run(tmp_path, "init")
+    parent = home / "example.test/team"
+    parent.mkdir(parents=True)
+    (parent / ".gitignore").write_text("repository\n")
+    before = _home_test_snapshot(home)
+    failed = _home_test_run(tmp_path, "clone", remote, code=1)
+    _expect("ignored" in failed.stderr, failed)
+    _expect(_home_test_snapshot(home) == before, "failed clone changed home state")
+    _home_test_run(tmp_path, "clone", "--force", remote)
+    _expect((parent / "repository/.git").is_file(), "forced clone did not register")
+
+
 @pytest.mark.parametrize("branch", ["main", "trunk"])
 def test_local_init_stages_files_without_committing_or_requiring_home(
     tmp_path: Path,
