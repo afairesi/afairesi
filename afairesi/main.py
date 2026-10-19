@@ -88,12 +88,13 @@ def run(
     *,
     check: bool = True,
     input_source: str | None = None,
+    capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    """Run a process and preserve failures and captured output."""
+    """Run a process with captured output or inherited terminal streams."""
     completed = subprocess.run(  # noqa: S603
         arguments,
         cwd=cwd,
-        capture_output=True,
+        capture_output=capture_output,
         check=False,
         input=input_source,
         text=True,
@@ -112,11 +113,13 @@ def git(
     arguments: list[str],
     *,
     check: bool = True,
+    capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run Git in a selected repository."""
     return run(
         ["git", "-C", str(root), *arguments],
         check=check,
+        capture_output=capture_output,
     )
 
 
@@ -1886,8 +1889,7 @@ def remove_resource(
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
-    removal = git(root, [*arguments, "--", str(relative)])
-    sys.stdout.write(removal.stdout)
+    git(root, [*arguments, "--", str(relative)], capture_output=False)
     report_change("update '.gitignore'", dry_run=False)
     _refresh_gitignore(root)
     git(root, ["add", "--", ".gitignore"])
@@ -2176,7 +2178,7 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         encoding="utf-8",
     )
     git(root, ["add", "--", "flake.nix"])
-    run([executable, "flake", "lock"], cwd=root)
+    run([executable, "flake", "lock"], cwd=root, capture_output=False)
     packages = detect_packages(root)
     (root / ".gitignore").write_text(
         render_gitignore(
@@ -2186,7 +2188,7 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         encoding="utf-8",
     )
     git(root, ["add", "--", ".gitignore", "flake.lock"])
-    run([executable, "fmt"], cwd=root)
+    run([executable, "fmt"], cwd=root, capture_output=False)
     git(root, ["add", "--", ".gitignore", "flake.lock", "flake.nix"])
 
 
@@ -3196,7 +3198,7 @@ def inspection_remote_repository(remote: str) -> Iterator[Path]:
     """Inspect a native Git clone without changing existing repositories."""
     with tempfile.TemporaryDirectory(prefix="afairesi-inspect-") as temporary:
         checkout = Path(temporary) / "repository"
-        run(["git", "clone", "--", remote, str(checkout)])
+        run(["git", "clone", "--", remote, str(checkout)], capture_output=False)
         yield checkout
 
 
@@ -3844,13 +3846,11 @@ def remove_home_submodule(
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
-    removal = run(
+    run(
         ["git", *arguments, "--", f":(literal){relative.as_posix()}"],
         cwd=root,
+        capture_output=False,
     )
-    sys.stdout.write(removal.stdout)
-    if removal.stderr:
-        sys.stderr.write(removal.stderr)
     write_managed(root, Path(".gitignore"), updated, dry_run=False)
 
 
@@ -3861,7 +3861,7 @@ def initialize_home() -> None:
         msg = "cannot initialize a flake repository as a home repository"
         raise CommandError(msg)
     _home_ignore_source(root)
-    run(["git", "init", "--", str(root)])
+    run(["git", "init", "--", str(root)], capture_output=False)
     _converge_home_ignore(root, dry_run=False)
 
 
@@ -3894,14 +3894,11 @@ def initialize_submodule(remote: str) -> None:
     try:
         with preserve_whitelist_on_error(home):
             _allow_home_submodule(home, relative)
-            completed = run(
+            run(
                 ["git", "submodule", "add", "--", remote, relative.as_posix()],
                 cwd=home,
+                capture_output=False,
             )
-            if completed.stdout:
-                sys.stdout.write(completed.stdout)
-            if completed.stderr:
-                sys.stderr.write(completed.stderr)
     except BaseException:
         remove_empty_directories(directories)
         raise

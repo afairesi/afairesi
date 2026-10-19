@@ -9,6 +9,7 @@ import keyword
 import os
 import pstats
 import re
+import selectors
 import shutil
 import stat
 import subprocess
@@ -96,6 +97,49 @@ def _git(root: Path, *arguments: str) -> str:
         check=True,
         timeout=10,
     ).stdout
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_native_process_output_arrives_before_exit(code: int) -> None:
+    """Forward both streams while a child is still waiting for terminal input."""
+    child = (
+        "import sys; print('native stdout', flush=True); "
+        "print('native stderr', file=sys.stderr, flush=True); "
+        f"sys.stdin.readline(); sys.exit({code})"
+    )
+    command = (
+        "from afairesi.main import run; "
+        f"run({[sys.executable, '-c', child]!r}, capture_output=False)"
+    )
+    with (
+        subprocess.Popen(  # noqa: S603
+            [sys.executable, "-c", command],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as process,
+        selectors.DefaultSelector() as selector,
+    ):
+        try:
+            if process.stdout is None or process.stderr is None:
+                msg = "native output test requires both output pipes"
+                raise AssertionError(msg)
+            selector.register(process.stdout, selectors.EVENT_READ, "native stdout\n")
+            selector.register(process.stderr, selectors.EVENT_READ, "native stderr\n")
+            while selector.get_map():
+                ready = selector.select(timeout=10)
+                _expect(bool(ready), "native output was buffered until process exit")
+                for key, _ in ready:
+                    _expect(os.read(key.fd, 4096).decode() == key.data, key.data)
+                    selector.unregister(key.fileobj)
+            stdout, stderr = process.communicate("\n", timeout=10)
+            _expect(process.returncode == code, process.returncode)
+            _expect(not stdout and not stderr, "native output was replayed")
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
 
 
 def _make_source_package(root: Path, name: str, source: str) -> Path:
