@@ -4551,7 +4551,7 @@ def test_campaign_fuzz_skip_missing_targets_and_report_failures(
     _campaign_expect(result.returncode == 1, result)
     _campaign_expect("2 passed, 3 failed" in result.stdout, result)
     _campaign_expect("No fuzz tests selected; skipping." in result.stdout, result)
-    _campaign_expect("Falsifying example:" in result.stderr, result)
+    _campaign_expect("Failing test case:" in result.stderr, result)
     _campaign_expect("fuzz tests require @given" in result.stderr, result)
     _campaign_expect("broken import" in result.stderr, result)
     (workspace,) = (root / "tmp").glob("python-fuzz-broken-*")
@@ -5123,9 +5123,7 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
             result,
         )
         (failed,) = (root / "tmp").glob("python-property-alpha-*")
-        diagnostic = (
-            "Falsifying example" if failure == "counterexample" else "timed out"
-        )
+        diagnostic = "Failing test case" if failure == "counterexample" else "timed out"
         _campaign_expect(
             diagnostic
             in result.stdout + result.stderr + (failed / "tests.log").read_text(),
@@ -5236,7 +5234,7 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
                 workspace,
             )
             _campaign_expect(
-                f"{max_examples} passing examples"
+                f"{max_examples} passing, 0 failing"
                 in (workspace / "tests.log").read_text(),
                 workspace,
             )
@@ -5571,10 +5569,6 @@ def main():
         == {"names": ["--quiet"], "options": {"action": "store_true"}},
         "lost helper context",
     )
-    _inspection_expect(
-        not report["warnings"],
-        "resolved declarations produced warnings",
-    )
 
 
 def test_nested_commands_and_commands_without_arguments() -> None:
@@ -5614,19 +5608,17 @@ add.add_argument("url")
                     },
                 },
             },
-            "warnings": [],
         },
         "command tree lost scope or empty commands",
     )
 
 
-def test_unknown_declarations_are_explicit() -> None:
-    """Keep unresolved metadata and parser bindings visible."""
+def test_unknown_metadata_is_explicit() -> None:
+    """Keep unresolved metadata when argument names and scope are known."""
     report = _inspection_discovery("""
 from argparse import ArgumentParser as Parser
 cli = Parser()
 cli.add_argument("--output", default=compute_default(), **options)
-other.add_argument("--external")
 """)
     options = report["arguments"][0]["options"]
     _inspection_expect(
@@ -5637,7 +5629,154 @@ other.add_argument("--external")
         options["**kwargs"] == {"unknown": "options"},
         "unresolved kwargs were hidden",
     )
-    _inspection_expect(bool(report["warnings"]), "unresolved parser was hidden")
+
+
+@pytest.mark.parametrize(
+    ("source", "reason"),
+    [
+        ('other.add_argument("--external")', "cannot resolve the argument parser"),
+        ('other.add_parser("external")', "cannot resolve the subcommand parser"),
+        ("other.parse_args()", "cannot resolve the public argparse parser"),
+        (
+            "cli = argparse.ArgumentParser(parents=[shared])",
+            "argparse parents= inheritance is not supported",
+        ),
+        (
+            (
+                "cli = argparse.ArgumentParser()\n"
+                'cli.add_subparsers().add_parser("run", parents=[shared])'
+            ),
+            "argparse parents= inheritance is not supported",
+        ),
+        (
+            "cli = argparse.ArgumentParser()\ncli.add_argument(*names)",
+            "argument names must be literal strings",
+        ),
+        (
+            "argparse.ArgumentParser().add_subparsers().add_parser(name)",
+            "subcommand name must be a literal string",
+        ),
+        (
+            (
+                "argparse.ArgumentParser().add_subparsers()"
+                '.add_parser("list", aliases=names)'
+            ),
+            "subcommand aliases must be literal strings",
+        ),
+    ],
+)
+def test_unresolved_cli_declarations_fail(source: str, reason: str) -> None:
+    """Fail discovery with source context instead of a partial successful report."""
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match=re.escape(reason),
+    ) as error:
+        inspection_subject.ArgumentDiscovery(
+            ast.parse("import argparse\n" + source),
+            "example/main.py",
+        ).report()
+    _inspection_expect(
+        re.search(r"example/main.py:\d+:\d+:", str(error.value)) is not None,
+        "missing source location",
+    )
+    _inspection_expect("\n  " in str(error.value), "missing offending expression")
+
+
+@pytest.mark.parametrize("constructor", ["argparse.ArgumentParser()", "Parser()"])
+def test_class_based_cli_fails_explicitly(constructor: str) -> None:
+    """Do not report a class-based CLI as an empty successful interface."""
+    source = f"""
+import argparse
+from argparse import ArgumentParser as Parser
+class CLI:
+    def run(self):
+        cli = {constructor}
+        cli.add_argument('--token', required=True)
+        cli.parse_args()
+def main():
+    CLI().run()
+"""
+    with pytest.raises(inspection_subject.CommandError, match="class-based argparse"):
+        _inspection_discovery(source)
+
+
+def test_ambiguous_nested_helpers_fail() -> None:
+    """Reject name collisions rather than assigning each option to both commands."""
+    source = """
+import argparse
+def configure_one(cli):
+    def configure(target):
+        target.add_argument('--one')
+    configure(cli)
+def configure_two(cli):
+    def configure(target):
+        target.add_argument('--two')
+    configure(cli)
+def parser():
+    cli = argparse.ArgumentParser()
+    commands = cli.add_subparsers()
+    configure_one(commands.add_parser('one'))
+    configure_two(commands.add_parser('two'))
+    return cli
+def main():
+    parser().parse_args()
+"""
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="ambiguous helper 'configure'",
+    ):
+        _inspection_discovery(source)
+
+
+def test_subcommand_aliases_preserve_arguments_and_nested_commands() -> None:
+    """Expose aliases with the same interface as their canonical command."""
+    report = _inspection_discovery("""
+import argparse
+cli = argparse.ArgumentParser()
+commands = cli.add_subparsers()
+listing = commands.add_parser(name='list', aliases=['ls'])
+listing.add_argument('--all', action='store_true')
+listing.add_subparsers().add_parser('files', aliases=['f'])
+""")
+    _inspection_expect(set(report["commands"]) == {"list", "ls"}, "missing alias")
+    listing = report["commands"]["list"]
+    _inspection_expect(listing == report["commands"]["ls"], "alias interface differs")
+    _inspection_expect(
+        listing["arguments"]
+        == [
+            {"names": ["--all"], "options": {"action": "store_true"}},
+        ],
+        "lost alias arguments",
+    )
+    _inspection_expect(
+        set(listing["commands"]) == {"files", "f"},
+        "missing nested alias",
+    )
+
+
+@pytest.mark.parametrize(
+    "method",
+    ["parse_intermixed_args", "parse_known_intermixed_args"],
+)
+def test_intermixed_cli_excludes_internal_parsers(method: str) -> None:
+    """Identify public roots for both intermixed argparse entry points."""
+    report = _inspection_discovery(f"""
+import argparse
+def internal():
+    cli = argparse.ArgumentParser()
+    cli.add_argument('--private')
+    return cli
+def parser():
+    cli = argparse.ArgumentParser()
+    cli.add_argument('--public')
+    return cli
+def main():
+    parser().{method}()
+""")
+    _inspection_expect(
+        [row["names"] for row in report["arguments"]] == [["--public"]],
+        "internal arguments leaked into the public interface",
+    )
 
 
 def test_factory_return_and_keyword_helper() -> None:
@@ -5696,10 +5835,6 @@ def parse(cli):
         "internal parser arguments leaked into the public CLI",
     )
     _inspection_expect(list(report["commands"]) == ["repo"], "internal command leaked")
-    _inspection_expect(
-        not report["warnings"],
-        "known internal parser produced warnings",
-    )
 
 
 def test_declared_test_identifiers(tmp_path: Path) -> None:
@@ -5791,6 +5926,19 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
     _expect(report["example"]["tests"] == ["test_default_output"], report)
     _expect(report["library"]["tests"] == [], report)
     _expect(report["example"]["description"] == "Example", report)
+
+
+def test_inspection_cli_failure_has_context_and_no_partial_json(tmp_path: Path) -> None:
+    """Surface discovery errors on stderr with a failing status and no JSON output."""
+    _inspection_repository(tmp_path)
+    source = tmp_path / "example/main.py"
+    source.write_text("import argparse\nother.add_argument('--missing')\n")
+    completed = _run(tmp_path, "inspect", str(tmp_path), code=1)
+    _expect(completed.stdout == "", completed)
+    _expect(f"{source}:2:1: cannot inspect CLI:" in completed.stderr, completed)
+    _expect("cannot resolve the argument parser" in completed.stderr, completed)
+    _expect("other.add_argument('--missing')" in completed.stderr, completed)
+    _expect("Traceback" not in completed.stderr, completed)
 
 
 def test_inspection_preserves_package_and_host_in_one_directory(tmp_path: Path) -> None:
@@ -6175,5 +6323,4 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
         _expect(arguments.count(["target"]) == 1, campaign)
         for option in ("--timeout", "-k", "-m"):
             _expect(arguments.count([option]) == (name != "coverage"), campaign)
-    _expect(not report["warnings"], report["warnings"])
     _expect(not report["arguments"], report["arguments"])

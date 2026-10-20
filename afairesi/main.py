@@ -29,6 +29,7 @@ import nix_syntax
 
 if TYPE_CHECKING:
     from collections.abc import Generator, Iterator
+    from typing import Never
 
     import libcst as cst
     from tree_sitter import Node
@@ -3257,12 +3258,15 @@ def _command_node(tree: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]
 class ArgumentDiscovery:
     """Follow static parser bindings, factory returns, and configuration helpers."""
 
-    def __init__(self, module: ast.Module) -> None:
+    def __init__(self, module: ast.Module, filename: str = "<source>") -> None:
         """Index parser assignments and helper call arguments."""
+        self.filename = filename
         self.imports = _imports(module, "argparse")
         self.bindings: dict[tuple[str, str], list[tuple[str, ast.expr]]] = {}
         self.returns: dict[str, list[ast.expr]] = {}
         self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+        self.ambiguous_functions: set[str] = set()
+        self.classes: dict[str, ast.ClassDef] = {}
         self.calls: list[tuple[str, ast.Call]] = []
         self._collect(module, "")
         for scope, call in self.calls:
@@ -3278,11 +3282,20 @@ class ArgumentDiscovery:
     def _bind(self, scope: str, name: str, source_scope: str, value: ast.expr) -> None:
         self.bindings.setdefault((scope, name), []).append((source_scope, value))
 
+    def _error(self, node: ast.expr, reason: str) -> Never:
+        message = (
+            f"{self.filename}:{node.lineno}:{node.col_offset + 1}: "
+            f"cannot inspect CLI: {reason}\n  {ast.unparse(node)}"
+        )
+        raise CommandError(message)
+
     def _collect(self, node: ast.AST, scope: str) -> None:
         if isinstance(node, ast.ClassDef):
+            self.classes[node.name] = node
             return
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             scope = node.name
+            self.ambiguous_functions.update(self.functions.keys() & {scope})
             self.functions[scope] = node
         if isinstance(node, ast.Assign):
             for target in node.targets:
@@ -3354,15 +3367,25 @@ class ArgumentDiscovery:
             }:
                 return parents
             if node.func.attr == "add_parser":
-                name = (
-                    _value(node.args[0]) if node.args else {"unknown": "command name"}
-                )
-                label = name if isinstance(name, str) else "unknown command"
-                return {(*parent, label) for parent in parents}
+                if not parents:
+                    return set()
+                keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+                name_node = node.args[0] if node.args else keywords.get("name")
+                name = _value(name_node) if name_node is not None else None
+                aliases = _value(keywords["aliases"]) if "aliases" in keywords else []
+                if not isinstance(name, str):
+                    self._error(node, "subcommand name must be a literal string")
+                if not isinstance(aliases, (list, tuple)) or not all(
+                    isinstance(alias, str) for alias in aliases
+                ):
+                    self._error(node, "subcommand aliases must be literal strings")
+                return {
+                    (*parent, label) for parent in parents for label in [name, *aliases]
+                }
         return set()
 
-    def _public_roots(self) -> set[str]:
-        """Select parsers consumed by the public entry point, when identifiable."""
+    def _public_scopes(self) -> set[str]:
+        """Find functions reachable from the public entry point."""
         scopes = {"", "main"}
         while True:
             reachable = scopes | {
@@ -3375,59 +3398,114 @@ class ArgumentDiscovery:
             if reachable == scopes:
                 break
             scopes = reachable
-        return {
-            path[0]
-            for scope, call in self.calls
-            if scope in scopes
-            and isinstance(call.func, ast.Attribute)
-            and call.func.attr in {"parse_args", "parse_known_args"}
-            for path in self._resolve(scope, call.func.value)
+        return scopes
+
+    def _public_roots(self) -> set[str]:
+        """Select consumed parsers, rejecting unsupported public construction."""
+        roots: set[str] = set()
+        scopes = self._public_scopes()
+        for scope, call in self.calls:
+            if scope not in scopes:
+                continue
+            if isinstance(call.func, ast.Name):
+                if call.func.id in self.ambiguous_functions:
+                    self._error(
+                        call,
+                        f"ambiguous helper {call.func.id!r}: multiple definitions",
+                    )
+                definition = self.classes.get(call.func.id)
+                if definition is not None and any(
+                    (
+                        isinstance(node, (ast.Name, ast.Attribute))
+                        and self._qualified(node) == "argparse.ArgumentParser"
+                    )
+                    or (
+                        isinstance(node, ast.Attribute)
+                        and node.attr in {"add_argument", "add_parser"}
+                    )
+                    for node in ast.walk(definition)
+                ):
+                    self._error(
+                        call,
+                        "class-based argparse construction is not supported",
+                    )
+            if not isinstance(call.func, ast.Attribute) or call.func.attr not in {
+                "parse_args",
+                "parse_known_args",
+                "parse_intermixed_args",
+                "parse_known_intermixed_args",
+            }:
+                continue
+            paths = self._resolve(scope, call.func.value)
+            if not paths and self.imports:
+                self._error(call, "cannot resolve the public argparse parser")
+            roots.update(path[0] for path in paths)
+        return roots
+
+    def _check_parents(self, scope: str, call: ast.Call, roots: set[str]) -> None:
+        """Reject inherited interfaces until their argument scopes can be resolved."""
+        contexts = self._resolve(scope, call)
+        if not any(not roots or context[0] in roots for context in contexts):
+            return
+        for option in call.keywords:
+            if option.arg == "parents" and _value(option.value) not in ([], ()):
+                self._error(call, "argparse parents= inheritance is not supported")
+
+    def _report_argument(
+        self,
+        result: dict[str, Any],
+        scope: str,
+        call: ast.Call,
+        roots: set[str],
+    ) -> None:
+        """Attach a declaration only when its parser and argument names are known."""
+        if not isinstance(call.func, ast.Attribute):
+            return
+        contexts = self._resolve(scope, call.func.value)
+        if not contexts:
+            if self.imports:
+                self._error(call, "cannot resolve the argument parser")
+            return
+        public_contexts = {
+            context[1:] for context in contexts if not roots or context[0] in roots
         }
+        if not public_contexts:
+            return
+        names = [_value(argument) for argument in call.args]
+        if any(not isinstance(name, str) for name in names):
+            self._error(call, "argument names must be literal strings")
+        options = {
+            keyword.arg or "**kwargs": _value(keyword.value)
+            for keyword in call.keywords
+        }
+        for context in sorted(public_contexts):
+            _command_node(result, context)["arguments"].append(
+                {"names": names, "options": options},
+            )
 
     def report(self) -> dict[str, Any]:
-        """Return a command tree with declared arguments and unresolved warnings."""
+        """Return a command tree, failing when its interface cannot be resolved."""
         result: dict[str, Any] = {
             "status": "argparse" if self.imports else "unknown",
             "arguments": [],
             "commands": {},
-            "warnings": [],
         }
-
-        warnings = []
         roots = self._public_roots()
         for scope, call in self.calls:
+            if self._qualified(call.func) == "argparse.ArgumentParser":
+                self._check_parents(scope, call, roots)
             if not isinstance(call.func, ast.Attribute):
                 continue
             if call.func.attr == "add_parser":
-                paths = {
-                    path[1:]
-                    for path in self._resolve(scope, call)
-                    if not roots or path[0] in roots
-                }
+                contexts = self._resolve(scope, call)
+                if not contexts and self.imports:
+                    self._error(call, "cannot resolve the subcommand parser")
+                self._check_parents(scope, call, roots)
+                paths = {path[1:] for path in contexts if not roots or path[0] in roots}
                 for path in sorted(paths):
                     _command_node(result, path)
-            if call.func.attr != "add_argument":
-                continue
-            contexts = self._resolve(scope, call.func.value)
-            if not contexts:
-                if self.imports:
-                    warnings.append(
-                        f"line {call.lineno}: unknown parser for {ast.unparse(call)}",
-                    )
-                continue
-            names = [_value(argument) for argument in call.args]
-            options = {
-                keyword.arg or "**kwargs": _value(keyword.value)
-                for keyword in call.keywords
-            }
-            public_contexts = {
-                context[1:] for context in contexts if not roots or context[0] in roots
-            }
-            for context in sorted(public_contexts):
-                _command_node(result, context)["arguments"].append(
-                    {"names": names, "options": options},
-                )
-        result["warnings"] = warnings
+            if call.func.attr == "add_argument":
+                self._report_argument(result, scope, call, roots)
         return result
 
 
@@ -3447,13 +3525,12 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     for package in detect_packages(root):
         module = _source(package.root / "main.py") if package.kind == "python" else None
         cli = (
-            ArgumentDiscovery(module).report()
+            ArgumentDiscovery(module, str(package.root / "main.py")).report()
             if module is not None
             else {
                 "status": "not applicable",
                 "arguments": [],
                 "commands": {},
-                "warnings": [],
             }
         )
         tests = package.root / "test_main.py"
@@ -3561,6 +3638,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="inspect interfaces and test identifiers",
         description=(
             "Describe hosts, packages, CLI arguments, and declared test identifiers. "
+            "Fail if CLI declarations cannot be resolved reliably. "
             "No package code or tests are executed."
         ),
     )
