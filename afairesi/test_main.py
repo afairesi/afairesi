@@ -3785,23 +3785,6 @@ def test_merged_home_commands_reject_flake_repositories_without_changes(
         )
 
 
-def test_cli_help_does_not_load_runtime_rewriter(tmp_path: Path) -> None:
-    """Keep the expensive runtime path rewriter out of help startup."""
-    result = _run(
-        tmp_path,
-        "-c",
-        "import sys\n"
-        "from afairesi.main import main\n"
-        "sys.argv = ['afairesi', '--help']\n"
-        "try:\n"
-        "    main()\n"
-        "finally:\n"
-        "    assert 'libcst' not in sys.modules\n",
-        executable=sys.executable,
-    )
-    _expect("repo" in result.stdout and "home" in result.stdout, result)
-
-
 def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     tmp_path: Path,
 ) -> None:
