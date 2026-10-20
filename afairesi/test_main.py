@@ -3809,7 +3809,7 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     executable = os.environ["PACKAGE_E2E_EXECUTABLE"]
     help_output = _run(tmp_path, "--help", executable=executable).stdout
     _expect(
-        "aims to minimize the description of a software system" in help_output,
+        "minimizes the persistent state needed to reconstruct" in help_output,
         help_output,
     )
     _expect("    repo " in help_output and "    home " in help_output, help_output)

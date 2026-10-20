@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Afairesi aims to minimize the description of a software system."""
+"""Afairesi minimizes the persistent state needed to reconstruct a software system."""
 
 from __future__ import annotations
 
@@ -3994,7 +3994,10 @@ def parser() -> argparse.ArgumentParser:
     """Construct the workspace command-line parser."""
     result = argparse.ArgumentParser(
         prog="afairesi",
-        description="Afairesi aims to minimize the description of a software system.",
+        description=(
+            "Afairesi minimizes the persistent state needed to reconstruct "
+            "a software system."
+        ),
     )
     scopes = result.add_subparsers(dest="scope", title="commands", metavar="SCOPE")
     home = scopes.add_parser(
