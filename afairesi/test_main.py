@@ -5533,6 +5533,38 @@ def _inspection_discovery(source: str) -> dict[str, Any]:
     )
 
 
+def test_empty_cli() -> None:
+    """A supported parser can expose no arguments or subcommands."""
+    report = _inspection_discovery("""
+import argparse
+def main():
+    argparse.ArgumentParser().parse_args()
+""")
+    _expect(report == {"arguments": [], "commands": {}}, report)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def main(): pass",
+        "import argparse",
+        "import click\n@click.command()\ndef main(): pass",
+        "import sys\ndef main(): return sys.argv[1:]",
+    ],
+)
+def test_inspection_requires_supported_cli(tmp_path: Path, source: str) -> None:
+    """Fail inspection when a Python package's interface cannot be discovered."""
+    _inspection_repository(tmp_path)
+    path = tmp_path / "example/main.py"
+    path.write_text(source)
+    completed = _run(tmp_path, "inspect", str(tmp_path), code=1)
+    _expect(completed.stdout == "", completed)
+    _expect(
+        f"{path}: cannot inspect CLI: no supported parser found" in completed.stderr,
+        completed,
+    )
+
+
 def test_argparse_helpers_factories_and_subcommands() -> None:
     """Resolve aliases, returned parsers, groups, and helper contexts."""
     report = _inspection_discovery("""
@@ -5553,20 +5585,19 @@ def main():
 """)
     _inspection_expect(list(report["commands"]) == ["build"], "lost subcommand")
     _inspection_expect(
-        report["arguments"] == [{"names": ["input"], "options": {"type": "str"}}],
+        report["arguments"] == [{"names": ["input"], "type": "str"}],
         "wrong positional scope",
     )
     rows = {
         tuple(row["names"]): row for row in report["commands"]["build"]["arguments"]
     }
     _inspection_expect(
-        rows[("-j", "--jobs")]["options"]
-        == {"type": "int", "default": 2, "choices": [1, 2]},
+        rows[("-j", "--jobs")]
+        == {"names": ["-j", "--jobs"], "type": "int", "default": 2, "choices": [1, 2]},
         "lost metadata",
     )
     _inspection_expect(
-        rows[("--quiet",)]
-        == {"names": ["--quiet"], "options": {"action": "store_true"}},
+        rows[("--quiet",)] == {"names": ["--quiet"], "action": "store_true"},
         "lost helper context",
     )
 
@@ -5589,20 +5620,19 @@ add.add_argument("url")
     _inspection_expect(
         report
         == {
-            "status": "argparse",
             "arguments": [
-                {"names": ["--verbose"], "options": {"action": "store_true"}},
+                {"names": ["--verbose"], "action": "store_true"},
             ],
             "commands": {
                 "version": {"arguments": [], "commands": {}},
                 "remote": {
                     "arguments": [
-                        {"names": ["--verbose"], "options": {"action": "count"}},
+                        {"names": ["--verbose"], "action": "count"},
                     ],
                     "commands": {
                         "list": {"arguments": [], "commands": {}},
                         "add": {
-                            "arguments": [{"names": ["url"], "options": {}}],
+                            "arguments": [{"names": ["url"]}],
                             "commands": {},
                         },
                     },
@@ -5620,15 +5650,317 @@ from argparse import ArgumentParser as Parser
 cli = Parser()
 cli.add_argument("--output", default=compute_default(), **options)
 """)
-    options = report["arguments"][0]["options"]
+    argument = report["arguments"][0]
     _inspection_expect(
-        options["default"] == {"unknown": "compute_default()"},
+        argument["default"] == {"unknown": "compute_default()"},
         "default was guessed",
     )
     _inspection_expect(
-        options["**kwargs"] == {"unknown": "options"},
+        argument["**kwargs"] == {"unknown": "options"},
         "unresolved kwargs were hidden",
     )
+
+
+@pytest.mark.parametrize(
+    "declaration",
+    [
+        'if enabled:\n    cli.add_argument("--token")',
+        'for item in items:\n    cli.add_argument("--token")',
+        'while enabled:\n    cli.add_argument("--token")',
+        '[cli.add_argument("--token") for item in items]',
+        (
+            'def configure(target):\n    target.add_argument("--token")\n'
+            "if enabled:\n    configure(cli)"
+        ),
+        'if enabled:\n    target = cli\ntarget.add_argument("--token")',
+    ],
+)
+def test_inspection_rejects_runtime_dependent_structure(declaration: str) -> None:
+    """Reject uncertain argument membership, including helper and alias dependencies."""
+    source = "import argparse\ncli = argparse.ArgumentParser()\n" + declaration
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="unresolved control flow",
+    ):
+        _inspection_discovery(source)
+
+
+@pytest.mark.parametrize(
+    "configure",
+    [
+        "configure(cli)",
+        "helpers.configure(target=cli)",
+        'configure({"parser": cli})',
+        'settings = {"parser": cli}\nconfigure(settings)',
+        'add = cli.add_argument\nadd("--token")',
+        "def configure(*parsers): pass\nconfigure(cli)",
+        "cli.customize()",
+    ],
+)
+def test_inspection_rejects_opaque_parser_configuration(configure: str) -> None:
+    """Fail when parser flow escapes the supported helper and method patterns."""
+    source = "import argparse\ncli = argparse.ArgumentParser()\n" + configure
+    with pytest.raises(inspection_subject.CommandError, match="cannot inspect CLI"):
+        _inspection_discovery(source)
+
+
+@pytest.mark.parametrize("consumed", [False, True])
+def test_inspection_rejects_multiple_public_parsers(*, consumed: bool) -> None:
+    """Require an unambiguous root instead of merging distinct command interfaces."""
+    source = """
+import argparse
+one = argparse.ArgumentParser()
+one.add_argument('--one')
+two = argparse.ArgumentParser()
+two.add_argument('--two')
+"""
+    if consumed:
+        source += "\ndef main():\n    one.parse_args()\n    two.parse_args()\n"
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="multiple public parsers",
+    ):
+        _inspection_discovery(source)
+
+
+def test_inspection_literal_control_flow() -> None:
+    """Resolve literal branches and preserve the order of finite literal loops."""
+    report = _inspection_discovery("""
+import argparse
+cli = argparse.ArgumentParser()
+if True:
+    cli.add_argument('--enabled')
+else:
+    cli.add_argument('--disabled')
+for name in ('--one', '--two'):
+    cli.add_argument(name, default=compute_default())
+for name in []:
+    cli.add_argument(name)
+""")
+    _expect(
+        report
+        == {
+            "arguments": [
+                {"names": ["--enabled"]},
+                {"names": ["--one"], "default": {"unknown": "compute_default()"}},
+                {"names": ["--two"], "default": {"unknown": "compute_default()"}},
+            ],
+            "commands": {},
+        },
+        report,
+    )
+
+
+def test_inspection_executable_module_guard() -> None:
+    """Treat the standard main guard as active when describing an executable CLI."""
+    report = _inspection_discovery("""
+import argparse
+if __name__ == '__main__':
+    cli = argparse.ArgumentParser()
+    cli.add_argument('--public')
+    cli.parse_args()
+""")
+    _expect(
+        report
+        == {
+            "arguments": [{"names": ["--public"]}],
+            "commands": {},
+        },
+        report,
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "(process(path) for path in cli.parse_args().files)",
+        "[process(path) for path in cli.parse_args().files]",
+        "{process(path) for path in cli.parse_args().files}",
+        "{path: process(path) for path in cli.parse_args().files}",
+    ],
+)
+def test_inspection_comprehension_eager_iterable(expression: str) -> None:
+    """Recognize a parser consumed while evaluating the first comprehension iterable."""
+    report = _inspection_discovery(
+        """
+import argparse
+def main():
+    cli = argparse.ArgumentParser()
+    cli.add_argument('files', nargs='+')
+    results = EXPRESSION
+""".replace("EXPRESSION", expression),
+    )
+    _expect(
+        report
+        == {
+            "arguments": [{"names": ["files"], "nargs": "+"}],
+            "commands": {},
+        },
+        report,
+    )
+
+
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "(cli.parse_args() for item in items)",
+        "(item for item in items if cli.parse_args())",
+        "(item for item in items for path in cli.parse_args().files)",
+    ],
+)
+def test_inspection_comprehension_conditional_consumption(expression: str) -> None:
+    """Reject parser consumption that depends on comprehension iterations or filters."""
+    source = """
+import argparse
+def main():
+    cli = argparse.ArgumentParser()
+    cli.add_argument('files', nargs='+')
+    results = EXPRESSION
+""".replace("EXPRESSION", expression)
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="unresolved control flow",
+    ):
+        _inspection_discovery(source)
+
+
+@pytest.mark.parametrize(
+    "loop",
+    [
+        "for path in cli.parse_args().files:\n        process(path)",
+        "while cli.parse_args().files:\n        break",
+    ],
+)
+def test_inspection_loop_eager_input(loop: str) -> None:
+    """Loop iterables and initial while conditions execute before their bodies."""
+    report = _inspection_discovery(
+        """
+import argparse
+def main():
+    cli = argparse.ArgumentParser()
+    cli.add_argument('files', nargs='+')
+    LOOP
+""".replace("LOOP", loop),
+    )
+    _expect(
+        report
+        == {
+            "arguments": [{"names": ["files"], "nargs": "+"}],
+            "commands": {},
+        },
+        report,
+    )
+
+
+def test_inspection_groups_and_parser_defaults() -> None:
+    """Expose group membership, exclusivity, and defaults in the correct command."""
+    report = _inspection_discovery("""
+import argparse
+cli = argparse.ArgumentParser()
+run = cli.add_subparsers().add_parser('run')
+options = run.add_argument_group('Credentials', 'Choose an identity')
+identity = options.add_mutually_exclusive_group(required=True)
+identity.add_argument('--token')
+identity.add_argument('--password')
+run.set_defaults(token='anonymous', password=compute_default())
+""")
+    command = report["commands"]["run"]
+    _expect(
+        command
+        == {
+            "arguments": [{"names": ["--token"]}, {"names": ["--password"]}],
+            "commands": {},
+            "groups": [
+                {
+                    "arguments": [["--token"], ["--password"]],
+                    "exclusive": False,
+                    "title": "Credentials",
+                    "description": "Choose an identity",
+                },
+                {
+                    "arguments": [["--token"], ["--password"]],
+                    "exclusive": True,
+                    "required": True,
+                },
+            ],
+            "defaults": {
+                "token": "anonymous",
+                "password": {"unknown": "compute_default()"},
+            },
+        },
+        command,
+    )
+
+
+def test_inspection_ignores_unreachable_configuration() -> None:
+    """Discover the consumed interface without executing uncalled configuration."""
+    report = _inspection_discovery("""
+import argparse
+cli = argparse.ArgumentParser()
+def unused():
+    external.configure(cli)
+    cli.add_argument('--unused')
+def main():
+    cli.add_argument('--public')
+    try:
+        cli.parse_args()
+    except ValueError:
+        cli.error('invalid input')
+""")
+    _expect(
+        report
+        == {
+            "arguments": [{"names": ["--public"]}],
+            "commands": {},
+        },
+        report,
+    )
+
+
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        "argparse.ArgumentParser(**options)",
+        "argparse.ArgumentParser().add_subparsers(**options)",
+        "argparse.ArgumentParser().add_subparsers().add_parser('run', **options)",
+    ],
+)
+def test_inspection_rejects_unknown_parser_settings(constructor: str) -> None:
+    """Unresolved parser settings may hide inherited arguments or command aliases."""
+    with pytest.raises(inspection_subject.CommandError, match="literal mapping"):
+        _inspection_discovery("import argparse\ncli = " + constructor)
+
+
+def test_inspection_literal_parser_settings() -> None:
+    """Expand literal parser settings while retaining subcommand aliases."""
+    report = _inspection_discovery("""
+import argparse
+cli = argparse.ArgumentParser(**{'parents': []})
+run = cli.add_subparsers().add_parser('run', **{'aliases': ['r']})
+run.add_argument('--token')
+""")
+    _expect(
+        report["commands"]
+        == {
+            "run": {"arguments": [{"names": ["--token"]}], "commands": {}},
+            "r": {"arguments": [{"names": ["--token"]}], "commands": {}},
+        },
+        report,
+    )
+
+
+def test_inspection_rejects_custom_subcommand_parsers() -> None:
+    """Custom parser classes can introduce declarations outside the inspected tree."""
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="custom subcommand parser",
+    ):
+        _inspection_discovery("""
+import argparse
+from helpers import CustomParser
+cli = argparse.ArgumentParser()
+cli.add_subparsers(parser_class=CustomParser).add_parser('run')
+""")
 
 
 @pytest.mark.parametrize(
@@ -5637,6 +5969,10 @@ cli.add_argument("--output", default=compute_default(), **options)
         ('other.add_argument("--external")', "cannot resolve the argument parser"),
         ('other.add_parser("external")', "cannot resolve the subcommand parser"),
         ("other.parse_args()", "cannot resolve the public argparse parser"),
+        (
+            "cli = argparse.ArgumentParser()\ncli.add_argument(**options)",
+            "argument names must be literal strings",
+        ),
         (
             "cli = argparse.ArgumentParser(parents=[shared])",
             "argparse parents= inheritance is not supported",
@@ -5744,7 +6080,7 @@ listing.add_subparsers().add_parser('files', aliases=['f'])
     _inspection_expect(
         listing["arguments"]
         == [
-            {"names": ["--all"], "options": {"action": "store_true"}},
+            {"names": ["--all"], "action": "store_true"},
         ],
         "lost alias arguments",
     )
@@ -5792,8 +6128,7 @@ def main():
     configure(target=cli)
 """)
     _inspection_expect(
-        report["arguments"]
-        == [{"names": ["--required"], "options": {"required": True}}],
+        report["arguments"] == [{"names": ["--required"], "required": True}],
         "factory or keyword binding was lost",
     )
 
@@ -5920,12 +6255,66 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         "wrong hosts",
     )
     _inspection_expect(
-        report["library"]["cli"]["status"] == "not applicable",
+        report["library"]["cli"] is None,
         "non-Python package has CLI metadata",
     )
     _expect(report["example"]["tests"] == ["test_default_output"], report)
     _expect(report["library"]["tests"] == [], report)
     _expect(report["example"]["description"] == "Example", report)
+
+
+@pytest.mark.parametrize("has_parser", [False, True])
+def test_inspection_python_library(tmp_path: Path, *, has_parser: bool) -> None:
+    """Retain metadata and tests for a declared non-executable Python library."""
+    _inspection_repository(tmp_path)
+    package = tmp_path / "example"
+    (package / "default.nix").write_text("""
+{ inputs, pkgs, ... }:
+let python = pkgs.python3;
+in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
+    inherit pkgs;
+    executable = false;
+    meta.description = "Python library";
+    src = ./.;
+}
+""")
+    if not has_parser:
+        (package / "main.py").write_text("raise RuntimeError('do not import')\n")
+    report = inspection_subject.inspect_repository(tmp_path)["example"]
+    _expect(
+        report
+        == {
+            "type": "package",
+            "kind": "python",
+            "description": "Python library",
+            "cli": None,
+            "tests": ["test_default_output"],
+        },
+        report,
+    )
+
+
+def test_inspection_scopes_executable_metadata(tmp_path: Path) -> None:
+    """Read executable metadata from the outer package rather than dependencies."""
+    _inspection_repository(tmp_path)
+    (tmp_path / "example/default.nix").write_text("""
+{ inputs, pkgs, ... }:
+let dependency = { executable = false; };
+in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
+    inherit pkgs;
+    executable = true;
+    src = ./.;
+}
+""")
+    report = inspection_subject.inspect_repository(tmp_path)["example"]
+    _expect(
+        report["cli"]
+        == {
+            "arguments": [{"names": ["--output"], "default": "result"}],
+            "commands": {},
+        },
+        report,
+    )
 
 
 def test_inspection_cli_failure_has_context_and_no_partial_json(tmp_path: Path) -> None:
