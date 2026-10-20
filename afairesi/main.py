@@ -35,7 +35,7 @@ if TYPE_CHECKING:
     from tree_sitter import Node
 PACKAGE_KINDS = ("html", "latex", "nix", "python")
 NIX_FMT_HELP = (
-    "nix fmt also cleans up structure, enforces all lint rules, and applies unsafe "
+    "nix fmt also enforces lint rules and applies unsafe "
     "fixes that can change behavior. Review the diff and run tests."
 )
 KIND_MARKERS = {
@@ -3034,8 +3034,8 @@ def _configure_test_target(result: argparse.ArgumentParser) -> None:
         default=None,
         metavar="PATH",
         help=(
-            "package or flake (default: current flake); "
-            "relative to Git root, or cwd outside Git"
+            "Python package or flake directory (default: current flake); "
+            "relative paths use the Git root, or the current directory outside Git"
         ),
     )
 
@@ -3046,13 +3046,15 @@ def _configure_test_selection(result: argparse.ArgumentParser) -> None:
         "-k",
         dest="keywords",
         default="",
-        help="pytest keyword expression",
+        metavar="EXPRESSION",
+        help="pytest keyword filter",
     )
     result.add_argument(
         "-m",
         dest="markers",
         default="",
-        help="pytest marker expression",
+        metavar="EXPRESSION",
+        help="pytest marker filter",
     )
 
 
@@ -3061,6 +3063,7 @@ def _configure_test_timeout(result: argparse.ArgumentParser) -> None:
     result.add_argument(
         "--timeout",
         type=float,
+        metavar="SECONDS",
         help="seconds per test run, excluding build (default: unlimited)",
     )
 
@@ -3075,20 +3078,22 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     )
     coverage = commands.add_parser(
         "coverage",
-        help="measure coverage and print report paths",
+        help="measure test coverage and print report paths",
         description=(
-            "Measure coverage from the package test suite; skip packages without "
-            "tests. Print HTML report paths in the Nix store."
+            "Build Nix coverage checks for Python package test suites. "
+            "When targeting a flake, skip packages without tests. "
+            "Print HTML report paths in the Nix store."
         ),
     )
     _configure_test_target(coverage)
     fuzz = commands.add_parser(
         "fuzz",
-        help="run a short generation-based fuzz campaign",
+        help="run Hypothesis fuzz tests",
         description=(
             "Run Hypothesis tests named test_fuzz_* in isolated package copies. "
-            "Skip packages without test_main.py or selected fuzz tests. "
-            "Logs and Hypothesis examples: flake tmp/."
+            "When targeting a flake, skip packages without test_main.py. "
+            "Skip packages with no selected fuzz tests. "
+            "Save logs and Hypothesis examples under the flake's tmp/."
         ),
     )
     _configure_test_target(fuzz)
@@ -3100,8 +3105,8 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         default=10,
         metavar="N",
         help=(
-            "generated examples per fuzz test (default: 10); "
-            "explicit test settings and Hypothesis profiles can override this"
+            "example budget per fuzz test (default: 10); "
+            "overridden by test settings or Hypothesis profiles"
         ),
     )
 
@@ -3110,7 +3115,8 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         help="run mutation tests",
         description=(
             "Run mutation tests in isolated package copies. "
-            "Skip packages without test_main.py. Logs and reports: flake tmp/."
+            "When targeting a flake, skip packages without test_main.py. "
+            "Save logs and reports under the flake's tmp/."
         ),
     )
     _configure_test_target(mutation)
@@ -3119,15 +3125,19 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         "--timeout",
         type=float,
         default=300.0,
-        help=("seconds per test run, excluding build (default: 300)"),
+        metavar="SECONDS",
+        help="seconds per test run, excluding build (default: 300)",
     )
 
     mutation.add_argument(
         "--lines",
         action="append",
         default=[],
-        metavar="N_OR_START-END",
-        help="native line ranges; include overlapping mutations (repeatable)",
+        metavar="LINE_OR_RANGE",
+        help=(
+            "main.py line N or range START-END; "
+            "include overlapping mutations (repeatable)"
+        ),
     )
     mutation.add_argument(
         "--exclude-operator",
@@ -3135,23 +3145,23 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         action="append",
         default=[],
         metavar="REGEX",
-        help="native operator exclusion regex, matched from the start (repeatable)",
+        help="exclude Cosmic Ray operators matching from the start (repeatable)",
     )
     mutation.add_argument(
         "--max-mutations",
         type=int,
         metavar="N",
-        help="maximum mutations to test",
+        help="mutation limit per package (default: unlimited)",
     )
     performance = commands.add_parser(
         "performance",
-        help="profile existing tests and package CLI calls",
+        help="profile tests and package CLI calls",
         description=(
-            "Profile tests with cProfile and show slow test phases; skip packages "
-            "without tests. Save separate pytest and package CLI profiles in flake "
-            "tmp/. Timings include profiler overhead. Profiles cover "
-            "each process's main Python thread; external executables and arbitrary "
-            "Python subprocesses are not profiled."
+            "Profile tests and package CLI calls with cProfile in isolated package "
+            "copies. Show slow test phases and save separate profiles under the "
+            "flake's tmp/. When targeting a flake, skip packages without test_main.py. "
+            "Timings include profiler overhead. Only the main Python threads of "
+            "pytest and package CLI processes are profiled."
         ),
     )
     _configure_test_target(performance)
@@ -3159,10 +3169,12 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     _configure_test_timeout(performance)
     property_tests = commands.add_parser(
         "property",
-        help="run property-based tests",
+        help="run test suites, including property-based tests",
         description=(
-            "Run property-based tests in isolated package copies. "
-            "Skip packages without test_main.py. Logs and reports: flake tmp/. "
+            "Run test suites, including property-based tests, "
+            "in isolated package copies. When targeting a flake, skip packages "
+            "without test_main.py. Save logs and Hypothesis examples under the "
+            "flake's tmp/. "
             'Select profiles with PYTEST_ADDOPTS="--hypothesis-profile=NAME".'
         ),
     )
@@ -3589,19 +3601,17 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     create = commands.add_parser(
         "add",
-        usage="%(prog)s [-h] {NAME TYPE | HOST}",
         help="create and stage a package or host",
         description=(
-            "Create and stage a canonical package or host. "
-            "Python checks are generated from test_main.py. "
-            "Host checks are generated from host configurations. "
-            "Keep only necessary supporting files under prm/."
+            "Create and stage a package or host. "
+            "Generate Python checks from test_main.py and host checks from host "
+            "configurations. Store supporting files under prm/."
         ),
     )
     create.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="new root directory name",
+        help="new directory name at the flake root",
     )
     create.add_argument(
         "type",
@@ -3612,10 +3622,10 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     fix = commands.add_parser(
         "fix",
-        help="fix and stage flake structure; remove unsupported files",
+        help="fix and stage flake structure; remove paths outside the source whitelist",
         description=(
-            "Fix and stage flake structure; delete paths outside the source whitelist. "
-            "Keep only necessary supporting files under prm/. "
+            "Fix and stage flake structure; remove paths outside the source whitelist. "
+            "Store supporting files under prm/. "
             f"{NIX_FMT_HELP}"
         ),
     )
@@ -3635,11 +3645,12 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     inspection = commands.add_parser(
         "inspect",
-        help="inspect interfaces and test identifiers",
+        help="inspect repository interfaces and test identifiers",
         description=(
-            "Describe hosts, packages, CLI arguments, and declared test identifiers. "
+            "Print JSON describing hosts, packages, CLI arguments, "
+            "and test identifiers. "
             "Fail if CLI declarations cannot be resolved reliably. "
-            "No package code or tests are executed."
+            "Inspect source without executing it."
         ),
     )
     inspection.add_argument(
@@ -3647,15 +3658,15 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         nargs="?",
         metavar="PATH_OR_REMOTE",
         help=(
-            "repository path or Git URL (default: current repository); "
-            "relative paths use the Git root, or cwd outside Git"
+            "repository directory or Git URL (default: current repository); "
+            "relative paths use the Git root, or the current directory outside Git"
         ),
     )
     move = commands.add_parser(
         "mv",
         help="rename and stage a package or host",
         description=(
-            "Rename and stage a canonical package or host. "
+            "Rename and stage a package or host. "
             "Update runtime paths and package references, move runtime data, "
             "and preserve unstaged edits."
         ),
@@ -3663,12 +3674,12 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     move.add_argument(
         "source",
         metavar="SOURCE",
-        help="existing root directory name",
+        help="existing directory name at the flake root",
     )
     move.add_argument(
         "destination",
         metavar="DESTINATION",
-        help="new root directory name",
+        help="new directory name at the flake root",
     )
     remove = commands.add_parser(
         "rm",
@@ -3681,7 +3692,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     remove.add_argument(
         "resource",
         metavar="RESOURCE",
-        help="root directory name",
+        help="existing directory name at the flake root",
     )
     remove.add_argument(
         "-f",
@@ -3691,8 +3702,8 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     testing = commands.add_parser(
         "test",
-        help="run test campaigns and profile existing tests",
-        description="Run a test campaign or profile tests. Choose a command below.",
+        help="run tests and measure coverage or performance",
+        description="Run tests and measure coverage or performance.",
     )
     _configure_test_parser(testing)
 
@@ -3998,13 +4009,13 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     add = commands.add_parser(
         "add",
-        help="add a Git submodule at its canonical home path",
+        help="add and stage a submodule",
         description=(
-            "Add a Git submodule at $HOME/<remote-hostname>/<repository-path> "
-            "and stage its submodule registration."
+            "Add a submodule at $HOME/<remote-hostname>/<repository-path>. "
+            "Update and stage its registration and the $HOME/.gitignore whitelist."
         ),
     )
-    add.add_argument("remote", metavar="REMOTE", help="existing hosted Git remote")
+    add.add_argument("remote", metavar="REMOTE", help="hosted Git repository URL")
     add.add_argument(
         "-f",
         "--force",
@@ -4013,9 +4024,9 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     fix_home = commands.add_parser(
         "fix",
-        help="fix and stage home structure",
+        help="fix and stage home repository structure",
         description=(
-            "Fix and stage the $HOME whitelist and submodule layout. "
+            "Fix and stage the $HOME/.gitignore whitelist and submodule layout. "
             "Move submodules to <remote-hostname>/<repository-path>."
         ),
     )
@@ -4028,20 +4039,22 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     commands.add_parser(
         "init",
         help="initialize the home repository and stage its whitelist",
-        description="Initialize the repository at $HOME and stage its whitelist.",
+        description=(
+            "Initialize the home repository and stage its .gitignore whitelist."
+        ),
     )
     remove = commands.add_parser(
         "rm",
-        help="remove and stage a home submodule unregistration",
+        help="remove and stage a submodule",
         description=(
-            "Remove a home submodule with git rm, update the home whitelist, "
-            "and stage its unregistration."
+            "Remove a submodule with git rm. "
+            "Update and stage the $HOME/.gitignore whitelist."
         ),
     )
     remove.add_argument(
         "resource",
-        metavar="RESOURCE",
-        help="home-relative registered submodule path",
+        metavar="PATH",
+        help="registered submodule path relative to $HOME",
     )
     remove.add_argument(
         "-f",
@@ -4077,21 +4090,21 @@ def parser() -> argparse.ArgumentParser:
             "a software system."
         ),
     )
-    scopes = result.add_subparsers(dest="scope", title="commands", metavar="SCOPE")
+    scopes = result.add_subparsers(dest="scope", title="scopes", metavar="SCOPE")
     home = scopes.add_parser(
         "home",
         help="manage the home repository and its submodules",
         description=(
-            "Manage $HOME submodules at <remote-hostname>/<repository-path>. "
+            "Manage the home repository and its submodules. "
             "Changes are staged; use Git to commit and push."
         ),
     )
     repo = scopes.add_parser(
         "repo",
-        help="manage the current repository",
+        help="manage Nix flake packages, hosts, checks, and tests",
         description=(
-            "Manage Nix flake package, host, and check conventions. "
-            "Structural changes are staged for review."
+            "Manage Nix flake packages, hosts, checks, and tests. "
+            "Structural changes are staged."
         ),
     )
     _configure_repo_parser(repo)
