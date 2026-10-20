@@ -5,6 +5,9 @@
   self ? inputs.self,
 }:
 let
+  formatterPython = pkgs.python3.withPackages (_: [
+    inputs.self.packages.${pkgs.stdenv.system}.afairesi
+  ]);
   nixFiles = [
     "flake.nix"
     "*/default.nix"
@@ -15,13 +18,6 @@ let
     "*/main.py"
     "*/test_main.py"
   ];
-  workflowFiles = [
-    ".github/workflows/workflow.yml"
-    ".forgejo/workflows/workflow.yml"
-  ];
-  formatterPython = pkgs.python3.withPackages (_: [
-    inputs.self.packages.${pkgs.stdenv.system}.afairesi
-  ]);
   pythonPackageNames =
     if enableMypy then
       builtins.attrNames (
@@ -118,6 +114,11 @@ let
     projectRootFile = "flake.nix";
     settings = {
       formatter = {
+        alphabetize-nix = {
+          command = inputs.self.packages.${pkgs.stdenv.system}.alphabetize_nix;
+          includes = nixFiles;
+          priority = 4;
+        };
         bibtex-tidy = {
           command = pkgs.bibtex-tidy;
           includes = [ "*/ms.bib" ];
@@ -130,11 +131,6 @@ let
             "--v2"
           ];
           priority = 5;
-        };
-        nix-alphabetize = {
-          command = inputs.self.packages.${pkgs.stdenv.system}.nix_alphabetize;
-          includes = nixFiles;
-          priority = 4;
         };
         oxlint = {
           command = pkgs.oxlint;
@@ -187,6 +183,10 @@ let
       global.excludes = [ "{prm,tmp,*/prm,*/tmp}/**" ];
     };
   };
+  workflowFiles = [
+    ".github/workflows/workflow.yml"
+    ".forgejo/workflows/workflow.yml"
+  ];
   wrapper = pkgs.writeShellApplication {
     name = "treefmt";
     runtimeInputs = [
