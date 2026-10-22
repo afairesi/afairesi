@@ -8,6 +8,7 @@ import argparse
 import ast
 import contextlib
 import inspect
+import io
 import json
 import keyword
 import math
@@ -1667,13 +1668,10 @@ pkgs.writeTextFile {
         files[root / "main.py"] = (
             "#!/usr/bin/env python3\n"
             "# ruff: noqa: CPY001 - Set copyright ownership when publishing.\n"
-            f"{description!r}\n\nimport argparse\n\n\n"
-            "def parser() -> argparse.ArgumentParser:\n"
-            '    """Declare the command-line interface."""\n'
-            f"    return argparse.ArgumentParser(description={description!r})\n\n\n"
-            "def main(argv: list[str] | None = None) -> None:\n"
+            f"{description!r}\n\n\n"
+            "def main() -> None:\n"
             f'    """Run {name}."""\n'
-            "    parser().parse_args(argv)\n\n\n"
+            "\n\n"
             'if __name__ == "__main__":\n    main()\n'
         )
     elif kind == "html":
@@ -3264,6 +3262,20 @@ class ArgumentDiscovery:
         """Index parser assignments and helper call arguments."""
         self.filename = filename
         self.imports = _imports(module, "argparse")
+        sys_imports = _imports(module, "sys")
+        self.argument_free = not any(
+            _imports(module, name)
+            for name in ("argparse", "click", "typer", "fire", "docopt", "getopt")
+        ) and not any(
+            (isinstance(node, ast.Name) and sys_imports.get(node.id) == "sys.argv")
+            or (
+                isinstance(node, ast.Attribute)
+                and node.attr == "argv"
+                and isinstance(node.value, ast.Name)
+                and sys_imports.get(node.value.id) == "sys"
+            )
+            for node in ast.walk(module)
+        )
         self.bindings: dict[tuple[str, str], list[tuple[str, ast.expr]]] = {}
         self.returns: dict[str, list[ast.expr]] = {}
         self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
@@ -3978,7 +3990,7 @@ class ArgumentDiscovery:
                     _command_node(result, path)
             if call.func.attr == "add_argument":
                 self._report_argument(result, scope, call, roots)
-        if not any(
+        if not self.argument_free and not any(
             self._qualified(call.func) == "argparse.ArgumentParser"
             for _scope, call in self.calls
         ):
@@ -4044,6 +4056,148 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     return dict(sorted(resources.items()))
 
 
+def _inspection_git_files(
+    root: Path,
+    revision: str | None,
+) -> list[tuple[str, str, Path]]:
+    """List raw blobs from a tree or the index without refreshing Git state."""
+    if revision is None:
+        listing = git(root, ["ls-files", "--stage", "-z"]).stdout
+    else:
+        tree = git(
+            root,
+            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{tree}}"],
+        ).stdout.strip()
+        listing = git(root, ["ls-tree", "-r", "-z", "--full-tree", tree]).stdout
+    files = []
+    for entry in listing.split("\0"):
+        if not entry:
+            continue
+        metadata, name = entry.split("\t", 1)
+        mode, middle, last = metadata.split()
+        if revision is None and last != "0":
+            message = "cannot inspect an unmerged index; resolve conflicts first"
+            raise CommandError(message)
+        if mode != "160000":
+            files.append((mode, middle if revision is None else last, Path(name)))
+    return files
+
+
+def _inspection_git_report(
+    root: Path,
+    revision: str | None = None,
+    *,
+    working_tree: bool = False,
+) -> dict[str, Any]:
+    """Inspect tracked sources in a temporary directory without checkout filters."""
+    files = _inspection_git_files(root, revision)
+    with tempfile.TemporaryDirectory(prefix="afairesi-inspect-diff-") as directory:
+        snapshot = Path(directory)
+        if working_tree:
+            for _mode, _oid, relative in files:
+                source = root / relative
+                if any((root / parent).is_symlink() for parent in relative.parents):
+                    continue
+                if source.is_file() or source.is_symlink():
+                    target = snapshot / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copyfile(source, target, follow_symlinks=False)
+        elif files:
+            completed = subprocess.run(  # noqa: S603
+                ["git", "-C", str(root), "cat-file", "--batch"],  # noqa: S607
+                input="".join(f"{oid}\n" for _mode, oid, _path in files).encode(),
+                capture_output=True,
+                check=False,
+            )
+            if completed.returncode:
+                sys.stderr.write(completed.stderr.decode(errors="replace"))
+                raise SystemExit(completed.returncode)
+            content = io.BytesIO(completed.stdout)
+            for mode, _oid, relative in files:
+                _object, separator, size = content.readline().partition(b" blob ")
+                if not separator:
+                    message = f"{relative}: could not read Git blob"
+                    raise CommandError(message)
+                source_bytes = content.read(int(size))
+                content.read(1)
+                target = snapshot / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if mode == "120000":
+                    target.symlink_to(os.fsdecode(source_bytes))
+                else:
+                    target.write_bytes(source_bytes)
+        return (
+            inspect_repository(snapshot) if (snapshot / "flake.nix").is_file() else {}
+        )
+
+
+def _inspection_diff_revisions(
+    options: argparse.Namespace,
+    cli: argparse.ArgumentParser,
+    root: Path,
+) -> list[str]:
+    """Resolve Git's two-dot and three-dot comparison shorthand."""
+    revisions: list[str] = options.revisions
+    if revisions[2:]:
+        cli.error("inspect diff accepts at most two revisions")
+    if len(revisions) == 1 and ".." in revisions[0]:
+        if options.cached:
+            cli.error("inspect diff --cached accepts one revision, not a range")
+        separator = "..." if "..." in revisions[0] else ".."
+        left, right = revisions[0].split(separator, 1)
+        revisions = [left or "HEAD", right or "HEAD"]
+        if separator == "...":
+            commits = [
+                git(
+                    root,
+                    ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+                ).stdout.strip()
+                for ref in revisions
+            ]
+            revisions[0] = git(root, ["merge-base", *commits]).stdout.strip()
+    if options.cached and len(revisions) > 1:
+        cli.error("inspect diff --cached accepts at most one revision")
+    return revisions
+
+
+def _dispatch_inspect_diff(
+    options: argparse.Namespace,
+    cli: argparse.ArgumentParser,
+    root: Path,
+) -> None:
+    """Render structural inspection changes with jd's native diff implementation."""
+    root = repository_root(root)
+    revisions = _inspection_diff_revisions(options, cli, root)
+    if options.cached:
+        head = git(root, ["rev-parse", "--verify", "HEAD"], check=False)
+        before = (
+            _inspection_git_report(root, revisions[0] if revisions else "HEAD")
+            if revisions or head.returncode == 0
+            else {}
+        )
+        after = _inspection_git_report(root)
+    else:
+        before = _inspection_git_report(root, revisions[0] if revisions else None)
+        after = (
+            _inspection_git_report(root, revisions[1])
+            if revisions[1:]
+            else _inspection_git_report(root, working_tree=True)
+        )
+    if options.reverse:
+        before, after = after, before
+    with tempfile.TemporaryDirectory(prefix="afairesi-inspect-diff-") as directory:
+        left, right = (Path(directory) / name for name in ("before.json", "after.json"))
+        left.write_text(json.dumps(before), encoding="utf-8")
+        right.write_text(json.dumps(after), encoding="utf-8")
+        completed = run(["jd", str(left), str(right)], check=False)
+    if completed.returncode not in {0, 1}:
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(completed.returncode)
+    sys.stdout.write(completed.stdout)
+    if options.exit_code and completed.returncode:
+        raise SystemExit(1)
+
+
 def _dispatch_inspect(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
@@ -4065,10 +4219,62 @@ def _dispatch_inspect(
             )
         )
         with repository as root:
+            if options.inspect_command == "diff":
+                _dispatch_inspect_diff(options, cli, root)
+                return
             report = inspect_repository(root)
     except CommandError as error:
         cli.exit(1, f"{cli.prog}: {error}\n")
     sys.stdout.write(json.dumps(report, indent=2) + "\n")
+
+
+def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
+    """Keep path inspection available alongside Git-style structural diffs."""
+    inspection.add_argument(
+        "--repository",
+        metavar="PATH_OR_REMOTE",
+        help=(
+            "repository directory or Git URL (default: current repository); "
+            "also accepted as 'inspect PATH_OR_REMOTE'; relative paths use the "
+            "Git root, or the current directory outside Git"
+        ),
+    )
+    commands = inspection.add_subparsers(
+        dest="inspect_command",
+        title="commands",
+        metavar="COMMAND",
+    )
+    difference = commands.add_parser(
+        "diff",
+        help="diff inspected interfaces in jd format",
+        description=(
+            "Print a jd-compatible structural diff of repository inspections. "
+            "Compare the index with tracked working-tree sources by default, "
+            "REV with the working tree, or REV1 with REV2. "
+            "Accept REV1..REV2 and REV1...REV2 (from their merge base). "
+            "Untracked files and implementation-only changes are omitted. "
+            "Inspect source without executing it or changing Git state."
+        ),
+    )
+    difference.add_argument("revisions", nargs="*", metavar="REV")
+    difference.add_argument(
+        "--cached",
+        "--staged",
+        dest="cached",
+        action="store_true",
+        help="compare HEAD (or REV) with the index; before the first commit use {}",
+    )
+    difference.add_argument(
+        "--exit-code",
+        action="store_true",
+        help="exit 1 for interface changes, 0 for no changes (default: exit 0)",
+    )
+    difference.add_argument(
+        "-R",
+        "--reverse",
+        action="store_true",
+        help="reverse the comparison",
+    )
 
 
 def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
@@ -4132,15 +4338,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
             "Inspect source without executing it."
         ),
     )
-    inspection.add_argument(
-        "repository",
-        nargs="?",
-        metavar="PATH_OR_REMOTE",
-        help=(
-            "repository directory or Git URL (default: current repository); "
-            "relative paths use the Git root, or the current directory outside Git"
-        ),
-    )
+    _configure_inspect_parser(inspection)
     move = commands.add_parser(
         "mv",
         help="rename and stage a package or host",
@@ -4712,7 +4910,14 @@ def _dispatch_workspace_command(
 def main() -> None:
     """Dispatch repository and home commands."""
     cli = parser()
-    options = cli.parse_args()
+    arguments = sys.argv[1:]
+    if arguments[:2] == ["repo", "inspect"] and arguments[2:]:
+        target, *remaining = arguments[2:]
+        if target == "--" and len(remaining) == 1:
+            arguments = [*arguments[:2], "--repository", remaining[0]]
+        elif target != "diff" and not target.startswith("-"):
+            arguments = [*arguments[:2], "--repository", *arguments[2:]]
+    options = cli.parse_args(arguments)
     _validate_resource_arguments(cli, options)
     try:
         _dispatch_workspace_command(options, cli)

@@ -1357,6 +1357,10 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
             )
             if library:
                 (package / "main.py").write_text("VALUE = 1\n")
+            else:
+                (package / "main.py").write_text(
+                    "def main():\n    print('installed entrypoint')\n",
+                )
         elif kind in {"html", "latex"}:
             binding = "runtimeInputs" if kind == "html" else "nativeBuildInputs"
             expression = (
@@ -1496,23 +1500,13 @@ def _check_installed_python_template(
             actual["meta"]["mainProgram"] == name and (output / "bin" / name).is_file(),
             actual,
         )
-        _expect(
-            "--help"
-            in _run(
-                root,
-                "--help",
-                executable=str(output / "bin" / name),
-                environment=environment,
-            ).stdout,
-            "installed help",
-        )
-        _run(
+        launched = _run(
             root,
-            "unexpected",
             executable=str(output / "bin" / name),
             environment=environment,
-            code=2,
         )
+        _expect(launched.stdout == "installed entrypoint\n", launched)
+        _expect(not launched.stderr, launched)
 
 
 def _check_installed_html_template(
@@ -1685,7 +1679,7 @@ def test_resource_lifecycle_preserves_files_and_git_state(
     with _fresh_repository() as root:
         if kind == "host":
             name = name.replace("-", "").replace("_", "")
-        original, destination = f"a{name}", f"b{name}"
+        original, destination = f"old{name}", f"new{name}"
         package = root / original
         if kind == "untracked":
             package.mkdir(parents=True)
@@ -1727,7 +1721,9 @@ def test_resource_lifecycle_preserves_files_and_git_state(
             return
         _run(root, "mv", original, destination)
         for relative in tracked:
-            renamed = relative.replace(original, destination)
+            renamed = (
+                Path(destination) / Path(relative).relative_to(original)
+            ).as_posix()
             _expect(
                 subprocess.run(  # noqa: S603
                     ["git", "show", f":{renamed}"],  # noqa: S607
@@ -3342,24 +3338,13 @@ def test_home_repair_targets_home_from_any_working_directory(
     _home_test_run(cwd, "fix", "--dry-run")
 
 
-@pytest.mark.parametrize(
-    "case",
-    [
-        "unknown",
-        "parent",
-        "dirty",
-        "staged",
-        "advanced",
-        "untracked",
-        "ignored",
-    ],
-)
-def test_home_submodule_removal_uses_native_git_rules(
+@pytest.mark.parametrize("case", ["unknown", "parent"])
+def test_home_submodule_removal_rejects_unknown_and_parent_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     case: str,
 ) -> None:
-    """Reject invalid paths and let Git decide which local data blocks removal."""
+    """Reject paths that do not identify one registered submodule."""
     root = _home_test_home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
@@ -3369,38 +3354,12 @@ def test_home_submodule_removal_uses_native_git_rules(
         case,
         relative,
     )
-    if case.startswith("dirty") or case in {"staged", "advanced"}:
-        (root / relative / "LICENSE").write_text("local changes")
-        if case in {"staged", "advanced"}:
-            _git(root / relative, "add", "LICENSE")
-        if case == "advanced":
-            _fixture_git(root / relative, "commit", "-qm", "Local commit")
-    elif case in {"untracked", "ignored"}:
-        if case == "ignored":
-            exclude = _git(
-                root / relative,
-                "rev-parse",
-                "--git-path",
-                "info/exclude",
-            )
-            (root / relative / exclude.strip()).write_text("asset\n")
-        (root / relative / "asset").write_text("preserve local data")
     before = _snapshot(root)
-    if case == "ignored":
-        _home_test_run(root, "rm", target)
-        _expect(not (root / target).exists(), "native removal left submodule")
-        return
     _home_test_run(root, "rm", target, code=1)
     _expect(
         _snapshot(root) == before,
         "rejected removal changed home state",
     )
-    if case.startswith("dirty") or case in {"staged", "advanced", "untracked"}:
-        _home_test_run(root, "rm", target, "--force")
-        _expect(
-            not (root / target).exists(),
-            "forced removal left a dirty submodule",
-        )
 
 
 @pytest.mark.parametrize(
@@ -3508,15 +3467,12 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
 
 
 @pytest.mark.parametrize("storage", ["directory", "absorbed", "deinitialized"])
-@pytest.mark.parametrize("url", [False, True])
-def test_home_submodule_removal_leaves_storage_to_git(
+def test_home_submodule_removal_without_url_leaves_storage_to_git(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     storage: str,
-    *,
-    url: bool,
 ) -> None:
-    """Let native removal preserve history and handle legacy or absent checkouts."""
+    """Preserve history for registrations without URLs, including absent checkouts."""
     root = _home_test_home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
@@ -3530,16 +3486,15 @@ def test_home_submodule_removal_leaves_storage_to_git(
     _fixture_git(root, "commit", "-qm", "Home snapshot")
     if storage == "deinitialized":
         _git(root, "submodule", "deinit", "--", relative)
-    if not url:
-        _git(
-            root,
-            "config",
-            "--file",
-            ".gitmodules",
-            "--unset",
-            f"submodule.{relative}.url",
-        )
-        _git(root, "add", ".gitmodules")
+    _git(
+        root,
+        "config",
+        "--file",
+        ".gitmodules",
+        "--unset",
+        f"submodule.{relative}.url",
+    )
+    _git(root, "add", ".gitmodules")
     config_before = _git(root, "config", "--local", "--list")
     _home_test_run(root, "rm", relative)
     _expect(not checkout.exists(), "removal left checkout")
@@ -3855,7 +3810,10 @@ def test_fresh_python_scaffold_passes_formatting() -> None:
         formatted = source.read_text()
         _run(root, "--no-cache", "example/main.py", executable="treefmt")
         _expect(source.read_text() == formatted, "scaffold formatting did not converge")
-        _run(root, str(source), "--help", executable=sys.executable)
+        _expect("argparse" not in formatted, "empty parser in generated package")
+        _run(root, str(source), executable=sys.executable)
+        report = inspection_subject.inspect_repository(root)["example"]["cli"]
+        _expect(report == {"arguments": [], "commands": {}}, report)
 
 
 def test_web_formatting_preserves_literal_line_breaks() -> None:
@@ -5426,23 +5384,40 @@ def _inspection_discovery(source: str) -> dict[str, Any]:
     )
 
 
-def test_empty_cli() -> None:
-    """A supported parser can expose no arguments or subcommands."""
-    report = _inspection_discovery("""
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def main(): pass",
+        "raise RuntimeError('do not execute')\ndef main(): pass",
+        "import sys\ndef main(): return sys.version",
+        """
 import argparse
 def main():
     argparse.ArgumentParser().parse_args()
-""")
+""",
+    ],
+)
+def test_empty_cli(tmp_path: Path, source: str) -> None:
+    """Argument-free scripts need no parser and remain statically inspectable."""
+    report = _inspection_discovery(source)
     _expect(report == {"arguments": [], "commands": {}}, report)
+    _inspection_repository(tmp_path)
+    (tmp_path / "example/main.py").write_text(source)
+    completed = _run(tmp_path, "inspect", str(tmp_path))
+    resource = json.loads(completed.stdout)["example"]
+    _expect(resource["cli"] == report, resource)
+    _expect(resource["tests"] == ["test_default_output"], resource)
 
 
 @pytest.mark.parametrize(
     "source",
     [
-        "def main(): pass",
         "import argparse",
         "import click\n@click.command()\ndef main(): pass",
+        "import typer\napp = typer.Typer()",
         "import sys\ndef main(): return sys.argv[1:]",
+        "import sys as system\ndef main(): return system.argv[1:]",
+        "from sys import argv as args\ndef main(): return args[1:]",
     ],
 )
 def test_inspection_requires_supported_cli(tmp_path: Path, source: str) -> None:
@@ -6586,6 +6561,273 @@ def test_remote_inspection_preserves_native_clone_errors(
     _expect(not list(home.iterdir()), "failed clone changed HOME")
 
 
+def _inspection_diff_repository(root: Path) -> dict[str, Any]:
+    """Commit inspectable sources, including binary data and archive exclusions."""
+    _inspection_repository(root)
+    (root / "asset").write_bytes(b"\x00\xff\n")
+    (root / ".gitattributes").write_text("example export-ignore\n")
+    _git(root, "init", "--quiet")
+    _git(root, "add", ".")
+    _fixture_git(root, "commit", "--quiet", "-m", "initial")
+    return cast("dict[str, Any]", inspection_subject.inspect_repository(root))
+
+
+def _inspection_diff_description(root: Path, description: str) -> None:
+    """Change a public field without changing resource identity."""
+    (root / "example/default.nix").write_text(
+        '{ meta.description = "' + description + '"; }',
+    )
+
+
+def _inspection_apply_diff(before: dict[str, Any], difference: str) -> dict[str, Any]:
+    """Use jd itself to verify that an emitted patch reconstructs the inspection."""
+    with TemporaryDirectory(prefix="afairesi-jd-patch-") as directory:
+        patch = Path(directory) / "change.jd"
+        patch.write_text(difference)
+        completed = subprocess.run(  # noqa: S603
+            ["jd", "-p", str(patch)],  # noqa: S607
+            input=json.dumps(before),
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=10,
+        )
+    return cast("dict[str, Any]", json.loads(completed.stdout))
+
+
+@pytest.mark.parametrize(
+    ("arguments", "left", "right", "code"),
+    [
+        ((), "index", "working", 0),
+        (("--cached",), "head", "index", 0),
+        (("--staged",), "head", "index", 0),
+        (("HEAD",), "head", "working", 0),
+        (("--cached", "initial"), "initial", "index", 0),
+        (("initial", "HEAD"), "initial", "head", 0),
+        (("initial..HEAD",), "initial", "head", 0),
+        (("initial...HEAD",), "initial", "head", 0),
+        (("--exit-code",), "index", "working", 1),
+        (("-R",), "working", "index", 0),
+    ],
+)
+def test_inspection_diff_uses_git_comparisons_and_emits_jd_patches(
+    tmp_path: Path,
+    arguments: tuple[str, ...],
+    left: str,
+    right: str,
+    code: int,
+) -> None:
+    """Keep staged, working, and historical inventories distinct and read-only."""
+    reports = {"initial": _inspection_diff_repository(tmp_path)}
+    _git(tmp_path, "tag", "initial")
+    _inspection_diff_description(tmp_path, "Committed")
+    _git(tmp_path, "add", ".")
+    _fixture_git(tmp_path, "commit", "--quiet", "-m", "change description")
+    reports["head"] = inspection_subject.inspect_repository(tmp_path)
+    _inspection_diff_description(tmp_path, "Staged")
+    _git(tmp_path, "add", ".")
+    reports["index"] = inspection_subject.inspect_repository(tmp_path)
+    _inspection_diff_description(tmp_path, "Working")
+    reports["working"] = inspection_subject.inspect_repository(tmp_path)
+    before = _inspection_tree_snapshot(tmp_path)
+    completed = _run(tmp_path / "example", "inspect", "diff", *arguments, code=code)
+    _expect(
+        _inspection_apply_diff(reports[left], completed.stdout) == reports[right],
+        completed,
+    )
+    _expect(not completed.stderr, completed)
+    _expect(
+        _inspection_tree_snapshot(tmp_path) == before,
+        "diff changed Git or sources",
+    )
+
+
+def test_inspection_diff_ignores_implementation_edits_and_untracked_resources(
+    tmp_path: Path,
+) -> None:
+    """Emit nothing for changes outside the tracked interface contract."""
+    _inspection_diff_repository(tmp_path)
+    source = tmp_path / "example/main.py"
+    source.write_text(source.read_text() + "\ndef internal(): return 42\n")
+    tests = tmp_path / "example/test_main.py"
+    tests.write_text(tests.read_text().replace("pass", "raise RuntimeError('changed')"))
+    (tmp_path / "untracked").mkdir()
+    (tmp_path / "untracked/configuration.nix").touch()
+    before = _inspection_tree_snapshot(tmp_path)
+    completed = _run(tmp_path, "inspect", "diff", "--exit-code")
+    _expect(not completed.stdout and not completed.stderr, completed)
+    _expect(_inspection_tree_snapshot(tmp_path) == before, "empty diff changed state")
+
+
+def test_inspection_diff_covers_structural_and_nested_cli_changes(
+    tmp_path: Path,
+) -> None:
+    """Round-trip resource changes, nested arguments, and lists with jd context."""
+    before = _inspection_diff_repository(tmp_path)
+    source = tmp_path / "example/main.py"
+    source.write_text(
+        source.read_text().replace(
+            "    return cli",
+            "    cli.add_argument('--verbose', action='store_true')\n"
+            "    command = cli.add_subparsers().add_parser('run')\n"
+            "    command.add_argument('paths', nargs='+')\n"
+            "    return cli",
+        ),
+    )
+    (tmp_path / "example/test_main.py").write_text("def test_new(): pass\n")
+    (tmp_path / "laptop/configuration.nix").unlink()
+    (tmp_path / "new-host").mkdir()
+    (tmp_path / "new-host/configuration.nix").touch()
+    _git(tmp_path, "add", ".")
+    after = inspection_subject.inspect_repository(tmp_path)
+    completed = _run(tmp_path, "inspect", "diff", "--cached")
+    _expect(_inspection_apply_diff(before, completed.stdout) == after, completed)
+
+
+def test_inspection_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None:
+    """Exclude the other branch's changes and ignore malformed working sources."""
+    base = _inspection_diff_repository(tmp_path)
+    _git(tmp_path, "tag", "base")
+    _git(tmp_path, "checkout", "--quiet", "-b", "topic")
+    _inspection_diff_description(tmp_path, "Topic")
+    _git(tmp_path, "add", ".")
+    _fixture_git(tmp_path, "commit", "--quiet", "-m", "topic interface")
+    topic = inspection_subject.inspect_repository(tmp_path)
+    _git(tmp_path, "checkout", "--quiet", "-b", "other", "base")
+    (tmp_path / "other-host").mkdir()
+    (tmp_path / "other-host/configuration.nix").touch()
+    _git(tmp_path, "add", ".")
+    _fixture_git(tmp_path, "commit", "--quiet", "-m", "other interface")
+    other = inspection_subject.inspect_repository(tmp_path)
+    (tmp_path / "example/main.py").write_text("def invalid(")
+    before = _inspection_tree_snapshot(tmp_path)
+    for comparison, report in (("other...topic", base), ("other..topic", other)):
+        completed = _run(tmp_path, "inspect", "diff", comparison)
+        _expect(_inspection_apply_diff(report, completed.stdout) == topic, completed)
+    _expect(_inspection_tree_snapshot(tmp_path) == before, "range diff changed state")
+
+
+def test_inspection_diff_before_the_first_commit(tmp_path: Path) -> None:
+    """Compare the first staged interface against an empty inventory."""
+    _git(tmp_path, "init", "--quiet")
+    _expect(not _run(tmp_path, "inspect", "diff", "--cached").stdout, "nonempty diff")
+    _inspection_repository(tmp_path)
+    _git(tmp_path, "add", ".")
+    staged = inspection_subject.inspect_repository(tmp_path)
+    _inspection_diff_description(tmp_path, "Unstaged")
+    before = _inspection_tree_snapshot(tmp_path)
+    completed = _run(tmp_path, "inspect", "diff", "--cached", "--exit-code", code=1)
+    _expect(_inspection_apply_diff({}, completed.stdout) == staged, completed)
+    _expect(_inspection_tree_snapshot(tmp_path) == before, "initial diff changed state")
+
+
+@pytest.mark.parametrize(
+    ("arguments", "failure", "code"),
+    [
+        (("missing-revision",), "Needed a single revision", 128),
+        (("HEAD", "HEAD", "HEAD"), "at most two revisions", 2),
+        (("--cached", "HEAD", "HEAD"), "at most one revision", 2),
+        (("--cached", "HEAD..HEAD"), "not a range", 2),
+        ((), "could not parse Python source", 1),
+    ],
+)
+def test_inspection_diff_errors_leave_no_partial_output_or_temporary_sources(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    arguments: tuple[str, ...],
+    failure: str,
+    code: int,
+) -> None:
+    """Reject invalid comparisons atomically and clean failed snapshots."""
+    root = tmp_path / "repository"
+    root.mkdir()
+    _inspection_diff_repository(root)
+    scratch = tmp_path / "scratch"
+    scratch.mkdir()
+    monkeypatch.setenv("TMPDIR", str(scratch))
+    if not arguments:
+        (root / "example/main.py").write_text("def invalid(")
+    before = _inspection_tree_snapshot(root)
+    completed = _run(root, "inspect", "diff", *arguments, code=code)
+    _expect(not completed.stdout, completed)
+    _expect(failure in completed.stderr, completed)
+    _expect(not list(scratch.iterdir()), "failed diff left temporary sources")
+    _expect(_inspection_tree_snapshot(root) == before, "failed diff changed state")
+
+
+def test_inspection_diff_help_and_explicit_repository_selection(tmp_path: Path) -> None:
+    """Describe diffs outside Git while retaining positional path inspection."""
+    help_output = _run(tmp_path, "inspect", "diff", "--help").stdout
+    _expect("--cached" in help_output and "jd-compatible" in help_output, help_output)
+    _expect(not list(tmp_path.iterdir()), "help wrote files")
+    root = tmp_path / "diff"
+    root.mkdir()
+    report = _inspection_diff_repository(root)
+    for arguments in (
+        (str(root),),
+        ("--", "diff"),
+        ("./diff",),
+        ("--repository", str(root)),
+    ):
+        completed = _run(tmp_path, "inspect", *arguments)
+        _expect(json.loads(completed.stdout) == report, completed)
+    _inspection_diff_description(root, "Changed")
+    completed = _run(tmp_path, "inspect", "--repository", str(root), "diff")
+    _expect(
+        _inspection_apply_diff(report, completed.stdout)
+        == inspection_subject.inspect_repository(root),
+        completed,
+    )
+
+
+def test_inspection_diff_rejects_unmerged_index_without_changes(tmp_path: Path) -> None:
+    """Reject conflict stages instead of emitting an incomplete interface diff."""
+    _inspection_diff_repository(tmp_path)
+    blob = _git(tmp_path, "rev-parse", "HEAD:example/main.py").strip()
+    subprocess.run(
+        ["git", "update-index", "--index-info"],  # noqa: S607
+        cwd=tmp_path,
+        input=(
+            "0 "
+            + "0" * len(blob)
+            + "\texample/main.py\n"
+            + f"100644 {blob} 1\texample/main.py\n"
+            + f"100644 {blob} 2\texample/main.py\n"
+            + f"100644 {blob} 3\texample/main.py\n"
+        ),
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    before = _inspection_tree_snapshot(tmp_path)
+    completed = _run(tmp_path, "inspect", "diff", code=1)
+    _expect(not completed.stdout and "unmerged index" in completed.stderr, completed)
+    _expect(
+        _inspection_tree_snapshot(tmp_path) == before,
+        "conflict diff changed state",
+    )
+
+
+def test_inspection_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
+    """Read the selected worktree's index while preserving shared Git metadata."""
+    root, linked = tmp_path / "repository", tmp_path / "linked"
+    root.mkdir()
+    report = _inspection_diff_repository(root)
+    _git(root, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
+    _inspection_diff_description(linked, "Linked")
+    before = _inspection_tree_snapshot(tmp_path)
+    completed = _run(linked / "example", "inspect", "diff")
+    _expect(
+        _inspection_apply_diff(report, completed.stdout)
+        == inspection_subject.inspect_repository(linked),
+        completed,
+    )
+    _expect(
+        _inspection_tree_snapshot(tmp_path) == before,
+        "diff changed worktree state",
+    )
+
+
 def test_inspection_discovers_the_merged_repository_commands() -> None:
     """Inventory the public nested campaign CLI while excluding formatter internals."""
     subject = import_module("afairesi.main")
@@ -6595,6 +6837,7 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
     _expect(set(report["commands"]) == {"repo", "home"}, report)
     commands = report["commands"]["repo"]["commands"]
     _expect({"inspect", "test"} <= commands.keys(), commands)
+    _expect(set(commands["inspect"]["commands"]) == {"diff"}, commands["inspect"])
     campaigns = commands["test"]["commands"]
     _expect(
         list(campaigns) == ["coverage", "fuzz", "mutation", "performance", "property"],

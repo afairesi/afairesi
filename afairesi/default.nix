@@ -63,6 +63,7 @@ in
     cosmicRay
     inputs.self.packages.${pkgs.stdenv.system}.nix_syntax
     pkgs.git
+    pkgs.jd-diff-patch
     pkgs.nix
     pkgs.python3.pkgs.libcst
   ];

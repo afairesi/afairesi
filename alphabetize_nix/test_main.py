@@ -33,9 +33,10 @@ def test_deeply_nested_bindings_do_not_repeat_rendering(
 
 
 def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
-    """Report an invalid input while still formatting subsequent selected files."""
+    """Preserve invalid input while reporting it and formatting subsequent files."""
     invalid = tmp_path / "invalid.nix"
-    invalid.write_text("{ broken = ; }")
+    source = "{ broken = ; }"
+    invalid.write_text(source)
     valid = tmp_path / "valid.nix"
     valid.write_text("{ z = 1; a = 2; }")
     result = subprocess.run(  # noqa: S603
@@ -47,6 +48,8 @@ def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
     )
     if result.returncode != 1 or str(invalid) not in result.stderr:
         raise AssertionError(result)
+    if invalid.read_text() != source:
+        raise AssertionError(invalid.read_text())
     if valid.read_text() != "{ a = 2; z = 1; }":
         raise AssertionError(valid.read_text())
 
@@ -123,21 +126,6 @@ def test_cli_formats_and_converges(tmp_path: Path, source: str, expected: str) -
             raise AssertionError(result)
         if path.read_text(encoding="utf-8") != expected:
             raise AssertionError(path.read_text(encoding="utf-8"))
-
-
-def test_cli_rejects_invalid_nix_without_overwriting_it(tmp_path: Path) -> None:
-    """A syntax error leaves the user's input intact and returns failure."""
-    path = tmp_path / "broken.nix"
-    source = "{ invalid = ; }"
-    path.write_text(source, encoding="utf-8")
-    result = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    if not result.returncode or not result.stderr or path.read_text() != source:
-        raise AssertionError(result)
 
 
 @pytest.mark.parametrize(
