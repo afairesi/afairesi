@@ -39,21 +39,15 @@ def process_file(path: Path, transform: Callable[[bytes], bytes]) -> None:
         path.write_bytes(updated_contents)
 
 
-def _try_process_file(path: Path, transform: Callable[[bytes], bytes]) -> bool:
-    """Report a file error and allow the remaining selected files to be processed."""
-    try:
-        process_file(path, transform)
-    except OSError as error:
-        sys.stderr.write(str(error) + "\n")
-        return False
-    return True
-
-
 def process_files(paths: Iterable[Path], transform: Callable[[bytes], bytes]) -> None:
     """Apply a byte transformation to selected files, reporting every file error."""
     failed = False
     for path in paths:
-        failed |= not _try_process_file(path, transform)
+        try:
+            process_file(path, transform)
+        except OSError as error:
+            sys.stderr.write(str(error) + "\n")
+            failed = True
     if failed:
         raise SystemExit(1)
 

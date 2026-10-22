@@ -145,7 +145,7 @@ in
         ))
         (lib.mapAttrs' (
           host: _:
-          lib.nameValuePair "${host}VmWithDisko" (
+          lib.nameValuePair "${host}Vm" (
             import ./host-check.nix {
               inputs = repositoryInputs;
               pkgs = packageSets.${system};
@@ -169,7 +169,7 @@ in
         // lib.mapAttrs' (testName: test: lib.nameValuePair "pkgs-${name}-${testName}" test) (
           supported system (package.passthru.tests or { })
         )
-      ) self.packages.${system}
+      ) (builtins.intersectAttrs (lib.genAttrs packageNames (_: null)) self.packages.${system})
     )
   );
   apps = lib.genAttrs systems (

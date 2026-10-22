@@ -355,6 +355,113 @@ def _treefmt_fixture(root: Path) -> None:
     )
 
 
+def test_cli_preserves_nondefaults_and_shared_host_overrides(tmp_path: Path) -> None:
+    """Remove a file's value only when every consuming host agrees on its default."""
+    root = tmp_path / "repository"
+    _treefmt_fixture(root)
+    flake = root / "flake.nix"
+    flake.write_text(
+        flake.read_text().replace(
+            "outputs = _: {};",
+            """outputs = { self, nixpkgs, ... }: {
+              nixosConfigurations = {
+                enabled.options.flag = {
+                  default = false;
+                  definitionsWithLocations = [{ file = "${self}/enabled.nix"; }];
+                };
+                disabled.options.flag = {
+                  default = false;
+                  definitionsWithLocations = [{ file = ./disabled.nix; }];
+                };
+                first.options.flag = {
+                  default = false;
+                  definitionsWithLocations = [{ file = "${self}/shared.nix"; }];
+                };
+                second.options.flag = {
+                  default = true;
+                  definitionsWithLocations = [{ file = "${self}/shared.nix"; }];
+                };
+                external.options.flag = {
+                  default = false;
+                  definitionsWithLocations = [{ file = "${nixpkgs}/unused.nix"; }];
+                };
+              };
+            };""",
+        ),
+    )
+    for name, value in (
+        ("enabled", "true"),
+        ("disabled", "false"),
+        ("shared", "false"),
+        ("unused", "false"),
+    ):
+        (root / f"{name}.nix").write_text(f"{{ flag = {value}; }}")
+    for _ in range(2):
+        subprocess.run(  # noqa: S603
+            [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
+            env=_nix_environment(tmp_path),
+            capture_output=True,
+            check=True,
+            timeout=30,
+        )
+        if (root / "enabled.nix").read_text() != "{ flag = true; }":
+            msg = "non-default value removed"
+            raise AssertionError(msg)
+        if (root / "shared.nix").read_text() != "{ flag = false; }":
+            msg = "override needed by another host removed"
+            raise AssertionError(msg)
+        if (root / "unused.nix").read_text() != "{ flag = false; }":
+            msg = "another input's source location matched a local file"
+            raise AssertionError(msg)
+        if "flag" in (root / "disabled.nix").read_text():
+            msg = "matching default retained"
+            raise AssertionError(msg)
+
+
+def test_cli_preserves_values_merged_from_multiple_modules(tmp_path: Path) -> None:
+    """An explicit list matching the default still contributes to a merged option."""
+    root = tmp_path / "repository"
+    _treefmt_fixture(root)
+    flake = root / "flake.nix"
+    flake.write_text(
+        flake.read_text().replace(
+            "outputs = _: {};",
+            """outputs = { self, ... }: {
+              nixosConfigurations.demo.options.values = {
+                default = [1];
+                definitionsWithLocations = [
+                  { file = "${self}/first.nix"; }
+                  { file = "${self}/second.nix"; }
+                ];
+              };
+            };""",
+        ),
+    )
+    (root / "first.nix").write_text("{ values = [1]; }")
+    (root / "second.nix").write_text("{ values = [2]; }")
+    environment = _nix_environment(tmp_path)
+    subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
+        env=environment,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    expression = (
+        f"((import {root / 'first.nix'}).values or []) ++ "
+        f"((import {root / 'second.nix'}).values or [])"
+    )
+    result = subprocess.run(  # noqa: S603
+        ["nix", "eval", "--impure", "--json", "--expr", expression],  # noqa: S607
+        env=environment,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    if json.loads(result.stdout) != [1, 2]:
+        raise AssertionError(result.stdout)
+
+
 @pytest.mark.parametrize(
     ("assignments", "retained"),
     [

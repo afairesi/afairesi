@@ -45,26 +45,25 @@ def _replace_children(document: nix_syntax.Document, node: Node) -> str:
 
 
 def _binding(document: nix_syntax.Document, node: Node) -> Binding:
-    rendered = _replace_children(document, node)
-    if node.type != "binding":
-        return Binding(None, None, rendered)
     attrpath = node.child_by_field_name("attrpath")
     expression = node.child_by_field_name("expression")
-    if attrpath is None or expression is None:
-        return Binding(None, None, rendered)
-    path = nix_syntax.static_attrpath(document, attrpath)
-    value = render_node(document, expression)
+    path = None if attrpath is None else nix_syntax.static_attrpath(document, attrpath)
+    if path is None or expression is None:
+        return Binding(None, None, _replace_children(document, node))
     nested = _nested_bindings(document, expression)
-    return Binding(path, value, rendered, nested)
+    value = (
+        render_node(document, expression)
+        if nested is None
+        else _render_set(_normalize(list(nested)))
+    )
+    return Binding(path, value, "", nested)
 
 
 def _nested_bindings(
     document: nix_syntax.Document,
     expression: Node,
 ) -> tuple[Binding, ...] | None:
-    if expression.type != "attrset_expression" or document.text(
-        expression,
-    ).lstrip().startswith("rec"):
+    if expression.type != "attrset_expression":
         return None
     binding_set = next(
         (child for child in expression.named_children if child.type == "binding_set"),
@@ -72,15 +71,25 @@ def _nested_bindings(
     )
     if binding_set is None:
         return ()
+    for child in binding_set.named_children:
+        if child.type == "binding":
+            attrpath = child.child_by_field_name("attrpath")
+            if (
+                attrpath is None
+                or nix_syntax.static_attrpath(document, attrpath) is None
+            ):
+                return None
+        elif (
+            child.type != "inherit"
+            or (attrs := child.child_by_field_name("attrs")) is None
+            or not all(attr.type == "identifier" for attr in attrs.named_children)
+            or any(node.type == "comment" for node in nix_syntax.walk(child))
+        ):
+            return None
     expanded: list[Binding] = []
     for child in binding_set.named_children:
         attrs = child.child_by_field_name("attrs")
-        if (
-            child.type == "inherit"
-            and attrs is not None
-            and all(attr.type == "identifier" for attr in attrs.named_children)
-            and not any(node.type == "comment" for node in nix_syntax.walk(child))
-        ):
+        if child.type == "inherit" and attrs is not None:
             expanded.extend(
                 Binding((document.text(attr),), document.text(attr), "")
                 for attr in attrs.named_children
@@ -101,7 +110,7 @@ def _normalize(bindings: list[Binding]) -> list[Binding]:
     opaque = [binding for binding in bindings if not binding.path]
     groups: dict[str, list[Binding]] = {}
     for binding in static:
-        if not (binding.path is not None):
+        if binding.path is None:
             raise AssertionError
         groups.setdefault(binding.path[0], []).append(binding)
     result = opaque
@@ -124,7 +133,7 @@ def _normalize(bindings: list[Binding]) -> list[Binding]:
             continue
         nested: list[Binding] = []
         for binding in group:
-            if not (binding.path is not None):
+            if binding.path is None:
                 raise AssertionError
             if len(binding.path) > 1:
                 nested.append(
@@ -230,7 +239,10 @@ def main() -> None:
         metavar="FILE",
         help="Nix files to rewrite in place",
     )
-    if not all(format_file(Path(argument)) for argument in parser.parse_args().files):
+    succeeded = True
+    for argument in parser.parse_args().files:
+        succeeded &= format_file(Path(argument))
+    if not succeeded:
         raise SystemExit(1)
 
 

@@ -56,19 +56,7 @@ PRM_NAME = "prm"
 TMP_NAME = "tmp"
 MINIMUM_REMOTE_COMPONENTS = 3
 RESOURCE_PATH_COMPONENTS = 1
-SOURCE_SUFFIXES = {
-    ".nix",
-    ".py",
-    ".html",
-    ".js",
-    ".mjs",
-    ".css",
-    ".tex",
-    ".sh",
-    ".ts",
-    ".tsx",
-    ".jsx",
-}
+PYTEST_NO_TESTS_COLLECTED = 5
 
 
 class CommandError(RuntimeError):
@@ -294,13 +282,12 @@ def _package_kind(name: str, markers: set[str]) -> str:
 
 def detect_packages(root: Path) -> list[Package]:
     """Detect supported packages from unambiguous marker files."""
-    packages_root = root
-    if not packages_root.is_dir():
+    if not root.is_dir():
         return []
     result: list[Package] = []
     for package_root in sorted(
         path
-        for path in packages_root.iterdir()
+        for path in root.iterdir()
         if path.is_dir()
         and not path.is_symlink()
         and path.name not in {PRM_NAME, TMP_NAME}
@@ -387,9 +374,8 @@ def required_package_files(package: Package) -> set[Path]:
 def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
     """Compute the repository whitelist represented by .gitignore."""
     allowed = {Path(item) for item in ROOT_FILES if (root / item).exists()}
-    hosts = root
-    if hosts.is_dir():
-        for host in hosts.iterdir():
+    if root.is_dir():
+        for host in root.iterdir():
             if host.is_dir() and (host / "configuration.nix").exists():
                 validate_host_name(host.name)
                 allowed.add(Path() / host.name / "configuration.nix")
@@ -607,7 +593,7 @@ def python_test_definitions(
             (owner, definition)
             for definition in definitions
             if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and definition.name.startswith("test_")
+            and definition.name.startswith("test")
         )
     return result
 
@@ -821,19 +807,6 @@ def source_package_description(source: str) -> str | None:
     return None
 
 
-def _meta_description(source: str) -> str | None:
-    """Return a literal meta.description through the Nix syntax tree."""
-    document, expression = _metadata_expression(source, "meta", ("description",))
-    return (
-        None
-        if expression is None
-        else cast(
-            "str | None",
-            nix_syntax.string_value(document, expression),
-        )
-    )
-
-
 def _attrset_expression(
     document: nix_syntax.Document,
     expression: Node,
@@ -856,30 +829,26 @@ def _attrset_expression(
     ]
 
 
-def _metadata_expression(
-    source: str,
-    namespace: str,
-    requested_path: tuple[str, ...],
-) -> tuple[nix_syntax.Document, Node | None]:
-    """Find an unambiguous metadata expression in dotted or nested form."""
+def _meta_description(source: str) -> str | None:
+    """Read the returned package's description without searching dependencies."""
     document = nix_syntax.parse(source)
-    matches = []
-    for binding in (
-        node for node in nix_syntax.walk(document.root) if node.type == "binding"
-    ):
-        attrpath = binding.child_by_field_name("attrpath")
-        expression = binding.child_by_field_name("expression")
-        if attrpath is None or expression is None:
-            continue
-        binding_path = nix_syntax.static_attrpath(document, attrpath)
-        if binding_path == (namespace, *requested_path):
-            matches.append(expression)
-        elif binding_path == (namespace,):
-            matches.extend(
-                _attrset_expression(document, expression, requested_path),
-            )
-    unique = {node.start_byte: node for node in matches}
-    return document, next(iter(unique.values())) if len(unique) == 1 else None
+    _scope, container = _package_body(document)
+    while container.type == "apply_expression":
+        argument = container.child_by_field_name("argument")
+        if argument is not None and argument.type in {
+            "attrset_expression",
+            "rec_attrset_expression",
+        }:
+            container = argument
+            break
+        function = container.child_by_field_name("function")
+        if function is None:
+            return None
+        container = function
+    matches = _attrset_expression(document, container, ("meta", "description"))
+    for metadata in _attrset_expression(document, container, ("meta",)):
+        matches.extend(_attrset_expression(document, metadata, ("description",)))
+    return nix_syntax.string_value(document, matches[0]) if len(matches) == 1 else None
 
 
 def _template_binding(document: nix_syntax.Document, name: str) -> Node | None:
@@ -1559,16 +1528,12 @@ def validate_flake_source(root: Path) -> list[Package]:
         formatted_issues = "\n".join(f"  - {issue}" for issue in issues)
         msg = f"repository layout validation failed:\n{formatted_issues}"
         raise CommandError(msg)
-    _validate_nix_sources(packages)
-    return packages
-
-
-def _validate_nix_sources(packages: list[Package]) -> None:
-    """Parse package definitions after validating repository structure."""
     for package in packages:
-        default = package.root / "default.nix"
-        if default.is_file():
-            nix_syntax.parse(default.read_bytes(), str(default))
+        if package.kind == "nix":
+            default = package.root / "default.nix"
+            if default.is_file():
+                nix_syntax.parse(default.read_bytes(), str(default))
+    return packages
 
 
 def _source_package_issues(root: Path, package: Package) -> list[str]:
@@ -2608,7 +2573,6 @@ def _prepare_package_tests(
         + (
             "    if code == pytest.ExitCode.NO_TESTS_COLLECTED:\n"
             "        print('No fuzz tests selected; skipping.')\n"
-            "        code = 0\n"
             if plugins
             else ""
         )
@@ -2796,7 +2760,7 @@ def _run_test_package(
     command: str,
     timeout: float | None,
     selection: TestSelection,
-) -> bool:
+) -> bool | None:
     """Run one isolated package and retain its logs and reports."""
     root = _test_target_root(package)
     tmp = root / "tmp"
@@ -2835,6 +2799,11 @@ def _run_test_package(
     log = workspace / "tests.log"
     try:
         _run_test_command(arguments, workspace, log, timeout=timeout)
+    except subprocess.CalledProcessError as error:
+        if command != "fuzz" or error.returncode != PYTEST_NO_TESTS_COLLECTED:
+            raise
+        sys.stdout.write(log.read_text(encoding="utf-8"))
+        return None
     except (KeyboardInterrupt, subprocess.TimeoutExpired):
         if log.exists():
             sys.stdout.write(log.read_text(encoding="utf-8"))
@@ -2885,10 +2854,9 @@ def _run_test_repository(
         sys.stdout.write(f"Running {package.name}...\n")
         sys.stdout.flush()
         try:
+            result = _run_test_package(package, command, timeout, selection)
             outcomes[package.name] = (
-                "passed"
-                if _run_test_package(package, command, timeout, selection)
-                else "failed"
+                "skipped" if result is None else "passed" if result else "failed"
             )
         except (
             CommandError,
@@ -2933,11 +2901,14 @@ def _dispatch_test_runner(
     runner = (
         _run_test_repository if (target / "flake.nix").is_file() else _run_test_package
     )
-    return runner(
-        target,
-        options.test_command,
-        options.timeout,
-        selection,
+    return (
+        runner(
+            target,
+            options.test_command,
+            options.timeout,
+            selection,
+        )
+        is not False
     )
 
 
@@ -3170,7 +3141,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     _configure_test_timeout(performance)
     property_tests = commands.add_parser(
         "property",
-        help="run test suites, including property-based tests",
+        help="run complete test suites, including Hypothesis tests",
         description=(
             "Run test suites, including property-based tests, "
             "in isolated package copies. When targeting a flake, skip packages "
@@ -3350,7 +3321,8 @@ class ArgumentDiscovery:
             return
         if self._collect_runtime_loop(node, scope, control):
             return
-        control = self._runtime_control(node, control)
+        if control is None and isinstance(node, ast.Match):
+            control = node.subject
         if isinstance(node, ast.ClassDef):
             self.classes[node.name] = node
             return
@@ -3422,15 +3394,6 @@ class ArgumentDiscovery:
         ):
             return isinstance(node.ops[0], ast.Eq)
         return ast.literal_eval(node)
-
-    @staticmethod
-    def _runtime_control(node: ast.AST, control: ast.expr | None) -> ast.expr | None:
-        """Mark constructs whose execution count or selected branch is unresolved."""
-        if control is not None:
-            return control
-        if isinstance(node, ast.Match):
-            return node.subject
-        return None
 
     def _collect_runtime_loop(
         self,
@@ -4183,7 +4146,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="rename and stage a package or host",
         description=(
             "Rename and stage a package or host. "
-            "Update runtime paths and package references, move runtime data, "
+            "Update declared runtime paths, move data inside the resource directory, "
             "and preserve unstaged edits."
         ),
     )
@@ -4201,7 +4164,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         "rm",
         help="remove and stage a package or host",
         description=(
-            "Remove a tracked package or host and related check files with git rm. "
+            "Remove a tracked package or host directory with git rm. "
             "Untracked and ignored files remain."
         ),
     )

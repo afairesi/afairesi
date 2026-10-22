@@ -15,6 +15,7 @@ import stat
 import subprocess
 import sys
 from contextlib import contextmanager
+from functools import partial
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -31,7 +32,6 @@ from hypothesis import strategies as st
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from typing import Any
 
 
 def _run(
@@ -40,11 +40,12 @@ def _run(
     code: int = 0,
     executable: str | None = None,
     environment: dict[str, str] | None = None,
+    scope: tuple[str, ...] = ("repo",),
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(  # noqa: S603
         [
             executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
-            *(["repo"] if executable in (None, "afairesi") else []),
+            *(scope if executable in (None, "afairesi") else ()),
             *arguments,
         ],
         cwd=root,
@@ -709,7 +710,7 @@ def test_resource_removal_uses_git_rules_and_preserves_untracked_data(
             if change == "staged":
                 _git(root, "add", "--", str(path.relative_to(root)))
         else:
-            check = "exampleVmWithDisko" if kind == "host" else "example"
+            check = "exampleVm" if kind == "host" else "example"
             path = (
                 root / "checks" / check / "asset"
                 if change == "check"
@@ -987,7 +988,7 @@ def test_convergence_removes_check_directories(*, tracked: bool) -> None:
     """Discard unsupported check files instead of preserving overrides."""
     with _fresh_repository() as root:
         _fixture_add(root, "laptop")
-        check = root / "checks/laptopVmWithDisko/default.nix"
+        check = root / "checks/laptopVm/default.nix"
         check.parent.mkdir(parents=True)
         check.write_text("{}\n")
         if tracked:
@@ -1914,83 +1915,52 @@ def test_static_test_detection_does_not_execute_source(
     _expect(subject.has_python_tests(path) == expected, source)
 
 
-def _home_test_run(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-    executable: str | None = None,
-    environment: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
+@pytest.mark.parametrize(
+    "source",
+    [
+        "def testCamelCase(): pass\ndef test(): pass\n",
+        "class TestBehavior:\n    def testCamelCase(self): pass\n",
+        (
+            "from unittest import TestCase\n"
+            "class Reports(TestCase):\n    def testCamelCase(self): pass\n"
+        ),
+    ],
+)
+def test_static_test_names_match_native_collection(tmp_path: Path, source: str) -> None:
+    """Use pytest's collection as the oracle for ordinary and unittest test names."""
+    path = tmp_path / "test_main.py"
+    path.write_text(source)
     result = subprocess.run(  # noqa: S603
         [
-            executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
-            *(["home"] if executable in (None, "afairesi") else []),
-            *arguments,
+            sys.executable,
+            "-B",
+            "-m",
+            "pytest",
+            "-p",
+            "no:cacheprovider",
+            "--import-mode=importlib",
+            "--collect-only",
+            "-q",
+            str(path),
         ],
-        cwd=root,
-        env=environment,
+        cwd=tmp_path,
         capture_output=True,
         text=True,
-        check=False,
+        check=True,
         timeout=30,
     )
-    if result.returncode != code:
-        msg = (
-            f"expected exit {code}, got {result.returncode}\n"
-            f"{result.stdout}{result.stderr}"
-        )
-        raise AssertionError(
-            msg,
-        )
-    return result
-
-
-def _home_test_repair_flake(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Exercise the private flake repair entry point used by the formatter."""
-    return _home_test_run(
-        root,
-        "-c",
-        "from afairesi.main import formatter_main; formatter_main()",
-        *arguments,
-        code=code,
-        executable=sys.executable,
+    collected = sorted(
+        line.split("::", 1)[1] for line in result.stdout.splitlines() if "::" in line
     )
+    subject = import_module("afairesi.main")
+    declared = sorted(
+        f"{owner}::{definition.name}" if owner else definition.name
+        for owner, definition in subject.python_test_definitions(ast.parse(source))
+    )
+    _expect(declared == collected, (declared, collected))
 
 
-def _home_test_git(root: Path, *arguments: str) -> str:
-    return subprocess.run(  # noqa: S603
-        ["git", *arguments],  # noqa: S607
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    ).stdout
-
-
-def _home_test_fixture_git(root: Path, *arguments: str) -> str:
-    """Run fixture Git commands with a local identity and no signing."""
-    return subprocess.run(  # noqa: S603
-        [  # noqa: S607
-            "git",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            *arguments,
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    ).stdout
+_home_test_run = partial(_run, scope=("home",))
 
 
 def _home_test_home_repository(root: Path) -> Path:
@@ -1998,8 +1968,8 @@ def _home_test_home_repository(root: Path) -> Path:
     relative = "forge.example/owner/demo"
     checkout = root / relative
     checkout.mkdir(parents=True)
-    _home_test_git(root, "init", "--quiet")
-    _home_test_git(checkout, "init", "--quiet")
+    _git(root, "init", "--quiet")
+    _git(checkout, "init", "--quiet")
     with (root / ".git/config").open("a", encoding="utf-8") as config:
         config.write("[maintenance]\n\tauto = false\n")
     with (checkout / ".git/config").open("a", encoding="utf-8") as config:
@@ -2012,9 +1982,9 @@ def _home_test_home_repository(root: Path) -> Path:
         )
     source = checkout / "LICENSE"
     source.write_text("first", encoding="utf-8")
-    _home_test_git(checkout, "add", "LICENSE")
-    _home_test_git(checkout, "commit", "--quiet", "-m", "first")
-    _home_test_git(checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
+    _git(checkout, "add", "LICENSE")
+    _git(checkout, "commit", "--quiet", "-m", "first")
+    _git(checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
     (root / ".gitmodules").write_text(
         f'[submodule "{relative}"]\npath = {relative}\n'
         "url = git@forge.example:owner/demo\n",
@@ -2025,7 +1995,7 @@ def _home_test_home_repository(root: Path) -> Path:
         "!/forge.example/\n!/forge.example/owner/\n!/forge.example/owner/demo\n",
         encoding="utf-8",
     )
-    _home_test_git(root, "add", "--force", ".gitignore", ".gitmodules", relative)
+    _git(root, "add", "--force", ".gitignore", ".gitmodules", relative)
     return root
 
 
@@ -2037,7 +2007,7 @@ def _home_test_home_repository(root: Path) -> Path:
         "git@example.test:team/project.git",
     ],
 )
-def test_merged_add_registers_existing_content_without_creating_commits(
+def test_add_registers_existing_content_without_creating_commits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote: str,
@@ -2048,10 +2018,10 @@ def test_merged_add_registers_existing_content_without_creating_commits(
     monkeypatch.setenv("HOME", str(home))
     origin = tmp_path / "remote"
     origin.mkdir()
-    _home_test_git(origin, "init", "--quiet")
+    _git(origin, "init", "--quiet")
     (origin / "LICENSE").write_text("existing repository")
-    _home_test_git(origin, "add", "LICENSE")
-    _home_test_git(
+    _git(origin, "add", "LICENSE")
+    _git(
         origin,
         "-c",
         "user.name=Test",
@@ -2067,7 +2037,7 @@ def test_merged_add_registers_existing_content_without_creating_commits(
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
     _home_test_run(tmp_path, "init")
-    _home_test_git(
+    _git(
         home,
         "-c",
         "user.name=Test",
@@ -2078,7 +2048,7 @@ def test_merged_add_registers_existing_content_without_creating_commits(
         "-m",
         "Home policy",
     )
-    head = _home_test_git(home, "rev-parse", "HEAD")
+    head = _git(home, "rev-parse", "HEAD")
     relative = "example.test/team/project"
     result = _home_test_run(tmp_path, "add", remote)
     checkout = home / relative
@@ -2090,16 +2060,16 @@ def test_merged_add_registers_existing_content_without_creating_commits(
     ):
         if ignore.splitlines().count(pattern) != 1:
             raise AssertionError(ignore)
-    if _home_test_git(home, "show", ":.gitignore") != ignore:
+    if _git(home, "show", ":.gitignore") != ignore:
         message = "add REMOTE did not stage the home whitelist"
         raise AssertionError(message)
     if (checkout / "LICENSE").read_text() != "existing repository":
         raise AssertionError(result.stdout + result.stderr)
-    if _home_test_git(home, "rev-parse", "HEAD") != head:
+    if _git(home, "rev-parse", "HEAD") != head:
         message = "add REMOTE created a home commit"
         raise AssertionError(message)
     if (
-        _home_test_git(
+        _git(
             home,
             "config",
             "--file",
@@ -2110,13 +2080,13 @@ def test_merged_add_registers_existing_content_without_creating_commits(
     ):
         message = "add REMOTE changed the registered remote"
         raise AssertionError(message)
-    if not _home_test_git(home, "ls-files", "--stage", "--", relative).startswith(
+    if not _git(home, "ls-files", "--stage", "--", relative).startswith(
         "160000 ",
     ):
         message = "add REMOTE did not stage the submodule"
         raise AssertionError(message)
     repeated = _home_test_run(tmp_path, "add", remote, code=128)
-    _home_test_expect("already exists in the index" in repeated.stderr, repeated)
+    _expect("already exists in the index" in repeated.stderr, repeated)
     if (home / ".gitignore").read_text(encoding="utf-8") != ignore:
         message = "repeated add changed the home whitelist"
         raise AssertionError(message)
@@ -2146,22 +2116,21 @@ def test_home_add_reuses_retained_history_only_with_force(
     _home_test_run(tmp_path, "init")
     _home_test_run(tmp_path, "add", remote)
     relative = "example.test/team/repository"
-    _home_test_fixture_git(home, "commit", "-qm", "Register submodule")
+    _fixture_git(home, "commit", "-qm", "Register submodule")
     _home_test_run(tmp_path, "rm", relative)
     storage = home / ".git/modules" / relative
     history = _home_test_history_snapshot(storage)
-    before = _home_test_snapshot(home)
+    before = _snapshot(home)
     failed = _home_test_run(tmp_path, "add", remote, code=128)
     _expect("--force" in failed.stderr, failed)
-    _expect(_home_test_snapshot(home) == before, "failed re-add changed home state")
+    _expect(_snapshot(home) == before, "failed re-add changed home state")
     _home_test_run(tmp_path, "add", force_flag, remote)
     _expect(
-        _home_test_git(home / relative, "rev-parse", "HEAD")
-        == _home_test_git(source, "rev-parse", "HEAD"),
+        _git(home / relative, "rev-parse", "HEAD") == _git(source, "rev-parse", "HEAD"),
         "reused checkout has the wrong commit",
     )
     _expect(
-        _home_test_git(
+        _git(
             home,
             "config",
             "-f",
@@ -2187,10 +2156,10 @@ def test_home_add_force_allows_path_ignored_by_nested_policy(
     parent = home / "example.test/team"
     parent.mkdir(parents=True)
     (parent / ".gitignore").write_text("repository\n")
-    before = _home_test_snapshot(home)
+    before = _snapshot(home)
     failed = _home_test_run(tmp_path, "add", remote, code=1)
     _expect("ignored" in failed.stderr, failed)
-    _expect(_home_test_snapshot(home) == before, "failed add changed home state")
+    _expect(_snapshot(home) == before, "failed add changed home state")
     _home_test_run(tmp_path, "add", "--force", remote)
     _expect((parent / "repository/.git").is_file(), "forced add did not register")
 
@@ -2387,7 +2356,7 @@ def test_local_init_reports_missing_nix_without_changes(
 
 
 @pytest.mark.parametrize("initialized_git", [False, True])
-def test_merged_home_prerequisites_explain_initialization_without_changes(
+def test_home_prerequisites_explain_initialization_without_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -2398,22 +2367,22 @@ def test_merged_home_prerequisites_explain_initialization_without_changes(
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     if initialized_git:
-        _home_test_git(home, "init", "--quiet")
-    before = _home_test_snapshot(home) if initialized_git else None
+        _git(home, "init", "--quiet")
+    before = _snapshot(home) if initialized_git else None
     result = _home_test_run(
         tmp_path,
         "add",
         "https://example.test/team/new.git",
         code=1,
     )
-    _home_test_expect("afairesi home init" in result.stderr, result)
+    _expect("afairesi home init" in result.stderr, result)
     if initialized_git:
-        _home_test_expect(
-            _home_test_snapshot(home) == before,
+        _expect(
+            _snapshot(home) == before,
             "home prerequisite check changed Git state",
         )
     else:
-        _home_test_expect(
+        _expect(
             not list(home.iterdir()),
             "home prerequisite check created files",
         )
@@ -2427,23 +2396,23 @@ def _home_test_check_home_commits(
     relative = "forge.example/owner/demo"
     checkout = root / relative
     source = checkout / "LICENSE"
-    first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
+    first = _git(checkout, "rev-parse", "HEAD").strip()
     source.write_text("second", encoding="utf-8")
     _home_test_run(root, "fix")
     if source.read_text() != "second":
         message = "convergence changed dirty submodule content"
         raise AssertionError(message)
-    _home_test_git(checkout, "add", "LICENSE")
-    _home_test_git(checkout, "commit", "--quiet", "-m", "second")
-    second = _home_test_git(checkout, "rev-parse", "HEAD").strip()
+    _git(checkout, "add", "LICENSE")
+    _git(checkout, "commit", "--quiet", "-m", "second")
+    second = _git(checkout, "rev-parse", "HEAD").strip()
     for published in (False, True):
         if published:
-            _home_test_git(checkout, "update-ref", "refs/remotes/origin/main", second)
+            _git(checkout, "update-ref", "refs/remotes/origin/main", second)
         _home_test_run(root, "fix")
-        if first not in _home_test_git(root, "ls-files", "--stage", relative):
+        if first not in _git(root, "ls-files", "--stage", relative):
             message = "convergence advanced the recorded submodule commit"
             raise AssertionError(message)
-    _home_test_git(root, "add", relative)
+    _git(root, "add", relative)
 
 
 def _home_test_check_home_whitelist(home_repository: Path) -> None:
@@ -2452,20 +2421,20 @@ def _home_test_check_home_whitelist(home_repository: Path) -> None:
     ignore = root / ".gitignore"
     expected = ignore.read_text(encoding="utf-8")
     ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n", encoding="utf-8")
-    before = _home_test_git(root, "show", ":.gitignore")
+    before = _git(root, "show", ":.gitignore")
     preview = _home_test_run(root, "fix", "--dry-run")
     if "would write '.gitignore'" not in preview.stdout:
         raise AssertionError(preview.stdout)
     if (
         ignore.read_text(encoding="utf-8") == expected
-        or _home_test_git(root, "show", ":.gitignore") != before
+        or _git(root, "show", ":.gitignore") != before
     ):
         message = "dry-run changed the home whitelist"
         raise AssertionError(message)
     _home_test_run(root, "fix")
     if ignore.read_text(encoding="utf-8") != expected:
         raise AssertionError(ignore.read_text(encoding="utf-8"))
-    if _home_test_git(root, "show", ":.gitignore") != expected:
+    if _git(root, "show", ":.gitignore") != expected:
         message = "convergence did not stage the repaired whitelist"
         raise AssertionError(message)
     _home_test_run(root, "fix", "--dry-run")
@@ -2481,14 +2450,11 @@ def _home_test_check_home_settings(
         "branch = main\nignore = dirty\nshallow = true\nupdate = checkout\n"
     )
     modules.write_text(source)
-    _home_test_git(root, "add", ".gitmodules")
-    index = _home_test_git(root, "ls-files", "--stage")
+    _git(root, "add", ".gitmodules")
+    index = _git(root, "ls-files", "--stage")
     _home_test_run(root, "fix", "--dry-run")
     _home_test_run(root, "fix")
-    if (
-        modules.read_text() != source
-        or _home_test_git(root, "ls-files", "--stage") != index
-    ):
+    if modules.read_text() != source or _git(root, "ls-files", "--stage") != index:
         message = "convergence changed optional submodule settings"
         raise AssertionError(message)
 
@@ -2501,19 +2467,19 @@ def _home_test_check_home_move(
     relative = "forge.example/owner/demo"
     checkout = root / relative
     source = checkout / "LICENSE"
-    first = _home_test_git(checkout, "rev-parse", "HEAD").strip()
+    first = _git(checkout, "rev-parse", "HEAD").strip()
     source.write_text("move snapshot", encoding="utf-8")
-    _home_test_git(checkout, "add", "LICENSE")
-    _home_test_git(checkout, "commit", "--quiet", "-m", "second")
-    _home_test_git(root, "submodule", "absorbgitdirs", relative)
-    _home_test_git(
+    _git(checkout, "add", "LICENSE")
+    _git(checkout, "commit", "--quiet", "-m", "second")
+    _git(root, "submodule", "absorbgitdirs", relative)
+    _git(
         root,
         "config",
         f"submodule.{relative}.url",
         "git@forge.example:owner/demo",
     )
     destination = "forge.example/owner/renamed"
-    _home_test_git(
+    _git(
         root,
         "config",
         "--file",
@@ -2522,18 +2488,18 @@ def _home_test_check_home_move(
         "git@forge.example:owner/renamed",
     )
     source.write_text("staged", encoding="utf-8")
-    _home_test_git(checkout, "add", "LICENSE")
+    _git(checkout, "add", "LICENSE")
     source.write_text("unstaged", encoding="utf-8")
     (checkout / "untracked").write_text("keep", encoding="utf-8")
     (root / "unrelated").write_text("keep home file", encoding="utf-8")
-    before = _home_test_git(checkout, "status", "--porcelain")
-    indexed = _home_test_git(checkout, "show", ":LICENSE")
+    before = _git(checkout, "status", "--porcelain")
+    indexed = _git(checkout, "show", ":LICENSE")
     target = root / destination
     target.mkdir()
     rejected = _home_test_run(root, "fix", code=1)
     if "target already exists" not in rejected.stderr or not checkout.exists():
         raise AssertionError(rejected.stderr)
-    if destination in _home_test_git(
+    if destination in _git(
         root,
         "config",
         "--file",
@@ -2543,18 +2509,18 @@ def _home_test_check_home_move(
         message = "collision changed the submodule path"
         raise AssertionError(message)
     target.rmdir()
-    home_before = _home_test_snapshot(root)
+    home_before = _snapshot(root)
     for arguments in (("--dry-run",), ()):
         rejected = _home_test_run(root, "fix", *arguments, code=128)
-        _home_test_expect(
+        _expect(
             "stage your changes to .gitmodules" in rejected.stderr,
             rejected,
         )
-        _home_test_expect(
-            _home_test_snapshot(root) == home_before,
+        _expect(
+            _snapshot(root) == home_before,
             "rejected move changed home state",
         )
-    _home_test_git(root, "add", ".gitmodules")
+    _git(root, "add", ".gitmodules")
     _home_test_run(root, "fix", "--dry-run")
     if not checkout.exists() or target.exists():
         message = "dry-run moved the checkout"
@@ -2562,35 +2528,20 @@ def _home_test_check_home_move(
     _home_test_run(root, "fix")
     if (
         checkout.exists()
-        or _home_test_git(target, "status", "--porcelain") != before
-        or _home_test_git(target, "show", ":LICENSE") != indexed
+        or _git(target, "status", "--porcelain") != before
+        or _git(target, "show", ":LICENSE") != indexed
         or (target / "untracked").read_text() != "keep"
         or (root / "unrelated").read_text() != "keep home file"
-        or first not in _home_test_git(root, "ls-files", "--stage", destination)
-        or _home_test_git(target, "remote", "get-url", "origin").strip()
+        or first not in _git(root, "ls-files", "--stage", destination)
+        or _git(target, "remote", "get-url", "origin").strip()
         != "git@forge.example:owner/demo"
     ):
         message = "home rename failed to preserve Git state and local remote settings"
         raise AssertionError(message)
     _home_test_run(root, "fix", "--dry-run")
     whitelist = (root / ".gitignore").read_text().splitlines()
-    _home_test_expect(f"!/{relative}" not in whitelist, whitelist)
-    _home_test_expect(f"!/{destination}" in whitelist, whitelist)
-
-
-def _home_test_expect(condition: bool, detail: object) -> None:  # noqa: FBT001
-    """Report an invariant failure with its observed state."""
-    if not condition:
-        raise AssertionError(detail)
-
-
-def _home_test_snapshot(
-    root: Path,
-    *,
-    exclude: tuple[str, ...] = (),
-) -> tuple[object, ...]:
-    """Observe home state with the shared repository snapshot."""
-    return _snapshot(root, exclude=exclude)
+    _expect(f"!/{relative}" not in whitelist, whitelist)
+    _expect(f"!/{destination}" in whitelist, whitelist)
 
 
 def _home_test_history_snapshot(root: Path) -> dict[Path, bytes]:
@@ -2692,24 +2643,24 @@ def _git_rule_home_fixture(root: Path, state: str) -> Path:
     relative = "forge.example/owner/demo"
     checkout = native / relative
     if state != "legacy":
-        _home_test_git(native, "submodule", "absorbgitdirs")
-    _home_test_git(native, "config", f"submodule.{relative}.active", "true")
-    _home_test_git(
+        _git(native, "submodule", "absorbgitdirs")
+    _git(native, "config", f"submodule.{relative}.active", "true")
+    _git(
         native,
         "config",
         f"submodule.{relative}.url",
         "git@mirror.test:repo",
     )
-    _home_test_fixture_git(native, "commit", "-qm", "Home snapshot")
+    _fixture_git(native, "commit", "-qm", "Home snapshot")
     if state in {"dirty", "staged", "advanced"}:
         (checkout / "LICENSE").write_text("local edits")
         if state in {"staged", "advanced"}:
-            _home_test_git(checkout, "add", "LICENSE")
+            _git(checkout, "add", "LICENSE")
         if state == "advanced":
-            _home_test_fixture_git(checkout, "commit", "-qm", "Local commit")
+            _fixture_git(checkout, "commit", "-qm", "Local commit")
     elif state in {"untracked", "ignored"}:
         if state == "ignored":
-            exclude = _home_test_git(
+            exclude = _git(
                 checkout,
                 "rev-parse",
                 "--path-format=absolute",
@@ -2719,7 +2670,7 @@ def _git_rule_home_fixture(root: Path, state: str) -> Path:
             Path(exclude).write_text("asset\n")
         (checkout / "asset").write_bytes(b"local data\x00\xff")
     elif state == "deinitialized":
-        _home_test_git(native, "submodule", "deinit", "--", relative)
+        _git(native, "submodule", "deinit", "--", relative)
     elif state == "dirty-modules":
         modules = native / ".gitmodules"
         modules.write_text(modules.read_text() + "# unstaged change\n")
@@ -2855,7 +2806,7 @@ def test_repo_mv_matches_native_git(
 
 
 @pytest.mark.parametrize("branch", ["main", "trunk"])
-def test_merged_init_home_stages_policy_without_cleaning_or_committing(
+def test_init_home_stages_policy_without_cleaning_or_committing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     branch: str,
@@ -2870,32 +2821,32 @@ def test_merged_init_home_stages_policy_without_cleaning_or_committing(
     monkeypatch.setenv("GIT_CONFIG_KEY_0", "init.defaultBranch")
     monkeypatch.setenv("GIT_CONFIG_VALUE_0", branch)
     _home_test_run(tmp_path, "init")
-    _home_test_expect(
-        _home_test_git(home, "branch", "--show-current").strip() == branch,
+    _expect(
+        _git(home, "branch", "--show-current").strip() == branch,
         "home initialization changed Git's initial branch",
     )
     expected = "*\n!/.gitignore\n!/.gitmodules\n"
-    _home_test_expect(
+    _expect(
         (home / ".gitignore").read_text() == expected,
         "wrong home policy",
     )
-    _home_test_expect(
-        _home_test_git(home, "show", ":.gitignore") == expected,
+    _expect(
+        _git(home, "show", ":.gitignore") == expected,
         "policy was not staged",
     )
-    _home_test_expect(
-        _home_test_git(home, "ls-files").splitlines() == [".gitignore"],
+    _expect(
+        _git(home, "ls-files").splitlines() == [".gitignore"],
         "home data was staged",
     )
-    _home_test_expect(
-        not _home_test_git(home, "for-each-ref"),
+    _expect(
+        not _git(home, "for-each-ref"),
         "home initialization created a commit",
     )
-    _home_test_expect(
+    _expect(
         local.read_bytes() == b"\x00keep home data\xff",
         "home initialization cleaned HOME",
     )
-    before = _home_test_snapshot(home)
+    before = _snapshot(home)
     template = tmp_path / "template"
     (template / "hooks").mkdir(parents=True)
     (template / "hooks/custom-hook").write_text("custom Git template")
@@ -2903,15 +2854,15 @@ def test_merged_init_home_stages_policy_without_cleaning_or_committing(
     monkeypatch.setenv("GIT_CONFIG_KEY_1", "init.templateDir")
     monkeypatch.setenv("GIT_CONFIG_VALUE_1", str(template))
     _home_test_run(tmp_path, "init")
-    _home_test_expect(
+    _expect(
         (home / ".git/hooks/custom-hook").read_text() == "custom Git template",
         "home initialization skipped native Git reinitialization",
     )
-    _home_test_expect(
-        _home_test_snapshot(home) == before,
+    _expect(
+        _snapshot(home) == before,
         "repeated home initialization changed state",
     )
-    _home_test_expect(
+    _expect(
         not (tmp_path / ".git").exists(),
         "home initialization initialized the working directory",
     )
@@ -2935,16 +2886,16 @@ def test_home_initialization_rejects_invalid_state_without_creating_files(
     (home / name).write_text(source)
     before = {path.name: path.read_bytes() for path in home.iterdir()}
     result = _home_test_run(tmp_path, "init", code=128 if case == "gitfile" else 1)
-    _home_test_expect(not (home / ".git").is_dir(), "failed init created Git metadata")
-    _home_test_expect(
+    _expect(not (home / ".git").is_dir(), "failed init created Git metadata")
+    _expect(
         {path.name: path.read_bytes() for path in home.iterdir()} == before,
         "failed initialization changed home files",
     )
     if case == "gitfile":
-        _home_test_expect("fatal:" in result.stderr, result)
+        _expect("fatal:" in result.stderr, result)
 
 
-def test_merged_failed_add_restores_home_whitelist_and_staging(
+def test_failed_add_restores_home_whitelist_and_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2961,15 +2912,15 @@ def test_merged_failed_add_restores_home_whitelist_and_staging(
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
     ignore = home / ".gitignore"
     ignore.write_text(ignore.read_text() + "!/working-only\n")
-    before = _home_test_snapshot(home)
+    before = _snapshot(home)
     _home_test_run(tmp_path, "add", remote, code=128)
-    _home_test_expect(
-        _home_test_snapshot(home) == before,
+    _expect(
+        _snapshot(home) == before,
         "failed add changed the home repository",
     )
 
 
-def test_merged_home_repair_rejects_collision_with_missing_checkout_registration(
+def test_home_repair_rejects_collision_with_missing_checkout_registration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2978,8 +2929,8 @@ def test_merged_home_repair_rejects_collision_with_missing_checkout_registration
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
     destination = "forge.example/owner/renamed"
-    commit = _home_test_git(root / relative, "rev-parse", "HEAD").strip()
-    _home_test_git(
+    commit = _git(root / relative, "rev-parse", "HEAD").strip()
+    _git(
         root,
         "update-index",
         "--add",
@@ -2988,7 +2939,7 @@ def test_merged_home_repair_rejects_collision_with_missing_checkout_registration
         commit,
         destination,
     )
-    _home_test_git(
+    _git(
         root,
         "config",
         "--file",
@@ -2996,7 +2947,7 @@ def test_merged_home_repair_rejects_collision_with_missing_checkout_registration
         f"submodule.{relative}.url",
         "git@forge.example:owner/renamed",
     )
-    _home_test_git(
+    _git(
         root,
         "config",
         "--file",
@@ -3004,7 +2955,7 @@ def test_merged_home_repair_rejects_collision_with_missing_checkout_registration
         f"submodule.{destination}.path",
         destination,
     )
-    _home_test_git(
+    _git(
         root,
         "config",
         "--file",
@@ -3012,23 +2963,23 @@ def test_merged_home_repair_rejects_collision_with_missing_checkout_registration
         f"submodule.{destination}.url",
         "git@forge.example:owner/elsewhere",
     )
-    _home_test_git(root, "add", ".gitmodules")
-    before = _home_test_snapshot(root)
+    _git(root, "add", ".gitmodules")
+    before = _snapshot(root)
     for arguments in [("--dry-run",), ()]:
         result = _home_test_run(root, "fix", *arguments, code=1)
-        _home_test_expect(
+        _expect(
             "conflicts with a missing checkout registration" in result.stderr,
             result,
         )
-        _home_test_expect(
-            _home_test_snapshot(root) == before,
+        _expect(
+            _snapshot(root) == before,
             "rejected repair changed home state",
         )
 
 
 @pytest.mark.parametrize("destination", ["demo", "renamed"])
 @pytest.mark.parametrize("state", ["deinitialized", "missing", "placeholder"])
-def test_merged_home_repair_preserves_missing_checkouts(
+def test_home_repair_preserves_missing_checkouts(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     destination: str,
@@ -3039,22 +2990,22 @@ def test_merged_home_repair_preserves_missing_checkouts(
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
     checkout = root / relative
-    _home_test_git(root, "submodule", "absorbgitdirs", "--", relative)
-    _home_test_git(
+    _git(root, "submodule", "absorbgitdirs", "--", relative)
+    _git(
         root,
         "config",
         f"submodule.{relative}.url",
         "git@mirror.example:owner/demo",
     )
-    _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
     if state == "deinitialized":
-        _home_test_git(root, "submodule", "deinit", "--", relative)
+        _git(root, "submodule", "deinit", "--", relative)
     else:
         shutil.rmtree(checkout)
         if state == "placeholder":
             checkout.mkdir()
             (checkout / "LICENSE").write_text("unrelated local data")
-    _home_test_git(
+    _git(
         root,
         "config",
         "--file",
@@ -3063,70 +3014,70 @@ def test_merged_home_repair_preserves_missing_checkouts(
         f"git@forge.example:owner/{destination}",
     )
     modules_before = (root / ".gitmodules").read_bytes()
-    gitlink_before = _home_test_git(root, "ls-files", "--stage", "--", relative)
-    config_before = _home_test_git(root, "config", "--local", "--list")
+    gitlink_before = _git(root, "ls-files", "--stage", "--", relative)
+    config_before = _git(root, "config", "--local", "--list")
     history = root / ".git/modules" / relative
     history_before = _home_test_history_snapshot(history)
     ignore = root / ".gitignore"
     expected_ignore = ignore.read_text()
     ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
-    before = _home_test_snapshot(root)
+    before = _snapshot(root)
     _home_test_run(root, "fix", "--dry-run")
-    _home_test_expect(
-        _home_test_snapshot(root) == before,
+    _expect(
+        _snapshot(root) == before,
         "repair preview changed missing checkout state",
     )
     _home_test_run(root, "fix")
-    _home_test_expect(
+    _expect(
         not (checkout / ".git").exists(),
         "repair initialized a missing checkout",
     )
-    _home_test_expect(
+    _expect(
         ignore.read_text() == expected_ignore,
         "repair failed to restore whitelist",
     )
-    _home_test_expect(
+    _expect(
         (root / ".gitmodules").read_bytes() == modules_before,
         "repair moved missing checkout registration",
     )
-    _home_test_expect(
-        _home_test_git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
+    _expect(
+        _git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
         "repair changed missing checkout gitlink",
     )
-    _home_test_expect(
-        _home_test_git(root, "config", "--local", "--list") == config_before,
+    _expect(
+        _git(root, "config", "--local", "--list") == config_before,
         "repair changed local registration",
     )
-    _home_test_expect(
+    _expect(
         _home_test_history_snapshot(history) == history_before,
         "repair changed stored history",
     )
     if state == "placeholder":
-        _home_test_expect(
+        _expect(
             (checkout / "LICENSE").read_text() == "unrelated local data",
             "repair changed placeholder data",
         )
     elif state == "missing":
-        _home_test_expect(
+        _expect(
             not checkout.exists(),
             "repair recreated missing checkout directory",
         )
     if destination != "demo":
-        _home_test_expect(
+        _expect(
             not (root / f"forge.example/owner/{destination}").exists(),
             "repair relocated a missing checkout",
         )
-    after = _home_test_snapshot(root)
+    after = _snapshot(root)
     _home_test_run(root, "fix")
-    _home_test_expect(
-        _home_test_snapshot(root) == after,
+    _expect(
+        _snapshot(root) == after,
         "repeated repair changed missing checkout state",
     )
 
 
 @pytest.mark.parametrize("destination", ["demo", "renamed", "new/team/repo"])
 @pytest.mark.parametrize("remote", ["fork", "missing"])
-def test_merged_home_repair_preserves_local_remote_settings(
+def test_home_repair_preserves_local_remote_settings(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     destination: str,
@@ -3137,23 +3088,23 @@ def test_merged_home_repair_preserves_local_remote_settings(
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
     checkout = root / relative
-    _home_test_git(root, "submodule", "absorbgitdirs", "--", relative)
+    _git(root, "submodule", "absorbgitdirs", "--", relative)
     local_url = "git@mirror.example:owner/demo"
-    _home_test_git(root, "config", f"submodule.{relative}.url", local_url)
+    _git(root, "config", f"submodule.{relative}.url", local_url)
     if remote == "missing":
-        _home_test_git(checkout, "remote", "remove", "origin")
+        _git(checkout, "remote", "remove", "origin")
     else:
-        _home_test_git(
+        _git(
             checkout,
             "remote",
             "set-url",
             "origin",
             "git@forge.example:me/fork",
         )
-        _home_test_git(checkout, "remote", "set-url", "--push", "origin", local_url)
+        _git(checkout, "remote", "set-url", "--push", "origin", local_url)
     expected = f"forge.example/owner/{destination}"
     declared_url = f"git@forge.example:owner/{destination}"
-    _home_test_git(
+    _git(
         root,
         "config",
         "--file",
@@ -3161,45 +3112,45 @@ def test_merged_home_repair_preserves_local_remote_settings(
         f"submodule.{relative}.url",
         declared_url,
     )
-    _home_test_git(root, "add", ".gitmodules")
-    before = _home_test_snapshot(root)
-    checkout_before = _home_test_snapshot(checkout)
-    home_config_before = _home_test_git(root, "config", "--local", "--list")
+    _git(root, "add", ".gitmodules")
+    before = _snapshot(root)
+    checkout_before = _snapshot(checkout)
+    home_config_before = _git(root, "config", "--local", "--list")
     remotes_before = {
         line
-        for line in _home_test_git(checkout, "config", "--local", "--list").splitlines()
+        for line in _git(checkout, "config", "--local", "--list").splitlines()
         if line.startswith("remote.")
     }
     _home_test_run(root, "fix", "--dry-run")
-    _home_test_expect(
-        _home_test_snapshot(root) == before,
+    _expect(
+        _snapshot(root) == before,
         "home repair preview changed state",
     )
-    _home_test_expect(
-        _home_test_snapshot(checkout) == checkout_before,
+    _expect(
+        _snapshot(checkout) == checkout_before,
         "preview changed checkout settings",
     )
     _home_test_run(root, "fix")
     target = root / expected
-    _home_test_expect(
+    _expect(
         target.is_dir(),
         "repair did not use the declared URL for placement",
     )
     remotes_after = {
         line
-        for line in _home_test_git(target, "config", "--local", "--list").splitlines()
+        for line in _git(target, "config", "--local", "--list").splitlines()
         if line.startswith("remote.")
     }
-    _home_test_expect(
+    _expect(
         remotes_after == remotes_before,
         "repair changed local remote settings",
     )
-    _home_test_expect(
-        _home_test_snapshot(target)[:3] == checkout_before[:3],
+    _expect(
+        _snapshot(target)[:3] == checkout_before[:3],
         "repair changed checkout state",
     )
-    _home_test_expect(
-        _home_test_git(
+    _expect(
+        _git(
             root,
             "config",
             "--local",
@@ -3210,21 +3161,21 @@ def test_merged_home_repair_preserves_local_remote_settings(
         "repair overwrote the local submodule URL override",
     )
     subject = import_module("afairesi.main")
-    _home_test_expect(
+    _expect(
         subject.home_submodules(root)[0]["url"] == declared_url,
         "repair changed declared URL",
     )
-    _home_test_expect(
+    _expect(
         subject.home_submodules(root)[0]["name"] == relative,
         "repair renamed Git's submodule section",
     )
-    _home_test_expect(
-        _home_test_git(root, "config", "--local", "--list") == home_config_before,
+    _expect(
+        _git(root, "config", "--local", "--list") == home_config_before,
         "repair changed local submodule configuration",
     )
 
 
-def test_merged_home_repair_leaves_nested_submodule_settings_untouched(
+def test_home_repair_leaves_nested_submodule_settings_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -3235,59 +3186,59 @@ def test_merged_home_repair_leaves_nested_submodule_settings_untouched(
     checkout = root / relative
     nested = checkout / "nested"
     nested.mkdir()
-    _home_test_git(nested, "init", "--quiet")
+    _git(nested, "init", "--quiet")
     (nested / "LICENSE").write_text("nested repository")
-    _home_test_git(nested, "add", "LICENSE")
-    _home_test_fixture_git(nested, "commit", "-qm", "Nested snapshot")
+    _git(nested, "add", "LICENSE")
+    _fixture_git(nested, "commit", "-qm", "Nested snapshot")
     mirror = "git@mirror.example:owner/child"
-    _home_test_git(nested, "remote", "add", "origin", mirror)
+    _git(nested, "remote", "add", "origin", mirror)
     (checkout / ".gitmodules").write_text(
         '[submodule "nested"]\npath = nested\nurl = git@forge.example:owner/child\n',
     )
-    _home_test_git(checkout, "add", ".gitmodules", "nested")
-    _home_test_fixture_git(checkout, "commit", "-qm", "Register nested repository")
-    _home_test_git(checkout, "config", "submodule.nested.url", mirror)
-    _home_test_git(checkout, "config", "submodule.nested.active", "true")
-    _home_test_git(root, "submodule", "absorbgitdirs", "--", relative)
-    _home_test_git(root, "add", relative)
-    _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
-    _home_test_git(
+    _git(checkout, "add", ".gitmodules", "nested")
+    _fixture_git(checkout, "commit", "-qm", "Register nested repository")
+    _git(checkout, "config", "submodule.nested.url", mirror)
+    _git(checkout, "config", "submodule.nested.active", "true")
+    _git(root, "submodule", "absorbgitdirs", "--", relative)
+    _git(root, "add", relative)
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
+    _git(
         root,
         "config",
         f"submodule.{relative}.url",
         "git@forge.example:owner/demo",
     )
-    _home_test_git(
+    _git(
         checkout,
         "remote",
         "set-url",
         "origin",
         "git@mirror.example:owner/demo",
     )
-    before = _home_test_snapshot(root)
-    checkout_before = _home_test_snapshot(checkout)
-    nested_before = _home_test_snapshot(nested)
+    before = _snapshot(root)
+    checkout_before = _snapshot(checkout)
+    nested_before = _snapshot(nested)
     _home_test_run(root, "fix", "--dry-run")
-    _home_test_expect(
-        _home_test_snapshot(root) == before,
+    _expect(
+        _snapshot(root) == before,
         "home repair preview changed state",
     )
-    _home_test_expect(
-        _home_test_snapshot(checkout) == checkout_before,
+    _expect(
+        _snapshot(checkout) == checkout_before,
         "preview changed checkout settings",
     )
-    _home_test_expect(
-        _home_test_snapshot(nested) == nested_before,
+    _expect(
+        _snapshot(nested) == nested_before,
         "preview changed nested repository",
     )
     _home_test_run(root, "fix")
-    _home_test_expect(
-        _home_test_git(checkout, "remote", "get-url", "origin").strip()
+    _expect(
+        _git(checkout, "remote", "get-url", "origin").strip()
         == "git@mirror.example:owner/demo",
         "home repair changed the direct submodule remote",
     )
-    _home_test_expect(
-        _home_test_git(
+    _expect(
+        _git(
             checkout,
             "config",
             "--local",
@@ -3297,13 +3248,13 @@ def test_merged_home_repair_leaves_nested_submodule_settings_untouched(
         == mirror,
         "home repair changed nested submodule registration",
     )
-    _home_test_expect(
-        _home_test_snapshot(nested) == nested_before,
+    _expect(
+        _snapshot(nested) == nested_before,
         "home repair changed nested repository",
     )
 
 
-def test_merged_home_repair_preserves_dirty_submodules() -> None:
+def test_home_repair_preserves_dirty_submodules() -> None:
     """Preserve checkout/index state through home convergence and relocation."""
     with (
         TemporaryDirectory(prefix="afairesi-home-") as directory,
@@ -3311,11 +3262,11 @@ def test_merged_home_repair_preserves_dirty_submodules() -> None:
     ):
         root = _home_test_home_repository(Path(directory))
         patch.setenv("HOME", str(root))
-        before = _home_test_snapshot(root)
-        rejected = _home_test_repair_flake(root, code=1)
-        _home_test_expect("run afairesi home fix" in rejected.stderr, rejected)
-        _home_test_expect(
-            _home_test_snapshot(root) == before,
+        before = _snapshot(root)
+        rejected = _repair_flake(root, code=1)
+        _expect("run afairesi home fix" in rejected.stderr, rejected)
+        _expect(
+            _snapshot(root) == before,
             "flake repair changed home state",
         )
         _home_test_check_home_commits(root)
@@ -3326,11 +3277,10 @@ def test_merged_home_repair_preserves_dirty_submodules() -> None:
         modules.write_text(
             modules.read_text() + "url = git@forge.example:owner/other\n",
         )
-        before = _home_test_snapshot(root)
+        before = _snapshot(root)
         result = _home_test_run(root, "fix", code=1)
-        _home_test_expect(
-            "duplicate url field" in result.stderr
-            and _home_test_snapshot(root) == before,
+        _expect(
+            "duplicate url field" in result.stderr and _snapshot(root) == before,
             result,
         )
 
@@ -3339,7 +3289,7 @@ def test_merged_home_repair_preserves_dirty_submodules() -> None:
     "location",
     ["home", "nested", "submodule", "flake", "outside"],
 )
-def test_merged_home_repair_targets_home_from_any_working_directory(
+def test_home_repair_targets_home_from_any_working_directory(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     location: str,
@@ -3351,7 +3301,7 @@ def test_merged_home_repair_targets_home_from_any_working_directory(
     (checkout / "flake.nix").touch()
     flake = tmp_path / "flake"
     flake.mkdir()
-    _home_test_git(flake, "init", "--quiet")
+    _git(flake, "init", "--quiet")
     (flake / "flake.nix").touch()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -3365,30 +3315,30 @@ def test_merged_home_repair_targets_home_from_any_working_directory(
     ignore = home / ".gitignore"
     expected = ignore.read_text()
     ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
-    before = _home_test_snapshot(home)
-    checkout_before = _home_test_snapshot(checkout)
-    flake_before = _home_test_snapshot(flake)
+    before = _snapshot(home)
+    checkout_before = _snapshot(checkout)
+    flake_before = _snapshot(flake)
     preview = _home_test_run(cwd, "fix", "--dry-run")
-    _home_test_expect("would write '.gitignore'" in preview.stdout, preview)
-    _home_test_expect(
-        _home_test_snapshot(home) == before,
+    _expect("would write '.gitignore'" in preview.stdout, preview)
+    _expect(
+        _snapshot(home) == before,
         "home repair preview changed state",
     )
     _home_test_run(cwd, "fix")
-    _home_test_expect(ignore.read_text() == expected, "home whitelist was not repaired")
-    _home_test_expect(
-        _home_test_git(home, "show", ":.gitignore") == expected,
+    _expect(ignore.read_text() == expected, "home whitelist was not repaired")
+    _expect(
+        _git(home, "show", ":.gitignore") == expected,
         "repair was not staged",
     )
-    _home_test_expect(
-        _home_test_snapshot(checkout) == checkout_before,
+    _expect(
+        _snapshot(checkout) == checkout_before,
         "home repair changed submodule",
     )
-    _home_test_expect(
-        _home_test_snapshot(flake) == flake_before,
+    _expect(
+        _snapshot(flake) == flake_before,
         "home repair changed unrelated flake",
     )
-    _home_test_expect(not list(outside.iterdir()), "home repair changed outside path")
+    _expect(not list(outside.iterdir()), "home repair changed outside path")
     _home_test_run(cwd, "fix", "--dry-run")
 
 
@@ -3404,7 +3354,7 @@ def test_merged_home_repair_targets_home_from_any_working_directory(
         "ignored",
     ],
 )
-def test_merged_home_submodule_removal_uses_native_git_rules(
+def test_home_submodule_removal_uses_native_git_rules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     case: str,
@@ -3413,8 +3363,8 @@ def test_merged_home_submodule_removal_uses_native_git_rules(
     root = _home_test_home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
-    _home_test_git(root, "submodule", "absorbgitdirs")
-    _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
+    _git(root, "submodule", "absorbgitdirs")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
     target = {"unknown": "missing", "parent": "forge.example/owner"}.get(
         case,
         relative,
@@ -3422,12 +3372,12 @@ def test_merged_home_submodule_removal_uses_native_git_rules(
     if case.startswith("dirty") or case in {"staged", "advanced"}:
         (root / relative / "LICENSE").write_text("local changes")
         if case in {"staged", "advanced"}:
-            _home_test_git(root / relative, "add", "LICENSE")
+            _git(root / relative, "add", "LICENSE")
         if case == "advanced":
-            _home_test_fixture_git(root / relative, "commit", "-qm", "Local commit")
+            _fixture_git(root / relative, "commit", "-qm", "Local commit")
     elif case in {"untracked", "ignored"}:
         if case == "ignored":
-            exclude = _home_test_git(
+            exclude = _git(
                 root / relative,
                 "rev-parse",
                 "--git-path",
@@ -3435,19 +3385,19 @@ def test_merged_home_submodule_removal_uses_native_git_rules(
             )
             (root / relative / exclude.strip()).write_text("asset\n")
         (root / relative / "asset").write_text("preserve local data")
-    before = _home_test_snapshot(root)
+    before = _snapshot(root)
     if case == "ignored":
         _home_test_run(root, "rm", target)
-        _home_test_expect(not (root / target).exists(), "native removal left submodule")
+        _expect(not (root / target).exists(), "native removal left submodule")
         return
     _home_test_run(root, "rm", target, code=1)
-    _home_test_expect(
-        _home_test_snapshot(root) == before,
+    _expect(
+        _snapshot(root) == before,
         "rejected removal changed home state",
     )
     if case.startswith("dirty") or case in {"staged", "advanced", "untracked"}:
         _home_test_run(root, "rm", target, "--force")
-        _home_test_expect(
+        _expect(
             not (root / target).exists(),
             "forced removal left a dirty submodule",
         )
@@ -3458,7 +3408,7 @@ def test_merged_home_submodule_removal_uses_native_git_rules(
     ["home", "nested", "submodule", "flake", "outside"],
 )
 @pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
-def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
+def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -3470,7 +3420,7 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
     relative = "forge.example/owner/demo"
     flake = tmp_path / "flake"
     flake.mkdir()
-    _home_test_git(flake, "init", "--quiet")
+    _git(flake, "init", "--quiet")
     (flake / "flake.nix").touch()
     outside = tmp_path / "outside"
     outside.mkdir()
@@ -3481,10 +3431,10 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
         "flake": flake,
         "outside": outside,
     }[location]
-    flake_before = _home_test_snapshot(flake)
-    _home_test_git(root, "submodule", "absorbgitdirs")
+    flake_before = _snapshot(flake)
+    _git(root, "submodule", "absorbgitdirs")
     if name != relative:
-        _home_test_git(
+        _git(
             root,
             "config",
             "--file",
@@ -3493,16 +3443,16 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
             f"submodule.{relative}",
             f"submodule.{name}",
         )
-        _home_test_git(root, "add", ".gitmodules")
-    _home_test_git(
+        _git(root, "add", ".gitmodules")
+    _git(
         root,
         "config",
         f"submodule.{name}.url",
         "git@forge.example:owner/demo",
     )
-    _home_test_git(root, "config", f"submodule.{name}.active", "true")
-    _home_test_git(root, "config", "submodule.unrelated.active", "false")
-    local_config_before = _home_test_git(root, "config", "--local", "--list")
+    _git(root, "config", f"submodule.{name}.active", "true")
+    _git(root, "config", "submodule.unrelated.active", "false")
+    local_config_before = _git(root, "config", "--local", "--list")
     history = root / ".git/modules" / relative
     history_before = _home_test_history_snapshot(history)
     ignore = root / ".gitignore"
@@ -3511,20 +3461,20 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
         + f"!/{relative}/\n!/{relative}/LICENSE\n"
         + "!/forge.example/owner/demo-other\n!/.ssh/\n",
     )
-    _home_test_git(root, "add", ".gitignore")
-    _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
+    _git(root, "add", ".gitignore")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
     _home_test_run(cwd, "rm", relative)
-    _home_test_expect(
-        _home_test_snapshot(flake) == flake_before,
+    _expect(
+        _snapshot(flake) == flake_before,
         "removal changed unrelated flake",
     )
-    _home_test_expect(not list(outside.iterdir()), "removal changed outside path")
-    _home_test_expect(
+    _expect(not list(outside.iterdir()), "removal changed outside path")
+    _expect(
         not (root / relative).exists(),
         "submodule checkout was not removed",
     )
     lines = ignore.read_text().splitlines()
-    _home_test_expect(
+    _expect(
         f"!/{relative}" not in lines and f"!/{relative}/LICENSE" not in lines,
         lines,
     )
@@ -3534,24 +3484,24 @@ def test_merged_home_submodule_removal_stages_metadata_and_preserves_shared_path
         "!/forge.example/owner/demo-other",
         "!/.ssh/",
     ):
-        _home_test_expect(entry in lines, lines)
+        _expect(entry in lines, lines)
     subject = import_module("afairesi.main")
-    _home_test_expect(
+    _expect(
         subject.home_submodules(root) == [],
         "submodule remains registered",
     )
-    _home_test_expect(
-        _home_test_git(root, "config", "--local", "--list") == local_config_before,
+    _expect(
+        _git(root, "config", "--local", "--list") == local_config_before,
         "removal changed local submodule settings",
     )
-    _home_test_expect(
+    _expect(
         _home_test_history_snapshot(history) == history_before,
         "removal changed stored history",
     )
-    staged = _home_test_git(root, "diff", "--cached", "--name-only").splitlines()
-    _home_test_expect(set(staged) == {".gitignore", ".gitmodules", relative}, staged)
-    _home_test_expect(
-        not _home_test_git(root, "diff", "--name-only"),
+    staged = _git(root, "diff", "--cached", "--name-only").splitlines()
+    _expect(set(staged) == {".gitignore", ".gitmodules", relative}, staged)
+    _expect(
+        not _git(root, "diff", "--name-only"),
         "metadata was not staged",
     )
     _home_test_run(root, "fix", "--dry-run")
@@ -3573,15 +3523,15 @@ def test_home_submodule_removal_leaves_storage_to_git(
     checkout = root / relative
     history = root / ".git/modules" / relative
     if storage != "directory":
-        _home_test_git(root, "submodule", "absorbgitdirs")
+        _git(root, "submodule", "absorbgitdirs")
     history_before = _home_test_history_snapshot(
         checkout / ".git" if storage == "directory" else history,
     )
-    _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
     if storage == "deinitialized":
-        _home_test_git(root, "submodule", "deinit", "--", relative)
+        _git(root, "submodule", "deinit", "--", relative)
     if not url:
-        _home_test_git(
+        _git(
             root,
             "config",
             "--file",
@@ -3589,23 +3539,23 @@ def test_home_submodule_removal_leaves_storage_to_git(
             "--unset",
             f"submodule.{relative}.url",
         )
-        _home_test_git(root, "add", ".gitmodules")
-    config_before = _home_test_git(root, "config", "--local", "--list")
+        _git(root, "add", ".gitmodules")
+    config_before = _git(root, "config", "--local", "--list")
     _home_test_run(root, "rm", relative)
-    _home_test_expect(not checkout.exists(), "removal left checkout")
-    _home_test_expect(
+    _expect(not checkout.exists(), "removal left checkout")
+    _expect(
         _home_test_history_snapshot(history) == history_before,
         "removal changed stored history",
     )
-    _home_test_expect(
-        _home_test_git(root, "config", "--local", "--list") == config_before,
+    _expect(
+        _git(root, "config", "--local", "--list") == config_before,
         "removal changed local configuration",
     )
 
 
 @pytest.mark.parametrize("registered", [True, False])
 @pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
-def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
+def test_home_repair_preserves_unrelated_local_submodule_configuration(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     name: str,
@@ -3616,9 +3566,9 @@ def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
     root = _home_test_home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
-    _home_test_git(root, "submodule", "absorbgitdirs")
+    _git(root, "submodule", "absorbgitdirs")
     if name != relative:
-        _home_test_git(
+        _git(
             root,
             "config",
             "--file",
@@ -3627,40 +3577,40 @@ def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
             f"submodule.{relative}",
             f"submodule.{name}",
         )
-        _home_test_git(root, "add", ".gitmodules")
+        _git(root, "add", ".gitmodules")
     else:
-        _home_test_git(
+        _git(
             root,
             "config",
             f"submodule.{name}.url",
             "git@forge.example:owner/demo",
         )
-    _home_test_git(root, "config", f"submodule.{name}.active", "true")
-    _home_test_git(root, "config", f"submodule.{name}.update", "none")
-    _home_test_git(root, "config", "submodule.active", "forge.example/*")
-    _home_test_git(
+    _git(root, "config", f"submodule.{name}.active", "true")
+    _git(root, "config", f"submodule.{name}.update", "none")
+    _git(root, "config", "submodule.active", "forge.example/*")
+    _git(
         root,
         "config",
         "submodule.removed.with.dots.url",
         "git@forge.example:old/repo",
     )
-    _home_test_git(root, "config", "submodule.active-only.active", "true")
-    _home_test_fixture_git(root, "commit", "-qm", "Home snapshot")
+    _git(root, "config", "submodule.active-only.active", "true")
+    _fixture_git(root, "commit", "-qm", "Home snapshot")
     if not registered:
-        _home_test_git(root, "rm", "--", relative)
+        _git(root, "rm", "--", relative)
         (root / ".gitmodules").unlink()
     history = root / ".git/modules" / relative
     history_before = _home_test_history_snapshot(history)
-    before = _home_test_snapshot(root)
+    before = _snapshot(root)
     _home_test_run(root, "fix", "--dry-run")
-    _home_test_expect(
-        _home_test_snapshot(root) == before,
+    _expect(
+        _snapshot(root) == before,
         "repair preview changed home state",
     )
     _home_test_run(root, "fix")
     submodule_settings = {
         line
-        for line in _home_test_git(root, "config", "--local", "--list").splitlines()
+        for line in _git(root, "config", "--local", "--list").splitlines()
         if line.startswith("submodule.") and not line.startswith("submodule.active=")
     }
     expected_settings = {
@@ -3671,18 +3621,18 @@ def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
     }
     if name == relative:
         expected_settings.add(f"submodule.{relative}.url=git@forge.example:owner/demo")
-    _home_test_expect(
+    _expect(
         submodule_settings == expected_settings,
         "repair changed unrelated registrations or lost active settings",
     )
-    _home_test_expect(
-        _home_test_git(root, "config", "--local", "--get", "submodule.active").strip()
+    _expect(
+        _git(root, "config", "--local", "--get", "submodule.active").strip()
         == "forge.example/*",
         "repair changed shared submodule settings",
     )
     if registered:
-        _home_test_expect(
-            _home_test_git(
+        _expect(
+            _git(
                 root,
                 "config",
                 "--local",
@@ -3692,24 +3642,24 @@ def test_merged_home_repair_preserves_unrelated_local_submodule_configuration(
             == "none",
             "repair changed active submodule settings",
         )
-    _home_test_expect(
+    _expect(
         _home_test_history_snapshot(history) == history_before,
         "repair changed stored history",
     )
-    after = _home_test_snapshot(root)
+    after = _snapshot(root)
     _home_test_run(root, "fix")
-    _home_test_expect(
-        _home_test_snapshot(root) == after,
+    _expect(
+        _snapshot(root) == after,
         "repeated repair changed home state",
     )
 
 
-def test_merged_home_submodule_whitelist_move_preserves_unrelated_entries(
+def test_home_submodule_whitelist_move_preserves_unrelated_entries(
     tmp_path: Path,
 ) -> None:
     """Preview moves safely and migrate subtree rules without touching sibling paths."""
     subject = import_module("afairesi.main")
-    _home_test_git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "init", "--quiet")
     ignore = tmp_path / ".gitignore"
     source = (
         "*\n!/.gitignore\n!/forge.example/\n!/forge.example/team/\n"
@@ -3717,43 +3667,43 @@ def test_merged_home_submodule_whitelist_move_preserves_unrelated_entries(
         "!/forge.example/team/older\n!/forge.example/team/new\n!/future\n"
     )
     ignore.write_text(source)
-    _home_test_git(tmp_path, "add", ".gitignore")
+    _git(tmp_path, "add", ".gitignore")
     old = Path("forge.example/team/old")
     new = Path("forge.example/team/new")
-    _home_test_expect(
+    _expect(
         subject._move_home_whitelist(tmp_path, old, new, dry_run=True),  # noqa: SLF001
         tmp_path,
     )
-    _home_test_expect(ignore.read_text() == source, ignore)
-    _home_test_expect(_home_test_git(tmp_path, "show", ":.gitignore") == source, ignore)
+    _expect(ignore.read_text() == source, ignore)
+    _expect(_git(tmp_path, "show", ":.gitignore") == source, ignore)
     subject._move_home_whitelist(tmp_path, old, new, dry_run=False)  # noqa: SLF001
     expected = (
         "*\n!/.gitignore\n!/forge.example/\n!/forge.example/team/\n"
         "!/forge.example/team/older\n!/forge.example/team/new\n!/future\n"
         "!/forge.example/team/new/prm/\n"
     )
-    _home_test_expect(ignore.read_text() == expected, ignore.read_text())
-    _home_test_expect(
-        _home_test_git(tmp_path, "show", ":.gitignore") == expected,
+    _expect(ignore.read_text() == expected, ignore.read_text())
+    _expect(
+        _git(tmp_path, "show", ":.gitignore") == expected,
         ignore,
     )
-    _home_test_expect(
+    _expect(
         not subject._move_home_whitelist(tmp_path, old, new, dry_run=True),  # noqa: SLF001
         ignore,
     )
 
 
-def test_merged_home_cli_exposes_only_home_lifecycle_commands(
+def test_home_cli_exposes_only_home_lifecycle_commands(
     tmp_path: Path,
 ) -> None:
     """Keep home lifecycle commands separate from flake resource management."""
     commands = ("add", "fix", "init", "rm")
     help_output = _home_test_run(tmp_path, "--help").stdout
-    _home_test_expect(_home_test_run(tmp_path).stdout == help_output, help_output)
+    _expect(_home_test_run(tmp_path).stdout == help_output, help_output)
     positions = [help_output.index(f"    {name} ") for name in commands]
-    _home_test_expect(positions == sorted(positions), help_output)
+    _expect(positions == sorted(positions), help_output)
     for command in commands:
-        _home_test_expect(
+        _expect(
             "usage:" in _home_test_run(tmp_path, command, "--help").stdout,
             command,
         )
@@ -3765,22 +3715,22 @@ def test_merged_home_cli_exposes_only_home_lifecycle_commands(
         ("rm",),
     ):
         _home_test_run(tmp_path, *arguments, code=2)
-    _home_test_expect(not list(tmp_path.iterdir()), "invalid requests created files")
+    _expect(not list(tmp_path.iterdir()), "invalid requests created files")
 
 
-def test_merged_home_commands_reject_flake_repositories_without_changes(
+def test_home_commands_reject_flake_repositories_without_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Prevent home lifecycle commands from modifying a flake repository."""
-    _home_test_git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "init", "--quiet")
     (tmp_path / "flake.nix").touch()
     monkeypatch.setenv("HOME", str(tmp_path))
-    before = _home_test_snapshot(tmp_path)
+    before = _snapshot(tmp_path)
     for arguments in (("init",), ("fix",), ("rm", "example")):
         _home_test_run(tmp_path, *arguments, code=1)
-        _home_test_expect(
-            _home_test_snapshot(tmp_path) == before,
+        _expect(
+            _snapshot(tmp_path) == before,
             "home command changed flake state",
         )
 
@@ -3929,71 +3879,7 @@ def test_web_formatting_preserves_literal_line_breaks() -> None:
         _expect("first\n\nsecond" in html.read_text(), html.read_text())
 
 
-if TYPE_CHECKING:
-    from collections.abc import Iterator
-
-
-def _campaign_run(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-    executable: str | None = None,
-    environment: dict[str, str] | None = None,
-) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(  # noqa: S603
-        [
-            executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
-            *(["repo", "test"] if executable in (None, "afairesi") else []),
-            *arguments,
-        ],
-        cwd=root,
-        env=environment,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    if result.returncode != code:
-        raise AssertionError(result.stdout + result.stderr)
-    return result
-
-
-def _campaign_repair_flake(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Exercise the private flake repair entry point used by the formatter."""
-    return _campaign_run(
-        root,
-        "-c",
-        "from afairesi.main import formatter_main; formatter_main()",
-        *arguments,
-        code=code,
-        executable=sys.executable,
-    )
-
-
-def _campaign_git(root: Path, *arguments: str) -> str:
-    return subprocess.run(  # noqa: S603
-        ["git", *arguments],  # noqa: S607
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    ).stdout
-
-
-def _campaign_make_source_package(root: Path, name: str, source: str) -> Path:
-    """Create a canonical package fixture without executing its source."""
-    package = root / name
-    package.mkdir(parents=True)
-    (root / "flake.nix").touch()
-    (package / "default.nix").touch()
-    (package / "main.py").touch()
-    (package / "test_main.py").write_text(source)
-    return package
+_campaign_run = partial(_run, scope=("repo", "test"))
 
 
 def _campaign_make_runner_target(
@@ -4021,8 +3907,7 @@ def _campaign_prepare_runner_flake(
     name: str = "example",
 ) -> dict[str, str]:
     """Provide an offline flake backed by this check's real Python environment."""
-    package = _campaign_make_runner_target(root, source, tests, name=name)
-    (package / "main.py").write_text(source, encoding="utf-8")
+    _campaign_make_runner_target(root, source, tests, name=name)
     builders = root / "prm/builders"
     shutil.copytree(Path(__file__).with_name("prm"), builders)
     shutil.copyfile(Path(__file__).with_name("main.py"), builders.parent / "main.py")
@@ -4089,7 +3974,7 @@ def _campaign_prepare_coverage_flake(
 ) -> dict[str, str]:
     """Build generated checks and coverage variants with offline Nix inputs."""
     root.mkdir(parents=True)
-    _campaign_git(root, "init", "--quiet")
+    _git(root, "init", "--quiet")
     for filename in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
         (root / filename).write_text(
             "{}" if filename.endswith((".nix", ".lock")) else "",
@@ -4097,7 +3982,7 @@ def _campaign_prepare_coverage_flake(
     (root / "flake.lock").write_text(
         json.dumps({"nodes": {"root": {}}, "root": "root", "version": 7}),
     )
-    _campaign_git(root, "add", ".")
+    _git(root, "add", ".")
     environment = dict(os.environ)
     store = root.parent / "nix"
     environment["NIX_REMOTE"] = (
@@ -4132,7 +4017,7 @@ def _campaign_prepare_coverage_flake(
     shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
     shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/main.py")
     for name in ("example", "z-last"):
-        _campaign_manage(root, "add", f"{name}", "python")
+        _run(root, "add", f"{name}", "python")
         package = root / name
         source = (
             "import os\n"
@@ -4203,7 +4088,7 @@ def _campaign_prepare_coverage_flake(
             f"packageDrv = packages.{json.dumps(name)}; "
             f"check = checks.{json.dumps(name)}; }};",
         )
-    _campaign_repair_flake(root)
+    _repair_flake(root)
     (root / "flake.nix").write_text(
         "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
         f"system = {json.dumps(system)}; "
@@ -4227,39 +4112,8 @@ def _campaign_prepare_coverage_flake(
         "in { packages.${system} = packages // { " + " ".join(reports) + " }; "
         "checks.${system} = checks; }; }\n",
     )
-    _campaign_git(root, "add", ".")
+    _git(root, "add", ".")
     return environment
-
-
-def _campaign_expect(condition: bool, detail: object) -> None:  # noqa: FBT001
-    """Report an invariant failure with its observed state."""
-    if not condition:
-        raise AssertionError(detail)
-
-
-def _campaign_repository(root: Path, *, object_format: str = "sha1") -> Path:
-    """Index a minimal flake in an existing temporary directory."""
-    _campaign_git(root, "init", "--quiet", f"--object-format={object_format}")
-    for name in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
-        (root / name).write_text("", encoding="utf-8")
-    _campaign_git(root, "add", ".")
-    return root
-
-
-@contextmanager
-def _campaign_fresh_repository(*, object_format: str = "sha1") -> Iterator[Path]:
-    """Give every generated example its own repository and cleanup."""
-    with TemporaryDirectory(prefix="afairesi-contract-") as directory:
-        yield _campaign_repository(Path(directory), object_format=object_format)
-
-
-def _campaign_snapshot(
-    root: Path,
-    *,
-    exclude: tuple[str, ...] = (),
-) -> tuple[object, ...]:
-    """Observe campaign state with the shared repository snapshot."""
-    return _snapshot(root, exclude=exclude)
 
 
 def _campaign_runner_package(
@@ -4272,10 +4126,10 @@ def _campaign_runner_package(
     flake = (root / "flake.nix").read_text()
     _campaign_make_runner_target(root, source, tests, name=name)
     (root / "flake.nix").write_text(flake)
-    _campaign_git(root, "add", ".")
+    _git(root, "add", ".")
 
 
-def _campaign_campaign(
+def _run_campaign(
     root: Path,
     environment: dict[str, str],
     command: str,
@@ -4283,7 +4137,7 @@ def _campaign_campaign(
     cwd: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an omitted target and preserve original sources, settings, and refs."""
-    before = _campaign_snapshot(root, exclude=("tmp",))
+    before = _snapshot(root, exclude=("tmp",))
     result = subprocess.run(  # noqa: S603
         [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "test", command, *arguments],
         cwd=cwd or root,
@@ -4293,20 +4147,11 @@ def _campaign_campaign(
         check=False,
         timeout=120,
     )
-    _campaign_expect(
-        _campaign_snapshot(root, exclude=("tmp",)) == before,
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
         "campaign changed original sources or Git state",
     )
     return result
-
-
-def _campaign_manage(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Set up repository fixtures through the management executable."""
-    return _run(root, *arguments, code=code)
 
 
 @pytest.mark.parametrize("nested", [False, True])
@@ -4325,8 +4170,8 @@ def test_campaigns_route_targets_and_forward_test_selection(
 ) -> None:
     """Resolve one target and forward its selectors without shell interpretation."""
     subject = import_module("afairesi.main")
-    root = _campaign_repository(tmp_path)
-    package = _campaign_make_source_package(root, "alpha", "def test_alpha(): pass\n")
+    root = _repository(tmp_path)
+    package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
     directory = package / "prm/nested" if nested else package
     directory.mkdir(parents=True, exist_ok=True)
     monkeypatch.chdir(directory)
@@ -4383,7 +4228,7 @@ def test_bare_test_command_shows_help_without_running_campaigns(
     subject = import_module("afairesi.main")
     root = tmp_path / "repository"
     root.mkdir()
-    _campaign_repository(root)
+    _repository(root)
     nested = root / "example/prm/nested"
     nested.mkdir(parents=True)
     monkeypatch.chdir({"outside": tmp_path, "root": root, "nested": nested}[location])
@@ -4391,7 +4236,7 @@ def test_bare_test_command_shows_help_without_running_campaigns(
     other_campaigns = Mock(side_effect=AssertionError("unexpected campaign"))
     monkeypatch.setattr(subject, "_run_coverage", coverage_run)
     monkeypatch.setattr(subject, "_dispatch_test_runner", other_campaigns)
-    before = _campaign_snapshot(root)
+    before = _snapshot(root)
     monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "--help"])
     with pytest.raises(SystemExit) as completed:
         subject.main()
@@ -4409,8 +4254,8 @@ def test_bare_test_command_shows_help_without_running_campaigns(
         raise AssertionError((coverage_run.call_count, 0))
     if other_campaigns.call_count != 0:
         raise AssertionError((other_campaigns.call_count, 0))
-    if _campaign_snapshot(root) != before:
-        raise AssertionError((_campaign_snapshot(root), before))
+    if _snapshot(root) != before:
+        raise AssertionError((_snapshot(root), before))
 
     if list(tmp_path.iterdir()) != [root]:
         raise AssertionError(list(tmp_path.iterdir()))
@@ -4513,15 +4358,15 @@ def test_campaign_fuzz_select_targets_and_apply_example_budgets(
     arguments = ["-k", "cli", "--timeout", "30"]
     if limit is not None:
         arguments.extend(["--max-examples", str(limit)])
-    result = _campaign_campaign(root, environment, "fuzz", *arguments)
-    _campaign_expect(result.returncode == 0 and "1 passed" in result.stdout, result)
+    result = _run_campaign(root, environment, "fuzz", *arguments)
+    _expect(result.returncode == 0 and "1 passed" in result.stdout, result)
     (workspace,) = (root / "tmp").glob("python-fuzz-example-*")
-    _campaign_expect(
+    _expect(
         len((workspace / "examples").read_text().splitlines()) == (limit or 10),
         workspace,
     )
-    _campaign_expect((workspace / "hypothesis").is_dir(), workspace)
-    _campaign_expect(not list(workspace.glob("test-runtime-*")), workspace)
+    _expect((workspace / "hypothesis").is_dir(), workspace)
+    _expect(not list(workspace.glob("test-runtime-*")), workspace)
 
 
 def test_campaign_fuzz_skip_missing_targets_and_report_failures(
@@ -4547,15 +4392,15 @@ def test_campaign_fuzz_skip_missing_targets_and_report_failures(
         "import_failure",
         "raise ImportError('broken import')\n",
     )
-    result = _campaign_campaign(root, environment, "fuzz")
-    _campaign_expect(result.returncode == 1, result)
-    _campaign_expect("2 passed, 3 failed" in result.stdout, result)
-    _campaign_expect("No fuzz tests selected; skipping." in result.stdout, result)
-    _campaign_expect("Failing test case:" in result.stderr, result)
-    _campaign_expect("fuzz tests require @given" in result.stderr, result)
-    _campaign_expect("broken import" in result.stderr, result)
+    result = _run_campaign(root, environment, "fuzz")
+    _expect(result.returncode == 1, result)
+    _expect("0 passed, 3 failed, 2 skipped" in result.stdout, result)
+    _expect("No fuzz tests selected; skipping." in result.stdout, result)
+    _expect("Failing test case:" in result.stderr, result)
+    _expect("fuzz tests require @given" in result.stderr, result)
+    _expect("broken import" in result.stderr, result)
     (workspace,) = (root / "tmp").glob("python-fuzz-broken-*")
-    _campaign_expect((workspace / "tests.log").is_file(), workspace)
+    _expect((workspace / "tests.log").is_file(), workspace)
 
 
 @pytest.mark.parametrize("failing", [False, True])
@@ -4601,38 +4446,38 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
             "    raise AssertionError('selection ignored')\n"
         )
         environment = _campaign_prepare_runner_flake(root, tests, source)
-        result = _campaign_campaign(
+        result = _run_campaign(
             root,
             environment,
             "performance",
             "-k",
             "cli or explicit",
         )
-        _campaign_expect(result.returncode == int(failing), result)
+        _expect(result.returncode == int(failing), result)
         output = result.stdout + result.stderr
-        _campaign_expect("slowest" in output and "test_cli" in output, result)
+        _expect("slowest" in output and "test_cli" in output, result)
         (workspace,) = (root / "tmp").glob("python-performance-example-*")
-        _campaign_expect(
+        _expect(
             "7" in (workspace / "examples").read_text().splitlines()
             and len((workspace / "examples").read_text().splitlines()) > 1,
             workspace,
         )
         profiles = workspace / "profiles"
-        _campaign_expect(str(profiles) in result.stdout, result)
-        _campaign_expect(
+        _expect(str(profiles) in result.stdout, result)
+        _expect(
             (root / "example/main.py").read_text() == source,
             root,
         )
         for script, function in (("run-tests", "test_cli"), ("package-entry", "work")):
             reports = list(profiles.glob(f"{script}-*.prof"))
-            _campaign_expect(
+            _expect(
                 len(reports) == (1 if script == "run-tests" else 2),
                 reports,
             )
             for report in reports:
                 stats = pstats.Stats(str(report))
                 functions = stats.get_stats_profile().func_profiles
-                _campaign_expect(function in functions, functions)
+                _expect(function in functions, functions)
 
 
 @pytest.mark.parametrize(
@@ -4641,16 +4486,16 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
 )
 def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> None:
     """Skip untested repository packages and reject nonrunnable targets safely."""
-    with _campaign_fresh_repository() as root:
+    with _fresh_repository() as root:
         target = root
         if layout == "nonpython":
-            _campaign_manage(root, "add", "web", "html")
+            _run(root, "add", "web", "html")
         elif layout in {"untested", "single_untested"}:
             target = _campaign_make_runner_target(root, "", "")
             (target / "test_main.py").unlink()
             if layout == "untested":
                 target = root
-        before = _campaign_snapshot(root)
+        before = _snapshot(root)
         for command in ("property", "mutation"):
             result = _campaign_run(
                 root,
@@ -4659,21 +4504,21 @@ def test_campaigns_handle_nonrunnable_targets_without_changes(layout: str) -> No
                 code=0 if layout == "untested" else 1,
             )
             if layout == "untested":
-                _campaign_expect(
+                _expect(
                     "Skipping example: no test_main.py" in result.stdout
                     and "0 passed, 0 failed, 1 skipped" in result.stdout,
                     result,
                 )
             elif layout != "single_untested":
-                _campaign_expect("no Python packages found" in result.stderr, result)
+                _expect("no Python packages found" in result.stderr, result)
         if layout == "empty":
-            _campaign_expect(
+            _expect(
                 "no Python packages found"
                 in _campaign_run(root, "coverage", code=1).stderr,
                 "coverage",
             )
-        _campaign_expect(
-            _campaign_snapshot(root) == before,
+        _expect(
+            _snapshot(root) == before,
             "nonrunnable target created state",
         )
 
@@ -4683,7 +4528,7 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
     with TemporaryDirectory(prefix="afairesi-coverage-") as directory:
         root = Path(directory) / "source with spaces"
         environment = _campaign_prepare_coverage_flake(root)
-        before = _campaign_snapshot(root)
+        before = _snapshot(root)
         expression = (
             f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
             "in f.checks.${builtins.currentSystem}.example"
@@ -4699,7 +4544,7 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
             executable="nix",
             environment=environment,
         )
-        _campaign_expect(
+        _expect(
             not any(
                 path.name.startswith(".coverage")
                 or path.name in {"html", "coverage.json"}
@@ -4708,27 +4553,27 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
             "ordinary checks produced coverage artifacts",
         )
         result = _campaign_run_runner_cli(root, environment, "coverage")
-        _campaign_expect(not result.returncode, result)
+        _expect(not result.returncode, result)
         reports = [
             line
             for line in result.stdout.splitlines()
             if line.endswith("/html/index.html")
         ]
         expected_reports = 2
-        _campaign_expect(len(reports) == expected_reports, result)
+        _expect(len(reports) == expected_reports, result)
         for line in reports:
             report = Path(line.split(": ", 1)[1]).parents[1]
             files = json.loads((report / "coverage.json").read_text())["files"]
-            _campaign_expect(
+            _expect(
                 len(files) == 1 and next(iter(files)).endswith("/main.py"),
                 files,
             )
-            _campaign_expect(
+            _expect(
                 set(next(iter(files.values()))["executed_lines"]) == {1, 2, 3, 4, 6},
                 files,
             )
             measured = next(iter(files.values()))
-            _campaign_expect(
+            _expect(
                 {tuple(branch) for branch in measured["executed_branches"]}
                 == {(3, 4), (3, 6)}
                 and any(
@@ -4741,8 +4586,8 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
                 ),
                 measured,
             )
-        _campaign_expect(
-            _campaign_snapshot(root) == before and not (root / "tmp").exists(),
+        _expect(
+            _snapshot(root) == before and not (root / "tmp").exists(),
             "coverage changed repository state",
         )
 
@@ -4754,14 +4599,14 @@ def test_coverage_continues_after_failed_nix_builds(
 ) -> None:
     """Check build failures and continuation at the Nix process boundary."""
     campaign_subject = import_module("afairesi.main")
-    _campaign_repository(tmp_path)
-    failed = _campaign_make_source_package(
+    _repository(tmp_path)
+    failed = _make_source_package(
         tmp_path,
         "example",
         "def test_ready(): pass\n",
     )
-    _campaign_make_source_package(tmp_path, "z-last", "def test_ready(): pass\n")
-    untested = _campaign_make_source_package(tmp_path, "untested", "")
+    _make_source_package(tmp_path, "z-last", "def test_ready(): pass\n")
+    untested = _make_source_package(tmp_path, "untested", "")
     (untested / "test_main.py").unlink()
     report = tmp_path / "tmp/report"
     (report / "html").mkdir(parents=True)
@@ -4785,7 +4630,7 @@ def test_coverage_continues_after_failed_nix_builds(
         "run",
         Mock(wraps=subprocess.run, side_effect=run),
     )
-    before = _campaign_snapshot(tmp_path)
+    before = _snapshot(tmp_path)
     for target, status in ((tmp_path, 1), (failed, 17)):
         monkeypatch.setattr(
             sys,
@@ -4794,20 +4639,20 @@ def test_coverage_continues_after_failed_nix_builds(
         )
         with pytest.raises(SystemExit) as completed:
             campaign_subject.main()
-        _campaign_expect(completed.value.code == status, completed)
+        _expect(completed.value.code == status, completed)
         output = capsys.readouterr()
-        _campaign_expect("error: coverage builder failed" in output.err, output)
+        _expect("error: coverage builder failed" in output.err, output)
         if target == tmp_path:
-            _campaign_expect(
+            _expect(
                 "1 passed, 1 failed, 1 skipped" in output.out
                 and "z-last:" in output.out
                 and str(report / "html/index.html") in output.out
                 and "afairesi repo test coverage: example:" in output.err,
                 output,
             )
-        _campaign_expect(_campaign_snapshot(tmp_path) == before, target)
+        _expect(_snapshot(tmp_path) == before, target)
     prefix = f"git+{tmp_path.as_uri()}#"
-    _campaign_expect(
+    _expect(
         builds
         == [
             prefix + name
@@ -4880,8 +4725,8 @@ def test_coverage_rejects_missing_report_files(
     campaign_subject = import_module("afairesi.main")
     root = tmp_path / "source"
     root.mkdir()
-    _campaign_repository(root)
-    package = _campaign_make_source_package(root, "example", "def test_ready(): pass\n")
+    _repository(root)
+    package = _make_source_package(root, "example", "def test_ready(): pass\n")
     report = tmp_path / "report"
     report.mkdir()
     builds: list[list[str]] = []
@@ -4900,7 +4745,7 @@ def test_coverage_rejects_missing_report_files(
         "run",
         Mock(wraps=subprocess.run, side_effect=run),
     )
-    before = _campaign_snapshot(root)
+    before = _snapshot(root)
     message = "no HTML report"
     monkeypatch.setattr(
         sys,
@@ -4909,13 +4754,13 @@ def test_coverage_rejects_missing_report_files(
     )
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
-    _campaign_expect(
+    _expect(
         completed.value.code == 1 and message in capsys.readouterr().err,
         completed,
     )
-    _campaign_expect(len(builds) == 1, builds)
-    _campaign_expect(
-        _campaign_snapshot(root) == before,
+    _expect(len(builds) == 1, builds)
+    _expect(
+        _snapshot(root) == before,
         "coverage validation modified source state",
     )
 
@@ -4936,7 +4781,7 @@ def test_package_campaign_preserves_native_nix_errors(
     (root / "flake.nix").write_text(
         "{ outputs = _: {}; }" if failure == "missing-output" else "{",
     )
-    _campaign_git(root, "add", "flake.nix")
+    _git(root, "add", "flake.nix")
     attribute = (
         "example-coverage" if command == "coverage" else "example-test-environment"
     )
@@ -4956,8 +4801,8 @@ def test_package_campaign_preserves_native_nix_errors(
         check=False,
         timeout=30,
     )
-    _campaign_expect(expected.returncode != 0, expected)
-    before = _campaign_snapshot(root, exclude=("tmp",))
+    _expect(expected.returncode != 0, expected)
+    before = _snapshot(root, exclude=("tmp",))
     actual = _campaign_run(
         root,
         command,
@@ -4965,12 +4810,12 @@ def test_package_campaign_preserves_native_nix_errors(
         code=expected.returncode,
         environment=environment,
     )
-    _campaign_expect(
+    _expect(
         expected.stderr.strip() in actual.stderr,
         (expected.stderr, actual.stderr),
     )
-    _campaign_expect(
-        _campaign_snapshot(root, exclude=("tmp",)) == before,
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
         "failed campaign changed package sources or Git state",
     )
 
@@ -5017,8 +4862,8 @@ def test_package_property_preserves_native_pytest_status(
         check=False,
         timeout=30,
     )
-    _campaign_expect(expected.returncode != 0, expected)
-    before = _campaign_snapshot(root, exclude=("tmp",))
+    _expect(expected.returncode != 0, expected)
+    before = _snapshot(root, exclude=("tmp",))
     actual = _campaign_run(
         root,
         "property",
@@ -5033,9 +4878,9 @@ def test_package_property_preserves_native_pytest_status(
         if line.startswith("ERROR:") or "SyntaxError:" in line
     ]
     for diagnostic in diagnostics:
-        _campaign_expect(diagnostic in actual.stderr, (diagnostic, actual.stderr))
-    _campaign_expect(
-        _campaign_snapshot(root, exclude=("tmp",)) == before,
+        _expect(diagnostic in actual.stderr, (diagnostic, actual.stderr))
+    _expect(
+        _snapshot(root, exclude=("tmp",)) == before,
         "pytest failure changed original package sources or Git state",
     )
 
@@ -5047,18 +4892,18 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
 ) -> None:
     """Validate package eligibility and continuation separately from Nix builds."""
     campaign_subject = import_module("afairesi.main")
-    _campaign_repository(tmp_path)
-    _campaign_make_source_package(tmp_path, "alpha", "def invalid(")
-    untested = _campaign_make_source_package(tmp_path, "untested", "")
+    _repository(tmp_path)
+    _make_source_package(tmp_path, "alpha", "def invalid(")
+    untested = _make_source_package(tmp_path, "untested", "")
     (untested / "test_main.py").unlink()
-    ready = _campaign_make_source_package(
+    ready = _make_source_package(
         tmp_path,
         "z-last",
         "def test_ready(): pass\n",
     )
     built: list[Path] = []
     monkeypatch.setattr(campaign_subject, "_build_package_coverage", built.append)
-    before = _campaign_snapshot(tmp_path)
+    before = _snapshot(tmp_path)
     monkeypatch.setattr(
         sys,
         "argv",
@@ -5066,16 +4911,16 @@ def test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
     )
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
-    _campaign_expect(completed.value.code == 1, "invalid source must fail coverage")
+    _expect(completed.value.code == 1, "invalid source must fail coverage")
     output = capsys.readouterr()
-    _campaign_expect(built == [ready], built)
-    _campaign_expect(
+    _expect(built == [ready], built)
+    _expect(
         "1 passed, 1 failed, 1 skipped" in output.out
         and "afairesi repo test coverage: alpha:" in output.err,
         output,
     )
-    _campaign_expect(
-        _campaign_snapshot(tmp_path) == before,
+    _expect(
+        _snapshot(tmp_path) == before,
         "coverage eligibility modified sources",
     )
 
@@ -5111,20 +4956,20 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
         _campaign_runner_package(root, "alpha", bad_tests)
         _campaign_runner_package(root, "untested", "")
         (root / "untested/test_main.py").unlink()
-        result = _campaign_campaign(
+        result = _run_campaign(
             root,
             environment,
             "property",
             "--timeout",
             "20" if failure == "counterexample" else "2",
         )
-        _campaign_expect(
+        _expect(
             result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
             result,
         )
         (failed,) = (root / "tmp").glob("python-property-alpha-*")
         diagnostic = "Failing test case" if failure == "counterexample" else "timed out"
-        _campaign_expect(
+        _expect(
             diagnostic
             in result.stdout + result.stderr + (failed / "tests.log").read_text(),
             result,
@@ -5132,7 +4977,7 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
         if failure == "timeout":
             pid = int((failed / "child.pid").read_text())
             status = Path(f"/proc/{pid}/status")
-            _campaign_expect(
+            _expect(
                 not status.exists() or "State:\tZ" in status.read_text(),
                 "timed-out suite left a running descendant",
             )
@@ -5211,39 +5056,39 @@ def test_property_campaigns_generate_cases_in_isolated_sources(
             "TMPDIR",
         ):
             environment[variable] = str(caller_home)
-        before = _campaign_snapshot(root, exclude=("tmp",))
+        before = _snapshot(root, exclude=("tmp",))
         result = _campaign_run_runner_cli(
             root,
             environment,
             "property",
         )
-        _campaign_expect(
+        _expect(
             not result.returncode and "1 passed, 0 failed, 0 skipped" in result.stdout,
             result,
         )
-        _campaign_expect(
-            _campaign_snapshot(root, exclude=("tmp",)) == before,
+        _expect(
+            _snapshot(root, exclude=("tmp",)) == before,
             "property campaign modified source",
         )
         workspaces = list((root / "tmp").glob("python-property-git-example-*"))
-        _campaign_expect(len(workspaces) == 1, workspaces)
+        _expect(len(workspaces) == 1, workspaces)
         for workspace in workspaces:
-            _campaign_expect(
+            _expect(
                 len((workspace / "examples").read_text().splitlines())
                 == max_examples + 1,
                 workspace,
             )
-            _campaign_expect(
+            _expect(
                 f"{max_examples} passing, 0 failing"
                 in (workspace / "tests.log").read_text(),
                 workspace,
             )
-            _campaign_expect(
+            _expect(
                 "2 passed" in (workspace / "tests.log").read_text()
                 and not list(workspace.glob("test-runtime-*")),
                 workspace,
             )
-        _campaign_expect(
+        _expect(
             sentinel.read_text() == "preserve",
             caller_home,
         )
@@ -5280,11 +5125,11 @@ def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
         )
         environment["PYTEST_PLUGINS"] = "example.prm.native_plugin"
         environment["PYTEST_ADDOPTS"] = "--native-option --hypothesis-profile=package"
-        result = _campaign_campaign(root, environment, command)
-        _campaign_expect(result.returncode == 0, result)
+        result = _run_campaign(root, environment, command)
+        _expect(result.returncode == 0, result)
         (workspace,) = (root / "tmp").glob(f"python-{command}-example-*")
         expected_examples = 3
-        _campaign_expect(
+        _expect(
             len((workspace / "examples").read_text().splitlines()) == expected_examples,
             workspace,
         )
@@ -5312,7 +5157,7 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
             _campaign_runner_package(root, name, baseline)
         _campaign_runner_package(root, "untested", "")
         (root / "untested/test_main.py").unlink()
-        result = _campaign_campaign(
+        result = _run_campaign(
             root,
             environment,
             "mutation",
@@ -5321,7 +5166,7 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
             "--max-mutations",
             "1",
         )
-        _campaign_expect(
+        _expect(
             result.returncode == 1
             and "1 passed, 4 failed, 1 skipped" in result.stdout
             and "baseline.log" in result.stderr,
@@ -5329,7 +5174,7 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
         )
         for name in baselines:
             (failed,) = (root / "tmp").glob(f"python-mutation-{name}-*")
-            _campaign_expect(
+            _expect(
                 (failed / "baseline.log").is_file()
                 and not (failed / "session.sqlite").exists(),
                 failed,
@@ -5349,10 +5194,10 @@ def test_mutation_campaigns_report_empty_sessions() -> None:
             "    assert value in {0, 1} and main is not None\n"
         )
         environment = _campaign_prepare_runner_flake(root, tests, "")
-        result = _campaign_campaign(root, environment, "mutation")
+        result = _run_campaign(root, environment, "mutation")
         (workspace,) = (root / "tmp").glob("python-mutation-example-*")
         with use_db(workspace / "session.sqlite", WorkDB.Mode.open) as database:
-            _campaign_expect(
+            _expect(
                 not result.returncode and database.num_work_items == 0,
                 result,
             )
@@ -5391,7 +5236,7 @@ def test_mutation_runs_preserve_engine_failure_status(
                 ),
             )
     succeeded = campaign_subject._mutation_run_succeeded(tmp_path)  # noqa: SLF001 - Check engine status without running mutations.
-    _campaign_expect(
+    _expect(
         succeeded == (problem not in {"error", "pending", "incompetent"}),
         problem,
     )
@@ -5433,7 +5278,7 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations() -> None:
             name="git-example",
         )
         target_line = 2
-        focused = _campaign_campaign(
+        focused = _run_campaign(
             root,
             environment,
             "mutation",
@@ -5449,9 +5294,9 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations() -> None:
             "1",
             cwd=root / "git-example",
         )
-        _campaign_expect(not focused.returncode, focused)
+        _expect(not focused.returncode, focused)
         (focused_workspace,) = (root / "tmp").glob("python-mutation-git-example-*")
-        _campaign_expect(
+        _expect(
             (focused_workspace / "report.html").stat().st_size > 0,
             focused,
         )
@@ -5461,14 +5306,14 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations() -> None:
                 for item, result in database.completed_work_items
                 if result.worker_outcome != WorkerOutcome.SKIPPED
             ]
-        _campaign_expect(
+        _expect(
             len(selected) == 1
             and selected[0][1].test_outcome == MutationTestOutcome.KILLED
             and selected[0][0].mutations[0].start_pos[0] == target_line,
             selected,
         )
         existing_workspaces = set((root / "tmp").iterdir())
-        weaker = _campaign_campaign(
+        weaker = _run_campaign(
             root,
             environment,
             "mutation",
@@ -5484,7 +5329,7 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations() -> None:
             "1",
             cwd=root / "git-example",
         )
-        _campaign_expect(not weaker.returncode, weaker)
+        _expect(not weaker.returncode, weaker)
         (weaker_workspace,) = set((root / "tmp").iterdir()) - existing_workspaces
         with use_db(weaker_workspace / "session.sqlite", WorkDB.Mode.open) as database:
             weaker_selected = [
@@ -5492,7 +5337,7 @@ def test_mutation_campaigns_report_outcomes_and_filter_mutations() -> None:
                 for item, result in database.completed_work_items
                 if result.worker_outcome != WorkerOutcome.SKIPPED
             ]
-        _campaign_expect(
+        _expect(
             len(weaker_selected) == 1
             and weaker_selected[0][0].mutations[0].start_pos[0] == target_line
             and "NumberReplacer" in weaker_selected[0][0].mutations[0].operator_name
@@ -5508,22 +5353,70 @@ def test_campaign_home_target_requires_native_git_traversal(
 ) -> None:
     """Reject home scope instead of silently traversing registered submodules."""
     campaign_subject = import_module("afairesi.main")
-    _campaign_git(tmp_path, "init", "--quiet")
+    _git(tmp_path, "init", "--quiet")
     (tmp_path / ".gitmodules").touch()
     monkeypatch.chdir(tmp_path)
     monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "property"])
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
-    _campaign_expect(completed.value.code == 1, completed)
-    _campaign_expect("git submodule foreach" in capsys.readouterr().err, completed)
+    _expect(completed.value.code == 1, completed)
+    _expect("git submodule foreach" in capsys.readouterr().err, completed)
 
 
 inspection_subject = import_module("afairesi.main")
 
 
-def _inspection_expect(condition: bool, message: str) -> None:  # noqa: FBT001
-    if not condition:
-        raise AssertionError(message)
+@pytest.mark.parametrize("description", [None, "package"])
+def test_description_ignores_dependency_metadata(description: str | None) -> None:
+    """Read only the returned package's description, including curried builders."""
+    metadata = "" if description is None else f'meta.description = "{description}";'
+    source = (
+        '{ pkgs }: let dependency = { meta.description = "dependency"; }; '
+        f'in pkgs.runCommand "example" {{ {metadata} }} "touch $out"'
+    )
+    _expect(
+        inspection_subject.source_package_description(source) == description,
+        source,
+    )
+
+
+def test_formatter_discovery_only_uses_available_packages(tmp_path: Path) -> None:
+    """Ignore orphan sources, unavailable packages, and aliases during mypy setup."""
+    for name in ("example", "orphan", "unavailable"):
+        directory = tmp_path / name
+        directory.mkdir()
+        (directory / "main.py").write_text("VALUE = 1\n")
+        if name != "orphan":
+            (directory / "default.nix").write_text("{}")
+    formatter = Path(__file__).with_name("prm") / "formatter.nix"
+    expression = f"""let
+      self = {{ outPath = {json.dumps(str(tmp_path))};
+        packages.test = {{ example = {{}}; default = {{}}; }}; }};
+      pkgs = {{ stdenv.system = "test";
+        writeShellApplication = _: {{ passthru = {{}}; }};
+        lib.filterAttrs = predicate: attrs: builtins.listToAttrs
+          (map (name: {{ inherit name; value = attrs.${{name}}; }})
+          (builtins.filter (name: predicate name attrs.${{name}})
+            (builtins.attrNames attrs)));
+        lib.genAttrs = names: value: builtins.listToAttrs
+          (map (name: {{ inherit name; value = value name; }}) names);
+      }};
+      inputs.treefmt-nix.lib.evalModule = _: module: {{
+        config.build.wrapper = module.programs.mypy.directories;
+      }};
+      formatter = import {formatter} {{ inherit inputs pkgs self; }};
+      in builtins.attrNames formatter.passthru.raw"""
+    result = _run(
+        tmp_path,
+        "eval",
+        "--impure",
+        "--json",
+        "--expr",
+        expression,
+        executable="nix",
+        environment=_nix_environment(tmp_path),
+    )
+    _expect(json.loads(result.stdout) == ["example"], result)
 
 
 def _inspection_discovery(source: str) -> dict[str, Any]:
@@ -5583,20 +5476,20 @@ def parser():
 def main():
     parser().parse_args()
 """)
-    _inspection_expect(list(report["commands"]) == ["build"], "lost subcommand")
-    _inspection_expect(
+    _expect(list(report["commands"]) == ["build"], "lost subcommand")
+    _expect(
         report["arguments"] == [{"names": ["input"], "type": "str"}],
         "wrong positional scope",
     )
     rows = {
         tuple(row["names"]): row for row in report["commands"]["build"]["arguments"]
     }
-    _inspection_expect(
+    _expect(
         rows[("-j", "--jobs")]
         == {"names": ["-j", "--jobs"], "type": "int", "default": 2, "choices": [1, 2]},
         "lost metadata",
     )
-    _inspection_expect(
+    _expect(
         rows[("--quiet",)] == {"names": ["--quiet"], "action": "store_true"},
         "lost helper context",
     )
@@ -5617,7 +5510,7 @@ subcommands.add_parser("list")
 add = subcommands.add_parser("add")
 add.add_argument("url")
 """)
-    _inspection_expect(
+    _expect(
         report
         == {
             "arguments": [
@@ -5651,11 +5544,11 @@ cli = Parser()
 cli.add_argument("--output", default=compute_default(), **options)
 """)
     argument = report["arguments"][0]
-    _inspection_expect(
+    _expect(
         argument["default"] == {"unknown": "compute_default()"},
         "default was guessed",
     )
-    _inspection_expect(
+    _expect(
         argument["**kwargs"] == {"unknown": "options"},
         "unresolved kwargs were hidden",
     )
@@ -6011,11 +5904,11 @@ def test_unresolved_cli_declarations_fail(source: str, reason: str) -> None:
             ast.parse("import argparse\n" + source),
             "example/main.py",
         ).report()
-    _inspection_expect(
+    _expect(
         re.search(r"example/main.py:\d+:\d+:", str(error.value)) is not None,
         "missing source location",
     )
-    _inspection_expect("\n  " in str(error.value), "missing offending expression")
+    _expect("\n  " in str(error.value), "missing offending expression")
 
 
 @pytest.mark.parametrize("constructor", ["argparse.ArgumentParser()", "Parser()"])
@@ -6074,17 +5967,17 @@ listing = commands.add_parser(name='list', aliases=['ls'])
 listing.add_argument('--all', action='store_true')
 listing.add_subparsers().add_parser('files', aliases=['f'])
 """)
-    _inspection_expect(set(report["commands"]) == {"list", "ls"}, "missing alias")
+    _expect(set(report["commands"]) == {"list", "ls"}, "missing alias")
     listing = report["commands"]["list"]
-    _inspection_expect(listing == report["commands"]["ls"], "alias interface differs")
-    _inspection_expect(
+    _expect(listing == report["commands"]["ls"], "alias interface differs")
+    _expect(
         listing["arguments"]
         == [
             {"names": ["--all"], "action": "store_true"},
         ],
         "lost alias arguments",
     )
-    _inspection_expect(
+    _expect(
         set(listing["commands"]) == {"files", "f"},
         "missing nested alias",
     )
@@ -6109,7 +6002,7 @@ def parser():
 def main():
     parser().{method}()
 """)
-    _inspection_expect(
+    _expect(
         [row["names"] for row in report["arguments"]] == [["--public"]],
         "internal arguments leaked into the public interface",
     )
@@ -6127,7 +6020,7 @@ def main():
     cli = parser()
     configure(target=cli)
 """)
-    _inspection_expect(
+    _expect(
         report["arguments"] == [{"names": ["--required"], "required": True}],
         "factory or keyword binding was lost",
     )
@@ -6165,11 +6058,11 @@ def parse(cli):
     cli.parse_args()
 """
     report = _inspection_discovery(source.replace("ENTRYPOINT", entrypoint))
-    _inspection_expect(
+    _expect(
         [row["names"] for row in report["arguments"]] == [["--shared"], ["--public"]],
         "internal parser arguments leaked into the public CLI",
     )
-    _inspection_expect(list(report["commands"]) == ["repo"], "internal command leaked")
+    _expect(list(report["commands"]) == ["repo"], "internal command leaked")
 
 
 def test_declared_test_identifiers(tmp_path: Path) -> None:
@@ -6190,7 +6083,7 @@ class Helper:
     def test_not_collected(self): pass
 """)
     rows = inspection_subject.inspect_repository(tmp_path)["example"]["tests"]
-    _inspection_expect(
+    _expect(
         rows
         == [
             "Arguments::test_valid_input",
@@ -6242,7 +6135,7 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         for path in tmp_path.rglob("*")
         if path.is_file()
     }
-    _inspection_expect(before == after, "inspection wrote to the repository")
+    _expect(before == after, "inspection wrote to the repository")
     _expect(list(report) == ["example", "laptop", "library"], report)
     _expect(report["example"]["type"] == "package", report)
     _expect(
@@ -6250,11 +6143,11 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         report,
     )
     _expect("packages" not in report and "hosts" not in report, report)
-    _inspection_expect(
+    _expect(
         report["laptop"] == {"type": "host"},
         "wrong hosts",
     )
-    _inspection_expect(
+    _expect(
         report["library"]["cli"] is None,
         "non-Python package has CLI metadata",
     )
@@ -6369,7 +6262,7 @@ def test_cli_inventory_resolves_repository_paths(
     """Return the same JSON inventory through supported paths inside and outside Git."""
     _inspection_repository(tmp_path)
     expected = inspection_subject.inspect_repository(tmp_path)
-    _inspection_expect(
+    _expect(
         "test_default_output" in expected["example"]["tests"],
         "inventory lost test identifier",
     )
@@ -6393,7 +6286,7 @@ def test_cli_inventory_resolves_repository_paths(
             check=True,
             timeout=30,
         )
-        _inspection_expect(
+        _expect(
             json.loads(completed.stdout) == expected,
             "path resolution changed the CLI inventory",
         )
@@ -6415,7 +6308,7 @@ def test_invalid_repository_and_source(tmp_path: Path) -> None:
 def test_empty_repository(tmp_path: Path) -> None:
     """Return an empty resource map for an empty repository."""
     (tmp_path / "flake.nix").touch()
-    _inspection_expect(
+    _expect(
         inspection_subject.inspect_repository(tmp_path) == {},
         "empty collections were omitted",
     )
@@ -6491,25 +6384,25 @@ def test_remote_inspection_preserves_home_and_does_not_block_submodule_add(
     if initialized:
         inspection_subject.initialize_home()
     before = _inspection_tree_snapshot(home)
-    _inspection_expect(
+    _expect(
         _inspection_inspect_target(remote)
         == inspection_subject.inspect_repository(source),
         "wrong remote inventory",
     )
     _inspection_advance_remote(source)
-    _inspection_expect(
+    _expect(
         _inspection_inspect_target(remote)
         == inspection_subject.inspect_repository(source),
         "remote inspection was stale",
     )
-    _inspection_expect(
+    _expect(
         _inspection_tree_snapshot(home) == before,
         "remote inspection changed HOME",
     )
     if initialized:
         inspection_subject.initialize_submodule(remote)
         checkout = home / "example.test/team/repository"
-        _inspection_expect(
+        _expect(
             inspection_subject.git(checkout, ["rev-parse", "HEAD"]).stdout
             == inspection_subject.git(source, ["rev-parse", "HEAD"]).stdout,
             "inspection interfered with native submodule add",
@@ -6539,13 +6432,13 @@ def test_remote_inspection_cleans_temporary_checkout(
             inspection_subject.inspect_repository(checkout)
     else:
         with inspection_subject.inspection_remote_repository(remote) as checkout:
-            _inspection_expect(
+            _expect(
                 inspection_subject.inspect_repository(checkout)
                 == inspection_subject.inspect_repository(source),
                 "wrong temporary checkout contents",
             )
-    _inspection_expect(not checkout.exists(), "temporary checkout survived inspection")
-    _inspection_expect(not list(home.iterdir()), "temporary inspection changed HOME")
+    _expect(not checkout.exists(), "temporary checkout survived inspection")
+    _expect(not list(home.iterdir()), "temporary inspection changed HOME")
 
 
 def test_local_path_and_remote_url_inspect_the_requested_contents(
@@ -6564,17 +6457,17 @@ def test_local_path_and_remote_url_inspect_the_requested_contents(
         ["remote", "set-url", "origin", "https://fork.test/team/repository"],
     )
     before = _inspection_tree_snapshot(home)
-    _inspection_expect(
+    _expect(
         _inspection_inspect_target(str(checkout))
         == inspection_subject.inspect_repository(checkout),
         "explicit local inspection ignored local content",
     )
-    _inspection_expect(
+    _expect(
         _inspection_inspect_target(remote)
         == inspection_subject.inspect_repository(source),
         "remote URL inspected a local fork or untracked files",
     )
-    _inspection_expect(
+    _expect(
         _inspection_tree_snapshot(home) == before,
         "inspection changed local Git state",
     )
@@ -6619,12 +6512,12 @@ def test_remote_inspection_ignores_existing_home_storage(
             (checkout / "LICENSE").write_text("local changes")
     _inspection_advance_remote(source)
     before = _inspection_tree_snapshot(home)
-    _inspection_expect(
+    _expect(
         _inspection_inspect_target(remote)
         == inspection_subject.inspect_repository(source),
         "local state affected remote inspection",
     )
-    _inspection_expect(
+    _expect(
         _inspection_tree_snapshot(home) == before,
         "inspection changed existing Git storage",
     )
@@ -6636,12 +6529,12 @@ def test_remote_inspection_accepts_native_file_urls(
 ) -> None:
     """Let Git handle transports without imposing hosted repository conventions."""
     home, source, _remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    _inspection_expect(
+    _expect(
         _inspection_inspect_target(source.as_uri())
         == inspection_subject.inspect_repository(source),
         "native file URL was rejected",
     )
-    _inspection_expect(not list(home.iterdir()), "file URL inspection changed HOME")
+    _expect(not list(home.iterdir()), "file URL inspection changed HOME")
 
 
 @pytest.mark.parametrize("remote_kind", ["missing", "unsupported", "invalid"])
@@ -6680,7 +6573,7 @@ def test_remote_inspection_preserves_native_clone_errors(
         "<CHECKOUT>",
         actual.stderr,
     )
-    _inspection_expect(
+    _expect(
         (actual.returncode, actual.stdout, actual_error)
         == (
             expected.returncode,
@@ -6689,8 +6582,8 @@ def test_remote_inspection_preserves_native_clone_errors(
         ),
         f"native clone error changed: {expected.stderr!r}, {actual.stderr!r}",
     )
-    _inspection_expect(not list(scratch.iterdir()), "failed clone left temporary files")
-    _inspection_expect(not list(home.iterdir()), "failed clone changed HOME")
+    _expect(not list(scratch.iterdir()), "failed clone left temporary files")
+    _expect(not list(home.iterdir()), "failed clone changed HOME")
 
 
 def test_inspection_discovers_the_merged_repository_commands() -> None:

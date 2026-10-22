@@ -15,6 +15,42 @@ from hypothesis import strategies as st
 from alphabetize_nix import main as alphabetize
 
 
+def test_deeply_nested_bindings_do_not_repeat_rendering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Bound tree visits so small nested inputs cannot trigger exponential work."""
+    from unittest.mock import Mock  # noqa: PLC0415
+
+    depth = 10
+    source = "{ a = " * depth + "1" + "; }" * depth
+    renderer = Mock(wraps=alphabetize.render_node)
+    monkeypatch.setattr(alphabetize, "render_node", renderer)
+    formatted = alphabetize.format_text(source)
+    if renderer.call_count > len(source) * 4:
+        raise AssertionError(renderer.call_count)
+    if alphabetize.format_text(formatted) != formatted:
+        raise AssertionError(formatted)
+
+
+def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
+    """Report an invalid input while still formatting subsequent selected files."""
+    invalid = tmp_path / "invalid.nix"
+    invalid.write_text("{ broken = ; }")
+    valid = tmp_path / "valid.nix"
+    valid.write_text("{ z = 1; a = 2; }")
+    result = subprocess.run(  # noqa: S603
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(invalid), str(valid)],
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=10,
+    )
+    if result.returncode != 1 or str(invalid) not in result.stderr:
+        raise AssertionError(result)
+    if valid.read_text() != "{ a = 2; z = 1; }":
+        raise AssertionError(valid.read_text())
+
+
 @settings(deadline=None)
 @given(
     st.dictionaries(

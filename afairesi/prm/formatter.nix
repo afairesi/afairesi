@@ -22,14 +22,10 @@ let
     if enableMypy then
       builtins.attrNames (
         pkgs.lib.filterAttrs (
-          name: type:
-          type == "directory"
-          && !(builtins.elem name [
-            "prm"
-            "tmp"
-          ])
+          name: _:
+          builtins.pathExists (self.outPath + "/${name}/default.nix")
           && builtins.pathExists (self.outPath + "/${name}/main.py")
-        ) (if builtins.pathExists self.outPath then builtins.readDir self.outPath else { })
+        ) self.packages.${pkgs.stdenv.system}
       )
     else
       [ ];
@@ -203,6 +199,15 @@ wrapper
 // {
   passthru = wrapper.passthru // {
     raw = rawFormatter;
-    tests.check = treefmtEval.config.build.check self.outPath;
+    tests.check = (treefmtEval.config.build.check self.outPath).overrideAttrs (previous: {
+      nativeBuildInputs = (previous.nativeBuildInputs or [ ]) ++ [
+        pkgs.git
+        pkgs.nix
+      ];
+      buildCommand = ''
+        ${formatterPython}/bin/python -c 'from afairesi import formatter_main; formatter_main()' --source ${self.outPath}
+      ''
+      + previous.buildCommand;
+    });
   };
 }

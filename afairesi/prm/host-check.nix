@@ -188,7 +188,7 @@ let
     in
     key // { inherit index preserved; }
   ) hostConfig.services.openssh.hostKeys;
-  name = "${host}VmWithDisko";
+  name = "${host}Vm";
   preservedDirectories = lib.concatMap (
     state:
     map (directory: {

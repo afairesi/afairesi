@@ -107,7 +107,7 @@ def literal(document: nix_syntax.Document, node: Node) -> Literal:
         return cast("str", _run_nix(text))
     if node.type == "list_expression":
         return [literal(document, child) for child in node.named_children]
-    if node.type == "attrset_expression" and not text.lstrip().startswith("rec"):
+    if node.type == "attrset_expression":
         return _literal_attrset(document, node)
     msg = "not a literal"
     raise ValueError(msg)
@@ -132,8 +132,6 @@ def collect_candidates(
     result: list[Candidate] = []
 
     def collect_set(set_node: Node, prefix: tuple[str, ...]) -> None:
-        if document.text(set_node).lstrip().startswith("rec"):
-            return
         binding_set = next(
             (child for child in set_node.named_children if child.type == "binding_set"),
             None,
@@ -190,12 +188,7 @@ def package_arguments(document: nix_syntax.Document) -> list[tuple[Node, str]]:
         return []
     argument = node.child_by_field_name("argument")
     function = node.child_by_field_name("function")
-    if (
-        argument is None
-        or function is None
-        or argument.type != "attrset_expression"
-        or document.text(argument).lstrip().startswith("rec")
-    ):
+    if argument is None or function is None or argument.type != "attrset_expression":
         return []
     builder = PACKAGE_BUILDERS.get(nix_syntax.compact(document.text(function)))
     return [] if builder is None else [(argument, builder)]
@@ -304,21 +297,20 @@ def package_defaults(
 
 def nixos_removals(
     root: Path,
-    candidates: list[Candidate],
+    candidates: dict[Path, list[Candidate]],
 ) -> dict[Path, set[tuple[str, ...]]]:
-    """Resolve matching NixOS defaults and their defining source files."""
-    if not candidates:
+    """Remove a file's value only when all consuming hosts use it as their default."""
+    if not any(candidates.values()):
         return {}
-    unique_candidates = {
-        (path, json.dumps(value, sort_keys=True, ensure_ascii=False))
-        for path, value in candidates
-    }
     rendered = (
         "[ "
         + " ".join(
-            f"{{ path = {_path_list(path)}; "
-            f"value = builtins.fromJSON {nix_syntax.quote_string(value)}; }}"
-            for path, value in sorted(unique_candidates)
+            f"{{ file = {nix_syntax.quote_string(path.relative_to(root).as_posix())}; "
+            f"path = {_path_list(option)}; "
+            "value = builtins.fromJSON "
+            f"{nix_syntax.quote_string(json.dumps(value))}; }}"
+            for path, values in candidates.items()
+            for option, value in values
         )
         + " ]"
     )
@@ -326,26 +318,25 @@ def nixos_removals(
         "let f = builtins.getFlake (toString (/. + "
         f"{nix_syntax.quote_string(str(root))})); lib = f.inputs.nixpkgs.lib; "
         "cs = f.nixosConfigurations or {}; names = builtins.attrNames cs; "
-        f"candidates = {rendered}; "
-        "eq = a: b: builtins.toJSON a == builtins.toJSON b; files = name: "
-        "candidate: let option = lib.attrByPath candidate.path {} "
-        "(builtins.getAttr name cs).options; raw = if builtins.isAttrs "
-        "option && option ? default && eq candidate.value option.default "
-        "then builtins.concatMap (d: if builtins.isAttrs d && d ? file "
-        "then [d.file] else []) (option.definitionsWithLocations or []) "
-        "else []; tried = builtins.tryEval (builtins.deepSeq raw raw); in "
-        "if tried.success then tried.value else []; "
-        "one = candidate: { inherit (candidate) path; files = "
-        "builtins.concatMap (name: files name candidate) names; }; in "
-        "builtins.map one candidates"
+        "one = candidate: let matches = builtins.concatMap (name: let "
+        "option = lib.attrByPath candidate.path {} cs.${name}.options; "
+        "definitions = option.definitionsWithLocations or []; "
+        'file = "${f.outPath}/${candidate.file}"; '
+        'in if builtins.any (definition: toString (definition.file or "") == file) '
+        "definitions "
+        "then [ (builtins.length definitions == 1 && option ? default && "
+        "builtins.toJSON candidate.value == builtins.toJSON option.default) ] "
+        "else []) names; "
+        "tried = builtins.tryEval "
+        "(matches != [] && builtins.all (match: match) matches); "
+        "in if tried.success && tried.value then [{ inherit (candidate) file path; }] "
+        "else []; in builtins.seq names (builtins.concatMap one " + rendered + ")"
     )
     removals: dict[Path, set[tuple[str, ...]]] = {}
     for record in cast("list[dict[str, Any]]", _run_nix(expression)):
-        for source in record["files"]:
-            marker = source.find("-source/")
-            relative = source[marker + 8 :] if marker >= 0 else None
-            local = root / relative if relative is not None else Path(source)
-            removals.setdefault(local.resolve(), set()).add(tuple(record["path"]))
+        removals.setdefault((root / record["file"]).resolve(), set()).add(
+            tuple(record["path"]),
+        )
     return removals
 
 
@@ -426,10 +417,7 @@ def process_repository(root: Path) -> None:
     candidates = {
         path: collect_candidates(document) for path, document in documents.items()
     }
-    nixos = nixos_removals(
-        root,
-        [candidate for values in candidates.values() for candidate in values],
-    )
+    nixos = nixos_removals(root, candidates)
     treefmt_nodes = {
         path: treefmt_arguments(document) for path, document in documents.items()
     }
