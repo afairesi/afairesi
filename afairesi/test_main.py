@@ -5398,15 +5398,26 @@ def test_description_ignores_dependency_metadata(description: str | None) -> Non
     )
 
 
-def test_formatter_discovery_only_uses_available_packages(tmp_path: Path) -> None:
-    """Ignore orphan sources, unavailable packages, and aliases during mypy setup."""
+@pytest.mark.parametrize("kind", ["python", "lean4"])
+def test_formatter_discovery_only_uses_available_packages(
+    tmp_path: Path,
+    kind: str,
+) -> None:
+    """Ignore orphan sources, unavailable packages, and aliases in language tooling."""
+    marker = "main.py" if kind == "python" else "main.lean"
     for name in ("example", "orphan", "unavailable"):
         directory = tmp_path / name
         directory.mkdir()
-        (directory / "main.py").write_text("VALUE = 1\n")
+        (directory / marker).touch()
         if name != "orphan":
             (directory / "default.nix").write_text("{}")
     formatter = Path(__file__).with_name("prm") / "formatter.nix"
+    selection = (
+        "module.programs.mypy.directories"
+        if kind == "python"
+        else 'pkgs.lib.filterAttrs (name: _: builtins.match "lean4-.*" name != null) '
+        "module.settings.formatter"
+    )
     expression = f"""let
       self = {{ outPath = {json.dumps(str(tmp_path))};
         packages.test = {{ example = {{}}; default = {{}}; }}; }};
@@ -5418,9 +5429,10 @@ def test_formatter_discovery_only_uses_available_packages(tmp_path: Path) -> Non
             (builtins.attrNames attrs)));
         lib.genAttrs = names: value: builtins.listToAttrs
           (map (name: {{ inherit name; value = value name; }}) names);
+        lib.genAttrs' = names: value: builtins.listToAttrs (map value names);
       }};
       inputs.treefmt-nix.lib.evalModule = _: module: {{
-        config.build.wrapper = module.programs.mypy.directories;
+        config.build.wrapper = {selection};
       }};
       formatter = import {formatter} {{ inherit inputs pkgs self; }};
       in builtins.attrNames formatter.passthru.raw"""
@@ -5434,7 +5446,8 @@ def test_formatter_discovery_only_uses_available_packages(tmp_path: Path) -> Non
         executable="nix",
         environment=_nix_environment(tmp_path),
     )
-    _expect(json.loads(result.stdout) == ["example"], result)
+    expected = "example" if kind == "python" else "lean4-example"
+    _expect(json.loads(result.stdout) == [expected], result)
 
 
 def _inspection_discovery(source: str) -> dict[str, Any]:

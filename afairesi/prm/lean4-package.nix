@@ -9,8 +9,16 @@ let
   module = "«${pname}»";
   leanDeps = arguments.leanDeps or [ ];
   library = "${pname}_lib";
+  leanOptions = {
+    autoImplicit = false;
+    warningAsError = true;
+    linter.all = true;
+    linter.coreInternal.internalModule = false;
+  };
   lakefile = (pkgs.formats.toml { }).generate "lakefile.toml" {
+    inherit leanOptions;
     name = pname;
+    srcDir = ".lake/src";
     defaultTargets = [ (if executable then pname else library) ];
     lean_lib = [
       {
@@ -49,12 +57,15 @@ pkgs.leanPackages.buildLakePackage (
     postPatch = ''
       ${arguments.postPatch or ""}
       cp ${lakefile} lakefile.toml
-      ${pkgs.lib.optionalString (
-        pname != "main"
-      ) "cp main.lean ${pkgs.lib.escapeShellArg "${pname}.lean"}"}
+      mkdir -p .lake/src
+      ln -s ../../main.lean ${pkgs.lib.escapeShellArg ".lake/src/${pname}.lean"}
       if [ -d prm ]; then
-        cp -R prm ${pkgs.lib.escapeShellArg pname}
+        ln -s ../../prm ${pkgs.lib.escapeShellArg ".lake/src/${pname}"}
       fi
+    '';
+    postBuild = ''
+      ${arguments.postBuild or ""}
+      lake --wfail lint --builtin-only
     '';
     meta =
       builtins.removeAttrs (arguments.meta or { }) [ "mainProgram" ]

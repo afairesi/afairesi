@@ -7,7 +7,6 @@
 pkgs.runCommand packageName
   (
     {
-      inherit (packageDrv) src;
       nativeBuildInputs = testEnvironment.dependencies ++ [ testEnvironment.lean4 ];
       buildInputs = [ packageDrv ];
     }
@@ -16,9 +15,9 @@ pkgs.runCommand packageName
     }
   )
   ''
-    cp -R "$src" source
+    cp -R ${packageDrv} source
     chmod -R u+w source
     cd source
-    lean -DwarningAsError=true test_main.lean
+    lake lean test_main.lean
     mkdir -p "$out"
   ''

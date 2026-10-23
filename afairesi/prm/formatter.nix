@@ -18,17 +18,17 @@ let
     "*/main.py"
     "*/test_main.py"
   ];
-  pythonPackageNames =
-    if enableMypy then
-      builtins.attrNames (
-        pkgs.lib.filterAttrs (
-          name: _:
-          builtins.pathExists (self.outPath + "/${name}/default.nix")
-          && builtins.pathExists (self.outPath + "/${name}/main.py")
-        ) self.packages.${pkgs.stdenv.system}
-      )
-    else
-      [ ];
+  packageNamesFor =
+    marker:
+    builtins.attrNames (
+      pkgs.lib.filterAttrs (
+        name: _:
+        builtins.pathExists (self.outPath + "/${name}/default.nix")
+        && builtins.pathExists (self.outPath + "/${name}/${marker}")
+      ) self.packages.${pkgs.stdenv.system}
+    );
+  lean4PackageNames = packageNamesFor "main.lean";
+  pythonPackageNames = if enableMypy then packageNamesFor "main.py" else [ ];
   rawFormatter = treefmtEval.config.build.wrapper;
   treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
     programs = {
@@ -175,6 +175,18 @@ let
       }
       // pkgs.lib.genAttrs (map (name: "mypy-${name}") pythonPackageNames) (_: {
         priority = 6;
+      })
+      // pkgs.lib.genAttrs' lean4PackageNames (name: {
+        name = "lean4-${name}";
+        value = {
+          command = import ./lean4-format.nix {
+            inherit pkgs;
+            packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+            packageName = name;
+          };
+          includes = [ "${name}/*.lean" ];
+          priority = 5;
+        };
       });
       global.excludes = [ "{prm,tmp,*/prm,*/tmp}/**" ];
     };

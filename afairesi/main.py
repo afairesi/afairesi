@@ -1694,7 +1694,9 @@ pkgs.writeTextFile {
             'if __name__ == "__main__":\n    main()\n'
         )
     elif kind == "lean4":
-        files[root / "main.lean"] = "def main : IO Unit := pure ()\n"
+        files[root / "main.lean"] = (
+            "/-- Run the application. -/\ndef main : IO Unit :=\n  pure ()\n"
+        )
     elif kind == "html":
         files.update(
             {

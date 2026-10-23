@@ -21,7 +21,7 @@ let
   system = pkgs.stdenv.hostPlatform.system;
   package = consumer.packages.${system}.example;
   leanExample = consumer.packages.${system}.lean-example;
-  leanLibrary = consumer.packages.${system}.lean-library;
+  leanLibrary = consumer.packages.${system}.test_main;
   vmCoverage = inputs.self.lib.mkCoverage {
     check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
     packageDrv = package;
@@ -78,9 +78,9 @@ assert
 assert package.meta.mainProgram == "example";
 assert consumer.checks.${system} ? example;
 assert consumer.checks.${system} ? lean-example;
-assert consumer.checks.${system} ? lean-library;
+assert consumer.checks.${system} ? test_main;
 assert consumer.checks.${system}.pkgs-lean-example == leanExample;
-assert consumer.checks.${system}.pkgs-lean-library == leanLibrary;
+assert consumer.checks.${system}.pkgs-test_main == leanLibrary;
 assert
   consumer.checks.${system}.devshell-lean-example-test
   == consumer.devShells.${system}.lean-example-test;
@@ -88,7 +88,7 @@ assert leanExample.meta.mainProgram == "lean-example";
 assert !(leanLibrary.meta ? mainProgram);
 assert !(leanExample.drvAttrs ? runtimeHook);
 assert !(consumer.legacyPackages.${system} ? lean-example-coverage);
-assert !(consumer.apps.${system} ? lean-library);
+assert !(consumer.apps.${system} ? test_main);
 assert inputs.self.lib ? mkLean4Package;
 assert !(acceptsLean { shellHook = "echo obsolete"; });
 assert
@@ -161,7 +161,8 @@ pkgs.runCommand "afairesi-consumer-contract"
       consumer.checks.${system}.pkgs-native
       consumer.checks.${system}.pkgs-native-contract
       consumer.checks.${system}.lean-example
-      consumer.checks.${system}.lean-library
+      consumer.checks.${system}.test_main
+      consumer.formatter.${system}.passthru.raw
     ];
   }
   ''
@@ -185,5 +186,37 @@ pkgs.runCommand "afairesi-consumer-contract"
     actual=$(${pkgs.lib.getExe leanExample} 'two words' --flag)
     test "$actual" = "$expected"
     test ! -e ${leanLibrary}/bin
+    cmp ${leanLibrary.src}/test_main.lean ${leanLibrary}/test_main.lean
+    cp -R ${consumerSource} formatted
+    chmod -R u+w formatted
+    cd formatted
+    touch flake.nix
+    treefmt --no-cache {lean-example,test_main}/{main,test_main}.lean
+    treefmt --no-cache --fail-on-change {lean-example,test_main}/{main,test_main}.lean
+    grep -F -- '-- lean-fmt: ignore[FMT005]' lean-example/main.lean
+    grep -F 'set_option linter.missingDocs false in' test_main/main.lean
+    cp test_main/main.lean expected-main.lean
+    cp ${consumerSource}/test_main/main.lean test_main/main.lean
+    printf '%s\n' 'import MissingFormatterDependency' > test_main/test_main.lean
+    if treefmt --no-cache test_main/{main,test_main}.lean > format-failure.log 2>&1; then
+      exit 1
+    fi
+    cmp expected-main.lean test_main/main.lean
+    cp ${consumerSource}/test_main/main.lean test_main/main.lean
+    cat > test_main/test_main.lean <<'LEAN'
+    #eval show IO Unit from do
+      let some target ← IO.getEnv "AFAIRESI_EDIT_TARGET"
+        | throw (IO.userError "missing edit target")
+      let marker := System.FilePath.mk (target ++ ".edited")
+      unless ← marker.pathExists do
+        IO.FS.writeFile marker ""
+        IO.FS.writeFile target "-- concurrent edit\n"
+    LEAN
+    printf '%s\n' '-- concurrent edit' > expected-edit.lean
+    status=0
+    AFAIRESI_EDIT_TARGET="$PWD/test_main/main.lean" \
+      treefmt --no-cache test_main/{main,test_main}.lean > concurrent-format.log 2>&1 || status=$?
+    cmp expected-edit.lean test_main/main.lean
+    test "$status" -ne 0
     mkdir -p $out
   ''
