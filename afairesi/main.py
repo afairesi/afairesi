@@ -35,7 +35,7 @@ if TYPE_CHECKING:
 
     import libcst as cst
     from tree_sitter import Node
-PACKAGE_KINDS = ("html", "latex", "nix", "python")
+PACKAGE_KINDS = ("html", "latex", "lean4", "nix", "python")
 NIX_FMT_HELP = (
     "nix fmt also enforces lint rules and applies unsafe "
     "fixes that can change behavior. Review the diff and run tests."
@@ -43,6 +43,7 @@ NIX_FMT_HELP = (
 KIND_MARKERS = {
     "html": "index.html",
     "latex": "ms.tex",
+    "lean4": "main.lean",
     "python": "main.py",
 }
 ROOT_FILES = {
@@ -356,6 +357,7 @@ def package_files(package: Package) -> set[Path]:
         "python": {"main.py", "test_main.py"},
         "html": {"index.html", "script.js", "style.css"},
         "latex": {"ms.tex", "ms.bib"},
+        "lean4": {"main.lean", "test_main.lean"},
         "nix": set(),
     }[package.kind]
     return {relative / "default.nix", *(relative / item for item in kind_files)}
@@ -366,6 +368,7 @@ def required_package_files(package: Package) -> set[Path]:
     optional = {
         "html": {"script.js", "style.css"},
         "latex": set(),
+        "lean4": {"test_main.lean"},
         "nix": set(),
         "python": {"test_main.py"},
     }[package.kind]
@@ -1012,16 +1015,20 @@ def _package_body(document: nix_syntax.Document) -> tuple[Node | None, Node]:
     return scope, body
 
 
-def _python_required_edits(
+def _shared_package_required_edits(
     package: Package,
     source: str,
 ) -> dict[str, list[tuple[int, int, bytes]]]:
-    """Enforce the shared Python constructor's source interface."""
+    """Enforce shared language constructors while retaining custom attributes."""
     document = nix_syntax.parse(source)
     _scope, body = _package_body(document)
     argument = body.child_by_field_name("argument")
     function = body.child_by_field_name("function")
-    constructor = "(inputs.afairesi or inputs.self).lib.mkPythonPackage"
+    language, builder = {
+        "python": ("Python", "mkPythonPackage"),
+        "lean4": ("Lean 4", "mkLean4Package"),
+    }[package.kind]
+    constructor = f"(inputs.afairesi or inputs.self).lib.{builder}"
     if (
         body.type != "apply_expression"
         or function is None
@@ -1030,7 +1037,7 @@ def _python_required_edits(
         or argument is None
         or argument.type not in {"attrset_expression", "rec_attrset_expression"}
     ):
-        msg = "Python package must call the shared mkPythonPackage constructor"
+        msg = f"{language} package must call the shared {builder} constructor"
         raise CommandError(msg)
     edits = {
         "pkgs": _nix_binding_edits(document, argument, ("pkgs",), "pkgs"),
@@ -1040,8 +1047,10 @@ def _python_required_edits(
             argument,
             ("executable",),
             "true"
-            if source_python_has_main(read_regular(package.root / "main.py"))
+            if package.kind == "lean4"
+            or source_python_has_main(read_regular(package.root / "main.py"))
             else "false",
+            overwrite=package.kind == "python",
         ),
     }
     outer = document.root
@@ -1049,7 +1058,7 @@ def _python_required_edits(
         outer = cast("Node", outer.child_by_field_name("expression"))
     formals = outer.child_by_field_name("formals")
     if formals is None:
-        msg = "Python package must accept inputs and pkgs arguments"
+        msg = f"{language} package must accept inputs and pkgs arguments"
         raise CommandError(msg)
     names = {
         document.text(name)
@@ -1069,9 +1078,9 @@ def _python_required_edits(
     return edits
 
 
-def _canonical_python_default(package: Package, source: str) -> str:
-    """Repair required Python bindings without removing custom attributes."""
-    edits = _python_required_edits(package, source)
+def _canonical_shared_default(package: Package, source: str) -> str:
+    """Repair required language bindings without removing custom attributes."""
+    edits = _shared_package_required_edits(package, source)
     return cast(
         "bytes",
         nix_syntax.apply_edits(
@@ -1091,12 +1100,12 @@ def canonical_package_default(package: Package) -> str | None:
             Path() / package.name / "default.nix"
         ]
         return (
-            _canonical_python_default(package, rendered)
-            if package.kind == "python"
+            _canonical_shared_default(package, rendered)
+            if package.kind in {"python", "lean4"}
             else rendered
         )
-    if package.kind == "python":
-        return _canonical_python_default(package, source)
+    if package.kind in {"python", "lean4"}:
+        return _canonical_shared_default(package, source)
     document = nix_syntax.parse(source, str(package.root / "default.nix"))
     scope, body = _package_body(document)
     function = body.child_by_field_name("function")
@@ -1433,6 +1442,7 @@ def _flake_resource_issues(root: Path) -> list[str]:
         "buildPythonApplication": (1, "NAME/default.nix"),
         "derivation": (1, "NAME/default.nix"),
         "mkDerivation": (1, "NAME/default.nix"),
+        "mkLean4Package": (1, "NAME/default.nix"),
         "mkPythonPackage": (1, "NAME/default.nix"),
         "nixosSystem": (1, "NAME/configuration.nix"),
         "runNixOSTest": (1, "the host testing structure"),
@@ -1564,12 +1574,21 @@ def scaffold(
             "python": "A Python package.",
             "html": "An HTML package.",
             "latex": "A LaTeX package.",
+            "lean4": "A Lean 4 package.",
             "nix": "A Nix package.",
         }[kind]
     )
     description_literal = nix_syntax.quote_string(description)
     root = Path() / name
     defaults = {
+        "lean4": """{ inputs, pkgs, ... }:
+(inputs.afairesi or inputs.self).lib.mkLean4Package {
+  inherit pkgs;
+  executable = true;
+  meta.description = __DESCRIPTION__;
+  src = ./.;
+}
+""",
         "python": """{ inputs, pkgs, ... }:
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
@@ -1674,6 +1693,8 @@ pkgs.writeTextFile {
             "\n\n"
             'if __name__ == "__main__":\n    main()\n'
         )
+    elif kind == "lean4":
+        files[root / "main.lean"] = "def main : IO Unit := pure ()\n"
     elif kind == "html":
         files.update(
             {
@@ -4050,6 +4071,9 @@ def inspect_repository(root: Path) -> dict[str, Any]:
                     for owner, definition in python_test_definitions(test_module)
                 )
                 if test_module is not None
+                else ["test_main.lean"]
+                if package.kind == "lean4"
+                and (package.root / "test_main.lean").is_file()
                 else []
             ),
         }
@@ -4289,7 +4313,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="create and stage a package or host",
         description=(
             "Create and stage a package or host. "
-            "Generate Python checks from test_main.py and host checks from host "
+            "Generate checks from test_main.py, test_main.lean, and host "
             "configurations. Store supporting files under prm/."
         ),
     )

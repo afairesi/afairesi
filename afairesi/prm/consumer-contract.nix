@@ -20,6 +20,8 @@ let
   };
   system = pkgs.stdenv.hostPlatform.system;
   package = consumer.packages.${system}.example;
+  leanExample = consumer.packages.${system}.lean-example;
+  leanLibrary = consumer.packages.${system}.lean-library;
   vmCoverage = inputs.self.lib.mkCoverage {
     check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
     packageDrv = package;
@@ -54,6 +56,18 @@ let
         // attributes
       )
     )).success;
+  acceptsLean =
+    attributes:
+    (builtins.tryEval (
+      inputs.self.lib.mkLean4Package (
+        {
+          inherit pkgs;
+          executable = true;
+          src = ./consumer-contract/lean-example;
+        }
+        // attributes
+      )
+    )).success;
 in
 assert
   package.consumerConfig == {
@@ -63,6 +77,25 @@ assert
   };
 assert package.meta.mainProgram == "example";
 assert consumer.checks.${system} ? example;
+assert consumer.checks.${system} ? lean-example;
+assert consumer.checks.${system} ? lean-library;
+assert consumer.checks.${system}.pkgs-lean-example == leanExample;
+assert consumer.checks.${system}.pkgs-lean-library == leanLibrary;
+assert
+  consumer.checks.${system}.devshell-lean-example-test
+  == consumer.devShells.${system}.lean-example-test;
+assert leanExample.meta.mainProgram == "lean-example";
+assert !(leanLibrary.meta ? mainProgram);
+assert !(leanExample.drvAttrs ? runtimeHook);
+assert !(consumer.legacyPackages.${system} ? lean-example-coverage);
+assert !(consumer.apps.${system} ? lean-library);
+assert inputs.self.lib ? mkLean4Package;
+assert !(acceptsLean { shellHook = "echo obsolete"; });
+assert
+  !(acceptsLean {
+    executable = false;
+    runtimeHook = "echo invalid";
+  });
 assert builtins.attrNames consumer.formatter == builtins.attrNames consumer.packages;
 assert consumer.checks.${system}.formatter == consumer.formatter.${system}.passthru.tests.check;
 assert consumer.checks.${system}.pkgs-example == package;
@@ -121,11 +154,14 @@ assert !(inputs.self.lib ? blueprint);
 assert inputs.self.packages.${system}.default == inputs.self.packages.${system}.afairesi;
 pkgs.runCommand "afairesi-consumer-contract"
   {
+    leanShell = consumer.devShells.${system}.lean-example-test;
     nativeBuildInputs = [
       consumer.checks.${system}.example
       consumer.legacyPackages.${system}.example-coverage
       consumer.checks.${system}.pkgs-native
       consumer.checks.${system}.pkgs-native-contract
+      consumer.checks.${system}.lean-example
+      consumer.checks.${system}.lean-library
     ];
   }
   ''
@@ -142,5 +178,12 @@ pkgs.runCommand "afairesi-consumer-contract"
     AFAIRESI_CONSUMER_FAIL=1 ${consumer.apps.${system}.example.program} > failed-output || status=$?
     test "$status" = 23
     test ! -s failed-output
+    expected=$(printf '%s\n' '42:resource:loaded' 'two words' '--flag')
+    actual=$(${consumer.apps.${system}.lean-example.program} 'two words' --flag)
+    test "$actual" = "$expected"
+    expected=$(printf '%s\n' '42:resource:unloaded' 'two words' '--flag')
+    actual=$(${pkgs.lib.getExe leanExample} 'two words' --flag)
+    test "$actual" = "$expected"
+    test ! -e ${leanLibrary}/bin
     mkdir -p $out
   ''

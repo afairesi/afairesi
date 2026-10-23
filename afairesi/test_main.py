@@ -477,6 +477,7 @@ def _check_launcher_environment(
         ("python", {"default.nix", "main.py"}),
         ("html", {"default.nix", "index.html", "script.js", "style.css"}),
         ("latex", {"default.nix", "ms.tex", "ms.bib"}),
+        ("lean4", {"default.nix", "main.lean"}),
         ("nix", {"default.nix"}),
         ("host", {"configuration.nix"}),
     ],
@@ -504,6 +505,7 @@ def test_create_stages_the_requested_resource_and_whitelist(
                 "python": "A Python package.",
                 "html": "An HTML package.",
                 "latex": "A LaTeX package.",
+                "lean4": "A Lean 4 package.",
                 "nix": "A Nix package.",
             }
             _expect(
@@ -564,7 +566,7 @@ def test_invalid_resource_arguments_are_usage_errors_outside_git(
     _expect(not any(tmp_path.iterdir()), "invalid arguments created files")
 
 
-@pytest.mark.parametrize("kind", ["python", "html", "latex", "nix", "host"])
+@pytest.mark.parametrize("kind", ["python", "html", "latex", "lean4", "nix", "host"])
 def test_add_targets_repository_root_and_rejects_existing_resources(kind: str) -> None:
     """Add from a nested cwd and reject existing resources without changes."""
     with _fresh_repository() as root:
@@ -1099,6 +1101,7 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
         'pkgs.stdenv.mkDerivation { name = "parallel"; src = ./prm; }',
         'pkgs.python3.pkgs.buildPythonPackage { pname = "parallel"; src = ./prm; }',
         "inputs.afairesi.lib.mkPythonPackage { inherit pkgs; src = ./prm; }",
+        "inputs.afairesi.lib.mkLean4Package { inherit pkgs; src = ./prm; }",
         "inputs.nixpkgs.lib.nixosSystem { modules = [ ./prm/host.nix ]; }",
         'builtins.derivation { name = "parallel"; builder = "/bin/sh"; }',
         '(let build = pkgs.runCommand; in build "parallel" {} "touch $out")',
@@ -1297,6 +1300,58 @@ def test_convergence_repairs_python_arguments_and_preserves_supported_entrypoint
             definition,
         )
         _preview_flake_repair(root)
+
+
+@pytest.mark.parametrize("executable", [True, False])
+def test_lean4_convergence_preserves_sources_and_explicit_package_options(
+    *,
+    executable: bool,
+) -> None:
+    """Repair Lean bindings and whitelist tests while preserving library choices."""
+    with _fresh_repository() as root:
+        _run(root, "add", "lean-example", "lean4")
+        package = root / "lean-example"
+        definition = package / "default.nix"
+        definition.write_text(
+            "{ ... }: (inputs.afairesi or inputs.self).lib.mkLean4Package {\n"
+            f"executable = {str(executable).lower()}; src = ./wrong;\n"
+            'meta.description = "Lean proofs"; passthru.custom = "preserved";\n}\n',
+        )
+        source = "def answer : Nat := 42\n"
+        tests = "example : 1 + 1 = 2 := rfl\n"
+        (package / "main.lean").write_text(source)
+        (package / "test_main.lean").write_text(tests)
+        _repair_flake(root)
+        _preview_flake_repair(root)
+        repaired = definition.read_text()
+        _expect("src = ./.;" in repaired, repaired)
+        _expect(f"executable = {str(executable).lower()};" in repaired, repaired)
+        _expect('passthru.custom = "preserved";' in repaired, repaired)
+        _expect((package / "main.lean").read_text() == source, source)
+        _expect((package / "test_main.lean").read_text() == tests, tests)
+        _expect("lean-example/test_main.lean" in _git(root, "ls-files"), repaired)
+        report = import_module("afairesi.main").inspect_repository(root)
+        _expect(report["lean-example"]["kind"] == "lean4", report)
+        _expect(report["lean-example"]["description"] == "Lean proofs", report)
+        _expect(report["lean-example"]["tests"] == ["test_main.lean"], report)
+
+
+def test_lean4_detection_repairs_missing_defaults_and_rejects_ambiguous_sources() -> (
+    None
+):
+    """Recognize Lean source without its Nix file and reject mixed language roots."""
+    with _fresh_repository() as root:
+        _run(root, "add", "example", "lean4")
+        package = root / "example"
+        definition = package / "default.nix"
+        definition.unlink()
+        _repair_flake(root)
+        _expect("mkLean4Package" in definition.read_text(), definition)
+        (package / "main.py").touch()
+        before = _snapshot(root)
+        rejected = _repair_flake(root, code=1)
+        _expect("ambiguous project markers" in rejected.stderr, rejected)
+        _expect(_snapshot(root) == before, "ambiguous package repair changed state")
 
 
 def test_convergence_respects_excluded_trees() -> None:
@@ -1660,13 +1715,16 @@ def _stage_resource_edits(
 
 @settings(deadline=None)
 @given(
-    kind=st.sampled_from(("python", "html", "latex", "nix", "host", "untracked")),
+    kind=st.sampled_from(
+        ("python", "html", "latex", "lean4", "nix", "host", "untracked"),
+    ),
     name=PACKAGE_NAMES,
     payload=st.binary(max_size=40),
 )
 @example(kind="python", name="dash-case", payload=b"\x00\xff")
 @example(kind="html", name="snake_case", payload=b"HTML")
 @example(kind="latex", name="document", payload=b"LaTeX")
+@example(kind="lean4", name="proof", payload=b"Lean 4")
 @example(kind="nix", name="value", payload=b"Nix")
 @example(kind="host", name="laptop", payload=b"host")
 @example(kind="untracked", name="untracked", payload=b"untracked")
@@ -1698,6 +1756,8 @@ def test_resource_lifecycle_preserves_files_and_git_state(
                     "    def test_result(self): pass\n"
                 ),
             )
+        if kind == "lean4":
+            (package / "test_main.lean").write_text("example : 1 + 1 = 2 := rfl\n")
         resource = package / "prm/nested/asset.bin"
         resource.parent.mkdir(parents=True)
         resource.write_bytes(payload)

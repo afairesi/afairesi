@@ -38,6 +38,9 @@ let
   pythonNames = builtins.filter (
     name: builtins.pathExists (source + "/${name}/main.py")
   ) packageNames;
+  lean4Names = builtins.filter (
+    name: builtins.pathExists (source + "/${name}/main.lean")
+  ) packageNames;
   moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) pythonNames;
   packageSets = lib.genAttrs systems (
     system:
@@ -58,10 +61,18 @@ let
       || lib.meta.availableOn packageSets.${system}.stdenv.hostPlatform package
     );
   namesFor =
-    system: builtins.filter (name: builtins.hasAttr name self.packages.${system}) pythonNames;
+    system:
+    builtins.filter (name: builtins.hasAttr name self.packages.${system}) (pythonNames ++ lean4Names);
   testedNames =
     system:
-    builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.py")) (namesFor system);
+    builtins.filter (
+      name: builtins.elem name pythonNames && builtins.pathExists (source + "/${name}/test_main.py")
+    ) (namesFor system);
+  testedLean4Names =
+    system:
+    builtins.filter (
+      name: builtins.elem name lean4Names && builtins.pathExists (source + "/${name}/test_main.lean")
+    ) (namesFor system);
   hostsFor =
     system:
     lib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
@@ -134,6 +145,15 @@ in
     system:
     mergeChecks (
       [
+        (lib.genAttrs (testedLean4Names system) (
+          name:
+          import ./lean4-check.nix {
+            pkgs = packageSets.${system};
+            packageDrv = self.packages.${system}.${name};
+            packageName = name;
+            testEnvironment = environments.${system}.${name};
+          }
+        ))
         (lib.genAttrs (testedNames system) (
           name:
           import ./python-check.nix {
@@ -199,7 +219,7 @@ in
     system:
     lib.mapAttrs' (
       name: environment: lib.nameValuePair "${name}-test-environment" environment.manifest
-    ) environments.${system}
+    ) (lib.filterAttrs (_: environment: environment ? manifest) environments.${system})
     // lib.genAttrs' (testedNames system) (
       name:
       lib.nameValuePair "${name}-coverage" (

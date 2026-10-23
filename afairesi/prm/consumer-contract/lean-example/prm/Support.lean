@@ -1,0 +1,1 @@
+def support : String := "resource"
