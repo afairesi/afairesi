@@ -8,10 +8,7 @@ let
   bootstrapNode =
     seeded: _:
     {
-      boot.initrd.systemd = {
-        inherit (hostConfig.boot.initrd.systemd) enable;
-        storePaths = [ fixture ];
-      };
+      boot.initrd.systemd.storePaths = [ fixture ];
       imports = [
         inputs.preservation.nixosModules.default
       ]
