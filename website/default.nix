@@ -19,8 +19,10 @@ in
 pkgs.writeShellApplication {
   meta.description = "afairesi: Keep only what matters.";
   name = pname;
-  runtimeInputs = [ pkgs.http-server ]
-    ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.xdg-utils ];
+  runtimeInputs = [
+    pkgs.http-server
+  ]
+  ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.xdg-utils ];
   text = ''
     open_args=()
     if [[ -n "''${DISPLAY:-}" || -n "''${WAYLAND_DISPLAY:-}" ]]; then
