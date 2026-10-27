@@ -34,3 +34,7 @@
 !/remove_nix_defaults/test_main.py
 !/uncomment/
 !/uncomment/default.nix
+!/website/
+!/website/default.nix
+!/website/index.html
+!/website/style.css
