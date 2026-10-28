@@ -5415,7 +5415,7 @@ def test_formatter_discovery_only_uses_available_packages(
 def _inspection_discovery(source: str) -> dict[str, Any]:
     return cast(
         "dict[str, Any]",
-        inspection_subject.ArgumentDiscovery(ast.parse(source)).report(),
+        inspection_subject.ArgumentDiscovery(source).report(),
     )
 
 
@@ -5911,7 +5911,7 @@ def test_unresolved_cli_declarations_fail(source: str, reason: str) -> None:
         match=re.escape(reason),
     ) as error:
         inspection_subject.ArgumentDiscovery(
-            ast.parse("import argparse\n" + source),
+            "import argparse\n" + source,
             "example/main.py",
         ).report()
     _expect(
@@ -5939,8 +5939,8 @@ def main():
         _inspection_discovery(source)
 
 
-def test_ambiguous_nested_helpers_fail() -> None:
-    """Reject name collisions rather than assigning each option to both commands."""
+def test_nested_helpers_keep_their_lexical_scopes() -> None:
+    """Keep same-named helpers attached to their own subcommands."""
     source = """
 import argparse
 def configure_one(cli):
@@ -5960,11 +5960,167 @@ def parser():
 def main():
     parser().parse_args()
 """
-    with pytest.raises(
-        inspection_subject.CommandError,
-        match="ambiguous helper 'configure'",
-    ):
+    report = _inspection_discovery(source)
+    _expect(
+        report
+        == {
+            "arguments": [],
+            "commands": {
+                "one": {"arguments": [{"names": ["--one"]}], "commands": {}},
+                "two": {"arguments": [{"names": ["--two"]}], "commands": {}},
+            },
+        },
+        report,
+    )
+
+
+def test_inspection_rejects_redefined_helpers_in_the_same_scope() -> None:
+    """Retain an explicit failure when helper definitions remain ambiguous."""
+    with pytest.raises(inspection_subject.CommandError, match="ambiguous helper"):
+        _inspection_discovery("""
+import argparse
+def configure(cli):
+    cli.add_argument('--first')
+def configure(cli):
+    cli.add_argument('--second')
+def main():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.parse_args()
+""")
+
+
+def test_inspection_resolves_closure_parameters() -> None:
+    """Follow parser parameters read by a nested helper without global fallback."""
+    report = _inspection_discovery("""
+import argparse
+def configure(cli):
+    def add():
+        cli.add_argument('--closed-over')
+    add()
+def main():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.parse_args()
+""")
+    _expect(
+        report == {"arguments": [{"names": ["--closed-over"]}], "commands": {}},
+        report,
+    )
+
+
+def test_inspection_resolves_imports_in_their_declaring_scopes() -> None:
+    """Keep an unrelated factory alias from replacing the CLI constructor."""
+    report = _inspection_discovery("""
+def parser():
+    from argparse import ArgumentParser as Factory
+    return Factory()
+def unrelated():
+    from argparse import Namespace as Factory
+    return Factory()
+def main():
+    cli = parser()
+    cli.add_argument('--public')
+    cli.parse_args()
+""")
+    _expect(
+        report == {"arguments": [{"names": ["--public"]}], "commands": {}},
+        report,
+    )
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        """
+from argparse import ArgumentParser
+def main(ArgumentParser):
+    cli = ArgumentParser()
+    cli.add_argument('--unknown')
+    cli.parse_args()
+""",
+        """
+import argparse
+argparse = external_module
+cli = argparse.ArgumentParser()
+cli.add_argument('--unknown')
+cli.parse_args()
+""",
+        """
+from argparse import ArgumentParser
+ArgumentParser = external_factory
+cli = ArgumentParser()
+cli.add_argument('--unknown')
+cli.parse_args()
+""",
+    ],
+)
+def test_inspection_rejects_shadowed_constructor_aliases(source: str) -> None:
+    """Do not treat reassigned names or parameters as their shadowed imports."""
+    with pytest.raises(inspection_subject.CommandError, match="cannot resolve"):
         _inspection_discovery(source)
+
+
+def test_inspection_rejects_reassigned_helpers() -> None:
+    """An opaque callable must not inherit the interface of a replaced helper."""
+    with pytest.raises(inspection_subject.CommandError, match="external helper"):
+        _inspection_discovery("""
+import argparse
+def configure(cli):
+    cli.add_argument('--hidden')
+configure = external_helper
+def main():
+    cli = argparse.ArgumentParser()
+    configure(cli)
+    cli.parse_args()
+""")
+
+
+@pytest.mark.parametrize("module", ["argparse", "click"])
+def test_inspection_rejects_unresolved_cli_star_imports(module: str) -> None:
+    """Keep unresolved wildcard interfaces from becoming an empty successful CLI."""
+    with pytest.raises(inspection_subject.CommandError, match="no supported parser"):
+        _inspection_discovery(f"from {module} import *\ndef main(): pass\n")
+
+
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_inspection_maps_unicode_names_and_source_positions(newline: str) -> None:
+    """Match AST byte columns to LibCST names across Unicode and line endings."""
+    source = """import argparse
+def main():
+    label = 'é\u2028'; cli = argparse.ArgumentParser()
+    cli.add_argument('--résumé', default=label)
+    cli.parse_args()
+""".replace("\n", newline)
+    report = _inspection_discovery(source)
+    _expect(
+        report
+        == {
+            "arguments": [
+                {"names": ["--résumé"], "default": {"unknown": "label"}},
+            ],
+            "commands": {},
+        },
+        report,
+    )
+
+
+def test_inspection_preserves_declared_source_encoding() -> None:
+    """Decode a source encoding cookie before matching metadata byte offsets."""
+    source = """# coding: latin-1
+import argparse
+label = 'é'; cli = argparse.ArgumentParser()
+cli.add_argument('--résumé', default='é')
+""".encode("latin-1")
+    report = inspection_subject.ArgumentDiscovery(source, "encoded.py").report()
+    _expect(
+        report
+        == {
+            "arguments": [{"names": ["--résumé"], "default": "é"}],
+            "commands": {},
+        },
+        report,
+    )
 
 
 def test_subcommand_aliases_preserve_arguments_and_nested_commands() -> None:
@@ -6862,7 +7018,7 @@ def test_inspection_discovers_the_merged_repository_commands() -> None:
     """Inventory the public nested campaign CLI while excluding formatter internals."""
     subject = import_module("afairesi.main")
     report = subject.ArgumentDiscovery(
-        ast.parse(Path(__file__).with_name("main.py").read_bytes()),
+        Path(__file__).with_name("main.py").read_bytes(),
     ).report()
     _expect(set(report["commands"]) == {"repo", "home"}, report)
     commands = report["commands"]["repo"]["commands"]
