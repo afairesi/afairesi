@@ -12,7 +12,7 @@ from remove_empty_lines import process_files
 
 def remove_new_lines(contents: bytes) -> bytes:
     """Remove CR and LF bytes without changing other bytes."""
-    return contents.replace(b"\n", b"").replace(b"\r", b"")
+    return contents.translate(None, b"\r\n")
 
 
 def main() -> None:

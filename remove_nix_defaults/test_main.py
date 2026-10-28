@@ -6,12 +6,11 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 
-if TYPE_CHECKING:
-    from pathlib import Path
+from remove_nix_defaults import main as remove_nix_defaults
 
 
 def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
@@ -116,7 +115,7 @@ def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
     previous = None
     retained_scopes = 2
     for _ in range(2):
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(  # noqa: S603 - Test harness executable with a fixture repository path.
             command,
             env=environment,
             capture_output=True,
@@ -240,7 +239,7 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
         "experimental-features = nix-command flakes\nbuild-users-group =\n"
     )
     command = [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)]
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Test harness executable with a fixture repository path.
         command,
         env=environment,
         capture_output=True,
@@ -260,7 +259,7 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
         or "formatter.bar = true;" not in formatter.read_text()
     ):
         raise AssertionError(output)
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Test harness executable with a fixture repository path.
         command,
         env=environment,
         capture_output=True,
@@ -297,15 +296,15 @@ def test_cli_preserves_native_parse_errors(tmp_path: Path, source: str) -> None:
     path = root / "configuration.nix"
     path.write_text(source)
     environment = _nix_environment(tmp_path)
-    native = subprocess.run(  # noqa: S603
-        ["nix-instantiate", "--parse", str(path)],  # noqa: S607
+    native = subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
+        ["nix-instantiate", "--parse", "--", str(path)],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
         check=False,
         timeout=10,
     )
-    actual = subprocess.run(  # noqa: S603
+    actual = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
         env=environment,
         capture_output=True,
@@ -320,6 +319,24 @@ def test_cli_preserves_native_parse_errors(tmp_path: Path, source: str) -> None:
         or path.read_text() != source
     ):
         raise AssertionError((native, actual))
+
+
+def test_process_repository_parses_option_like_relative_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Treat a leading dash in a repository path as a filename, not an option."""
+    monkeypatch.chdir(tmp_path)
+    for name, value in _nix_environment(tmp_path).items():
+        if name.startswith("NIX_"):
+            monkeypatch.setenv(name, value)
+    root = Path("-repository")
+    root.mkdir()
+    (root / "configuration.nix").write_text("{ broken = ; }")
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        remove_nix_defaults.process_repository(root)
+    if "syntax error" not in error.value.stderr:
+        raise AssertionError(error.value.stderr)
 
 
 def _treefmt_fixture(root: Path) -> None:
@@ -397,7 +414,7 @@ def test_cli_preserves_nondefaults_and_shared_host_overrides(tmp_path: Path) -> 
     ):
         (root / f"{name}.nix").write_text(f"{{ flag = {value}; }}")
     for _ in range(2):
-        subprocess.run(  # noqa: S603
+        subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
             env=_nix_environment(tmp_path),
             capture_output=True,
@@ -440,7 +457,7 @@ def test_cli_preserves_values_merged_from_multiple_modules(tmp_path: Path) -> No
     (root / "first.nix").write_text("{ values = [1]; }")
     (root / "second.nix").write_text("{ values = [2]; }")
     environment = _nix_environment(tmp_path)
-    subprocess.run(  # noqa: S603
+    subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
         env=environment,
         capture_output=True,
@@ -451,7 +468,7 @@ def test_cli_preserves_values_merged_from_multiple_modules(tmp_path: Path) -> No
         f"((import {root / 'first.nix'}).values or []) ++ "
         f"((import {root / 'second.nix'}).values or [])"
     )
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Fixed Nix executable with test-authored expressions.
         ["nix", "eval", "--impure", "--json", "--expr", expression],  # noqa: S607
         env=environment,
         capture_output=True,
@@ -501,7 +518,7 @@ def test_cli_preserves_native_treefmt_values(
         "{ inputs = flake.inputs; pkgs = {}; }).config"
     )
     command = ["nix", "eval", "--impure", "--json", "--expr", expression]
-    expected = subprocess.run(  # noqa: S603
+    expected = subprocess.run(  # noqa: S603 - Fixed Nix executable with test-authored expressions.
         command,
         env=environment,
         capture_output=True,
@@ -509,14 +526,14 @@ def test_cli_preserves_native_treefmt_values(
         timeout=30,
     ).stdout
     for _ in range(2):
-        subprocess.run(  # noqa: S603
+        subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
             env=environment,
             capture_output=True,
             check=True,
             timeout=30,
         )
-        actual = subprocess.run(  # noqa: S603
+        actual = subprocess.run(  # noqa: S603 - Fixed Nix executable with test-authored expressions.
             command,
             env=environment,
             capture_output=True,
@@ -552,7 +569,7 @@ def test_cli_preserves_native_evaluation_errors(tmp_path: Path, value: str) -> N
     source = "{ flag = false; }"
     path.write_text(source)
     environment = _nix_environment(tmp_path)
-    native = subprocess.run(  # noqa: S603
+    native = subprocess.run(  # noqa: S603 - Fixed Nix executable with test-authored expressions.
         [  # noqa: S607
             "nix",
             "eval",
@@ -567,7 +584,7 @@ def test_cli_preserves_native_evaluation_errors(tmp_path: Path, value: str) -> N
         check=False,
         timeout=30,
     )
-    actual = subprocess.run(  # noqa: S603
+    actual = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)],
         env=environment,
         capture_output=True,

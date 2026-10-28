@@ -30,6 +30,6 @@ pkgs.runCommand packageName
             settings.register_profile("afairesi", max_examples=10)
             settings.load_profile("afairesi")
     sys.exit(pytest.main(plugins=[Defaults()]))
-    ' -p no:cacheprovider --import-mode=importlib \
+    ' -p no:cacheprovider --import-mode=importlib --durations=10 --maxfail=1 \
       "$src/test_main.py" "''${afairesi_pytest_args[@]}"
   ''

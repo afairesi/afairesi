@@ -36,7 +36,7 @@ def test_cli_cleans_selected_files_and_preserves_protected_inputs(
     empty = tmp_path / "empty"
     empty.touch()
     for _ in range(2):
-        completed = subprocess.run(  # noqa: S603
+        completed = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [
                 os.environ["PACKAGE_E2E_EXECUTABLE"],
                 str(selected),
@@ -72,7 +72,7 @@ def test_cli_reports_filesystem_errors_and_processes_other_files(
     selected = tmp_path / "selected.txt"
     selected.write_bytes(b"first\r\nlast\n")
     expected_errors = [_read_error(path) for path in (missing, directory)]
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [
             os.environ["PACKAGE_E2E_EXECUTABLE"],
             str(missing),

@@ -53,7 +53,7 @@ def test_cli_validates_files_and_reports_each_failure(tmp_path: Path) -> None:
     missing = tmp_path / "missing.nix"
     originals = {path: path.read_bytes() for path in (valid, invalid)}
     for paths, code in [([valid], 0), ([invalid, valid, missing], 1)]:
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], *map(str, paths)],
             capture_output=True,
             text=True,
@@ -69,6 +69,25 @@ def test_cli_validates_files_and_reports_each_failure(tmp_path: Path) -> None:
     if any(path.read_bytes() != source for path, source in originals.items()):
         message = "validation modified an input"
         raise AssertionError(message)
+
+
+def _parse_with_native_and_cli(
+    path: Path,
+) -> tuple[subprocess.CompletedProcess[bytes], subprocess.CompletedProcess[bytes]]:
+    """Run both parsers with identical input and process settings."""
+    native = subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
+        ["nix-instantiate", "--parse", "--", str(path)],  # noqa: S607
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    actual = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
+        capture_output=True,
+        check=False,
+        timeout=10,
+    )
+    return native, actual
 
 
 @pytest.mark.parametrize(
@@ -90,18 +109,7 @@ def test_cli_matches_native_parser(tmp_path: Path, source: bytes) -> None:
     """Native Nix determines acceptance, error text, and exit status."""
     path = tmp_path / "expression with spaces.nix"
     path.write_bytes(source)
-    native = subprocess.run(  # noqa: S603
-        ["nix-instantiate", "--parse", "--", str(path)],  # noqa: S607
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    actual = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
+    native, actual = _parse_with_native_and_cli(path)
     if (actual.returncode, actual.stderr, actual.stdout) != (
         native.returncode,
         native.stderr,
@@ -121,18 +129,7 @@ def test_cli_uses_native_file_resolution(tmp_path: Path, kind: str) -> None:
         target = tmp_path / "target.nix"
         target.write_text("{}")
         path.symlink_to(target)
-    native = subprocess.run(  # noqa: S603
-        ["nix-instantiate", "--parse", "--", str(path)],  # noqa: S607
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    actual = subprocess.run(  # noqa: S603
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
+    native, actual = _parse_with_native_and_cli(path)
     if (actual.returncode, actual.stderr, actual.stdout) != (
         native.returncode,
         native.stderr,
@@ -155,7 +152,7 @@ def test_cli_uses_native_file_resolution(tmp_path: Path, kind: str) -> None:
 )
 def test_string_value_matches_native_nix(source: str) -> None:
     """Decode literals with Nix's own escape and line-ending rules."""
-    native = subprocess.run(  # noqa: S603
+    native = subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
         ["nix-instantiate", "--eval", "--strict", "--json", "--expr", source],  # noqa: S607
         capture_output=True,
         check=True,

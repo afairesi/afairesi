@@ -83,7 +83,7 @@ def run(
     capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run a process with captured output or inherited terminal streams."""
-    completed = subprocess.run(  # noqa: S603
+    completed = subprocess.run(  # noqa: S603 - Callers construct argv; commands run without a shell.
         arguments,
         cwd=cwd,
         capture_output=capture_output,
@@ -819,10 +819,7 @@ def _attrset_expression(
     """Find direct static bindings beneath an attribute-set expression."""
     if expression.type not in {"attrset_expression", "rec_attrset_expression"}:
         return []
-    binding_set = next(
-        (child for child in expression.named_children if child.type == "binding_set"),
-        None,
-    )
+    binding_set = nix_syntax.binding_set(expression)
     return [
         value
         for binding in ([] if binding_set is None else binding_set.named_children)
@@ -867,10 +864,7 @@ def _template_binding(document: nix_syntax.Document, name: str) -> Node | None:
         container = child
     if container.type != "let_expression":
         return None
-    bindings = next(
-        (child for child in container.named_children if child.type == "binding_set"),
-        None,
-    )
+    bindings = nix_syntax.binding_set(container)
     return next(
         (
             binding.child_by_field_name("expression")
@@ -911,10 +905,7 @@ def _nix_binding_edits(
     }:
         replacement = f"({document.text(container)}) // {{ {assignment} }}"
         return [(container.start_byte, container.end_byte, replacement.encode())]
-    bindings = next(
-        (node for node in container.named_children if node.type == "binding_set"),
-        None,
-    )
+    bindings = nix_syntax.binding_set(container)
     children = [] if bindings is None else bindings.named_children
     for binding in children:
         attrpath = binding.child_by_field_name("attrpath")
@@ -1413,10 +1404,7 @@ def _resource_variable_constructor(
             ):
                 return None
         if scope.type in {"let_expression", "rec_attrset_expression"}:
-            bindings = next(
-                (node for node in scope.named_children if node.type == "binding_set"),
-                None,
-            )
+            bindings = nix_syntax.binding_set(scope)
             for binding in [] if bindings is None else bindings.named_children:
                 path = binding.child_by_field_name("attrpath")
                 value = binding.child_by_field_name("expression")
@@ -2316,7 +2304,7 @@ def _run_test_command(
     """Capture command output and clean up subprocess groups on interruption."""
     with (
         log.open("w", encoding="utf-8") as output,
-        subprocess.Popen(  # noqa: S603
+        subprocess.Popen(  # noqa: S603 - Run the prepared test command without a shell.
             command,
             cwd=workspace,
             stdout=output,
@@ -2408,17 +2396,6 @@ class TestSelection:
 
 
 COVERAGE_RUNTIME_START = None
-
-
-def start_subprocess_coverage() -> None:
-    """Start coverage in child interpreters and inherit the active test context."""
-    import os  # noqa: PLC0415
-
-    import coverage  # noqa: PLC0415
-
-    tracer = coverage.Coverage.current() or coverage.process_startup()
-    if tracer is not None:
-        tracer.switch_context(os.environ.get("AFAIRESI_TEST_CONTEXT", ""))
 
 
 def remap_coverage_paths(installed_path: str) -> None:
@@ -2943,7 +2920,7 @@ def _build_package_coverage(package: Path) -> None:
     root = _test_target_root(package)
     sys.stdout.write(f"Building coverage for {package.name}...\n")
     sys.stdout.flush()
-    completed = subprocess.run(  # noqa: S603
+    completed = subprocess.run(  # noqa: S603 - Fixed Nix command; installable is a generated git+ URI.
         [  # noqa: S607
             "nix",
             "build",
@@ -4129,7 +4106,7 @@ def _inspection_git_report(
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(source, target, follow_symlinks=False)
         elif files:
-            completed = subprocess.run(  # noqa: S603
+            completed = subprocess.run(  # noqa: S603 - Fixed Git command; object IDs are passed on stdin.
                 ["git", "-C", str(root), "cat-file", "--batch"],  # noqa: S607
                 input="".join(f"{oid}\n" for _mode, oid, _path in files).encode(),
                 capture_output=True,

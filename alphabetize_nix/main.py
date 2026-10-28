@@ -65,10 +65,7 @@ def _nested_bindings(
 ) -> tuple[Binding, ...] | None:
     if expression.type != "attrset_expression":
         return None
-    binding_set = next(
-        (child for child in expression.named_children if child.type == "binding_set"),
-        None,
-    )
+    binding_set = nix_syntax.binding_set(expression)
     if binding_set is None:
         return ()
     for child in binding_set.named_children:

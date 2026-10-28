@@ -7,6 +7,7 @@ import os
 import subprocess
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import Mock
 
 import pytest
 from hypothesis import given, settings
@@ -19,8 +20,6 @@ def test_deeply_nested_bindings_do_not_repeat_rendering(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bound tree visits so small nested inputs cannot trigger exponential work."""
-    from unittest.mock import Mock  # noqa: PLC0415
-
     depth = 10
     source = "{ a = " * depth + "1" + "; }" * depth
     renderer = Mock(wraps=alphabetize.render_node)
@@ -39,7 +38,7 @@ def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
     invalid.write_text(source)
     valid = tmp_path / "valid.nix"
     valid.write_text("{ z = 1; a = 2; }")
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], str(invalid), str(valid)],
         capture_output=True,
         text=True,
@@ -116,7 +115,7 @@ def test_cli_formats_and_converges(tmp_path: Path, source: str, expected: str) -
     path = tmp_path / "example with spaces.nix"
     path.write_text(source, encoding="utf-8")
     for _ in range(2):
-        result = subprocess.run(  # noqa: S603
+        result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
             capture_output=True,
             check=False,
@@ -161,7 +160,7 @@ def test_cli_preserves_native_nix_value(tmp_path: Path, source: str) -> None:
     )
     expected = _evaluate(original, environment)
     for _ in range(2):
-        subprocess.run(  # noqa: S603
+        subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], str(formatted)],
             capture_output=True,
             check=True,
@@ -182,7 +181,7 @@ def _evaluate(
     path: Path,
     environment: dict[str, str],
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603
+    return subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
         ["nix-instantiate", "--eval", "--strict", "--json", str(path)],  # noqa: S607
         env=environment,
         capture_output=True,
@@ -214,7 +213,7 @@ def test_cli_preserves_native_nix_errors(
         f"local?store={tmp_path / 'store'}&state={tmp_path / 'state'}"
     )
     expected = _evaluate(path, environment)
-    subprocess.run(  # noqa: S603
+    subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
         capture_output=True,
         check=True,

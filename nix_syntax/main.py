@@ -79,6 +79,14 @@ def walk(node: Node) -> Iterable[Node]:
         yield from walk(child)
 
 
+def binding_set(node: Node) -> Node | None:
+    """Find the direct binding set of an attribute set or let expression."""
+    return next(
+        (child for child in node.named_children if child.type == "binding_set"),
+        None,
+    )
+
+
 def quote_string(value: str) -> str:
     """Encode a quoted Nix string without enabling interpolation."""
     escaped = (
@@ -98,7 +106,7 @@ def string_value(document: Document, node: Node) -> str | None:
         child.type == "interpolation" for child in walk(node)
     ):
         return None
-    completed = subprocess.run(  # noqa: S603
+    completed = subprocess.run(  # noqa: S603 - Evaluate only a parsed string without interpolation.
         [  # noqa: S607
             "nix-instantiate",
             "--store",
@@ -211,7 +219,7 @@ def main() -> None:
     )
     status = 0
     for argument in parser.parse_args().files:
-        completed = subprocess.run(  # noqa: S603
+        completed = subprocess.run(  # noqa: S603 - Fixed parser command; filenames follow "--".
             ["nix-instantiate", "--parse", "--", argument],  # noqa: S607
             stdout=subprocess.DEVNULL,
             check=False,

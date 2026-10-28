@@ -15,10 +15,7 @@ let
     "from _afairesi_coverage_support import _coverage_context_plugin\n"
     + "pytest_runtest_protocol = _coverage_context_plugin()\n"
   );
-  startup = builtins.toFile "sitecustomize.py" (
-    "from _afairesi_coverage_support import start_subprocess_coverage\n"
-    + "start_subprocess_coverage()\n"
-  );
+  startup = builtins.toFile "sitecustomize.py" ("import coverage\n" + "coverage.process_startup()\n");
 in
 overrideCheck (previous: {
   name = "${previous.name}-coverage";
@@ -33,6 +30,7 @@ overrideCheck (previous: {
     cat > "$COVERAGE_PROCESS_START" <<EOF
     [run]
     core = ctrace
+    context = \$AFAIRESI_TEST_CONTEXT
     parallel = true
     branch = true
     data_file = $out/.coverage

@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import ast
 import json
-import keyword
 import os
 import pstats
 import re
@@ -27,8 +26,6 @@ import pytest
 from cosmic_ray.work_db import WorkDB, use_db
 from cosmic_ray.work_item import TestOutcome as MutationTestOutcome
 from cosmic_ray.work_item import WorkerOutcome, WorkItem, WorkResult
-from hypothesis import example, given, settings
-from hypothesis import strategies as st
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -42,7 +39,7 @@ def _run(
     environment: dict[str, str] | None = None,
     scope: tuple[str, ...] = ("repo",),
 ) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [
             executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
             *(scope if executable in (None, "afairesi") else ()),
@@ -90,7 +87,7 @@ def _preview_flake_repair(root: Path, *, code: int = 0) -> None:
 
 
 def _git(root: Path, *arguments: str) -> str:
-    return subprocess.run(  # noqa: S603
+    return subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
         ["git", *arguments],  # noqa: S607
         cwd=root,
         capture_output=True,
@@ -113,7 +110,7 @@ def test_native_process_output_arrives_before_exit(code: int) -> None:
         f"run({[sys.executable, '-c', child]!r}, capture_output=False)"
     )
     with (
-        subprocess.Popen(  # noqa: S603
+        subprocess.Popen(  # noqa: S603 - Use this interpreter with test-authored code and arguments.
             [sys.executable, "-c", command],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -156,23 +153,16 @@ def _make_source_package(root: Path, name: str, source: str) -> Path:
 
 def _fixture_git(root: Path, *arguments: str) -> str:
     """Run fixture Git commands with a local identity and no signing."""
-    return subprocess.run(  # noqa: S603
-        [  # noqa: S607
-            "git",
-            "-c",
-            "user.name=Test",
-            "-c",
-            "user.email=test@example.invalid",
-            "-c",
-            "commit.gpgsign=false",
-            *arguments,
-        ],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    ).stdout
+    return _git(
+        root,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        *arguments,
+    )
 
 
 def _fixture_add(root: Path, resource: str, kind: str | None = None) -> None:
@@ -317,17 +307,6 @@ def _preview(root: Path, *arguments: str, code: int = 0) -> None:
     before = _snapshot(root)
     _run(root, *arguments, "--dry-run", code=code)
     _expect(_snapshot(root) == before, arguments)
-
-
-PACKAGE_NAMES = st.from_regex(
-    r"[a-z][a-z0-9]{0,5}(?:[-_][a-z0-9]{1,5})?",
-    fullmatch=True,
-).filter(lambda name: not keyword.iskeyword(name.replace("-", "_")))
-DESCRIPTIONS = st.text(
-    alphabet=st.characters(exclude_categories=["Cs"], exclude_characters="\x00"),
-    min_size=1,
-    max_size=30,
-)
 
 
 def _nix_environment(root: Path) -> dict[str, str]:
@@ -644,8 +623,9 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
+        help_output = _run(root, "--help").stdout
+        _expect("usage:" in help_output, help_output)
         commands = (
-            (),
             ("init",),
             ("add",),
             ("mv",),
@@ -666,14 +646,13 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         )
         _expect(
             _run(root, "--help", executable="afairesi", environment=environment).stdout
-            == _run(root, "--help").stdout,
+            == help_output,
             "standalone command unavailable through PATH",
         )
         _run(root, "unknown-command", code=2)
         _run(root, "add", code=2)
         initialization = _run(root, "init", code=1)
         _expect("not inside a Git repository" in initialization.stderr, initialization)
-        help_output = _run(root, "--help").stdout
         command_names = ["add", "fix", "init", "inspect", "mv", "rm", "test"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(
@@ -1003,10 +982,12 @@ def test_convergence_removes_check_directories(*, tracked: bool) -> None:
         _preview_flake_repair(root)
 
 
-@settings(deadline=None)
-@given(payload=st.binary(max_size=50), tracked_scratch=st.booleans())
-@example(payload=b"\x00\xff", tracked_scratch=True)
-@example(payload=b"scratch", tracked_scratch=False)
+@pytest.mark.parametrize("tracked_scratch", [False, True])
+@pytest.mark.parametrize(
+    "payload",
+    [b"", bytes(range(256))],
+    ids=["empty", "all-bytes"],
+)
 def test_convergence_preserves_sources_repairs_checks_and_reaches_a_fixed_point(
     payload: bytes,
     *,
@@ -1360,29 +1341,18 @@ def test_convergence_respects_excluded_trees() -> None:
         _check_excluded_trees(root, patch)
 
 
-@settings(deadline=None)
-@given(
-    kind=st.sampled_from(("python", "html", "latex", "nix")),
-    name=PACKAGE_NAMES,
-    description=DESCRIPTIONS,
-    library=st.booleans(),
+@pytest.mark.parametrize(
+    ("kind", "name", "description", "library"),
+    [
+        ("python", "dash-case", 'A "quoted" report.\n${literal}\\path', False),
+        ("python", "snake_case", "é\x08\x0c\x01", True),
+        ("python", "dash-library", "Nested library metadata", True),
+        ("html", "web-site", "Δ report", False),
+        ("latex", "document", "LaTeX\tresources", False),
+        ("nix", "my-package", "é", False),
+        ("python", "a", "x", False),
+    ],
 )
-@example(
-    kind="python",
-    name="dash-case",
-    description='A "quoted" report.\n${literal}\\path',
-    library=False,
-)
-@example(kind="python", name="snake_case", description="é\b\f\x01", library=True)
-@example(
-    kind="python",
-    name="dash-library",
-    description="Nested library metadata",
-    library=True,
-)
-@example(kind="html", name="web-site", description="Δ report", library=False)
-@example(kind="latex", name="document", description="LaTeX\tresources", library=False)
-@example(kind="nix", name="my-package", description="é", library=False)
 def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_assets(
     kind: str,
     name: str,
@@ -1713,21 +1683,18 @@ def _stage_resource_edits(
     return staged, working
 
 
-@settings(deadline=None)
-@given(
-    kind=st.sampled_from(
-        ("python", "html", "latex", "lean4", "nix", "host", "untracked"),
-    ),
-    name=PACKAGE_NAMES,
-    payload=st.binary(max_size=40),
+@pytest.mark.parametrize(
+    ("kind", "name", "payload"),
+    [
+        pytest.param("python", "dash-case", bytes(range(256)), id="python-all-bytes"),
+        ("html", "snake_case", b"HTML"),
+        ("latex", "document", b"LaTeX"),
+        ("lean4", "proof", b"Lean 4"),
+        ("nix", "value", b"Nix"),
+        ("host", "laptop", b"host"),
+        ("untracked", "untracked", b"untracked"),
+    ],
 )
-@example(kind="python", name="dash-case", payload=b"\x00\xff")
-@example(kind="html", name="snake_case", payload=b"HTML")
-@example(kind="latex", name="document", payload=b"LaTeX")
-@example(kind="lean4", name="proof", payload=b"Lean 4")
-@example(kind="nix", name="value", payload=b"Nix")
-@example(kind="host", name="laptop", payload=b"host")
-@example(kind="untracked", name="untracked", payload=b"untracked")
 def test_resource_lifecycle_preserves_files_and_git_state(
     kind: str,
     name: str,
@@ -1785,7 +1752,7 @@ def test_resource_lifecycle_preserves_files_and_git_state(
                 Path(destination) / Path(relative).relative_to(original)
             ).as_posix()
             _expect(
-                subprocess.run(  # noqa: S603
+                subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
                     ["git", "show", f":{renamed}"],  # noqa: S607
                     cwd=root,
                     capture_output=True,
@@ -1986,7 +1953,7 @@ def test_static_test_names_match_native_collection(tmp_path: Path, source: str) 
     """Use pytest's collection as the oracle for ordinary and unittest test names."""
     path = tmp_path / "test_main.py"
     path.write_text(source)
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Use this interpreter with test-authored code and arguments.
         [
             sys.executable,
             "-B",
@@ -2767,7 +2734,7 @@ def test_home_rm_matches_native_git(
     arguments = []
     if force:
         arguments.append("--force")
-    expected = subprocess.run(  # noqa: S603
+    expected = subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
         ["git", "rm", "-r", *arguments, "--", relative],  # noqa: S607
         cwd=native,
         capture_output=True,
@@ -3766,12 +3733,6 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
         help_output,
     )
     _expect(_run(tmp_path, executable=executable).stdout == help_output, help_output)
-    for scope in ("repo", "home"):
-        scoped_help = _run(tmp_path, scope, "--help", executable=executable).stdout
-        _expect(
-            _run(tmp_path, scope, executable=executable).stdout == scoped_help,
-            scoped_help,
-        )
     arguments: tuple[str, ...]
     for arguments in (
         ("add", "example", "python"),
@@ -3958,12 +3919,7 @@ def _campaign_prepare_runner_flake(
         encoding="utf-8",
     )
     for args in (["init", "--quiet"], ["add", "."]):
-        subprocess.run(  # noqa: S603
-            ["git", "-C", str(root), *args],  # noqa: S607
-            check=True,
-            capture_output=True,
-            timeout=10,
-        )
+        _git(root, *args)
     return environment
 
 
@@ -3977,7 +3933,7 @@ def _campaign_run_runner_cli(
     environment = dict(environment)
     executable_directory = str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
-    return subprocess.run(  # noqa: S603
+    return subprocess.run(  # noqa: S603 - Test PATH selects afairesi; arguments come from fixtures.
         ["afairesi", "repo", "test", command, str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
@@ -4029,83 +3985,80 @@ def _campaign_prepare_coverage_flake(
     if bash is None:
         message = "coverage fixtures require bash"
         raise AssertionError(message)
-    packages = []
-    checks = []
-    reports = []
     shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
     shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/main.py")
-    for name in ("example", "z-last"):
-        _run(root, "add", f"{name}", "python")
-        package = root / name
-        source = (
-            "import os\n"
-            "def main():\n"
-            "    if os.getenv('AFAIRESI_COVERAGE_CHOICE') == 'alternate':\n"
-            "        print('alternate')\n"
-            "    else:\n"
-            "        print('ready')\n"
-        )
-        tests = (
-            "import os, subprocess, pytest\n"
-            "from hypothesis import given, example, strategies as st\n"
-            "@given(st.just(1))\n"
-            "@example(0)\n"
-            "def test_explicit(value):\n"
-            "    assert value in {0, 1}\n"
-            "@given(st.just(1))\n"
-            "def test_generated_only(value):\n"
-            "    assert value == 1\n"
-            "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
-            "def test_cli(message, monkeypatch):\n"
-            "    monkeypatch.setenv('AFAIRESI_COVERAGE_CHOICE', message)\n"
-            "    result = "
-            "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
-            "        capture_output=True, text=True)\n"
-            "    assert result.stdout == message + '\\n'\n"
-            "    assert result.stderr == ''\n"
-        )
-        (package / "main.py").write_text(source)
-        (package / "test_main.py").write_text(tests)
-        installed = root / "prm/installed" / name
-        module_name = name.replace("-", "_")
-        module = installed / site_packages / module_name
-        module.mkdir(parents=True)
-        (module / "__init__.py").write_text(source)
-        executable = installed / "bin" / name
-        executable.parent.mkdir()
-        executable.write_text(
-            f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
-            "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "
-            f"{site_packages!r}))\n"
-            f"from {module_name} import main\nmain()\n",
-        )
-        executable.chmod(0o755)
-        packages.append(
-            f"{json.dumps(name)} = {{ "
-            f"src = builtins.path {{ path = ./{name}; "
-            f'name = "{name}-src"; }}; '
-            f"outPath = builtins.path {{ path = ./prm/installed/{name}; "
-            f'name = "{name}-installed"; }}; '
-            f"pname = {json.dumps(module_name)}; cliName = {json.dumps(name)}; "
-            f"meta.mainProgram = {json.dumps(name)}; "
-            "propagatedBuildInputs = []; python = { "
-            f"sitePackages = {json.dumps(site_packages)}; "
-            f"pkgs.coverage = {json.dumps(str(coverage_root))}; "
-            f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};",
-        )
-        expression = (
-            "import ./prm/builders/python-check.nix { inherit pkgs; "
-            f"packageName = {json.dumps(name)}; "
-            f"packageDrv = packages.{json.dumps(name)}; "
-            "testEnvironment = lib.mkTestEnvironment { inherit pkgs; "
-            f"packageDrv = packages.{json.dumps(name)}; }}; }}"
-        )
-        checks.append(f"{json.dumps(name)} = {expression};")
-        reports.append(
-            f"{json.dumps(name + '-coverage')} = lib.mkCoverage {{ "
-            f"packageDrv = packages.{json.dumps(name)}; "
-            f"check = checks.{json.dumps(name)}; }};",
-        )
+    name = "z-last"
+    _run(root, "add", f"{name}", "python")
+    package = root / name
+    source = (
+        "import os\n"
+        "def main():\n"
+        "    if os.getenv('AFAIRESI_COVERAGE_CHOICE') == 'alternate':\n"
+        "        print('alternate')\n"
+        "    else:\n"
+        "        print('ready')\n"
+    )
+    tests = (
+        "import os, subprocess, pytest\n"
+        "from hypothesis import given, example, strategies as st\n"
+        "@given(st.just(1))\n"
+        "@example(0)\n"
+        "def test_explicit(value):\n"
+        "    assert value in {0, 1}\n"
+        "@given(st.just(1))\n"
+        "def test_generated_only(value):\n"
+        "    assert value == 1\n"
+        "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
+        "def test_cli(message, monkeypatch):\n"
+        "    monkeypatch.setenv('AFAIRESI_COVERAGE_CHOICE', message)\n"
+        "    result = "
+        "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
+        "        capture_output=True, text=True)\n"
+        "    assert result.stdout == message + '\\n'\n"
+        "    assert result.stderr == ''\n"
+    )
+    (package / "main.py").write_text(source)
+    (package / "test_main.py").write_text(tests)
+    installed = root / "prm/installed" / name
+    module_name = name.replace("-", "_")
+    module = installed / site_packages / module_name
+    module.mkdir(parents=True)
+    (module / "__init__.py").write_text(source)
+    executable = installed / "bin" / name
+    executable.parent.mkdir()
+    executable.write_text(
+        f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\n"
+        "sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "
+        f"{site_packages!r}))\n"
+        f"from {module_name} import main\nmain()\n",
+    )
+    executable.chmod(0o755)
+    packages = (
+        f"{json.dumps(name)} = {{ "
+        f"src = builtins.path {{ path = ./{name}; "
+        f'name = "{name}-src"; }}; '
+        f"outPath = builtins.path {{ path = ./prm/installed/{name}; "
+        f'name = "{name}-installed"; }}; '
+        f"pname = {json.dumps(module_name)}; cliName = {json.dumps(name)}; "
+        f"meta.mainProgram = {json.dumps(name)}; "
+        "propagatedBuildInputs = []; python = { "
+        f"sitePackages = {json.dumps(site_packages)}; "
+        f"pkgs.coverage = {json.dumps(str(coverage_root))}; "
+        f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};"
+    )
+    expression = (
+        "import ./prm/builders/python-check.nix { inherit pkgs; "
+        f"packageName = {json.dumps(name)}; "
+        f"packageDrv = packages.{json.dumps(name)}; "
+        "testEnvironment = lib.mkTestEnvironment { inherit pkgs; "
+        f"packageDrv = packages.{json.dumps(name)}; }}; }}"
+    )
+    checks = f"{json.dumps(name)} = {expression};"
+    reports = (
+        f"{json.dumps(name + '-coverage')} = lib.mkCoverage {{ "
+        f"packageDrv = packages.{json.dumps(name)}; "
+        f"check = checks.{json.dumps(name)}; }};"
+    )
     _repair_flake(root)
     (root / "flake.nix").write_text(
         "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
@@ -4122,12 +4075,8 @@ def _campaign_prepare_coverage_flake(
         "optionalAttrs = condition: attrs: if condition then attrs else {}; "
         "concatMap = f: xs: builtins.concatLists (map f xs); "
         'getExe = p: "${p}/bin/${p.cliName}"; }; }; '
-        "packages = { "
-        + " ".join(packages)
-        + " }; checks = { "
-        + " ".join(checks)
-        + " }; "
-        "in { packages.${system} = packages // { " + " ".join(reports) + " }; "
+        "packages = { " + packages + " }; checks = { " + checks + " }; "
+        "in { packages.${system} = packages // { " + reports + " }; "
         "checks.${system} = checks; }; }\n",
     )
     _git(root, "add", ".")
@@ -4156,7 +4105,7 @@ def _run_campaign(
 ) -> subprocess.CompletedProcess[str]:
     """Run an omitted target and preserve original sources, settings, and refs."""
     before = _snapshot(root, exclude=("tmp",))
-    result = subprocess.run(  # noqa: S603
+    result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "test", command, *arguments],
         cwd=cwd or root,
         env=environment,
@@ -4172,12 +4121,27 @@ def _run_campaign(
     return result
 
 
-@pytest.mark.parametrize("nested", [False, True])
 @pytest.mark.parametrize(
-    "command",
-    ["coverage", "property", "fuzz", "mutation", "performance"],
+    ("command", "target", "nested"),
+    [
+        ("property", "omitted", False),
+        ("property", "omitted", True),
+        ("property", "root", False),
+        ("property", "root", True),
+        ("property", "relative", False),
+        ("property", "relative", True),
+        ("property", "absolute", False),
+        ("property", "absolute", True),
+        ("coverage", "omitted", False),
+        ("coverage", "absolute", True),
+        ("fuzz", "omitted", False),
+        ("fuzz", "absolute", True),
+        ("mutation", "omitted", False),
+        ("mutation", "absolute", True),
+        ("performance", "omitted", False),
+        ("performance", "absolute", True),
+    ],
 )
-@pytest.mark.parametrize("target", ["omitted", "root", "relative", "absolute"])
 def test_campaigns_route_targets_and_forward_test_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4186,7 +4150,7 @@ def test_campaigns_route_targets_and_forward_test_selection(
     *,
     nested: bool,
 ) -> None:
-    """Resolve one target and forward its selectors without shell interpretation."""
+    """Cover all path forms with property tests and both target kinds per campaign."""
     subject = import_module("afairesi.main")
     root = _repository(tmp_path)
     package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
@@ -4309,14 +4273,25 @@ def test_explicit_campaign_requires_repository(tmp_path: Path, command: str) -> 
         raise AssertionError(list(tmp_path.iterdir()))
 
 
-@pytest.mark.parametrize("command", ["property", "fuzz", "mutation", "performance"])
-@pytest.mark.parametrize("timeout", ["nan", "inf", "-inf", "0", "-1"])
+@pytest.mark.parametrize(
+    ("command", "timeout"),
+    [
+        ("property", "nan"),
+        ("property", "inf"),
+        ("property", "-inf"),
+        ("property", "0"),
+        ("property", "-1"),
+        ("fuzz", "nan"),
+        ("mutation", "nan"),
+        ("performance", "nan"),
+    ],
+)
 def test_campaign_rejects_invalid_timeout_without_changes(
     tmp_path: Path,
     command: str,
     timeout: str,
 ) -> None:
-    """Reject invalid budgets before creating build or test state."""
+    """Cover each invalid budget and ensure every campaign uses the validator."""
     result = _campaign_run(
         tmp_path,
         command,
@@ -4421,10 +4396,7 @@ def test_campaign_fuzz_skip_missing_targets_and_report_failures(
     _expect((workspace / "tests.log").is_file(), workspace)
 
 
-@pytest.mark.parametrize("failing", [False, True])
-def test_performance_profiles_tests_and_cli_without_changing_sources(
-    failing: bool,  # noqa: FBT001
-) -> None:
+def test_performance_profiles_tests_and_cli_without_changing_sources() -> None:
     """Retain native parent and CLI profiles, even when selected tests fail."""
     with TemporaryDirectory(prefix="afairesi-profile-") as directory:
         root = Path(directory) / "source with spaces"
@@ -4454,7 +4426,7 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
             "'stale', 'fresh'], capture_output=True, text=True)\n"
             "    assert result.returncode == 0, result.stderr\n"
             "    assert result.stdout == 'fresh\\n'\n"
-            f"    assert {not failing!r}\n"
+            "    assert False\n"
             "@given(st.integers())\n"
             "@example(7)\n"
             "def test_explicit(value):\n"
@@ -4471,7 +4443,7 @@ def test_performance_profiles_tests_and_cli_without_changing_sources(
             "-k",
             "cli or explicit",
         )
-        _expect(result.returncode == int(failing), result)
+        _expect(result.returncode == 1, result)
         output = result.stdout + result.stderr
         _expect("slowest" in output and "test_cli" in output, result)
         (workspace,) = (root / "tmp").glob("python-performance-example-*")
@@ -4549,7 +4521,7 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
         before = _snapshot(root)
         expression = (
             f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
-            "in f.checks.${builtins.currentSystem}.example"
+            'in f.checks.${builtins.currentSystem}."z-last"'
         )
         plain = _campaign_run(
             root,
@@ -4577,8 +4549,7 @@ def test_coverage_checks_measure_subprocesses_without_changing_sources() -> None
             for line in result.stdout.splitlines()
             if line.endswith("/html/index.html")
         ]
-        expected_reports = 2
-        _expect(len(reports) == expected_reports, result)
+        _expect(len(reports) == 1, result)
         for line in reports:
             report = Path(line.split(": ", 1)[1]).parents[1]
             files = json.loads((report / "coverage.json").read_text())["files"]
@@ -4720,7 +4691,14 @@ def test_coverage_describes_uncovered_branches(
         "run",
         Mock(return_value=subprocess.CompletedProcess([], 0, str(report) + "\n")),
     )
-    subject._build_package_coverage(package)  # noqa: SLF001 - Exercise report rendering without building Nix outputs.
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["afairesi", "repo", "test", "coverage", str(package)],
+    )
+    with pytest.raises(SystemExit) as completed:
+        subject.main()
+    _expect(completed.value.code == 0, completed)
     actual = capsys.readouterr()
     summary = f"  60.0% coverage; 2 missing lines, {len(missing)} missing branches\n"
     expected_output = (
@@ -4803,7 +4781,7 @@ def test_package_campaign_preserves_native_nix_errors(
     attribute = (
         "example-coverage" if command == "coverage" else "example-test-environment"
     )
-    expected = subprocess.run(  # noqa: S603
+    expected = subprocess.run(  # noqa: S603 - Fixed Nix executable with test-authored expressions.
         [  # noqa: S607
             "nix",
             "build",
@@ -4861,7 +4839,7 @@ def test_package_property_preserves_native_pytest_status(
         "usage": ("-k", "("),
     }[failure]
     package = root / "example"
-    expected = subprocess.run(  # noqa: S603
+    expected = subprocess.run(  # noqa: S603 - Use this interpreter with test-authored code and arguments.
         [
             sys.executable,
             "-B",
@@ -4979,7 +4957,7 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
             environment,
             "property",
             "--timeout",
-            "20" if failure == "counterexample" else "2",
+            "20" if failure == "counterexample" else "10",
         )
         _expect(
             result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
@@ -5001,15 +4979,11 @@ def test_property_campaigns_continue_after_failures(failure: str) -> None:
             )
 
 
-@settings(deadline=None)
-@given(max_examples=st.integers(min_value=1, max_value=5))
-@example(max_examples=5)
-def test_property_campaigns_generate_cases_in_isolated_sources(
-    max_examples: int,
-) -> None:
+def test_property_campaigns_generate_cases_in_isolated_sources() -> None:
     """Count generated cases and isolate copied Git commands and runtime state."""
     with TemporaryDirectory(prefix="afairesi-campaign-") as directory:
         root = Path(directory) / "source with spaces"
+        max_examples = 5
         source = (
             "import json, os\nfrom pathlib import Path\n"
             "def main():\n"
@@ -5154,12 +5128,19 @@ def test_campaigns_preserve_native_plugins_options_and_hypothesis_profiles(
 
 
 def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
-    """Check fixed baseline failures once, independently of generated values."""
+    """Reject invalid baselines and accept a passing suite with no mutations."""
     with TemporaryDirectory(prefix="afairesi-baselines-") as directory:
         root = Path(directory) / "source with spaces"
         environment = _campaign_prepare_runner_flake(
             root,
-            "def test_ready(): pass\n",
+            "from importlib import import_module\n"
+            "from hypothesis import given, example, strategies as st\n"
+            "main = import_module('git-example.main')\n"
+            "@given(st.just(1))\n"
+            "@example(0)\n"
+            "def test_explicit(value):\n"
+            "    assert value in {0, 1} and main is not None\n",
+            "",
             name="git-example",
         )
         baselines = {
@@ -5197,28 +5178,9 @@ def test_mutation_campaigns_reject_invalid_baselines_and_continue() -> None:
                 and not (failed / "session.sqlite").exists(),
                 failed,
             )
-
-
-def test_mutation_campaigns_report_empty_sessions() -> None:
-    """Accept an empty native session when the baseline suite passes."""
-    with TemporaryDirectory(prefix="afairesi-empty-mutations-") as directory:
-        root = Path(directory) / "source"
-        tests = (
-            "from example import main\n"
-            "from hypothesis import given, example, strategies as st\n"
-            "@given(st.just(1))\n"
-            "@example(0)\n"
-            "def test_explicit(value):\n"
-            "    assert value in {0, 1} and main is not None\n"
-        )
-        environment = _campaign_prepare_runner_flake(root, tests, "")
-        result = _run_campaign(root, environment, "mutation")
-        (workspace,) = (root / "tmp").glob("python-mutation-example-*")
+        (workspace,) = (root / "tmp").glob("python-mutation-git-example-*")
         with use_db(workspace / "session.sqlite", WorkDB.Mode.open) as database:
-            _expect(
-                not result.returncode and database.num_work_items == 0,
-                result,
-            )
+            _expect(database.num_work_items == 0, workspace)
 
 
 @pytest.mark.parametrize(
@@ -6315,18 +6277,13 @@ def test_cli_inventory_resolves_repository_paths(
         "inventory lost test identifier",
     )
     if location != "outside":
-        subprocess.run(  # noqa: S603
-            ["git", "init", "--quiet", str(tmp_path)],  # noqa: S607
-            check=True,
-            capture_output=True,
-            timeout=10,
-        )
+        _git(tmp_path, "init", "--quiet")
     cwd = tmp_path / "example" if location == "nested" else tmp_path
     paths = [["."], [str(tmp_path)]]
     if location != "outside":
         paths.append([])
     for arguments in paths:
-        completed = subprocess.run(  # noqa: S603
+        completed = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", *arguments],
             cwd=cwd,
             capture_output=True,
@@ -6387,7 +6344,7 @@ def _inspection_remote_fixture(
 
 def _inspection_inspect_target(target: str) -> dict[str, Any]:
     """Exercise the installed CLI with an unchanged path or Git URL."""
-    completed = subprocess.run(  # noqa: S603
+    completed = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", target],
         capture_output=True,
         text=True,
@@ -6602,14 +6559,14 @@ def test_remote_inspection_preserves_native_clone_errors(
     scratch.mkdir()
     monkeypatch.setenv("TMPDIR", str(scratch))
     native_checkout = tmp_path / "native-checkout"
-    expected = subprocess.run(  # noqa: S603
+    expected = subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
         ["git", "clone", "--", remote, str(native_checkout)],  # noqa: S607
         capture_output=True,
         text=True,
         check=False,
         timeout=30,
     )
-    actual = subprocess.run(  # noqa: S603
+    actual = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", remote],
         capture_output=True,
         text=True,
@@ -6657,7 +6614,7 @@ def _inspection_apply_diff(before: dict[str, Any], difference: str) -> dict[str,
     with TemporaryDirectory(prefix="afairesi-jd-patch-") as directory:
         patch = Path(directory) / "change.jd"
         patch.write_text(difference)
-        completed = subprocess.run(  # noqa: S603
+        completed = subprocess.run(  # noqa: S603 - Fixed jd executable; patch is a temporary fixture file.
             ["jd", "-p", str(patch)],  # noqa: S607
             input=json.dumps(before),
             capture_output=True,

@@ -61,10 +61,7 @@ def find_nix_files(root: Path) -> list[Path]:
 
 def _literal_attrset(document: nix_syntax.Document, node: Node) -> dict[str, Literal]:
     """Decode a nonrecursive set containing distinct, literal attribute names."""
-    binding_set = next(
-        (child for child in node.named_children if child.type == "binding_set"),
-        None,
-    )
+    binding_set = nix_syntax.binding_set(node)
     values: dict[str, Literal] = {}
     for binding in [] if binding_set is None else binding_set.named_children:
         attrpath = binding.child_by_field_name("attrpath")
@@ -132,10 +129,7 @@ def collect_candidates(
     result: list[Candidate] = []
 
     def collect_set(set_node: Node, prefix: tuple[str, ...]) -> None:
-        binding_set = next(
-            (child for child in set_node.named_children if child.type == "binding_set"),
-            None,
-        )
+        binding_set = nix_syntax.binding_set(set_node)
         for binding in [] if binding_set is None else binding_set.named_children:
             attrpath = binding.child_by_field_name("attrpath")
             value = binding.child_by_field_name("expression")
@@ -195,7 +189,7 @@ def package_arguments(document: nix_syntax.Document) -> list[tuple[Node, str]]:
 
 
 def _run_nix(expression: str) -> object:
-    completed = subprocess.run(  # noqa: S603
+    completed = subprocess.run(  # noqa: S603 - Fixed Nix command; expression is one --expr argument.
         ["nix", "eval", "--impure", "--json", "--expr", expression],  # noqa: S607
         capture_output=True,
         check=True,
@@ -351,10 +345,7 @@ def rewrite(
     target = _returned_expression(root or document.root)
 
     def rewrite_set(node: Node, prefix: tuple[str, ...]) -> tuple[str, bool]:
-        binding_set = next(
-            (child for child in node.named_children if child.type == "binding_set"),
-            None,
-        )
+        binding_set = nix_syntax.binding_set(node)
         if binding_set is None:
             return document.text(node), False
         edits: list[tuple[int, int, bytes]] = []
@@ -404,10 +395,11 @@ def rewrite(
 
 def process_repository(root: Path) -> None:
     """Parse, resolve defaults, and safely rewrite a flake repository."""
+    root = root.resolve()
     paths = find_nix_files(root)
     for path in paths:
-        subprocess.run(  # noqa: S603
-            ["nix-instantiate", "--parse", str(path)],  # noqa: S607
+        subprocess.run(  # noqa: S603 - Fixed parser command with absolute filenames.
+            ["nix-instantiate", "--parse", "--", str(path)],  # noqa: S607
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
