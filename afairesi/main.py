@@ -3587,6 +3587,17 @@ class ArgumentDiscovery:
         names = self.names.names(node, imported=True)
         return next(iter(names)) if len(names) == 1 else ""
 
+    def _sources(self, node: ast.expr) -> list[ast.expr]:
+        """Follow assignments, helper returns, and method receivers."""
+        if isinstance(node, ast.Name):
+            return self._bindings(node)
+        if isinstance(node, ast.Call):
+            if isinstance(node.func, ast.Attribute):
+                return [node.func.value]
+            if (key := self._function(node.func)) is not None:
+                return self.returns.get(key, [])
+        return []
+
     def _conditions(
         self,
         node: ast.expr,
@@ -3598,15 +3609,7 @@ class ArgumentDiscovery:
             return set()
         seen = seen | {key}
         result = {self.controls[id(node)]} if id(node) in self.controls else set()
-        sources: list[ast.expr] = []
-        if isinstance(node, ast.Name):
-            sources = self._bindings(node)
-        elif isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Attribute):
-                sources = [node.func.value]
-            elif (function_key := self._function(node.func)) is not None:
-                sources = self.returns.get(function_key, [])
-        for value in sources:
+        for value in self._sources(node):
             result.update(self._conditions(value, seen))
         return result
 
@@ -3882,25 +3885,16 @@ class ArgumentDiscovery:
         if key in seen:
             return set()
         seen = seen | {key}
-        if isinstance(node, ast.Name):
-            return set().union(
-                *(self._groups(value, seen) for value in self._bindings(node)),
-            )
-        if not isinstance(node, ast.Call):
-            return set()
-        if (function_key := self._function(node.func)) is not None:
-            return set().union(
-                *(
-                    self._groups(value, seen)
-                    for value in self.returns.get(function_key, [])
-                ),
-            )
-        if isinstance(node.func, ast.Attribute):
-            groups = self._groups(node.func.value, seen)
-            if node.func.attr in {"add_argument_group", "add_mutually_exclusive_group"}:
-                groups.add(id(node))
-            return groups
-        return set()
+        groups: set[int] = set()
+        for value in self._sources(node):
+            groups.update(self._groups(value, seen))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in {"add_argument_group", "add_mutually_exclusive_group"}
+        ):
+            groups.add(id(node))
+        return groups
 
     def _group_members(
         self,
