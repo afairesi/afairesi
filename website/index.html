@@ -33,79 +33,53 @@
         structure.
       </p>
       <details class="installation">
-        <summary>
-          <span class="disclosure" aria-hidden="true"></span> Run without installing
-        </summary>
-        <pre><code class="tree-command">nix run github:afairesi/afairesi -- --help</code></pre>
+        <summary><span class="disclosure" aria-hidden="true"></span> Getting started</summary>
+        <p>Run without installing:</p>
+        <pre><code>nix run github:afairesi/afairesi -- --help</code></pre>
+        <p>Or install on non-NixOS systems:</p>
+        <pre><code>nix profile add github:afairesi/afairesi</code></pre>
+        <p>Or install on NixOS by adding to <code>flake.nix</code>:</p>
+        <pre><code>{
+  ...
+  inputs.afairesi.url = "github:afairesi/afairesi";
+  ...
+}</code></pre>
+        <p>With <code>inputs</code> passed to your module, add to <code>configuration.nix</code>:</p>
+        <pre><code>{ inputs, pkgs, ... }:
+{
+  ...
+  environment.systemPackages = [
+    ...
+    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.default
+  ];
+  ...
+}</code></pre>
+        <p>Apply the NixOS configuration:</p>
+        <pre><code>sudo nixos-rebuild switch</code></pre>
       </details>
-      <details class="installation">
-        <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
-        <p>Add afairesi to your system flake:</p>
-        <pre><code class="tree-command">inputs.afairesi.url = "github:afairesi/afairesi";</code></pre>
-        <p>With <code>inputs</code> in your NixOS module's scope, add:</p>
-        <pre><code class="tree-command">environment.systemPackages = [
-  inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.default
-];</code></pre>
-        <p>Apply:</p>
-        <pre><code class="tree-command">sudo nixos-rebuild switch</code></pre>
-      </details>
-      <details class="installation">
-        <summary>
-          <span class="disclosure" aria-hidden="true"></span> Install on non-NixOS systems
-        </summary>
-        <pre><code class="tree-command">nix profile add github:afairesi/afairesi</code></pre>
-      </details>
-      <details class="installation">
-        <summary><span class="disclosure" aria-hidden="true"></span> Repository setup</summary>
-        <p>
-          For an existing afairesi repository, initialize your home repository, add the submodule,
-          and enter it:
-        </p>
-        <pre><code class="tree-command">afairesi home init
-afairesi home add https://github.com/you/project.git
-cd ~/github.com/you/project</code></pre>
-        <p>
-          Existing afairesi repositories already contain their flake. For a new project, initialize
-          a Git repository containing only .git:
-        </p>
-        <pre><code class="tree-command">git init project
-cd project
-afairesi repo init</code></pre>
-        <p>Run <code>afairesi repo</code> and local Nix commands from the project's directory.</p>
-      </details>
-      <details class="directory">
-        <summary><span class="disclosure" aria-hidden="true"></span> Directory structure</summary>
-        <p>
-          At repository and package level, optional <code>prm/</code> directories hold permanent
-          project files tracked by Git; optional <code>tmp/</code> directories hold ignored
-          temporary files.
-        </p>
+      <section class="directory" aria-label="Directory structure">
         <figure
           class="tree"
           tabindex="0"
           role="region"
-          aria-label="Directory structure and setup commands"
+          aria-label="Directory structure and Nix commands"
         >
-          <pre><code>~/                          <span class="tree-comment"># <span class="tree-command">afairesi home init</span></span>
-│                           <span class="tree-comment"># <span class="tree-command">git submodule foreach 'COMMAND'</span>: run in each checked-out repository.</span>
-│                           <span class="tree-comment"># <span class="tree-command">git clean</span>: remove untracked files; flags control scope and preview.</span>
-├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI; extend with !/ entries after *.</span>
+          <pre><code>~/
+├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span></code></pre>
-          <details class="package">
+          <details class="package" open>
             <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
-            <pre><code>    │                       <span class="tree-comment"># Submodule paths match remote URLs.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: create a flake in a Git repository containing only .git.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: fix and stage structure, remove files outside the allowlist, lint, and format.</span>
+            <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/</code></summary>
+            <pre><code>    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run checks.</span>
     ├── .gitignore          <span class="tree-comment"># Managed by the afairesi CLI.</span>
     ├── flake.nix
     ├── flake.lock
-    ├── prm/                <span class="tree-comment"># Optional project files; tracked.</span>
+    ├── prm/                <span class="tree-comment"># Optional permanent project files; tracked.</span>
     ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add html_package html</span></span></code></summary>
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/</code></summary>
               <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
     │   ├── default.nix
     │   ├── index.html
@@ -114,17 +88,17 @@ afairesi repo init</code></pre>
             </details>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>python_package/     <span class="tree-comment"># <span class="tree-command">afairesi repo add python_package python</span></span></code></summary>
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>python_package/</code></summary>
               <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
     │   ├── default.nix
     │   ├── main.py
     │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span>
-    │   ├── prm/            <span class="tree-comment"># Optional project files; tracked.</span>
+    │   ├── prm/            <span class="tree-comment"># Optional permanent project files; tracked.</span>
     │   └── tmp/            <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
             </details>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>latex_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add latex_package latex</span></span></code></summary>
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>latex_package/</code></summary>
               <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
     │   ├── default.nix
     │   ├── ms.tex
@@ -132,7 +106,7 @@ afairesi repo init</code></pre>
             </details>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add lean4_package lean4</span></span></code></summary>
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/</code></summary>
               <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
     │   ├── default.nix
     │   ├── main.lean
@@ -140,20 +114,20 @@ afairesi repo init</code></pre>
             </details>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/        <span class="tree-comment"># <span class="tree-command">afairesi repo add nix_package nix</span></span></code></summary>
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/</code></summary>
               <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
     │   └── default.nix</code></pre>
             </details>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>my_host/            <span class="tree-comment"># <span class="tree-command">afairesi repo add my_host host</span></span></code></summary>
+              <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>my_host/</code></summary>
               <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.my_host.config.system.build.toplevel</span></span>
         ├── configuration.nix
         └── hardware-configuration.nix <span class="tree-comment"># Optional hardware configuration.</span></code></pre>
             </details>
           </details>
         </figure>
-      </details>
+      </section>
     </main>
   </body>
 </html>
