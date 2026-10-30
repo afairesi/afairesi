@@ -21,6 +21,7 @@ body {
     "Liberation Mono",
     monospace;
 }
+h1,
 p,
 pre,
 figure {
@@ -38,13 +39,19 @@ a:focus-visible,
   outline: 2px solid var(--accent);
   outline-offset: 4px;
 }
-.package summary:focus-visible {
+summary:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
 pre,
 code {
   font: inherit;
+}
+h1 {
+  font: inherit;
+}
+.installation pre {
+  overflow-x: auto;
 }
 .top {
   display: flex;
@@ -67,30 +74,32 @@ main {
   font-size: 12px;
   line-height: 1.5;
   overflow-x: auto;
-  scrollbar-width: none;
-}
-.tree::-webkit-scrollbar {
-  display: none;
 }
 .package {
   min-width: max-content;
 }
-.package summary {
+summary {
   cursor: pointer;
   list-style: none;
+}
+.package summary {
   white-space: pre;
 }
-.package summary::-webkit-details-marker {
+summary::-webkit-details-marker {
   display: none;
 }
-.package summary:hover {
+summary:hover {
   background: var(--surface);
 }
-.disclosure::before {
-  content: "▸";
+.installation > :not(summary),
+.directory > :not(summary) {
+  margin-inline-start: 2ch;
 }
-.package[open] > summary .disclosure::before {
-  content: "▾";
+.disclosure::before {
+  content: "▶";
+}
+details[open] > summary .disclosure::before {
+  content: "▼";
 }
 .tree-comment {
   color: var(--secondary);

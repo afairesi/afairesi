@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — A reproducible computing environment and CLI built on Git and Nix flakes."
+      content="afairesi — A CLI and Nix flake library for organizing Git repositories, packages, and NixOS configurations."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -17,25 +17,76 @@
   </head>
   <body>
     <header class="top">
-      <span>afairesi</span>
+      <h1>afairesi</h1>
       <nav aria-label="Project links">
         <a href="https://github.com/afairesi/afairesi">Source</a>
         <a href="https://github.com/afairesi/afairesi/blob/main/LICENSE">MIT License</a>
       </nav>
     </header>
     <main>
-      <p>What: A reproducible computing environment and CLI built on Git and Nix flakes.</p>
-      <p>Why: Follow a predefined directory structure with minimal persistent state.</p>
-      <figure aria-label="Home and repository layout">
-        <figcaption>How: Git submodules organize repositories; Nix flakes define their packages.</figcaption>
-        <div
+      <p>
+        What: A CLI and Nix flake library for organizing Git repositories, packages, and NixOS
+        configurations.
+      </p>
+      <p>
+        Why: Keep projects predictable and their builds reproducible through a shared directory
+        structure.
+      </p>
+      <details class="installation">
+        <summary>
+          <span class="disclosure" aria-hidden="true"></span> Run without installing
+        </summary>
+        <pre><code class="tree-command">nix run github:afairesi/afairesi -- --help</code></pre>
+      </details>
+      <details class="installation">
+        <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
+        <p>Add afairesi to your system flake:</p>
+        <pre><code class="tree-command">inputs.afairesi.url = "github:afairesi/afairesi";</code></pre>
+        <p>With <code>inputs</code> in your NixOS module's scope, add:</p>
+        <pre><code class="tree-command">environment.systemPackages = [
+  inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.default
+];</code></pre>
+        <p>Apply:</p>
+        <pre><code class="tree-command">sudo nixos-rebuild switch</code></pre>
+      </details>
+      <details class="installation">
+        <summary>
+          <span class="disclosure" aria-hidden="true"></span> Install on non-NixOS systems
+        </summary>
+        <pre><code class="tree-command">nix profile add github:afairesi/afairesi</code></pre>
+      </details>
+      <details class="installation">
+        <summary><span class="disclosure" aria-hidden="true"></span> Repository setup</summary>
+        <p>
+          For an existing afairesi repository, initialize your home repository, add the submodule,
+          and enter it:
+        </p>
+        <pre><code class="tree-command">afairesi home init
+afairesi home add https://github.com/you/project.git
+cd ~/github.com/you/project</code></pre>
+        <p>
+          Existing afairesi repositories already contain their flake. For a new project, initialize
+          a Git repository containing only .git:
+        </p>
+        <pre><code class="tree-command">git init project
+cd project
+afairesi repo init</code></pre>
+        <p>Run <code>afairesi repo</code> and local Nix commands from the project's directory.</p>
+      </details>
+      <details class="directory">
+        <summary><span class="disclosure" aria-hidden="true"></span> Directory structure</summary>
+        <p>
+          At repository and package level, optional <code>prm/</code> directories hold permanent
+          project files tracked by Git; optional <code>tmp/</code> directories hold ignored
+          temporary files.
+        </p>
+        <figure
           class="tree"
           tabindex="0"
           role="region"
           aria-label="Directory structure and setup commands"
         >
-          <pre><code>                            <span class="tree-comment"># <span class="tree-command">nix run github:afairesi/afairesi</span>: show help for the afairesi CLI.</span>
-~/                          <span class="tree-comment"># <span class="tree-command">afairesi home init</span></span>
+          <pre><code>~/                          <span class="tree-comment"># <span class="tree-command">afairesi home init</span></span>
 │                           <span class="tree-comment"># <span class="tree-command">git submodule foreach 'COMMAND'</span>: run in each checked-out repository.</span>
 │                           <span class="tree-comment"># <span class="tree-command">git clean</span>: remove untracked files; flags control scope and preview.</span>
 ├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI; extend with !/ entries after *.</span>
@@ -45,12 +96,12 @@
             <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
             <pre><code>    │                       <span class="tree-comment"># Submodule paths match remote URLs.</span>
     │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: create a flake in a Git repository containing only .git.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: fix and stage structure, remove files outside the whitelist, lint, and format.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: fix and stage structure, remove files outside the allowlist, lint, and format.</span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run checks.</span>
     ├── .gitignore          <span class="tree-comment"># Managed by the afairesi CLI.</span>
     ├── flake.nix
     ├── flake.lock
-    ├── prm/                <span class="tree-comment"># Optional persistent files; tracked.</span>
+    ├── prm/                <span class="tree-comment"># Optional project files; tracked.</span>
     ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
             <details class="package">
               <!-- prettier-ignore -->
@@ -58,8 +109,8 @@
               <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
     │   ├── default.nix
     │   ├── index.html
-    │   ├── script.js
-    │   └── style.css</code></pre>
+    │   ├── script.js      <span class="tree-comment"># Optional JavaScript.</span>
+    │   └── style.css      <span class="tree-comment"># Optional stylesheet.</span></code></pre>
             </details>
             <details class="package">
               <!-- prettier-ignore -->
@@ -68,7 +119,7 @@
     │   ├── default.nix
     │   ├── main.py
     │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span>
-    │   ├── prm/            <span class="tree-comment"># Optional persistent files; tracked.</span>
+    │   ├── prm/            <span class="tree-comment"># Optional project files; tracked.</span>
     │   └── tmp/            <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
             </details>
             <details class="package">
@@ -95,14 +146,14 @@
             </details>
             <details class="package">
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>host_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add host_package host</span></span></code></summary>
-              <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.host_package.config.system.build.toplevel</span></span>
+              <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>my_host/            <span class="tree-comment"># <span class="tree-command">afairesi repo add my_host host</span></span></code></summary>
+              <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.my_host.config.system.build.toplevel</span></span>
         ├── configuration.nix
         └── hardware-configuration.nix <span class="tree-comment"># Optional hardware configuration.</span></code></pre>
             </details>
           </details>
-        </div>
-      </figure>
+        </figure>
+      </details>
     </main>
   </body>
 </html>
