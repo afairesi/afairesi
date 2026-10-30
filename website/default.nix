@@ -17,7 +17,7 @@ let
   '';
 in
 pkgs.writeShellApplication {
-  meta.description = "A reproducible computing environment built on Git and Nix.";
+  meta.description = "A reproducible computing environment built on Git and Nix flakes.";
   name = pname;
   runtimeInputs = [
     pkgs.http-server

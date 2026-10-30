@@ -4,7 +4,6 @@
   --surface: #eee8d5;
   --ink: #586e75;
   --secondary: #657b83;
-  --line: #93a1a1;
   --accent: #268bd2;
 }
 * {
@@ -50,9 +49,6 @@ pre,
 code {
   font: inherit;
 }
-.page {
-  max-width: 760px;
-}
 .top {
   padding: 18px 0 12px;
   border-bottom: 1px solid var(--surface);
@@ -71,8 +67,10 @@ main {
   font-size: 12px;
   line-height: 1.5;
   overflow-x: auto;
-  scrollbar-width: thin;
-  scrollbar-color: var(--line) var(--surface);
+  scrollbar-width: none;
+}
+.tree::-webkit-scrollbar {
+  display: none;
 }
 .package {
   min-width: max-content;

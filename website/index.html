@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — A reproducible computing environment built on Git and Nix."
+      content="afairesi — A reproducible computing environment built on Git and Nix flakes."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -20,7 +20,7 @@
     <div class="page">
       <header class="top">
         <a class="brand" href="#main">afairesi</a>
-        <span> — A reproducible computing environment built on Git and Nix.</span>
+        <span> — A reproducible computing environment built on Git and Nix flakes.</span>
       </header>
       <main id="main">
         <figure class="directory" aria-label="Home and repository layout">
@@ -31,6 +31,7 @@
             aria-label="Directory structure and setup commands"
           >
             <pre><code>                            <span class="tree-comment"># <span class="tree-command">nix run github:afairesi/afairesi</span>: show CLI help.</span>
+                            <span class="tree-comment"># Use afairesi to change persistent state: add, remove, or update repositories, packages, and hosts.</span>
                             <span class="tree-comment"># Lifecycle commands stage changes; use Git to commit and push.</span>
 ~/                          <span class="tree-comment"># <span class="tree-command">afairesi home init</span></span>
 │                           <span class="tree-comment"># <span class="tree-command">git submodule foreach 'COMMAND'</span>: run a command in each checked-out repository.</span>
@@ -65,6 +66,7 @@
                 <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
     │   ├── default.nix
     │   ├── main.py
+    │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by nix flake check.</span>
     │   ├── prm/            <span class="tree-comment"># Optional persistent package data, kept in Git.</span>
     │   └── tmp/            <span class="tree-comment"># Optional temporary package data, ignored by Git.</span></code></pre>
               </details>
@@ -78,17 +80,31 @@
               </details>
               <details class="package">
                 <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>lean4_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add lean4_package lean4</span></span></code></summary>
-                <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
-        ├── default.nix
-        └── main.lean</code></pre>
+                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add lean4_package lean4</span></span></code></summary>
+                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
+    │   ├── default.nix
+    │   ├── main.lean
+    │   └── test_main.lean  <span class="tree-comment"># Optional tests, run by nix flake check.</span></code></pre>
+              </details>
+              <details class="package">
+                <!-- prettier-ignore -->
+                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/        <span class="tree-comment"># <span class="tree-command">afairesi repo add nix_package nix</span></span></code></summary>
+                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
+    │   └── default.nix</code></pre>
+              </details>
+              <details class="package">
+                <!-- prettier-ignore -->
+                <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>host_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add host_package host</span></span></code></summary>
+                <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.host_package.config.system.build.toplevel</span></span>
+        ├── configuration.nix
+        └── hardware-configuration.nix <span class="tree-comment"># Optional hardware configuration.</span></code></pre>
               </details>
             </details>
           </div>
         </figure>
       </main>
       <footer class="foot">
-        <span>MIT</span>
+        <span>MIT License</span>
         <a
           class="source"
           href="https://github.com/afairesi/afairesi"

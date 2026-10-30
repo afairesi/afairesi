@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""A reproducible computing environment built on Git and Nix."""
+"""A reproducible computing environment built on Git and Nix flakes."""
 
 from __future__ import annotations
 
@@ -315,9 +315,9 @@ def detect_packages(root: Path) -> list[Package]:
 
 
 def validate_name(name: str) -> None:
-    """Enforce package naming conventions."""
+    """Enforce shared package and host naming conventions."""
     if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*|[a-z0-9]+(?:-[a-z0-9]+)*", name):
-        msg = f"package name must use snake_case or dash-case: {name}"
+        msg = f"resource name must use snake_case or dash-case: {name}"
         raise CommandError(msg)
 
 
@@ -344,10 +344,8 @@ def validate_python_package_names(packages: list[Package]) -> None:
 
 
 def validate_host_name(name: str) -> None:
-    """Enforce lower camelCase host names."""
-    if not re.fullmatch(r"[a-z][A-Za-z0-9]*", name):
-        msg = f"host name must use camelCase: {name}"
-        raise CommandError(msg)
+    """Apply the shared resource naming conventions to hosts."""
+    validate_name(name)
 
 
 def package_files(package: Package) -> set[Path]:
@@ -1894,12 +1892,8 @@ def _parse_resource_path(
         validate_host_name(name)
     elif kind == "package":
         validate_name(name)
-    elif not (
-        re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*|[a-z0-9]+(?:-[a-z0-9]+)*", name)
-        or re.fullmatch(r"[a-z][A-Za-z0-9]*", name)
-    ):
-        msg = f"invalid resource name: {name}"
-        raise CommandError(msg)
+    else:
+        validate_name(name)
     return kind or "package", name, path
 
 
@@ -4341,10 +4335,9 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     create.add_argument(
         "type",
-        nargs="?",
         metavar="TYPE",
-        choices=PACKAGE_KINDS,
-        help=f"required for packages, omitted for hosts ({', '.join(PACKAGE_KINDS)})",
+        choices=(*PACKAGE_KINDS, "host"),
+        help=f"resource type ({', '.join((*PACKAGE_KINDS, 'host'))})",
     )
     fix = commands.add_parser(
         "fix",
@@ -4803,7 +4796,7 @@ def parser() -> argparse.ArgumentParser:
     """Construct the workspace command-line parser."""
     result = argparse.ArgumentParser(
         prog="afairesi",
-        description=("A reproducible computing environment built on Git and Nix."),
+        description=("A reproducible computing environment built on Git and Nix flakes."),
     )
     scopes = result.add_subparsers(dest="scope", title="scopes", metavar="SCOPE")
     home = scopes.add_parser(
@@ -4834,7 +4827,7 @@ def _dispatch_create(root: Path, options: argparse.Namespace) -> None:
     """Create the selected package or host resource."""
     kind, name, _relative = _parse_resource_path(
         options.resource,
-        kind="host" if options.type is None else "package",
+        kind="host" if options.type == "host" else "package",
     )
     if kind == "host":
         add_host(root, name)
@@ -4856,7 +4849,7 @@ def _validate_resource_arguments(
         else:
             _parse_resource_path(
                 options.resource,
-                kind=("host" if options.type is None else "package")
+                kind=("host" if options.type == "host" else "package")
                 if options.command == "add"
                 else None,
             )

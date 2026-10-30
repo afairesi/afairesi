@@ -470,7 +470,7 @@ def test_create_stages_the_requested_resource_and_whitelist(
         _fixture_git(root, "commit", "-qm", "Initial repository")
         head = _git(root, "rev-parse", "HEAD")
         relative = "example"
-        arguments = () if kind == "host" else (kind,)
+        arguments = (kind,)
         _run(root, "add", relative, *arguments)
         resource = root / relative
         _expect(
@@ -504,7 +504,9 @@ def test_create_stages_the_requested_resource_and_whitelist(
 @pytest.mark.parametrize(
     ("arguments", "message"),
     [
-        (("nested/example",), "root directory name"),
+        (("nested/example", "host"), "root directory name"),
+        (("example",), "required"),
+        (("workLaptop", "host"), "snake_case or dash-case"),
         (("example", "unknown"), "invalid choice"),
         (("example", "python", "unexpected"), "unrecognized arguments"),
         (
@@ -534,7 +536,7 @@ def test_invalid_resource_arguments_are_usage_errors_outside_git(
 ) -> None:
     """Reject malformed resource requests before requiring a Git repository."""
     for arguments in (
-        ("add", "nested/example"),
+        ("add", "nested/example", "host"),
         ("add", "tmp", "python"),
         ("add", "example", "unknown"),
         ("rm", "other/example"),
@@ -552,7 +554,7 @@ def test_add_targets_repository_root_and_rejects_existing_resources(kind: str) -
         nested = root / "tmp/nested"
         nested.mkdir(parents=True)
         relative = "example"
-        arguments = () if kind == "host" else (kind,)
+        arguments = (kind,)
         _run(nested, "add", relative, *arguments)
         _expect(
             (root / relative).is_dir(),
@@ -868,7 +870,7 @@ def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
             root,
             "add",
             resource,
-            *(() if kind == "host" else (kind,)),
+            kind,
             code=128,
         )
         _expect("index.lock" in failed.stderr, failed)
@@ -1646,7 +1648,8 @@ def test_python_packages_require_the_shared_constructor() -> None:
     [
         (("mv", "example", "nested/renamed"), 2),
         (("add", "bad--name", "python"), 2),
-        (("add", "bad-name"), 2),
+        (("add", "bad--name", "host"), 2),
+        (("add", "laptop"), 2),
         (("rm", "../outside"), 2),
         (("rm", "/outside"), 2),
         (("mv", "example", "taken"), 1),
@@ -1692,6 +1695,8 @@ def _stage_resource_edits(
         ("lean4", "proof", b"Lean 4"),
         ("nix", "value", b"Nix"),
         ("host", "laptop", b"host"),
+        ("host", "work-laptop", b"host"),
+        ("host", "work_laptop", b"host"),
         ("untracked", "untracked", b"untracked"),
     ],
 )
@@ -1702,15 +1707,13 @@ def test_resource_lifecycle_preserves_files_and_git_state(
 ) -> None:
     """Add, rename, converge, and remove resources without losing Git state."""
     with _fresh_repository() as root:
-        if kind == "host":
-            name = name.replace("-", "").replace("_", "")
         original, destination = f"old{name}", f"new{name}"
         package = root / original
         if kind == "untracked":
             package.mkdir(parents=True)
             (package / "default.nix").write_text("{}\n")
         else:
-            _run(root, "add", original, *(() if kind == "host" else (kind,)))
+            _run(root, "add", original, kind)
         if kind == "python":
             _expect(
                 not (package / "test_main.py").exists(),
@@ -3724,7 +3727,7 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     executable = os.environ["PACKAGE_E2E_EXECUTABLE"]
     help_output = _run(tmp_path, "--help", executable=executable).stdout
     _expect(
-        "minimizes the persistent state needed to reconstruct" in help_output,
+        "A reproducible computing environment built on Git and Nix flakes." in help_output,
         help_output,
     )
     _expect("    repo " in help_output and "    home " in help_output, help_output)

@@ -45,7 +45,7 @@ in
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
-  meta.description = "A reproducible computing environment built on Git and Nix.";
+  meta.description = "A reproducible computing environment built on Git and Nix flakes.";
   passthru = {
     checkInputs = [
       python.pkgs.coverage
