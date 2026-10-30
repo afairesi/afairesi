@@ -378,7 +378,11 @@ def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
     allowed = {Path(item) for item in ROOT_FILES if (root / item).exists()}
     if root.is_dir():
         for host in root.iterdir():
-            if host.is_dir() and (host / "configuration.nix").exists():
+            if (
+                host.is_dir()
+                and not host.is_symlink()
+                and (host / "configuration.nix").exists()
+            ):
                 validate_host_name(host.name)
                 allowed.add(Path() / host.name / "configuration.nix")
                 hardware = Path() / host.name / "hardware-configuration.nix"
@@ -461,15 +465,27 @@ def _structure_paths(root: Path, excluded: set[Path]) -> list[Path]:
     return sorted(paths)
 
 
-def validate_flake_layout(root: Path, *, removing: Path | None = None) -> None:
+def validate_flake_layout(
+    root: Path,
+    *,
+    removing: Path | None = None,
+    cleanup: bool = False,
+) -> None:
     """Establish the managed layout and readable test metadata before a command."""
     excluded = prm_directories(root) | tmp_directories(root) | {Path(".git")}
+    packages = detect_packages(root)
+    protected = allowed_paths(root, packages) | {Path(item) for item in ROOT_FILES}
+    for package in packages:
+        protected.update(package_files(package))
+    protected.update(parent for path in tuple(protected) for parent in path.parents)
     for path in _structure_paths(root, excluded):
         relative = path.relative_to(root)
         if path.is_symlink():
+            if cleanup and relative not in protected:
+                continue
             msg = f"{relative}: managed layout requires regular files and directories"
             raise CommandError(msg)
-    for package in detect_packages(root):
+    for package in packages:
         tests = package.root / "test_main.py"
         if (
             package.kind == "python"
@@ -4860,12 +4876,17 @@ def _validate_resource_arguments(
         cli.error(str(error))
 
 
-def _require_flake_repository(message: str, *, removing: Path | None = None) -> Path:
+def _require_flake_repository(
+    message: str,
+    *,
+    removing: Path | None = None,
+    cleanup: bool = False,
+) -> Path:
     """Select the current repository and require flake lifecycle commands."""
     root = repository_root()
     if repository_type(root) != "flake":
         raise CommandError(message)
-    validate_flake_layout(root, removing=removing)
+    validate_flake_layout(root, removing=removing, cleanup=cleanup)
     return root
 
 
@@ -4885,6 +4906,7 @@ def formatter_main() -> None:
             return
         root = _require_flake_repository(
             "nix fmt requires a flake repository; run afairesi home fix for home",
+            cleanup=True,
         )
         converge_flake(root, dry_run=options.dry_run)
     except (
@@ -4922,6 +4944,7 @@ def _dispatch_workspace_command(
     root = _require_flake_repository(
         "afairesi repo commands require a flake repository; use afairesi home for home",
         removing=Path(options.resource) if options.command == "rm" else None,
+        cleanup=options.command == "fix",
     )
     if options.command == "add":
         _dispatch_create(root, options)

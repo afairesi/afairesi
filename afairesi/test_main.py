@@ -780,16 +780,18 @@ def test_creation_rejects_symlinks_without_writing_outside_the_repository(
 
 @pytest.mark.parametrize(
     "relative",
-    ["checks", "checks/example", "checks/example/default.nix"],
+    [".github", "example/main.py", "example/default.nix"],
 )
 @pytest.mark.parametrize("dry_run", [False, True])
-def test_repair_rejects_check_symlinks_before_changing_state(
+@pytest.mark.parametrize("formatter", [False, True])
+def test_repair_rejects_source_symlinks_before_changing_state(
     tmp_path: Path,
     relative: str,
     *,
     dry_run: bool,
+    formatter: bool,
 ) -> None:
-    """Reject check symlinks before writing templates or changing the index."""
+    """Reject source symlinks before writing templates or changing the index."""
     outside = tmp_path / "outside"
     outside.mkdir()
     external = outside / "default.nix"
@@ -808,10 +810,61 @@ def test_repair_rejects_check_symlinks_before_changing_state(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.symlink_to(external if path.suffix else outside)
         before = _snapshot(root)
-        rejected = _run(root, "fix", *(("--dry-run",) if dry_run else ()), code=1)
+        repair = (
+            partial(_repair_flake, root) if formatter else partial(_run, root, "fix")
+        )
+        rejected = repair(*(("--dry-run",) if dry_run else ()), code=1)
         _expect("managed layout" in rejected.stderr, rejected)
         _expect(_snapshot(root) == before, "rejected repair changed repository state")
         _expect(external.read_text() == "{}\n", "repair wrote outside the repository")
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["discarded", "checks/example/default.nix", "example/unsupported"],
+)
+@pytest.mark.parametrize("target_kind", ["file", "directory", "dangling"])
+@pytest.mark.parametrize("tracked", [False, True])
+@pytest.mark.parametrize("formatter", [False, True])
+def test_repair_removes_unsupported_symlinks_without_following_targets(
+    tmp_path: Path,
+    relative: str,
+    target_kind: str,
+    *,
+    tracked: bool,
+    formatter: bool,
+) -> None:
+    """Preview and remove arbitrary unsupported links while preserving targets."""
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "configuration.nix").write_text("{}\n")
+    external = outside / "asset"
+    external.write_bytes(bytes(range(256)))
+    target = {
+        "file": external,
+        "directory": outside,
+        "dangling": outside / "missing",
+    }[target_kind]
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", "python")
+        _repair_flake(root)
+        path = root / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.symlink_to(target, target_is_directory=target_kind == "directory")
+        if tracked:
+            _git(root, "add", "--force", "--", relative)
+        repair = (
+            partial(_repair_flake, root) if formatter else partial(_run, root, "fix")
+        )
+        before = _snapshot(root)
+        repair("--dry-run", code=1 if formatter else 0)
+        _expect(_snapshot(root) == before, "preview changed unsupported links")
+        repair()
+        _expect(not path.is_symlink(), "cleanup retained unsupported symlink")
+        _expect(relative not in _git(root, "ls-files").splitlines(), "link is indexed")
+        _expect(external.read_bytes() == bytes(range(256)), "cleanup changed target")
+        _expect((outside / "configuration.nix").read_text() == "{}\n", "target changed")
+        _preview_flake_repair(root)
 
 
 @pytest.mark.parametrize("command", ["mv", "rm"])
