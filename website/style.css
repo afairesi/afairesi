@@ -50,6 +50,15 @@ code {
 h1 {
   font: inherit;
 }
+main p {
+  max-width: 80ch;
+}
+main > p + p {
+  margin-top: 12px;
+}
+.installation {
+  margin-block: 12px;
+}
 .installation pre {
   max-width: 80ch;
   margin-block: 8px;

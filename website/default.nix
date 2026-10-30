@@ -17,7 +17,7 @@ let
   '';
 in
 pkgs.writeShellApplication {
-  meta.description = "A CLI and Nix flake library for organizing your home directory and Git repositories through a consistent directory structure.";
+  meta.description = "An opinionated CLI and Nix flake library for managing a Git-based home directory, repositories, packages, and NixOS configurations.";
   name = pname;
   runtimeInputs = [
     pkgs.http-server
