@@ -16,36 +16,34 @@
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
-    <a class="skip" href="#main">Skip to content</a>
-    <div class="page">
-      <header class="top">
-        <a class="brand" href="#main">afairesi</a>
-        <nav aria-label="Project links">
-          <a href="https://github.com/afairesi/afairesi">Source</a>
-          <a href="https://github.com/afairesi/afairesi/blob/main/LICENSE">MIT License</a>
-        </nav>
-      </header>
-      <main id="main">
-        <p>What: A reproducible computing environment and CLI built on Git and Nix flakes.</p>
-        <p>Why: Reduce persistent state and manual work.</p>
-        <figure class="directory" aria-label="Home and repository layout">
-          <figcaption>How:</figcaption>
-          <div
-            class="tree"
-            tabindex="0"
-            role="region"
-            aria-label="Directory structure and setup commands"
-          >
-            <pre><code>                            <span class="tree-comment"># <span class="tree-command">nix run github:afairesi/afairesi</span>: show help for the afairesi CLI.</span>
+    <header class="top">
+      <span>afairesi</span>
+      <nav aria-label="Project links">
+        <a href="https://github.com/afairesi/afairesi">Source</a>
+        <a href="https://github.com/afairesi/afairesi/blob/main/LICENSE">MIT License</a>
+      </nav>
+    </header>
+    <main>
+      <p>What: A reproducible computing environment and CLI built on Git and Nix flakes.</p>
+      <p>Why: Reduce persistent state and manual work.</p>
+      <figure aria-label="Home and repository layout">
+        <figcaption>How:</figcaption>
+        <div
+          class="tree"
+          tabindex="0"
+          role="region"
+          aria-label="Directory structure and setup commands"
+        >
+          <pre><code>                            <span class="tree-comment"># <span class="tree-command">nix run github:afairesi/afairesi</span>: show help for the afairesi CLI.</span>
 ~/                          <span class="tree-comment"># <span class="tree-command">afairesi home init</span></span>
 │                           <span class="tree-comment"># <span class="tree-command">git submodule foreach 'COMMAND'</span>: run in each checked-out repository.</span>
 │                           <span class="tree-comment"># <span class="tree-command">git clean</span>: remove untracked files; flags control scope and preview.</span>
 ├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI; extend with !/ entries after *.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span></code></pre>
-            <details class="package">
-              <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
-              <pre><code>    │                       <span class="tree-comment"># Submodule paths match remote URLs.</span>
+          <details class="package">
+            <!-- prettier-ignore -->
+            <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
+            <pre><code>    │                       <span class="tree-comment"># Submodule paths match remote URLs.</span>
     │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: create a flake; requires an empty Git worktree.</span>
     │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: repair, clean, and stage via the afairesi CLI; lint and format.</span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run checks.</span>
@@ -54,58 +52,57 @@
     ├── flake.lock
     ├── prm/                <span class="tree-comment"># Optional persistent files; tracked.</span>
     ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
-              <details class="package">
-                <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add html_package html</span></span></code></summary>
-                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
+            <details class="package">
+              <!-- prettier-ignore -->
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add html_package html</span></span></code></summary>
+              <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
     │   ├── default.nix
     │   ├── index.html
     │   ├── script.js
     │   └── style.css</code></pre>
-              </details>
-              <details class="package">
-                <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>python_package/     <span class="tree-comment"># <span class="tree-command">afairesi repo add python_package python</span></span></code></summary>
-                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
+            </details>
+            <details class="package">
+              <!-- prettier-ignore -->
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>python_package/     <span class="tree-comment"># <span class="tree-command">afairesi repo add python_package python</span></span></code></summary>
+              <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
     │   ├── default.nix
     │   ├── main.py
     │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span>
     │   ├── prm/            <span class="tree-comment"># Optional persistent files; tracked.</span>
     │   └── tmp/            <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
-              </details>
-              <details class="package">
-                <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>latex_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add latex_package latex</span></span></code></summary>
-                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
+            </details>
+            <details class="package">
+              <!-- prettier-ignore -->
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>latex_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add latex_package latex</span></span></code></summary>
+              <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
     │   ├── default.nix
     │   ├── ms.tex
     │   └── ms.bib</code></pre>
-              </details>
-              <details class="package">
-                <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add lean4_package lean4</span></span></code></summary>
-                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
+            </details>
+            <details class="package">
+              <!-- prettier-ignore -->
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/      <span class="tree-comment"># <span class="tree-command">afairesi repo add lean4_package lean4</span></span></code></summary>
+              <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
     │   ├── default.nix
     │   ├── main.lean
     │   └── test_main.lean  <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span></code></pre>
-              </details>
-              <details class="package">
-                <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/        <span class="tree-comment"># <span class="tree-command">afairesi repo add nix_package nix</span></span></code></summary>
-                <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
+            </details>
+            <details class="package">
+              <!-- prettier-ignore -->
+              <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/        <span class="tree-comment"># <span class="tree-command">afairesi repo add nix_package nix</span></span></code></summary>
+              <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
     │   └── default.nix</code></pre>
-              </details>
-              <details class="package">
-                <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>host_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add host_package host</span></span></code></summary>
-                <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.host_package.config.system.build.toplevel</span></span>
+            </details>
+            <details class="package">
+              <!-- prettier-ignore -->
+              <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>host_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add host_package host</span></span></code></summary>
+              <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.host_package.config.system.build.toplevel</span></span>
         ├── configuration.nix
         └── hardware-configuration.nix <span class="tree-comment"># Optional hardware configuration.</span></code></pre>
-              </details>
             </details>
-          </div>
-        </figure>
-      </main>
-    </div>
+          </details>
+        </div>
+      </figure>
+    </main>
   </body>
 </html>

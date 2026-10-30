@@ -9,9 +9,6 @@
 * {
   box-sizing: border-box;
 }
-html {
-  scroll-behavior: smooth;
-}
 body {
   margin: 0;
   padding: 0 clamp(16px, 3vw, 40px);
@@ -34,7 +31,6 @@ a {
   text-underline-offset: 3px;
 }
 a:hover {
-  text-decoration: underline;
   text-decoration-thickness: 2px;
 }
 a:focus-visible,
@@ -58,9 +54,6 @@ code {
   padding: 18px 0 12px;
   border-bottom: 1px solid var(--surface);
   font-size: 14px;
-}
-.brand {
-  text-decoration: none;
 }
 .top nav {
   display: flex;
@@ -108,17 +101,6 @@ main {
   border-radius: 3px;
   padding: 1px 4px;
 }
-.skip {
-  position: absolute;
-  top: -100px;
-  left: 16px;
-  background: var(--paper);
-  padding: 8px;
-  z-index: 5;
-}
-.skip:focus {
-  top: 8px;
-}
 ::selection {
   background: var(--surface);
   color: var(--ink);
@@ -135,10 +117,5 @@ main {
   }
   .tree {
     font-size: 11px;
-  }
-}
-@media (prefers-reduced-motion: reduce) {
-  html {
-    scroll-behavior: auto;
   }
 }
