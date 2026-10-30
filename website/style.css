@@ -24,6 +24,7 @@ body {
     "Liberation Mono",
     monospace;
 }
+p,
 pre,
 figure {
   margin: 0;
@@ -50,6 +51,10 @@ code {
   font: inherit;
 }
 .top {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 16px;
   padding: 18px 0 12px;
   border-bottom: 1px solid var(--surface);
   font-size: 14px;
@@ -57,11 +62,13 @@ code {
 .brand {
   text-decoration: none;
 }
+.top nav {
+  display: flex;
+  gap: 12px;
+  font-size: 12px;
+}
 main {
   padding: 20px 0 18px;
-}
-.directory {
-  margin-top: 18px;
 }
 .tree {
   font-size: 12px;
@@ -101,22 +108,6 @@ main {
   border-radius: 3px;
   padding: 1px 4px;
 }
-.foot {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  border-top: 1px solid var(--surface);
-  padding: 12px 0;
-  font-size: 10px;
-}
-.source {
-  padding: 5px;
-}
-.source svg {
-  display: block;
-  width: 14px;
-  height: 14px;
-}
 .skip {
   position: absolute;
   top: -100px;
@@ -144,9 +135,6 @@ main {
   }
   .tree {
     font-size: 11px;
-  }
-  .foot {
-    padding: 10px 0;
   }
 }
 @media (prefers-reduced-motion: reduce) {
