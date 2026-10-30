@@ -39,7 +39,8 @@
               <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
               <pre><code>    │                       <span class="tree-comment"># Repositories are submodules at paths matching their remote URLs.</span>
     │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span></span>
-    │                       <span class="tree-comment"># Strictly linted and formatted source: <span class="tree-command">nix fmt</span>.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: lint and format the entire repository.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run repository checks.</span>
     ├── .gitignore          <span class="tree-comment"># Managed by afairesi.</span>
     ├── flake.nix           <span class="tree-comment"># Each repository is a Nix flake with package definitions beside source.</span>
     ├── flake.lock
