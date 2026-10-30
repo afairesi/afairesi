@@ -25,9 +25,9 @@
     </header>
     <main>
       <p>What: A reproducible computing environment and CLI built on Git and Nix flakes.</p>
-      <p>Why: Reduce persistent state and manual work.</p>
+      <p>Why: Follow a predefined directory structure with minimal persistent state.</p>
       <figure aria-label="Home and repository layout">
-        <figcaption>How:</figcaption>
+        <figcaption>How: Git submodules organize repositories; Nix flakes define their packages.</figcaption>
         <div
           class="tree"
           tabindex="0"
@@ -44,8 +44,8 @@
             <!-- prettier-ignore -->
             <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
             <pre><code>    │                       <span class="tree-comment"># Submodule paths match remote URLs.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: create a flake; requires an empty Git worktree.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: repair, clean, and stage via the afairesi CLI; lint and format.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: create a flake in a Git repository containing only .git.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: fix and stage structure, remove files outside the whitelist, lint, and format.</span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run checks.</span>
     ├── .gitignore          <span class="tree-comment"># Managed by the afairesi CLI.</span>
     ├── flake.nix
