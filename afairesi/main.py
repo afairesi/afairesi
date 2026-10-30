@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Afairesi minimizes the persistent state needed to reconstruct a software system."""
+"""A reproducible computing environment built on Git and Nix."""
 
 from __future__ import annotations
 
@@ -4804,8 +4804,7 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="afairesi",
         description=(
-            "Afairesi minimizes the persistent state needed to reconstruct "
-            "a software system."
+            "A reproducible computing environment built on Git and Nix."
         ),
     )
     scopes = result.add_subparsers(dest="scope", title="scopes", metavar="SCOPE")

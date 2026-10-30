@@ -45,7 +45,7 @@ in
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
-  meta.description = "Afairesi minimizes the persistent state needed to reconstruct a software system.";
+  meta.description = "A reproducible computing environment built on Git and Nix.";
   passthru = {
     checkInputs = [
       python.pkgs.coverage

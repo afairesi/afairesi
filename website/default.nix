@@ -17,7 +17,7 @@ let
   '';
 in
 pkgs.writeShellApplication {
-  meta.description = "afairesi: Keep only what matters.";
+  meta.description = "A reproducible computing environment built on Git and Nix.";
   name = pname;
   runtimeInputs = [
     pkgs.http-server
