@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""A reproducible computing environment built on Git and Nix flakes."""
+"""Create and maintain the afairesi computing environment."""
 
 from __future__ import annotations
 
@@ -4797,7 +4797,8 @@ def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="afairesi",
         description=(
-            "A reproducible computing environment built on Git and Nix flakes."
+            "Create and maintain repositories, packages, and hosts "
+            "in the afairesi computing environment."
         ),
     )
     scopes = result.add_subparsers(dest="scope", title="scopes", metavar="SCOPE")

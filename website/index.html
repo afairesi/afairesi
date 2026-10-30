@@ -30,27 +30,25 @@
             role="region"
             aria-label="Directory structure and setup commands"
           >
-            <pre><code>                            <span class="tree-comment"># <span class="tree-command">nix run github:afairesi/afairesi</span>: show CLI help.</span>
-                            <span class="tree-comment"># Use afairesi to change persistent state: add, remove, or update repositories, packages, and hosts.</span>
-                            <span class="tree-comment"># Lifecycle commands stage changes; use Git to commit and push.</span>
+            <pre><code>                            <span class="tree-comment"># <span class="tree-command">nix run github:afairesi/afairesi</span>: show help for the afairesi CLI.</span>
+                            <span class="tree-comment"># The afairesi CLI manages repositories, packages, and hosts, staging changes for Git.</span>
 ~/                          <span class="tree-comment"># <span class="tree-command">afairesi home init</span></span>
-│                           <span class="tree-comment"># <span class="tree-command">git submodule foreach 'COMMAND'</span>: run a command in each checked-out repository.</span>
-│                           <span class="tree-comment"># <span class="tree-command">git clean</span>: remove untracked files; options control previews, directories, and ignored files.</span>
-├── .gitignore              <span class="tree-comment"># Managed by afairesi; add !/ entries after the initial * to keep extra paths.</span>
-├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span></code></pre>
+│                           <span class="tree-comment"># <span class="tree-command">git submodule foreach 'COMMAND'</span>: run in each checked-out repository.</span>
+│                           <span class="tree-comment"># <span class="tree-command">git clean</span>: remove untracked files; flags control scope and preview.</span>
+├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI; extend with !/ entries after *.</span>
+├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span></code></pre>
             <details class="package">
               <!-- prettier-ignore -->
               <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/project/ <span class="tree-comment"># <span class="tree-command">afairesi home add https://github.com/you/project.git</span></span></code></summary>
-              <pre><code>    │                       <span class="tree-comment"># Repositories are submodules at paths matching their remote URLs.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: initialize a flake in an empty Git worktree.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: repair structure, stage changes, lint and format the repository.</span>
-    │                       <span class="tree-comment"># Removes unsupported files; keep supporting files in prm/ and temporary files in tmp/.</span>
-    │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run repository checks.</span>
-    ├── .gitignore          <span class="tree-comment"># Managed by afairesi.</span>
-    ├── flake.nix           <span class="tree-comment"># Each repository is a Nix flake with package definitions beside source.</span>
+              <pre><code>    │                       <span class="tree-comment"># Submodule paths match remote URLs.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">afairesi repo init</span>: create a flake; requires an empty Git worktree.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span>: repair, clean, and stage via the afairesi CLI; lint and format.</span>
+    │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span>: run checks.</span>
+    ├── .gitignore          <span class="tree-comment"># Managed by the afairesi CLI.</span>
+    ├── flake.nix
     ├── flake.lock
-    ├── prm/                <span class="tree-comment"># Optional persistent files, kept in Git.</span>
-    ├── tmp/                <span class="tree-comment"># Optional temporary files and caches, ignored by Git.</span></code></pre>
+    ├── prm/                <span class="tree-comment"># Optional persistent files; tracked.</span>
+    ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
               <details class="package">
                 <!-- prettier-ignore -->
                 <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/       <span class="tree-comment"># <span class="tree-command">afairesi repo add html_package html</span></span></code></summary>
@@ -66,9 +64,9 @@
                 <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
     │   ├── default.nix
     │   ├── main.py
-    │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by nix flake check.</span>
-    │   ├── prm/            <span class="tree-comment"># Optional persistent package data, kept in Git.</span>
-    │   └── tmp/            <span class="tree-comment"># Optional temporary package data, ignored by Git.</span></code></pre>
+    │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span>
+    │   ├── prm/            <span class="tree-comment"># Optional persistent files; tracked.</span>
+    │   └── tmp/            <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
               </details>
               <details class="package">
                 <!-- prettier-ignore -->
@@ -84,7 +82,7 @@
                 <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
     │   ├── default.nix
     │   ├── main.lean
-    │   └── test_main.lean  <span class="tree-comment"># Optional tests, run by nix flake check.</span></code></pre>
+    │   └── test_main.lean  <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span></code></pre>
               </details>
               <details class="package">
                 <!-- prettier-ignore -->
