@@ -109,14 +109,7 @@ afairesi home add https://github.com/you/repo.git</code></pre>
   outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
 }</code></pre>
       </details>
-      <p>
-        The tree below shows afairesi conventions. Names such as <code>prm/</code>,
-        <code>ms.tex</code>, and the fixed package layouts are specific to afairesi. Optional
-        <code>prm/</code> directories hold tracked supporting files; optional
-        <code>tmp/</code> directories hold ignored temporary files. Both are available at the
-        repository root and in every package or host directory; they are shown only once at each
-        level below.
-      </p>
+      <p>An example layout using afairesi's file names and directory conventions.</p>
       <figure
         class="tree"
         tabindex="0"
@@ -135,7 +128,8 @@ afairesi home add https://github.com/you/repo.git</code></pre>
     ├── flake.nix
     ├── flake.lock
     ├── prm/                <span class="tree-comment"># Optional supporting files; tracked.</span>
-    ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
+    ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span>
+    │                       <span class="tree-comment"># prm/ and tmp/ are also available in every package and host.</span></code></pre>
           <details class="package">
             <!-- prettier-ignore -->
             <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/</code></summary>
