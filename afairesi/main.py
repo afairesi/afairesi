@@ -4796,7 +4796,9 @@ def parser() -> argparse.ArgumentParser:
     """Construct the workspace command-line parser."""
     result = argparse.ArgumentParser(
         prog="afairesi",
-        description=("A reproducible computing environment built on Git and Nix flakes."),
+        description=(
+            "A reproducible computing environment built on Git and Nix flakes."
+        ),
     )
     scopes = result.add_subparsers(dest="scope", title="scopes", metavar="SCOPE")
     home = scopes.add_parser(
