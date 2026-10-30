@@ -25,18 +25,9 @@ body {
     "Liberation Mono",
     monospace;
 }
-h1,
-p,
 pre,
 figure {
   margin: 0;
-}
-h1 {
-  font-size: 28px;
-  font-weight: 400;
-  line-height: 1.2;
-  letter-spacing: -0.045em;
-  margin-bottom: 12px;
 }
 a {
   color: inherit;
@@ -57,19 +48,10 @@ a:focus-visible,
 }
 pre,
 code {
-  font-family: inherit;
-}
-code {
-  font-size: 12px;
+  font: inherit;
 }
 .page {
   max-width: 760px;
-}
-.intro {
-  max-width: 64ch;
-}
-.intro code {
-  white-space: nowrap;
 }
 .top {
   padding: 18px 0 12px;
@@ -92,9 +74,6 @@ main {
   scrollbar-width: thin;
   scrollbar-color: var(--line) var(--surface);
 }
-.tree code {
-  font-size: inherit;
-}
 .package {
   min-width: max-content;
 }
@@ -112,7 +91,7 @@ main {
 .disclosure::before {
   content: "▸";
 }
-.package[open] .disclosure::before {
+.package[open] > summary .disclosure::before {
   content: "▾";
 }
 .tree-comment {
@@ -120,6 +99,9 @@ main {
 }
 .tree-command {
   color: var(--ink);
+  background: var(--surface);
+  border-radius: 3px;
+  padding: 1px 4px;
 }
 .language-icon {
   display: inline-block;
