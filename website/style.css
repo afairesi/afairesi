@@ -103,15 +103,6 @@ main {
   border-radius: 3px;
   padding: 1px 4px;
 }
-.language-icon {
-  display: inline-block;
-  width: 12px;
-  height: 12px;
-  vertical-align: -2px;
-}
-.language-icon.wordmark {
-  width: 32px;
-}
 .foot {
   display: flex;
   align-items: center;
