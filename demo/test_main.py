@@ -100,6 +100,12 @@ def test_interactive_terminal_and_pipeline_failure(tmp_path: Path) -> None:
     demo = Demo(tmp_path, recorder, "x86_64-linux")
     with pytest.raises(RuntimeError, match="exited 7"):
         demo.shell("(exit 7) | cat")
+    if "$ (exit 7) | cat" not in stream.getvalue():
+        message = "The pipeline was not displayed directly"
+        raise AssertionError(message)
+    if "$ bash" in stream.getvalue():
+        message = "The recording exposed its shell wrapper"
+        raise AssertionError(message)
 
 
 def test_private_home_and_local_remote(tmp_path: Path) -> None:
@@ -111,8 +117,9 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
         Recorder(io.StringIO(), speed=10, idle_limit=0.01),
         "x86_64-linux",
     )
-    demo.cwd = root / "repositories" / "sample"
+    demo.cwd = root / "sample"
     demo.cwd.mkdir(parents=True)
+    demo.repositories.append(demo.cwd)
     demo.run("git", "init")
     demo.run("git", "commit", "--allow-empty", "-m", "Sample")
     demo.home_scene()

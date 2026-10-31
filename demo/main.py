@@ -80,7 +80,7 @@ class Recorder:
         """Leave the current screen visible before the next playback event."""
         self.elapsed += seconds
 
-    def command(  # noqa: C901, PLR0912, PLR0915 - Keep PTY lifetime and cleanup together.
+    def command(  # noqa: C901, PLR0912, PLR0913, PLR0915 - Keep PTY lifetime and cleanup together.
         self,
         arguments: Sequence[str],
         cwd: Path,
@@ -88,9 +88,10 @@ class Recorder:
         *,
         timeout: float,
         terminal_input: Sequence[tuple[float, bytes]] = (),
+        display: str | None = None,
     ) -> None:
         """Execute argv in a terminal, stopping its entire process group on failure."""
-        command = shlex.join(arguments)
+        command = display if display is not None else shlex.join(arguments)
         self.output(f"\r\n\x1b[1;32m$ {command}\x1b[0m\r\n")
         self.hold(max(1.5, len(command) / 35))
         master, slave = pty.openpty()
@@ -172,6 +173,7 @@ class Demo:
         self.recorder = recorder
         self.system = system
         self.cwd = root
+        self.repositories: list[Path] = []
         self.home = root / "home"
         self.home.mkdir()
         config = root / "gitconfig"
@@ -212,8 +214,7 @@ class Demo:
         )
 
     def write(self, relative: str, source: str) -> None:
-        """Prepare a fixture with a short caption instead of printing its contents."""
-        self.recorder.note(f"Prepare example file: {relative}")
+        """Prepare a fixture without printing its contents."""
         path = self.cwd / relative
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(source, encoding="utf-8")
@@ -237,6 +238,7 @@ class Demo:
             terminal_input=(
                 ((3, b"j"), (6, b"l"), (12, b"q")) if browse else terminal_input
             ),
+            display=source,
         )
 
     def tree(self) -> None:
@@ -252,8 +254,9 @@ class Demo:
 
     def repository(self, name: str) -> None:
         """Use the website's empty-worktree getting-started flow."""
-        self.cwd = self.root / "repositories" / name
+        self.cwd = self.root / name
         self.cwd.mkdir(parents=True)
+        self.repositories.append(self.cwd)
         self.recorder.note(f"Repository: {name} ({self.cwd})")
         self.run("git", "init")
         self.run(
@@ -262,14 +265,6 @@ class Demo:
             "init",
             explain="Initialize this empty Git repository with an afairesi flake.",
         )
-
-    def finish(self) -> None:
-        """Format, validate, and commit a sample repository for home registration."""
-        self.run("nix", "fmt")
-        self.run("git", "add", ".")
-        self.run("git", "commit", "-m", "Add afairesi sample packages")
-        self.run("git", "status", "--short")
-        self.tree()
 
     def python(self) -> None:
         """Show a useful CLI, tests, structural inspection, and package lifecycle."""
@@ -282,6 +277,7 @@ class Demo:
             "python",
             explain="Create a Python package named hello from the standard template.",
         )
+        self.recorder.note("Prepare a greeting CLI, tests, and supporting files.")
         self.write(
             "hello/main.py",
             "#!/usr/bin/env python3\n# Copyright (c) 2026- Demo authors\n"
@@ -311,6 +307,8 @@ class Demo:
             '        message = "The name was not preserved"\n'
             "        raise AssertionError(message)\n",
         )
+        self.write("hello/prm/example.txt", "Supporting files are tracked.\n")
+        self.write("hello/tmp/session.txt", "Temporary files are ignored.\n")
         self.run(
             "afairesi",
             "repo",
@@ -321,236 +319,34 @@ class Demo:
         )
         self.run("nix", "fmt")
         self.run("git", "add", ".")
-        self.run("nix", "run", ".#hello")
         self.run("nix", "run", ".#hello", "--", "Ada")
         self.run("nix", "flake", "check")
-        self.run(
-            "afairesi",
-            "repo",
-            "inspect",
-            explain=(
-                "Inspect package interfaces and test names without running their code."
-            ),
+        self.shell(
+            "afairesi repo inspect | jless",
+            browse=True,
+            explain="Browse the package interface and test names in jless.",
         )
-        self.recorder.note(
-            "Browse the JSON interface with jless; expand with l, quit with q.",
-        )
-        self.shell("afairesi repo inspect | jless", browse=True)
-        self.run(
-            "afairesi",
-            "repo",
-            "test",
-            "coverage",
-            "hello",
-            explain="Measure which lines and branches the hello tests exercise.",
-        )
-        explanations = {
-            "fuzz": "Run fuzz tests to exercise the greeting with generated inputs.",
-            "property": (
-                "Run property tests to check behavior across generated examples."
-            ),
-            "performance": "Profile the tests to find where execution time is spent.",
-            "mutation": (
-                "Make small code mutations and check whether the tests catch them."
-            ),
-        }
-        for campaign in ("fuzz", "property", "performance", "mutation"):
-            extra = ["--max-mutations", "3"] if campaign == "mutation" else []
-            self.run(
-                "afairesi",
-                "repo",
-                "test",
-                campaign,
-                "hello",
-                *extra,
-                explain=explanations[campaign],
-            )
         self.run("git", "commit", "-m", "Add tested greeting CLI")
-        self.recorder.note("Save the public interface before renaming the package.")
-        self.shell("afairesi repo inspect > before.json")
-        self.run(
-            "afairesi",
-            "repo",
-            "mv",
-            "hello",
-            "greeter",
-            explain="Rename hello to greeter and stage the related metadata changes.",
-        )
-        self.run(
-            "afairesi",
-            "repo",
-            "inspect",
-            "diff",
-            "--cached",
-            explain=(
-                "Compare the staged public interface with the last commit in jd format."
-            ),
-        )
-        self.shell(
-            "afairesi repo inspect diff --cached > interface.jd",
-            explain="Save that structural diff as a patch for the earlier inspection.",
-        )
         self.recorder.note(
-            "jd-diff-patch provides jd; apply the diff to the saved interface.",
-        )
-        self.shell("jd -p interface.jd before.json | jless", browse=True)
-        self.shell("jd -p interface.jd before.json > patched.json")
-        self.shell(
-            "afairesi repo inspect > after.json",
-            explain=(
-                "Save a fresh inspection to verify that the patched JSON matches it."
-            ),
-        )
-        self.run("jd", "patched.json", "after.json")
-        self.run("rm", "before.json", "interface.jd", "patched.json", "after.json")
-        self.run(
-            "afairesi",
-            "repo",
-            "mv",
-            "greeter",
-            "hello",
-            explain="Restore the original package name before continuing.",
-        )
-        self.run(
-            "afairesi",
-            "repo",
-            "add",
-            "scratch",
-            "nix",
-            explain="Create a disposable Nix package to demonstrate removal.",
-        )
-        self.run(
-            "afairesi",
-            "repo",
-            "rm",
-            "--force",
-            "scratch",
-            explain="Remove the disposable package, including its uncommitted files.",
+            "Change the package description to see a small interface diff.",
         )
         self.write(
-            "unexpected.txt",
-            "A disposable file outside the source whitelist.\n",
-        )
-        self.run(
-            "afairesi",
-            "repo",
-            "fix",
-            "--dry-run",
-            explain=(
-                "Preview cleanup of a file outside the repository's source whitelist."
+            "hello/default.nix",
+            (self.cwd / "hello/default.nix")
+            .read_text()
+            .replace(
+                '"A Python package."',
+                '"A greeting CLI."',
             ),
         )
-        self.run(
-            "afairesi",
-            "repo",
-            "fix",
-            explain="Apply the previewed cleanup and stage managed changes.",
+        self.run("git", "add", "hello/default.nix")
+        self.shell(
+            "afairesi repo inspect diff --cached | less -R",
+            explain="Review the staged interface changes, already rendered by jd.",
+            terminal_input=((10, b"q"),),
         )
-        self.write("hello/prm/example.txt", "Supporting files are tracked.\n")
-        self.write("hello/tmp/session.txt", "Temporary files are ignored.\n")
-        self.run(
-            "afairesi",
-            "repo",
-            "fix",
-            explain=(
-                "Track supporting files in prm/ while keeping temporary files ignored."
-            ),
-        )
-        self.run("git", "check-ignore", "hello/tmp/session.txt")
-        self.run("nix", "fmt")
-        self.run("git", "add", ".")
-        self.run("git", "commit", "-m", "Add supporting package data")
+        self.run("git", "commit", "-m", "Describe the greeting CLI")
         self.tree()
-
-    def publishing(self) -> None:
-        """Create a website and a LaTeX document in a second repository."""
-        self.repository("publishing")
-        self.run(
-            "afairesi",
-            "repo",
-            "add",
-            "html_package",
-            "html",
-            explain="Create a website package with a local preview server.",
-        )
-        self.run(
-            "afairesi",
-            "repo",
-            "add",
-            "latex_package",
-            "latex",
-            explain="Create a LaTeX package for reproducible document builds.",
-        )
-        self.write(
-            "html_package/index.html",
-            '<!doctype html>\n<html lang="en"><head><title>afairesi demo</title></head>'
-            "<body><h1>Built with afairesi</h1><p>One repository, many packages.</p>"
-            "</body></html>\n",
-        )
-        self.write(
-            "latex_package/ms.tex",
-            "\\documentclass{article}\n\\begin{document}\n"
-            "\\section{Afairesi} A reproducible document package.\n\\end{document}\n",
-        )
-        self.run("nix", "fmt")
-        self.run("git", "add", ".")
-        self.run("nix", "run", ".#html_package", "--", "--help")
-        self.heavy_build(".#latex_package")
-        self.finish()
-
-    def heavy_build(self, target: str) -> None:
-        """Show the build plan for large document and system outputs."""
-        self.recorder.note("Preview the build plan.")
-        self.run("nix", "build", target, "--dry-run")
-
-    def systems(self) -> None:
-        """Create Lean, a native Nix artifact, and a bootable sample host."""
-        self.repository("systems")
-        for name, kind in (
-            ("lean4_package", "lean4"),
-            ("nix_package", "nix"),
-            ("my-host", "host"),
-        ):
-            self.run(
-                "afairesi",
-                "repo",
-                "add",
-                name,
-                kind,
-                explain=f"Create {name} using the {kind} template.",
-            )
-        self.write(
-            "lean4_package/main.lean",
-            "/-- Run the demo application. -/\ndef main : IO Unit :=\n"
-            '  IO.println "Hello from Lean and afairesi!"\n',
-        )
-        self.write(
-            "nix_package/default.nix",
-            '{ pkgs, ... }:\npkgs.writeText "afairesi-example" "Hello from Nix!\\n"\n',
-        )
-        self.write(
-            "my-host/configuration.nix",
-            '{ ... }: {\n  boot.loader.grub.devices = [ "/dev/vda" ];\n'
-            '  fileSystems."/" = { device = "/dev/disk/by-label/nixos";\n'
-            '    fsType = "ext4"; };\n'
-            f'  nixpkgs.hostPlatform = "{self.system}";\n'
-            '  system.stateVersion = "26.05";\n}\n',
-        )
-        self.run("nix", "fmt")
-        self.run("git", "add", ".")
-        self.run("nix", "build", ".#nix_package", "--no-link")
-        self.run("nix", "run", ".#lean4_package")
-        self.heavy_build(".#nixosConfigurations.my-host.config.system.build.toplevel")
-        self.run(
-            "afairesi",
-            "repo",
-            "inspect",
-            explain="List the Lean and Nix packages alongside the NixOS host.",
-        )
-        self.recorder.note(
-            "On a real NixOS host: sudo nixos-rebuild switch --flake .#my-host",
-        )
-        self.finish()
 
     def home_scene(self) -> None:
         """Register local sample repositories using hosted URLs and private rewrites."""
@@ -564,14 +360,19 @@ class Demo:
             "init",
             explain="Initialize the home directory as a Git repository.",
         )
-        for repository in sorted((self.root / "repositories").iterdir()):
+        for repository in self.repositories:
             remote = f"https://github.com/afairesi-demo/{repository.name}.git"
-            self.run(
-                "git",
-                "config",
-                "--global",
-                f"url.{repository.as_uri()}.insteadOf",
-                remote,
+            subprocess.run(  # noqa: S603 - Private URL rewrite for a fixed local fixture.
+                [
+                    shutil.which("git") or "git",
+                    "config",
+                    "--global",
+                    f"url.{repository.as_uri()}.insteadOf",
+                    remote,
+                ],
+                cwd=self.cwd,
+                env=self.environment,
+                check=True,
             )
             self.run(
                 "afairesi",
@@ -584,21 +385,7 @@ class Demo:
             )
         self.run("git", "commit", "-m", "Register demo repositories")
         self.tree()
-        self.run(
-            "afairesi",
-            "home",
-            "fix",
-            "--dry-run",
-            explain="Preview updates to the home repository's managed files.",
-        )
-        self.run(
-            "afairesi",
-            "home",
-            "fix",
-            explain="Apply home maintenance and stage the resulting metadata.",
-        )
-        self.run("git", "submodule", "status")
-        repository = next(iter(sorted((self.root / "repositories").iterdir())))
+        repository = self.repositories[0]
         self.run(
             "afairesi",
             "home",
@@ -615,14 +402,7 @@ def record(root: Path, output: Path, system: str) -> None:
         recorder = Recorder(stream, speed=1, idle_limit=10)
         demo = Demo(root, recorder, system)
         try:
-            demo.run(
-                "afairesi",
-                "--help",
-                explain="Explore the two command groups: home and repo.",
-            )
             demo.python()
-            demo.publishing()
-            demo.systems()
             demo.home_scene()
             recorder.note("Demo complete. Changes were staged and committed with Git.")
             recorder.output("\r\n", pause=4.0)
@@ -651,9 +431,7 @@ def main() -> None:
             "afairesi",
             "git",
             "nix",
-            "cat",
             "bash",
-            "jd",
             "jless",
             "less",
             "tree",
@@ -677,8 +455,8 @@ def main() -> None:
             timeout=30,
         ).strip()
         with tempfile.TemporaryDirectory(
-            prefix="afairesi-demo-",
-            dir=RUNTIME_DIR,
+            prefix="demo-",
+            dir="/tmp",
         ) as temporary:
             record(Path(temporary), output, system)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
