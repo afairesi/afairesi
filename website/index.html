@@ -38,15 +38,8 @@
         An opinionated CLI and Nix flake library for managing a Git-based home directory,
         repositories, packages, and NixOS configurations.
       </p>
-      <p>
-        In the home-directory model, <code>$HOME</code> is a Git repository and hosted repositories
-        are registered as submodules at
-        <code>~/&lt;remote-hostname&gt;/&lt;repository-path&gt;/</code>.
-      </p>
       <figure class="demo">
-        <figcaption>
-          Watch afairesi create packages, inspect interfaces, run tests, and manage repositories.
-        </figcaption>
+        <figcaption>Terminal walkthrough</figcaption>
         <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
         <p><a href="prm/afairesi-demo.cast" download>Download the recording</a></p>
       </figure>
@@ -141,11 +134,12 @@ afairesi home add https://github.com/you/repo.git</code></pre>
         </div>
         <div class="tree-scope tree-home">
           <span class="tree-scope-label">afairesi home</span>
-          <div>
-            <pre><code>~/
+          <pre><code>~/
 ├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI.</span>
-├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span></code></pre>
-          </div>
+├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span>
+│
+│
+│</code></pre>
         </div>
         <div class="tree-scope tree-repo">
           <span class="tree-scope-label">afairesi repo</span>

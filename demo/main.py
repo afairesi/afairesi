@@ -556,13 +556,13 @@ class Demo:
         """Register local sample repositories using hosted URLs and private rewrites."""
         self.cwd = self.home
         self.recorder.note(
-            "An isolated home repository; hosted URLs resolve to local samples.",
+            "Manage repositories from your home directory.",
         )
         self.run(
             "afairesi",
             "home",
             "init",
-            explain="Initialize the disposable home directory as a Git repository.",
+            explain="Initialize the home directory as a Git repository.",
         )
         for repository in sorted((self.root / "repositories").iterdir()):
             remote = f"https://github.com/afairesi-demo/{repository.name}.git"
@@ -615,7 +615,6 @@ def record(root: Path, output: Path, system: str) -> None:
         recorder = Recorder(stream, speed=1, idle_limit=10)
         demo = Demo(root, recorder, system)
         try:
-            recorder.note("afairesi — real commands in disposable sample repositories")
             demo.run(
                 "afairesi",
                 "--help",

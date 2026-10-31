@@ -53,9 +53,6 @@ h1 {
 main p {
   max-width: 80ch;
 }
-main > p + p {
-  margin-top: 12px;
-}
 .installation {
   margin-block: 12px;
 }
@@ -127,15 +124,8 @@ main {
   min-height: 28ch;
   margin-bottom: 12px;
 }
-.tree-home {
-  display: flex;
-  align-items: center;
-  min-height: 16ch;
-}
 .tree-repo {
   min-height: 16ch;
-  margin-top: 8px;
-  margin-inline-start: 48px;
 }
 summary {
   cursor: pointer;
