@@ -10,7 +10,9 @@
     pkgs.git
     pkgs.jd-diff-patch
     pkgs.jless
+    pkgs.less
     pkgs.nix
+    pkgs.tree
   ];
   src = ./.;
 }

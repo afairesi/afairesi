@@ -128,11 +128,14 @@ main {
   margin-bottom: 12px;
 }
 .tree-home {
+  display: flex;
+  align-items: center;
   min-height: 16ch;
 }
 .tree-repo {
   min-height: 16ch;
   margin-top: 8px;
+  margin-inline-start: 48px;
 }
 summary {
   cursor: pointer;
