@@ -112,6 +112,9 @@ main {
 .tree-scope + .tree-scope {
   margin-block-start: 12px;
 }
+.home-branch > summary {
+  padding-inline-start: 48px;
+}
 .tree-scope-label {
   position: absolute;
   top: 50%;
