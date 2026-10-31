@@ -131,42 +131,44 @@
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
         <p>
-          For NixOS with impermanence or preservation, install through your existing system flake.
-          Add the afairesi input and pass <code>inputs</code> through <code>specialArgs</code>:
+          Use afairesi to generate your flake outputs. Keep your existing inputs for impermanence,
+          preservation, and other modules:
         </p>
         <pre><code>{
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     afairesi.url = "github:afairesi/afairesi";
+    preservation.url = "github:nix-community/preservation";
   };
-  outputs = inputs@{ nixpkgs, ... }: {
-    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
-      specialArgs = { inherit inputs; };
-      modules = [ ./my-host/configuration.nix ];
+  outputs =
+    inputs:
+    inputs.afairesi.lib.mkFlake {
+      inherit inputs;
     };
-  };
 }</code></pre>
         <p>
-          Keep your existing nixpkgs input and NixOS settings. Adapt <code>my-host</code> and the
-          module path to your configuration. In that module, include the package:
+          <code>mkFlake</code> discovers <code>my-host/configuration.nix</code> and passes
+          <code>inputs</code> to it automatically. It uses afairesi's nixpkgs input unless you
+          provide your own. Keep your host's hardware and persistence settings, and include the CLI
+          in that module:
         </p>
         <pre><code>{ inputs, pkgs, ... }:
 {
   # Your existing NixOS settings go here.
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   environment.systemPackages = [
-    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.default
+    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
   ];
 }</code></pre>
         <p>Apply from the directory containing your configuration's <code>flake.nix</code>:</p>
         <pre><code>sudo nixos-rebuild switch --flake .#my-host</code></pre>
         <p>
-          In your existing
+          With
           <a href="https://github.com/nix-community/impermanence">impermanence</a> or
-          <a href="https://nix-community.github.io/preservation/examples.html">preservation</a>
-          configuration, persist <code>~/.git/</code>, <code>~/.gitignore</code>,
-          <code>~/.gitmodules</code>, and repository directories such as
-          <code>~/github.com/</code> across reboots.
+          <a href="https://nix-community.github.io/preservation/examples.html">preservation</a>,
+          keep your home directory on a persistent filesystem or bind-mount the home directory from
+          persistent storage. This keeps <code>~/.git/</code>, <code>~/.gitignore</code>,
+          <code>~/.gitmodules</code>, and repository checkouts together across reboots. Managed
+          files and repository path components must not be symlinks.
         </p>
       </details>
       <details class="installation">
@@ -187,37 +189,27 @@
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Get started</summary>
         <p>
-          To use the home-directory model, initialize your home repository and add an existing
-          hosted repository (replace the example URL with your own):
+          Register an existing hosted repository with at least one commit. Replace the URL and
+          choose a destination that does not already exist:
         </p>
         <pre><code>afairesi home init
-afairesi home add https://github.com/you/repo.git</code></pre>
+afairesi home add https://github.com/you/repo.git
+cd ~/github.com/you/repo</code></pre>
         <p>
-          This registers the repository at <code>~/github.com/you/repo/</code>. Use a destination
-          that does not already exist.
+          For an empty checkout, run <code>afairesi repo init</code> first. In an existing afairesi
+          repository, add and run a package directly:
         </p>
-        <p>After installing, create a flake in a new, empty Git worktree:</p>
-        <pre><code>mkdir -p ~/github.com/you/new-repo
-cd ~/github.com/you/new-repo
-git init
-afairesi repo init
-afairesi repo add hello python
+        <pre><code>afairesi repo add hello python
 nix run .#hello</code></pre>
         <p>
-          Replace <code>you/new-repo</code> with your repository path. Initialization generates
-          <code>flake.nix</code>, <code>flake.lock</code>, and <code>.gitignore</code>;
-          <code>repo add</code> creates the package files. Changes are staged; use Git to commit and
-          push.
+          Changes are staged. Commit and push inside the repository, then stage its updated
+          submodule revision and commit it in your home repository.
         </p>
         <p>
-          The generated flake uses the library as follows. <code>mkFlake</code> discovers packages
-          with <code>default.nix</code> and hosts with <code>configuration.nix</code> in immediate
-          subdirectories, and supplies <code>inputs</code> to their modules:
+          <code>afairesi repo init</code> generates the <code>mkFlake</code> outputs shown above.
+          Packages with <code>default.nix</code> and hosts with <code>configuration.nix</code>
+          are discovered in immediate subdirectories.
         </p>
-        <pre><code>{
-  inputs.afairesi.url = "github:afairesi/afairesi";
-  outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
-}</code></pre>
       </details>
     </main>
   </body>
