@@ -28,7 +28,7 @@ if TYPE_CHECKING:
     from collections.abc import Sequence
     from typing import TextIO
 
-RUNTIME_DIR = Path.home() / "github.com/afairesi/afairesi/afairesi_demo/tmp"
+RUNTIME_DIR = Path.home() / "github.com/afairesi/afairesi/demo/tmp"
 
 
 def _attach_terminal() -> None:

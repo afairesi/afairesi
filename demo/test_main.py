@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from afairesi_demo.main import Demo, Recorder
+from demo.main import Demo, Recorder
 
 if TYPE_CHECKING:
     from pathlib import Path
