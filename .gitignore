@@ -10,6 +10,10 @@
 !/afairesi/prm/
 !/afairesi/prm/**
 !/afairesi/test_main.py
+!/afairesi_demo/
+!/afairesi_demo/default.nix
+!/afairesi_demo/main.py
+!/afairesi_demo/test_main.py
 !/alphabetize_nix/
 !/alphabetize_nix/default.nix
 !/alphabetize_nix/main.py
@@ -37,4 +41,7 @@
 !/website/
 !/website/default.nix
 !/website/index.html
+!/website/prm/
+!/website/prm/**
+!/website/script.js
 !/website/style.css

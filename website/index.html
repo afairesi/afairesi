@@ -13,7 +13,16 @@
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23fdf6e3'/%3E%3Cpath d='M8 16h16' stroke='%23586e75' stroke-width='2'/%3E%3C/svg%3E"
     />
+    <link
+      rel="stylesheet"
+      href="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.css"
+    />
     <link rel="stylesheet" href="style.css" />
+    <script
+      src="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.min.js"
+      defer
+    ></script>
+    <script src="script.js" defer></script>
   </head>
   <body>
     <header class="top">
@@ -33,6 +42,13 @@
         are registered as submodules at
         <code>~/&lt;remote-hostname&gt;/&lt;repository-path&gt;/</code>.
       </p>
+      <figure class="demo">
+        <figcaption>
+          Watch afairesi create packages, inspect interfaces, run tests, and manage repositories.
+        </figcaption>
+        <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
+        <p><a href="prm/afairesi-demo.cast" download>Download the recording</a></p>
+      </figure>
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Run or install</summary>
         <p>
@@ -116,13 +132,24 @@ afairesi home add https://github.com/you/repo.git</code></pre>
         role="region"
         aria-label="Directory structure and Nix commands"
       >
-        <pre><code>~/
+        <div class="tree-scope tree-system">
+          <span class="tree-scope-label">nixos with<br />impermanence/preservation</span>
+          <pre><code>/
+├── …
+└── home/…/</code></pre>
+        </div>
+        <div class="tree-scope tree-home">
+          <span class="tree-scope-label">afairesi home</span>
+          <div>
+            <pre><code>~/
 ├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span></code></pre>
-        <details class="package" open>
-          <!-- prettier-ignore -->
-          <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/repo/</code></summary>
-          <pre><code>    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
+            <div class="tree-scope tree-repo">
+              <span class="tree-scope-label">afairesi repo</span>
+              <details class="package" open>
+                <!-- prettier-ignore -->
+                <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/repo/</code></summary>
+                <pre><code>    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
     ├── .gitignore          <span class="tree-comment"># Managed by the afairesi CLI.</span>
     ├── flake.nix
@@ -130,55 +157,58 @@ afairesi home add https://github.com/you/repo.git</code></pre>
     ├── prm/                <span class="tree-comment"># Optional supporting files; tracked.</span>
     ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span>
     │                       <span class="tree-comment"># prm/ and tmp/ are also available in every package and host.</span></code></pre>
-          <details class="package">
-            <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/</code></summary>
-            <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
+                <details class="package">
+                  <!-- prettier-ignore -->
+                  <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/</code></summary>
+                  <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
     │   ├── default.nix
     │   ├── index.html
     │   ├── script.js      <span class="tree-comment"># Optional JavaScript.</span>
     │   └── style.css      <span class="tree-comment"># Optional stylesheet.</span></code></pre>
-          </details>
-          <details class="package">
-            <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>python_package/</code></summary>
-            <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
+                </details>
+                <details class="package">
+                  <!-- prettier-ignore -->
+                  <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>python_package/</code></summary>
+                  <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
     │   ├── default.nix
     │   ├── main.py
     │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span>
     │   ├── prm/            <span class="tree-comment"># Optional supporting files; tracked.</span>
     │   └── tmp/            <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
-          </details>
-          <details class="package">
-            <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>latex_package/</code></summary>
-            <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
+                </details>
+                <details class="package">
+                  <!-- prettier-ignore -->
+                  <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>latex_package/</code></summary>
+                  <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
     │   ├── default.nix
     │   ├── ms.tex
     │   └── ms.bib</code></pre>
-          </details>
-          <details class="package">
-            <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/</code></summary>
-            <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
+                </details>
+                <details class="package">
+                  <!-- prettier-ignore -->
+                  <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>lean4_package/</code></summary>
+                  <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
     │   ├── default.nix
     │   ├── main.lean
     │   └── test_main.lean  <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span></code></pre>
-          </details>
-          <details class="package">
-            <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/</code></summary>
-            <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
+                </details>
+                <details class="package">
+                  <!-- prettier-ignore -->
+                  <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>nix_package/</code></summary>
+                  <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
     │   └── default.nix</code></pre>
-          </details>
-          <details class="package">
-            <!-- prettier-ignore -->
-            <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>my-host/</code></summary>
-            <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.my-host.config.system.build.toplevel</span></span>
+                </details>
+                <details class="package">
+                  <!-- prettier-ignore -->
+                  <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>my-host/</code></summary>
+                  <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.my-host.config.system.build.toplevel</span></span>
         ├── configuration.nix
         └── hardware-configuration.nix <span class="tree-comment"># Optional hardware configuration.</span></code></pre>
-          </details>
-        </details>
+                </details>
+              </details>
+            </div>
+          </div>
+        </div>
       </figure>
     </main>
   </body>
