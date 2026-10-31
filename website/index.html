@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — An opinionated CLI and Nix flake library for managing a Git-based home directory, repositories, packages, and NixOS configurations."
+      content="afairesi — A CLI and Nix flake library for NixOS with impermanence or preservation, Git-based home directories, and repositories."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -35,8 +35,8 @@
     </header>
     <main>
       <p>
-        An opinionated CLI and Nix flake library for managing a Git-based home directory,
-        repositories, packages, and NixOS configurations.
+        A CLI and Nix flake library for NixOS with impermanence or preservation. Manage a Git-based
+        home directory, repositories, packages, and system configurations.
       </p>
       <div class="overview">
         <figure
@@ -129,19 +129,10 @@
         </figure>
       </div>
       <details class="installation">
-        <summary><span class="disclosure" aria-hidden="true"></span> Run or install</summary>
+        <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
         <p>
-          Requires Nix with <code>nix-command</code> and <code>flakes</code> enabled. Add this to
-          your Nix configuration (for example, <code>~/.config/nix/nix.conf</code>):
-        </p>
-        <pre><code>experimental-features = nix-command flakes</code></pre>
-        <p>Run without installing:</p>
-        <pre><code>nix run github:afairesi/afairesi -- --help</code></pre>
-        <p>Or install for your user (Nix 2.30 or newer):</p>
-        <pre><code>nix profile add github:afairesi/afairesi</code></pre>
-        <p>
-          Or install system-wide on NixOS. In your configuration's <code>flake.nix</code>, add the
-          afairesi input and pass <code>inputs</code> through <code>specialArgs</code>:
+          For NixOS with impermanence or preservation, install through your existing system flake.
+          Add the afairesi input and pass <code>inputs</code> through <code>specialArgs</code>:
         </p>
         <pre><code>{
   inputs = {
@@ -162,15 +153,49 @@
         <pre><code>{ inputs, pkgs, ... }:
 {
   # Your existing NixOS settings go here.
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
   environment.systemPackages = [
     inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.default
   ];
 }</code></pre>
         <p>Apply from the directory containing your configuration's <code>flake.nix</code>:</p>
         <pre><code>sudo nixos-rebuild switch --flake .#my-host</code></pre>
+        <p>
+          In your existing
+          <a href="https://github.com/nix-community/impermanence">impermanence</a> or
+          <a href="https://nix-community.github.io/preservation/examples.html">preservation</a>
+          configuration, persist <code>~/.git/</code>, <code>~/.gitignore</code>,
+          <code>~/.gitmodules</code>, and repository directories such as
+          <code>~/github.com/</code> across reboots.
+        </p>
+      </details>
+      <details class="installation">
+        <summary>
+          <span class="disclosure" aria-hidden="true"></span> Other systems: home and repo
+        </summary>
+        <p>
+          On other systems with Nix, use <code>afairesi home</code> and
+          <code>afairesi repo</code> independently. Enable these features in
+          <code>~/.config/nix/nix.conf</code>:
+        </p>
+        <pre><code>experimental-features = nix-command flakes</code></pre>
+        <p>Run without installing:</p>
+        <pre><code>nix run github:afairesi/afairesi -- repo --help</code></pre>
+        <p>Or install for your user (Nix 2.30 or newer):</p>
+        <pre><code>nix profile add github:afairesi/afairesi</code></pre>
       </details>
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Get started</summary>
+        <p>
+          To use the home-directory model, initialize your home repository and add an existing
+          hosted repository (replace the example URL with your own):
+        </p>
+        <pre><code>afairesi home init
+afairesi home add https://github.com/you/repo.git</code></pre>
+        <p>
+          This registers the repository at <code>~/github.com/you/repo/</code>. Use a destination
+          that does not already exist.
+        </p>
         <p>After installing, create a flake in a new, empty Git worktree:</p>
         <pre><code>mkdir -p ~/github.com/you/new-repo
 cd ~/github.com/you/new-repo
@@ -183,16 +208,6 @@ nix run .#hello</code></pre>
           <code>flake.nix</code>, <code>flake.lock</code>, and <code>.gitignore</code>;
           <code>repo add</code> creates the package files. Changes are staged; use Git to commit and
           push.
-        </p>
-        <p>
-          To use the home-directory model, initialize your home repository and add an existing
-          hosted repository (replace the example URL with your own):
-        </p>
-        <pre><code>afairesi home init
-afairesi home add https://github.com/you/repo.git</code></pre>
-        <p>
-          This registers the repository at <code>~/github.com/you/repo/</code>. Use a destination
-          that does not already exist.
         </p>
         <p>
           The generated flake uses the library as follows. <code>mkFlake</code> discovers packages

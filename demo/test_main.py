@@ -109,7 +109,7 @@ def test_interactive_terminal_and_pipeline_failure(tmp_path: Path) -> None:
 
 
 def test_private_home_and_local_remote(tmp_path: Path) -> None:
-    """Register a sample via a hosted URL without touching the user's Git config."""
+    """Keep multiple hosted repositories inside the artificial home."""
     root = tmp_path / "workspace"
     root.mkdir()
     demo = Demo(
@@ -117,18 +117,21 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
         Recorder(io.StringIO(), speed=10, idle_limit=0.01),
         "x86_64-linux",
     )
-    demo.cwd = root / "sample"
-    demo.cwd.mkdir(parents=True)
-    demo.repositories.append(demo.cwd)
-    demo.run("git", "init")
-    demo.run("git", "commit", "--allow-empty", "-m", "Sample")
+    demo.start_home()
+    demo.register_repository("toolbox")
+    demo.register_repository("website")
     demo.home_scene()
     if not (demo.home / ".git").is_dir():
         message = "No isolated Git home was created"
         raise AssertionError(message)
-    if "insteadOf" not in (root / "gitconfig").read_text():
+    if "insteadOf" not in (root / ".gitconfig").read_text():
         message = "No private remote rewrite was configured"
         raise AssertionError(message)
-    if (demo.home / "github.com" / "afairesi-demo" / "sample").exists():
-        message = "home rm left the checkout behind"
+    if demo.environment["HOME"] != str(root):
+        message = "HOME does not point to the artificial home"
         raise AssertionError(message)
+    for name in ("toolbox", "website"):
+        checkout = demo.home / "github.com" / "afairesi-demo" / name
+        if not (checkout / ".git").is_file():
+            message = f"Missing repository inside HOME: {name}"
+            raise AssertionError(message)

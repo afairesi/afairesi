@@ -174,9 +174,8 @@ class Demo:
         self.system = system
         self.cwd = root
         self.repositories: list[Path] = []
-        self.home = root / "home"
-        self.home.mkdir()
-        config = root / "gitconfig"
+        self.home = root
+        config = root / ".gitconfig"
         config.write_text(
             "[user]\n name = Demo\n email = demo@example.invalid\n"
             "[init]\n defaultBranch = main\n"
@@ -252,18 +251,52 @@ class Demo:
             terminal_input=((6, b" "), (12, b"q")),
         )
 
-    def repository(self, name: str) -> None:
-        """Use the website's empty-worktree getting-started flow."""
-        self.cwd = self.root / name
-        self.cwd.mkdir(parents=True)
+    def start_home(self) -> None:
+        """Initialize the artificial home before creating repositories inside it."""
+        self.cwd = self.home
+        self.run(
+            "afairesi",
+            "home",
+            "init",
+            explain=f"Initialize the home directory: {self.home}",
+        )
+
+    def register_repository(self, name: str) -> None:
+        """Register an empty local seed through the normal hosted-URL workflow."""
+        seed = self.root / ".remotes" / name
+        seed.mkdir(parents=True)
+        remote = f"https://github.com/afairesi-demo/{name}.git"
+        for arguments in (
+            ["init", "--quiet"],
+            ["commit", "--quiet", "--allow-empty", "-m", "Initial commit"],
+            ["config", "--global", f"url.{seed.as_uri()}.insteadOf", remote],
+        ):
+            subprocess.run(  # noqa: S603 - Fixed setup commands in the private fixture.
+                [shutil.which("git") or "git", *arguments],
+                cwd=seed,
+                env=self.environment,
+                check=True,
+                timeout=30,
+            )
+        self.cwd = self.home
+        self.run(
+            "afairesi",
+            "home",
+            "add",
+            remote,
+            explain=f"Register {name} under ~/github.com/afairesi-demo/.",
+        )
+        self.cwd = self.home / "github.com" / "afairesi-demo" / name
         self.repositories.append(self.cwd)
-        self.recorder.note(f"Repository: {name} ({self.cwd})")
-        self.run("git", "init")
+
+    def repository(self, name: str) -> None:
+        """Create an afairesi flake inside a repository registered in the home."""
+        self.register_repository(name)
         self.run(
             "afairesi",
             "repo",
             "init",
-            explain="Initialize this empty Git repository with an afairesi flake.",
+            explain=f"Initialize {name} with an afairesi flake.",
         )
 
     def python(self) -> None:
@@ -346,54 +379,31 @@ class Demo:
             terminal_input=((10, b"q"),),
         )
         self.run("git", "commit", "-m", "Describe the greeting CLI")
-        self.tree()
+
+    def website(self) -> None:
+        """Create a second repository with a different package type."""
+        self.repository("website")
+        self.run(
+            "afairesi",
+            "repo",
+            "add",
+            "site",
+            "html",
+            explain="Create a website package in the second repository.",
+        )
+        self.run("git", "commit", "-m", "Add website package")
 
     def home_scene(self) -> None:
-        """Register local sample repositories using hosted URLs and private rewrites."""
+        """Show the completed home with both repositories registered as submodules."""
         self.cwd = self.home
-        self.recorder.note(
-            "Manage repositories from your home directory.",
-        )
         self.run(
-            "afairesi",
-            "home",
-            "init",
-            explain="Initialize the home directory as a Git repository.",
+            "git",
+            "add",
+            "--",
+            *(str(p.relative_to(self.home)) for p in self.repositories),
         )
-        for repository in self.repositories:
-            remote = f"https://github.com/afairesi-demo/{repository.name}.git"
-            subprocess.run(  # noqa: S603 - Private URL rewrite for a fixed local fixture.
-                [
-                    shutil.which("git") or "git",
-                    "config",
-                    "--global",
-                    f"url.{repository.as_uri()}.insteadOf",
-                    remote,
-                ],
-                cwd=self.cwd,
-                env=self.environment,
-                check=True,
-            )
-            self.run(
-                "afairesi",
-                "home",
-                "add",
-                remote,
-                explain=(
-                    "Register a hosted repository as a submodule in the home directory."
-                ),
-            )
         self.run("git", "commit", "-m", "Register demo repositories")
         self.tree()
-        repository = self.repositories[0]
-        self.run(
-            "afairesi",
-            "home",
-            "rm",
-            f"github.com/afairesi-demo/{repository.name}",
-            explain="Unregister a repository and remove its submodule checkout.",
-        )
-        self.run("git", "diff", "--cached", "--stat")
 
 
 def record(root: Path, output: Path, system: str) -> None:
@@ -402,7 +412,9 @@ def record(root: Path, output: Path, system: str) -> None:
         recorder = Recorder(stream, speed=1, idle_limit=10)
         demo = Demo(root, recorder, system)
         try:
+            demo.start_home()
             demo.python()
+            demo.website()
             demo.home_scene()
             recorder.note("Demo complete. Changes were staged and committed with Git.")
             recorder.output("\r\n", pause=4.0)
@@ -455,7 +467,7 @@ def main() -> None:
             timeout=30,
         ).strip()
         with tempfile.TemporaryDirectory(
-            prefix="demo-",
+            prefix="home-",
             dir="/tmp",
         ) as temporary:
             record(Path(temporary), output, system)
