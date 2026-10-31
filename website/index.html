@@ -190,37 +190,6 @@ sudo nixos-rebuild switch --flake .#my-host</code></pre>
         <p>Or install for your user (Nix 2.30 or newer):</p>
         <pre><code>nix profile add github:afairesi/afairesi</code></pre>
       </details>
-      <details class="installation">
-        <summary><span class="disclosure" aria-hidden="true"></span> Get started</summary>
-        <p>
-          Register an existing hosted afairesi repository with at least one commit. Replace the URL
-          with your repository's URL; its destination at <code>~/github.com/you/repo</code> must not
-          already exist:
-        </p>
-        <pre><code>afairesi home init
-afairesi home add https://github.com/you/repo.git
-cd ~/github.com/you/repo</code></pre>
-        <p>
-          For an empty Git worktree, run <code>afairesi repo init</code> first. In an existing
-          afairesi repository, add and run a package directly:
-        </p>
-        <pre><code>afairesi repo add hello python
-nix run .#hello</code></pre>
-        <p>
-          Structural changes are staged. Stage your source edits before committing and pushing
-          inside the repository, then stage its updated submodule revision and commit it in your
-          home repository.
-        </p>
-        <p>
-          <code>afairesi repo init</code> generates the <code>mkFlake</code> outputs shown above.
-          Packages with <code>default.nix</code> are discovered in immediate subdirectories.
-        </p>
-        <p>
-          <code>nix fmt</code> also enforces the repository's source whitelist, removes unsupported
-          files, and applies lint fixes that can change behavior. Review the diff and run
-          <code>nix flake check</code> afterward.
-        </p>
-      </details>
     </main>
   </body>
 </html>

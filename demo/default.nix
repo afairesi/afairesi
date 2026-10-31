@@ -9,7 +9,6 @@
     pkgs.coreutils
     pkgs.git
     pkgs.jless
-    pkgs.less
     pkgs.nix
     pkgs.tree
   ];

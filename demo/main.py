@@ -265,14 +265,10 @@ class Demo:
         )
 
     def tree(self) -> None:
-        """Browse the source layout without opening file contents or generated data."""
+        """Show the source layout without opening file contents or generated data."""
         self.shell(
-            "tree -a --gitignore -I .git --noreport | less -R",
-            explain=(
-                "Browse the source tree in less; "
-                "Git metadata and ignored files are hidden."
-            ),
-            terminal_input=((3, b" "), (6, b"q")),
+            "tree -a --gitignore -I .git --noreport",
+            explain="Show the source tree; Git metadata and ignored files are hidden.",
         )
 
     def start_home(self) -> None:
@@ -289,17 +285,17 @@ class Demo:
         """Show and perform directory changes between project steps."""
         if directory != self.cwd:
             relative = directory.relative_to(self.home)
-            destination = (
-                "~" if relative == Path() else "~/" + shlex.quote(str(relative))
+            command = (
+                "cd" if relative == Path() else "cd ~/" + shlex.quote(str(relative))
             )
-            self.shell(f"cd {destination}")
+            self.shell(command)
             self.cwd = directory
 
     def register_repository(self, name: str) -> None:
         """Register an empty local seed through the normal hosted-URL workflow."""
         seed = self.root / ".remotes" / name
         seed.mkdir(parents=True)
-        remote = f"https://github.com/user/{name}.git"
+        remote = f"https://github.com/afairesi/{name}.git"
         for arguments in (
             ["init", "--quiet"],
             ["commit", "--quiet", "--allow-empty", "-m", "Initial commit"],
@@ -318,9 +314,9 @@ class Demo:
             "home",
             "add",
             remote,
-            explain=f"Clone and register {name} under ~/github.com/user/.",
+            explain=f"Clone and register {name} under ~/github.com/afairesi/.",
         )
-        self.cd(self.home / "github.com" / "user" / name)
+        self.cd(self.home / "github.com" / "afairesi" / name)
         self.repositories.append(self.cwd)
 
     def repository(self, name: str) -> None:
@@ -435,7 +431,7 @@ class Demo:
             "fix",
             explain="Stage the tool and tests under the repository policy.",
         )
-        self.shell("nix fmt --quiet && nix flake check --quiet")
+        self.shell("nix fmt && nix flake check")
         self.run("git", "add", ".")
         self.shell(
             "afairesi repo inspect | jless",
@@ -443,9 +439,8 @@ class Demo:
             explain="Review the tool's public interface.",
         )
         self.shell(
-            "afairesi repo inspect diff --cached | less -R",
+            "afairesi repo inspect diff --cached",
             explain="Check the new interface before committing.",
-            terminal_input=((6, b"q"),),
         )
         self.run("git", "commit", "-m", "Add tested article reading-time tool")
 
@@ -488,7 +483,7 @@ class Demo:
             "fix",
             explain="Stage the article and website together.",
         )
-        self.shell("nix fmt --quiet && nix build .#notes --no-link --quiet")
+        self.shell("nix fmt && nix build .#notes")
         self.run("git", "commit", "-am", "Publish the first note with its reading time")
 
     def home_scene(self) -> None:
@@ -497,7 +492,6 @@ class Demo:
         self.run(
             "git",
             "add",
-            "--",
             *(str(p.relative_to(self.home)) for p in self.repositories),
         )
         self.run("git", "commit", "-m", "Track the reading-time tool and notes site")
@@ -543,7 +537,6 @@ def main() -> None:
             "nix",
             "bash",
             "jless",
-            "less",
             "tree",
         )
         if shutil.which(name) is None

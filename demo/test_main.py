@@ -130,7 +130,7 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
         message = "HOME does not point to the artificial home"
         raise AssertionError(message)
     for name in ("notes-tools", "notes-site"):
-        checkout = demo.home / "github.com" / "user" / name
+        checkout = demo.home / "github.com" / "afairesi" / name
         if not (checkout / ".git").is_file():
             message = f"Missing repository inside HOME: {name}"
             raise AssertionError(message)
