@@ -18,17 +18,42 @@ import signal
 import struct
 import subprocess
 import sys
-import tempfile
 import termios
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Iterator, Sequence
     from typing import TextIO
 
 RUNTIME_DIR = Path.home() / "github.com/afairesi/afairesi/demo/tmp"
+
+POST = """A small notes site should be easy to maintain. I keep the articles and the
+tools that help publish them in separate repositories, so each project has a
+clear purpose and its own history. Both repositories live inside my Git-based
+home directory, where I can find them again after setting up another machine.
+
+Before publishing a new article, I estimate how long it takes to read. A simple
+command counts the words and rounds the result up to whole minutes. Readers
+have different reading speeds, so the command should let me choose the rate
+instead of hiding that choice in its implementation.
+
+The website shows the estimate beside the article. Tests check the rounding and
+the command line option before I commit the change. Finally, I record the new
+repository revisions in my home repository, keeping the complete workspace easy
+to reproduce."""
+
+
+@contextlib.contextmanager
+def artificial_home(directory: str | Path) -> Iterator[Path]:
+    """Create an owned home directory, preserving any pre-existing directory."""
+    path = Path(directory)
+    path.mkdir(parents=True)
+    try:
+        yield path
+    finally:
+        shutil.rmtree(path)
 
 
 def _attach_terminal() -> None:
@@ -52,7 +77,7 @@ class Recorder:
                 "width": 100,
                 "height": 30,
                 "timestamp": int(time.time()),
-                "title": "afairesi: repositories, packages, tests, and home",
+                "title": "afairesi: build a reading-time tool and notes site",
                 "env": {"TERM": "xterm-256color"},
             },
         )
@@ -74,7 +99,7 @@ class Recorder:
     def note(self, text: str) -> None:
         """Add an explicitly narrated chapter caption."""
         self.output(f"\r\n\x1b[1;33m# {text}\x1b[0m\r\n")
-        self.hold(max(3.0, len(text.split()) / 2.5))
+        self.hold(max(3.0, len(text.split()) / 3))
 
     def hold(self, seconds: float) -> None:
         """Leave the current screen visible before the next playback event."""
@@ -148,7 +173,8 @@ class Recorder:
             if code:
                 message = f"command exited {code}: {shlex.join(arguments)}"
                 raise RuntimeError(message)
-            self.hold(min(10.0, max(2.5, output_lines / 4)))
+            if output_lines:
+                self.hold(min(4.0, max(1.5, output_lines / 6)))
         finally:
             if process is not None:
                 with contextlib.suppress(ProcessLookupError):
@@ -166,12 +192,10 @@ class Demo:
         self,
         root: Path,
         recorder: Recorder,
-        system: str,
     ) -> None:
         """Prepare private Git configuration and identities."""
         self.root = root
         self.recorder = recorder
-        self.system = system
         self.cwd = root
         self.repositories: list[Path] = []
         self.home = root
@@ -235,7 +259,7 @@ class Demo:
             self.environment,
             timeout=120,
             terminal_input=(
-                ((3, b"j"), (6, b"l"), (12, b"q")) if browse else terminal_input
+                ((2, b"j"), (4, b"l"), (6, b"q")) if browse else terminal_input
             ),
             display=source,
         )
@@ -248,7 +272,7 @@ class Demo:
                 "Browse the source tree in less; "
                 "Git metadata and ignored files are hidden."
             ),
-            terminal_input=((6, b" "), (12, b"q")),
+            terminal_input=((3, b" "), (6, b"q")),
         )
 
     def start_home(self) -> None:
@@ -258,14 +282,24 @@ class Demo:
             "afairesi",
             "home",
             "init",
-            explain=f"Initialize the home directory: {self.home}",
+            explain=f"Set up the notes workspace in {self.home}.",
         )
+
+    def cd(self, directory: Path) -> None:
+        """Show and perform directory changes between project steps."""
+        if directory != self.cwd:
+            relative = directory.relative_to(self.home)
+            destination = (
+                "~" if relative == Path() else "~/" + shlex.quote(str(relative))
+            )
+            self.shell(f"cd {destination}")
+            self.cwd = directory
 
     def register_repository(self, name: str) -> None:
         """Register an empty local seed through the normal hosted-URL workflow."""
         seed = self.root / ".remotes" / name
         seed.mkdir(parents=True)
-        remote = f"https://github.com/afairesi-demo/{name}.git"
+        remote = f"https://github.com/user/{name}.git"
         for arguments in (
             ["init", "--quiet"],
             ["commit", "--quiet", "--allow-empty", "-m", "Initial commit"],
@@ -278,15 +312,15 @@ class Demo:
                 check=True,
                 timeout=30,
             )
-        self.cwd = self.home
+        self.cd(self.home)
         self.run(
             "afairesi",
             "home",
             "add",
             remote,
-            explain=f"Register {name} under ~/github.com/afairesi-demo/.",
+            explain=f"Clone and register {name} under ~/github.com/user/.",
         )
-        self.cwd = self.home / "github.com" / "afairesi-demo" / name
+        self.cd(self.home / "github.com" / "user" / name)
         self.repositories.append(self.cwd)
 
     def repository(self, name: str) -> None:
@@ -299,125 +333,189 @@ class Demo:
             explain=f"Initialize {name} with an afairesi flake.",
         )
 
+    def write_tool(self, *, adjustable: bool) -> None:
+        """Prepare the article tool and tests without printing source code."""
+        option = (
+            '    parser.add_argument("--words-per-minute", type=int, default=200)\n'
+            if adjustable
+            else ""
+        )
+        rate = "options.words_per_minute" if adjustable else "200"
+        self.write(
+            "reading_time/main.py",
+            "#!/usr/bin/env python3\n# Copyright (c) 2026- Demo authors\n"
+            '"""Estimate how many minutes an article takes to read."""\n'
+            "import argparse\nimport sys\nfrom pathlib import Path\n\n\n"
+            "def reading_minutes(words: int, words_per_minute: int = 200) -> int:\n"
+            '    """Round the reading time up to whole minutes."""\n'
+            "    if words < 0 or words_per_minute <= 0:\n"
+            '        message = "Invalid word count or reading speed"\n'
+            "        raise ValueError(message)\n"
+            "    return (words + words_per_minute - 1) // words_per_minute\n\n\n"
+            "def main() -> None:\n"
+            '    """Read an article and print its estimated reading time."""\n'
+            "    parser = argparse.ArgumentParser(description=__doc__)\n"
+            '    parser.add_argument("path", type=Path)\n'
+            + option
+            + "    options = parser.parse_args()\n"
+            "    try:\n"
+            "        words = len(options.path.read_text().split())\n"
+            f"        minutes = reading_minutes(words, {rate})\n"
+            "    except (OSError, ValueError) as error:\n"
+            "        parser.error(str(error))\n"
+            '    sys.stdout.write(f"{minutes} min read\\n")\n\n\n'
+            'if __name__ == "__main__":\n    main()\n',
+        )
+        tests = (
+            "# Copyright (c) 2026- Demo authors\n"
+            '"""Check reading-time estimates and command line behavior."""\n'
+            "import pytest\nfrom reading_time.main import reading_minutes\n\n\n"
+            "@pytest.mark.parametrize(\n"
+            '    ("words", "expected"), [(0, 0), (1, 1), (200, 1), (201, 2)],\n'
+            ")\n"
+            "def test_reading_minutes(words: int, expected: int) -> None:\n"
+            '    """Round partial minutes up, including at the boundary."""\n'
+            "    if reading_minutes(words) != expected:\n"
+            '        message = "Incorrect reading time"\n'
+            "        raise AssertionError(message)\n"
+        )
+        if adjustable:
+            tests = tests.replace(
+                "import pytest\n",
+                "import sys\nfrom pathlib import Path\nimport pytest\n",
+            )
+            tests = tests.replace(
+                "import reading_minutes\n",
+                "import main, reading_minutes\n",
+            )
+            tests += (
+                "\n\ndef test_reading_speed(\n"
+                "    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,\n"
+                "    capsys: pytest.CaptureFixture[str],\n"
+                ") -> None:\n"
+                '    """Use the requested reading speed in the CLI output."""\n'
+                '    article = tmp_path / "article.txt"\n'
+                '    article.write_text("one two three four")\n'
+                "    arguments = [\n"
+                '        "reading_time", str(article), "--words-per-minute", "2",\n'
+                "    ]\n"
+                '    monkeypatch.setattr(sys, "argv", arguments)\n'
+                "    main()\n"
+                '    if capsys.readouterr().out != "2 min read\\n":\n'
+                '        message = "The reading speed option was ignored"\n'
+                "        raise AssertionError(message)\n"
+            )
+        self.write("reading_time/test_main.py", tests)
+
     def python(self) -> None:
-        """Show a useful CLI, tests, structural inspection, and package lifecycle."""
-        self.repository("toolbox")
+        """Create and verify the complete reading-time tool in one pass."""
+        self.repository("notes-tools")
         self.run(
             "afairesi",
             "repo",
             "add",
-            "hello",
+            "reading_time",
             "python",
-            explain="Create a Python package named hello from the standard template.",
+            explain="Create the tool that estimates article reading time.",
         )
-        self.recorder.note("Prepare a greeting CLI, tests, and supporting files.")
+        self.recorder.note("Implement the tool and its reading-speed tests.")
+        self.write_tool(adjustable=True)
         self.write(
-            "hello/main.py",
-            "#!/usr/bin/env python3\n# Copyright (c) 2026- Demo authors\n"
-            '"""Greet someone from an afairesi package."""\n'
-            "import argparse\nimport sys\n\n\ndef greeting(name: str) -> str:\n"
-            '    """Return a friendly greeting."""\n'
-            '    return f"Hello, {name}!"\n\n\ndef main() -> None:\n'
-            '    """Parse a name and print a greeting."""\n'
-            "    parser = argparse.ArgumentParser(description=__doc__)\n"
-            '    parser.add_argument("name", nargs="?", default="afairesi")\n'
-            '    sys.stdout.write(greeting(parser.parse_args().name) + "\\n")\n\n\n'
-            'if __name__ == "__main__":\n    main()\n',
+            "reading_time/default.nix",
+            (self.cwd / "reading_time/default.nix")
+            .read_text()
+            .replace(
+                '"A Python package."',
+                '"Estimate reading time for notes."',
+            ),
         )
-        self.write(
-            "hello/test_main.py",
-            "# Copyright (c) 2026- Demo authors\n"
-            '"""Check the greeting contract."""\n'
-            "from hypothesis import given, strategies as st\n"
-            "from hello.main import greeting\n\n\ndef test_greeting() -> None:\n"
-            '    """Keep the greeting stable."""\n'
-            '    if greeting("Ada") != "Hello, Ada!":\n'
-            '        message = "The greeting changed"\n'
-            "        raise AssertionError(message)\n\n\n"
-            "@given(st.text())\ndef test_fuzz_greeting(name: str) -> None:\n"
-            '    """Preserve arbitrary names in the greeting."""\n'
-            '    if greeting(name) != f"Hello, {name}!":\n'
-            '        message = "The name was not preserved"\n'
-            "        raise AssertionError(message)\n",
-        )
-        self.write("hello/prm/example.txt", "Supporting files are tracked.\n")
-        self.write("hello/tmp/session.txt", "Temporary files are ignored.\n")
         self.run(
             "afairesi",
             "repo",
             "fix",
-            explain=(
-                "Stage the example sources and refresh the repository's managed files."
-            ),
+            explain="Stage the tool and tests under the repository policy.",
         )
-        self.run("nix", "fmt")
+        self.shell("nix fmt --quiet && nix flake check --quiet")
         self.run("git", "add", ".")
-        self.run("nix", "run", ".#hello", "--", "Ada")
-        self.run("nix", "flake", "check")
         self.shell(
             "afairesi repo inspect | jless",
             browse=True,
-            explain="Browse the package interface and test names in jless.",
+            explain="Review the tool's public interface.",
         )
-        self.run("git", "commit", "-m", "Add tested greeting CLI")
-        self.recorder.note(
-            "Change the package description to see a small interface diff.",
-        )
-        self.write(
-            "hello/default.nix",
-            (self.cwd / "hello/default.nix")
-            .read_text()
-            .replace(
-                '"A Python package."',
-                '"A greeting CLI."',
-            ),
-        )
-        self.run("git", "add", "hello/default.nix")
         self.shell(
             "afairesi repo inspect diff --cached | less -R",
-            explain="Review the staged interface changes, already rendered by jd.",
-            terminal_input=((10, b"q"),),
+            explain="Check the new interface before committing.",
+            terminal_input=((6, b"q"),),
         )
-        self.run("git", "commit", "-m", "Describe the greeting CLI")
+        self.run("git", "commit", "-m", "Add tested article reading-time tool")
 
     def website(self) -> None:
-        """Create a second repository with a different package type."""
-        self.repository("website")
+        """Use the tool from a second repository to publish the first article."""
+        self.repository("notes-site")
         self.run(
             "afairesi",
             "repo",
             "add",
-            "site",
+            "notes",
             "html",
-            explain="Create a website package in the second repository.",
+            explain="Create the companion website for our notes.",
         )
-        self.run("git", "commit", "-m", "Add website package")
+        self.write("notes/prm/first-post.txt", POST)
+        self.recorder.note("Estimate the first article at 100 words per minute.")
+        self.run(
+            "nix",
+            "run",
+            "../notes-tools#reading_time",
+            "--",
+            "notes/prm/first-post.txt",
+            "--words-per-minute",
+            "100",
+        )
+        self.recorder.note("Add the article and reading-time label to the site.")
+        minutes = (len(POST.split()) + 99) // 100
+        paragraphs = "".join(f"<p>{text}</p>" for text in POST.split("\n\n"))
+        self.write(
+            "notes/index.html",
+            '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
+            "<title>Field notes</title></head><body><main><article>"
+            f"<h1>A reproducible notes workspace</h1><p>{minutes} min read</p>"
+            + paragraphs
+            + "</article></main></body></html>\n",
+        )
+        self.run(
+            "afairesi",
+            "repo",
+            "fix",
+            explain="Stage the article and website together.",
+        )
+        self.shell("nix fmt --quiet && nix build .#notes --no-link --quiet")
+        self.run("git", "commit", "-am", "Publish the first note with its reading time")
 
     def home_scene(self) -> None:
         """Show the completed home with both repositories registered as submodules."""
-        self.cwd = self.home
+        self.cd(self.home)
         self.run(
             "git",
             "add",
             "--",
             *(str(p.relative_to(self.home)) for p in self.repositories),
         )
-        self.run("git", "commit", "-m", "Register demo repositories")
+        self.run("git", "commit", "-m", "Track the reading-time tool and notes site")
         self.tree()
 
 
-def record(root: Path, output: Path, system: str) -> None:
+def record(root: Path, output: Path) -> None:
     """Run every chapter, preserving a partial cast if a command fails."""
     with output.open("w", encoding="utf-8") as stream:
-        recorder = Recorder(stream, speed=1, idle_limit=10)
-        demo = Demo(root, recorder, system)
+        recorder = Recorder(stream, speed=1, idle_limit=3)
+        demo = Demo(root, recorder)
         try:
             demo.start_home()
             demo.python()
             demo.website()
             demo.home_scene()
-            recorder.note("Demo complete. Changes were staged and committed with Git.")
-            recorder.output("\r\n", pause=4.0)
+            recorder.note("Workspace ready.")
+            recorder.output("\r\n", pause=2.0)
         except (
             OSError,
             RuntimeError,
@@ -454,23 +552,8 @@ def main() -> None:
         sys.exit(f"missing executables: {', '.join(missing)}")
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        system = subprocess.check_output(  # noqa: S603 - Fixed Nix query.
-            [
-                shutil.which("nix") or "nix",
-                "eval",
-                "--impure",
-                "--raw",
-                "--expr",
-                "builtins.currentSystem",
-            ],
-            text=True,
-            timeout=30,
-        ).strip()
-        with tempfile.TemporaryDirectory(
-            prefix="home-",
-            dir="/tmp",
-        ) as temporary:
-            record(Path(temporary), output, system)
+        with artificial_home("/tmp/home/user") as home:  # noqa: S108 - Requested path; exclusive creation and owned cleanup.
+            record(home, output)
     except (OSError, RuntimeError, subprocess.SubprocessError) as error:
         sys.stderr.write(f"error: {error}\nPartial recording (if started): {output}\n")
         sys.exit(1)

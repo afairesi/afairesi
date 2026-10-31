@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from demo.main import Demo, Recorder
+from demo.main import Demo, Recorder, artificial_home
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -97,7 +97,7 @@ def test_interactive_terminal_and_pipeline_failure(tmp_path: Path) -> None:
     output = "".join(json.loads(line)[2] for line in stream.getvalue().splitlines()[1:])
     if "received=q" not in output:
         raise AssertionError(output)
-    demo = Demo(tmp_path, recorder, "x86_64-linux")
+    demo = Demo(tmp_path, recorder)
     with pytest.raises(RuntimeError, match="exited 7"):
         demo.shell("(exit 7) | cat")
     if "$ (exit 7) | cat" not in stream.getvalue():
@@ -115,11 +115,10 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
     demo = Demo(
         root,
         Recorder(io.StringIO(), speed=10, idle_limit=0.01),
-        "x86_64-linux",
     )
     demo.start_home()
-    demo.register_repository("toolbox")
-    demo.register_repository("website")
+    demo.register_repository("notes-tools")
+    demo.register_repository("notes-site")
     demo.home_scene()
     if not (demo.home / ".git").is_dir():
         message = "No isolated Git home was created"
@@ -130,8 +129,26 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
     if demo.environment["HOME"] != str(root):
         message = "HOME does not point to the artificial home"
         raise AssertionError(message)
-    for name in ("toolbox", "website"):
-        checkout = demo.home / "github.com" / "afairesi-demo" / name
+    for name in ("notes-tools", "notes-site"):
+        checkout = demo.home / "github.com" / "user" / name
         if not (checkout / ".git").is_file():
             message = f"Missing repository inside HOME: {name}"
             raise AssertionError(message)
+
+
+def test_artificial_home_ownership(tmp_path: Path) -> None:
+    """Clean up the created home and refuse to overwrite existing contents."""
+    directory = tmp_path / "home" / "user"
+    with artificial_home(directory) as home:
+        (home / "session").write_text("demo")
+    if directory.exists():
+        message = "The completed demo left its home behind"
+        raise AssertionError(message)
+    directory.mkdir()
+    sentinel = directory / "existing"
+    sentinel.write_text("keep")
+    with pytest.raises(FileExistsError), artificial_home(directory):
+        pytest.fail("An existing home was reused")
+    if sentinel.read_text() != "keep":
+        message = "The existing home was modified"
+        raise AssertionError(message)
