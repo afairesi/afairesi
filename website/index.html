@@ -46,7 +46,7 @@
           aria-label="Directory structure and Nix commands"
         >
           <div class="tree-scope tree-system">
-            <span class="tree-scope-label">nixos with<br />impermanence/preservation</span>
+            <span class="tree-scope-label">NixOS with<br />impermanence/preservation</span>
             <pre><code>/
 ├── …
 └── home/…/</code></pre>
@@ -148,8 +148,8 @@
         <p>
           <code>mkFlake</code> discovers <code>my-host/configuration.nix</code> and passes
           <code>inputs</code> to it automatically. It uses afairesi's nixpkgs input unless you
-          provide your own. Keep your host's hardware and persistence settings, and include the CLI
-          in that module:
+          provide your own. Keep your host's hardware imports, platform, and persistence settings,
+          and include the CLI in that module:
         </p>
         <pre><code>{ inputs, pkgs, ... }:
 {
@@ -159,8 +159,12 @@
     inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
   ];
 }</code></pre>
-        <p>Apply from the directory containing your configuration's <code>flake.nix</code>:</p>
-        <pre><code>sudo nixos-rebuild switch --flake .#my-host</code></pre>
+        <p>
+          In a Git repository, stage new configuration files so Nix can see them. Apply from the
+          directory containing your configuration's <code>flake.nix</code>:
+        </p>
+        <pre><code>git add flake.nix my-host/
+sudo nixos-rebuild switch --flake .#my-host</code></pre>
         <p>
           With
           <a href="https://github.com/nix-community/impermanence">impermanence</a> or
@@ -189,26 +193,32 @@
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Get started</summary>
         <p>
-          Register an existing hosted repository with at least one commit. Replace the URL and
-          choose a destination that does not already exist:
+          Register an existing hosted afairesi repository with at least one commit. Replace the URL
+          with your repository's URL; its destination at <code>~/github.com/you/repo</code> must not
+          already exist:
         </p>
         <pre><code>afairesi home init
 afairesi home add https://github.com/you/repo.git
 cd ~/github.com/you/repo</code></pre>
         <p>
-          For an empty checkout, run <code>afairesi repo init</code> first. In an existing afairesi
-          repository, add and run a package directly:
+          For an empty Git worktree, run <code>afairesi repo init</code> first. In an existing
+          afairesi repository, add and run a package directly:
         </p>
         <pre><code>afairesi repo add hello python
 nix run .#hello</code></pre>
         <p>
-          Changes are staged. Commit and push inside the repository, then stage its updated
-          submodule revision and commit it in your home repository.
+          Structural changes are staged. Stage your source edits before committing and pushing
+          inside the repository, then stage its updated submodule revision and commit it in your
+          home repository.
         </p>
         <p>
           <code>afairesi repo init</code> generates the <code>mkFlake</code> outputs shown above.
-          Packages with <code>default.nix</code> and hosts with <code>configuration.nix</code>
-          are discovered in immediate subdirectories.
+          Packages with <code>default.nix</code> are discovered in immediate subdirectories.
+        </p>
+        <p>
+          <code>nix fmt</code> also enforces the repository's source whitelist, removes unsupported
+          files, and applies lint fixes that can change behavior. Review the diff and run
+          <code>nix flake check</code> afterward.
         </p>
       </details>
     </main>
