@@ -1,6 +1,6 @@
 const container = document.querySelector("#demo-player");
 if (container) {
-  globalThis.AsciinemaPlayer.create("prm/afairesi-demo.cast", container, {
+  globalThis.AsciinemaPlayer.create({ data: globalThis.afairesiDemoRecording }, container, {
     cols: 100,
     controls: true,
     fit: "width",

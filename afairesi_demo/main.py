@@ -429,6 +429,12 @@ def record(root: Path, output: Path, system: str) -> None:
         ) as error:
             recorder.note(f"Recording stopped: {error}")
             raise
+    recording = json.dumps(output.read_text(encoding="utf-8"))
+    output.with_suffix(".js").write_text(
+        "// Generated from afairesi-demo.cast for playback from local HTML files.\n"
+        f"globalThis.afairesiDemoRecording = {recording};\n",
+        encoding="utf-8",
+    )
 
 
 def main() -> None:
