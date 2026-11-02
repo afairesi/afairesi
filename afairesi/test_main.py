@@ -2132,6 +2132,7 @@ def test_add_registers_existing_content_without_creating_commits(
     result = _home_test_run(tmp_path, "add", remote)
     checkout = home / relative
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
+    _expect(ignore.splitlines()[1:] == sorted(ignore.splitlines()[1:]), ignore)
     for pattern in (
         "!/example.test/",
         "!/example.test/team/",
@@ -3392,8 +3393,13 @@ def test_home_repair_targets_home_from_any_working_directory(
         "outside": outside,
     }[location]
     ignore = home / ".gitignore"
-    expected = ignore.read_text()
-    ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
+    expected = (
+        "\n".join(
+            ["*", *sorted([*ignore.read_text().splitlines()[1:], "!/aaa", "!/zzz"])],
+        )
+        + "\n"
+    )
+    ignore.write_text("*\n!/zzz\n!/.gitmodules\n!/aaa\n!/.gitignore\n")
     before = _snapshot(home)
     checkout_before = _snapshot(checkout)
     flake_before = _snapshot(flake)
@@ -3516,6 +3522,7 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
         "submodule checkout was not removed",
     )
     lines = ignore.read_text().splitlines()
+    _expect(lines[1:] == sorted(lines[1:]), lines)
     _expect(
         f"!/{relative}" not in lines and f"!/{relative}/LICENSE" not in lines,
         lines,
@@ -3692,6 +3699,83 @@ def test_home_repair_preserves_unrelated_local_submodule_configuration(
     )
 
 
+@pytest.mark.parametrize("command", ["add", "rm"])
+def test_home_submodule_changes_sort_gitmodules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """Keep registration sections sorted after adding or removing a submodule."""
+    home, _source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    _home_test_run(tmp_path, "init")
+    relative = "example.test/team/repository"
+    if command == "rm":
+        _home_test_run(tmp_path, "add", remote)
+    for name in ("zzz", "aaa"):
+        for field, value in (
+            ("path", f"forge.example/team/{name}"),
+            ("url", f"https://forge.example/team/{name}.git"),
+        ):
+            _git(
+                home,
+                "config",
+                "--file",
+                ".gitmodules",
+                f"submodule.{name}.{field}",
+                value,
+            )
+    _git(home, "add", ".gitmodules")
+    if command == "rm":
+        _fixture_git(home, "commit", "-qm", "Home snapshot")
+    _home_test_run(tmp_path, command, remote if command == "add" else relative)
+    source = (home / ".gitmodules").read_text()
+    names = re.findall(r'^\[submodule "(.*)"\]$', source, re.MULTILINE)
+    expected = ["aaa", relative, "zzz"] if command == "add" else ["aaa", "zzz"]
+    _expect(names == expected, source)
+    _expect(_git(home, "show", ":.gitmodules") == source, source)
+
+
+@pytest.mark.parametrize("command", ["init", "fix"])
+def test_home_sorts_gitmodules_and_preserves_settings(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    """Sort and stage sections, preserving settings, comments, and dry-run state."""
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    _home_test_run(tmp_path, "init")
+    prefix = "# Home repositories\n"
+    last = (
+        '[submodule "zzz"] # retained comment\n'
+        "\tpath = forge.example/team/zzz\n"
+        "\turl = https://forge.example/team/zzz.git\n"
+        "\tbranch = stable\n\n"
+    )
+    other = "[custom]\n\tsetting = retained\n"
+    first = (
+        '[submodule "aaa]quoted\\"name"]\n'
+        "\tpath = forge.example/team/aaa\n"
+        "\turl = https://forge.example/team/aaa.git\n"
+        "\tupdate = none\n"
+    )
+    modules = home / ".gitmodules"
+    modules.write_text(prefix + last + other + first)
+    _git(home, "add", ".gitmodules")
+    before = _snapshot(home)
+    preview = _home_test_run(tmp_path, "fix", "--dry-run")
+    _expect("would write '.gitmodules'" in preview.stdout, preview)
+    _expect(_snapshot(home) == before, "preview changed home state")
+    _home_test_run(tmp_path, command)
+    expected = prefix + first + other + last
+    _expect(modules.read_text() == expected, modules.read_text())
+    _expect(_git(home, "show", ":.gitmodules") == expected, modules)
+    before = _snapshot(home)
+    _home_test_run(tmp_path, command)
+    _expect(_snapshot(home) == before, "repeated command changed home state")
+
+
 def test_home_submodule_whitelist_move_preserves_unrelated_entries(
     tmp_path: Path,
 ) -> None:
@@ -3717,8 +3801,8 @@ def test_home_submodule_whitelist_move_preserves_unrelated_entries(
     subject._move_home_whitelist(tmp_path, old, new, dry_run=False)  # noqa: SLF001
     expected = (
         "*\n!/.gitignore\n!/forge.example/\n!/forge.example/team/\n"
-        "!/forge.example/team/older\n!/forge.example/team/new\n!/future\n"
-        "!/forge.example/team/new/prm/\n"
+        "!/forge.example/team/new\n!/forge.example/team/new/prm/\n"
+        "!/forge.example/team/older\n!/future\n"
     )
     _expect(ignore.read_text() == expected, ignore.read_text())
     _expect(

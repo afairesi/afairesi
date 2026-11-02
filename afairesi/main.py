@@ -4492,13 +4492,60 @@ def home_submodules(
     return repositories
 
 
+def _converge_home_modules(root: Path, *, dry_run: bool) -> bool:
+    """Sort submodule sections while preserving their settings and other sections."""
+    source = read_regular(root / ".gitmodules")
+    if source is None:
+        return False
+    headers = list(
+        re.finditer(
+            r'(?m)^[ \t]*\[((?:[^"\]\n]|"(?:\\.|[^"\\\n])*")+)\]'
+            r"[ \t]*(?:[#;][^\n]*)?(?:\n|$)",
+            source,
+        ),
+    )
+    sections = [
+        source[header.start() : headers[index + 1].start()]
+        if index + 1 < len(headers)
+        else source[header.start() :]
+        for index, header in enumerate(headers)
+    ]
+    submodules = []
+    positions = []
+    for index, header in enumerate(headers):
+        match = re.fullmatch(
+            r'(?i:submodule)[ \t]+"((?:\\.|[^"\\])*)"',
+            header.group(1),
+        )
+        if match:
+            name = re.sub(r'\\(["\\])', r"\1", match.group(1))
+        elif header.group(1).lower().startswith("submodule."):
+            name = header.group(1)[len("submodule.") :].lower()
+        else:
+            continue
+        positions.append(index)
+        submodules.append((name, sections[index]))
+    ordered = sorted(submodules, key=lambda section: section[0])
+    if ordered == submodules:
+        return False
+    for position, (_, section) in zip(positions, ordered, strict=True):
+        sections[position] = section if section.endswith("\n") else section + "\n"
+    updated = source[: headers[0].start()] + "".join(sections)
+    return write_managed(root, Path(".gitmodules"), updated, dry_run=dry_run)
+
+
+def _render_home_ignore(patterns: list[str]) -> str:
+    """Render the home whitelist with sorted entries after its ignore-all rule."""
+    return "\n".join(["*", *sorted(patterns)]) + "\n"
+
+
 def _home_ignore_source(root: Path) -> str:
     """Validate the home whitelist and include its required entries."""
     path = root / ".gitignore"
     required = ["!/.gitignore", "!/.gitmodules"]
     source = read_regular(path)
     if source is None:
-        return "*\n" + "\n".join(required) + "\n"
+        return _render_home_ignore(required)
     lines = source.splitlines()
     if (
         not lines
@@ -4508,7 +4555,7 @@ def _home_ignore_source(root: Path) -> str:
         msg = f"{path}: must start with * and subsequent lines must start with !/"
         raise CommandError(msg)
     missing = [line for line in required if line not in lines]
-    return source.rstrip("\n") + "\n" + "\n".join(missing) + "\n" if missing else source
+    return _render_home_ignore([*lines[1:], *missing])
 
 
 def _converge_home_ignore(root: Path, *, dry_run: bool) -> bool:
@@ -4540,7 +4587,7 @@ def _allow_home_submodule(root: Path, relative: Path, *, dry_run: bool = False) 
         changed |= write_managed(
             root,
             Path(".gitignore"),
-            source.rstrip("\n") + "\n" + "\n".join(missing) + "\n",
+            _render_home_ignore([*source.splitlines()[1:], *missing]),
             dry_run=dry_run,
         )
     return changed
@@ -4590,7 +4637,7 @@ def _move_home_whitelist(
             replacement = new + line[len(old) :]
             if replacement not in retained:
                 retained.append(replacement)
-    updated = "\n".join(retained) + "\n"
+    updated = _render_home_ignore(retained[1:])
     if updated == source:
         return False
     return write_managed(root, Path(".gitignore"), updated, dry_run=dry_run)
@@ -4631,6 +4678,7 @@ def converge_home(root: Path, *, dry_run: bool) -> list[dict[str, str]]:
     _converge_home_ignore(root, dry_run=dry_run)
     for expected in repair_paths:
         _allow_home_submodule(root, expected, dry_run=dry_run)
+    _converge_home_modules(root, dry_run=dry_run)
     return repositories
 
 
@@ -4658,7 +4706,7 @@ def remove_home_submodule(
         for line in source.splitlines()
         if line != entry and not line.startswith(entry + "/")
     ]
-    updated = "\n".join(retained) + "\n" if retained else ""
+    updated = _render_home_ignore(retained[1:]) if retained else ""
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
@@ -4668,6 +4716,7 @@ def remove_home_submodule(
         capture_output=False,
     )
     write_managed(root, Path(".gitignore"), updated, dry_run=False)
+    _converge_home_modules(root, dry_run=False)
 
 
 def initialize_home() -> None:
@@ -4679,6 +4728,7 @@ def initialize_home() -> None:
     _home_ignore_source(root)
     run(["git", "init", "--", str(root)], capture_output=False)
     _converge_home_ignore(root, dry_run=False)
+    _converge_home_modules(root, dry_run=False)
 
 
 def _require_home_repository() -> Path:
@@ -4722,6 +4772,7 @@ def initialize_submodule(
                 cwd=home,
                 capture_output=False,
             )
+            _converge_home_modules(home, dry_run=False)
     except BaseException:
         remove_empty_directories(directories)
         raise
