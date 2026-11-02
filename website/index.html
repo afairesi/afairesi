@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — Eliminate differences that requirements do not justify. Derive a canonical working environment from executable code and declared state."
+      content="afairesi — Satisfy the requirements with the fewest independent decisions. Shared rules derive systems, repositories, builds, and checks from declared inputs."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -35,69 +35,98 @@
     </header>
     <main>
       <section class="principles" aria-labelledby="principle">
-        <h2 id="principle">Differences in solutions should reflect differences in requirements.</h2>
+        <h2 id="principle">Satisfy the requirements with the fewest independent decisions.</h2>
         <p>
-          Similar problems should have similar solutions. Eliminate differences that requirements do
-          not justify. For afairesi, requirements concern executable behavior and declared state.
+          An independent decision is something that must be specified because existing declarations
+          and rules do not determine it. Requirements concern executable behavior and declared
+          state. Shared rules replace repeated choices: similar problems, similar solutions.
+        </p>
+        <p class="inspiration">
+          The inspiration is the method of
+          <a href="https://davidtong.org/pdfs/teaching/classical-dynamics/clas2.pdf"
+            >stationary action</a
+          >: specify constraints and a governing criterion, then derive the rules. Afairesi's
+          criterion is fewer independent design decisions.
         </p>
         <div class="derivation">
           <h3>What follows</h3>
           <ol>
             <li>
-              <strong>Choose a canonical representation.</strong> Equivalent requirements should
-              lead to the same arrangement, independent of how it was assembled. Shared conventions
-              replace repeated local choices.
+              <strong>Derive before declaring.</strong> A determined value needs no independent
+              specification. This gives each independent fact one source of truth.
             </li>
             <li>
-              <strong>Derive what the rules determine.</strong> Once a declaration and a shared rule
-              determine a location, name, or registration, it needs no independent specification.
+              <strong>Share rules.</strong> Replace repeated local choices with common conventions.
+              Count the machinery and exceptions those conventions introduce too.
             </li>
             <li>
-              <strong>Keep one source of truth.</strong> Each independent fact has one authoritative
-              declaration; derived information follows it. This is a consequence of derivation.
-            </li>
-            <li>
-              <strong>Return to the canonical arrangement.</strong> Applying the same rules again
-              should make no further changes. This is the idea behind a &ldquo;home&rdquo;
-              operation.
+              <strong>Normalize repeatably.</strong> Fixed declarations and conventions determine a
+              canonical arrangement. Restoring it again should change nothing. Scoped repairs are
+              implemented; a whole-environment &ldquo;home&rdquo; operation remains a design goal.
             </li>
           </ol>
         </div>
       </section>
       <section class="implementation" aria-labelledby="implementation">
-        <h2 id="implementation">Implementation choices</h2>
+        <h2 id="implementation">Deriving the afairesi rules</h2>
         <p>
-          The afairesi CLI and Nix flake library apply this approach across the working environment.
-          Nix, Git submodules, and the particular naming and ordering conventions are choices that
-          serve the principle. The resulting structure spans NixOS configuration, home metadata
-          (<code>~/.gitmodules</code> and <code>~/.gitignore</code>), and repository, package, and
-          test names.
+          For each rule, preserve the requirement, remove independently maintained choices, and
+          account for the convention introduced. The CLI and Nix flake library apply this from
+          system configuration through home metadata to repository, package, and test names.
         </p>
         <dl>
-          <dt>System</dt>
+          <dt>Construction</dt>
           <dd>
-            Nix expresses builds and system configuration as code. On NixOS, impermanence or
-            preservation makes the choice of persistent state explicit.
+            Builds and hosts need reproducible environments. Nix/NixOS derives them from declared
+            dependencies and configuration, replacing separate setup procedures with shared
+            builders.
           </dd>
-          <dt>Home</dt>
+          <dt>Persistence</dt>
           <dd>
-            Git submodules record a collection of repositories and their revisions. Each
-            repository's location follows its remote: <code>~/host/owner/repository/</code>. Sorting
-            submodule sections and home whitelist entries removes differences caused by insertion
-            order.
+            Recovery needs surviving state. Declare it through impermanence or preservation and
+            reconstruct the rest, replacing dependence on a machine's accumulated history.
           </dd>
           <dt>Repositories</dt>
           <dd>
-            Package and host files determine flake outputs. Shared conventions derive builds and
-            checks from those files, avoiding separate registrations.
+            Independent histories and recorded revisions motivate Git submodules. Remotes determine
+            <code>~/host/owner/repository/</code>; gitlinks record commits. Updating revisions is
+            separate from restoring the recorded state.
           </dd>
-          <dt>Source</dt>
+          <dt>Discovery</dt>
           <dd>
-            Canonicalize structures whose order carries no meaning. Comment removal is an additional
-            policy: executable code and declared state carry the specification, so explanatory
-            comments are removed from managed source files.
+            Conventional package, host, and test files determine outputs and checks. Package
+            directories determine command names. Resource identities and test names remain inputs;
+            their registrations follow shared rules.
+          </dd>
+          <dt>Dependencies</dt>
+          <dd>
+            Tests and development need the package's dependencies. Derive their environments from
+            those dependencies and shared test tools, removing separate dependency lists.
+          </dd>
+          <dt>Tracked state</dt>
+          <dd>
+            Derive repository <code>.gitignore</code> entries from the permitted layout. Use
+            <code>prm/</code> for supporting files and <code>tmp/</code> for temporary data: two
+            shared locations replace repeated placement and tracking decisions.
+          </dd>
+          <dt>Representation</dt>
+          <dd>
+            Shared formatting removes local presentation choices. Sort order-insensitive source,
+            home submodule sections, and whitelist entries. Omit default-valued settings only when
+            their omission preserves behavior under the pinned configuration.
+          </dd>
+          <dt>Comments</dt>
+          <dd>
+            Executable code and declared state carry the specification. Remove independently
+            maintained explanatory comments; tool-interpreted directives must be considered for
+            their behavioral effects.
           </dd>
         </dl>
+        <p class="conventions">
+          Nix, alphabetical order, filenames, and the persistence module are chosen realizations.
+          The principle guides their comparison; it does not uniquely select them or prove a global
+          minimum.
+        </p>
       </section>
       <div class="overview">
         <figure

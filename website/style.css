@@ -64,6 +64,10 @@ main p {
   font-weight: normal;
   line-height: 1.35;
 }
+.inspiration,
+.conventions {
+  margin-block-start: 12px;
+}
 .derivation,
 .implementation {
   margin-block-start: 24px;
