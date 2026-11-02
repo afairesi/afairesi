@@ -156,7 +156,6 @@
         </p>
         <pre><code>{ inputs, pkgs, ... }:
 {
-  # Your existing NixOS settings go here.
   nix.settings.experimental-features = [ "nix-command" "flakes" ];
   environment.systemPackages = [
     inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
