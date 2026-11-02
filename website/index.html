@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — A CLI and Nix flake library for NixOS with impermanence or preservation, Git-based home directories, and repositories."
+      content="afairesi — Eliminate differences that requirements do not justify. Derive a canonical working environment from executable code and declared state."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -34,10 +34,67 @@
       </nav>
     </header>
     <main>
-      <p>
-        A CLI and Nix flake library for NixOS with impermanence or preservation. Manage a Git-based
-        home directory, repositories, packages, and system configurations.
-      </p>
+      <section class="principles" aria-labelledby="principle">
+        <h2 id="principle">Differences in solutions should reflect differences in requirements.</h2>
+        <p>
+          Similar problems should have similar solutions. Eliminate differences that requirements do
+          not justify. For afairesi, requirements concern executable behavior and declared state.
+        </p>
+        <div class="derivation">
+          <h3>What follows</h3>
+          <ol>
+            <li>
+              <strong>Choose a canonical representation.</strong> Equivalent requirements should
+              lead to the same arrangement, independent of how it was assembled. Shared conventions
+              replace repeated local choices.
+            </li>
+            <li>
+              <strong>Derive what the rules determine.</strong> Once a declaration and a shared rule
+              determine a location, name, or registration, it needs no independent specification.
+            </li>
+            <li>
+              <strong>Keep one source of truth.</strong> Each independent fact has one authoritative
+              declaration; derived information follows it. This is a consequence of derivation.
+            </li>
+            <li>
+              <strong>Return to the canonical arrangement.</strong> Applying the same rules again
+              should make no further changes. This is the idea behind a &ldquo;home&rdquo;
+              operation.
+            </li>
+          </ol>
+        </div>
+      </section>
+      <section class="implementation" aria-labelledby="implementation">
+        <h2 id="implementation">Implementation choices</h2>
+        <p>
+          The afairesi CLI and Nix flake library apply this approach across the working environment.
+          Nix, Git submodules, and the particular naming and ordering conventions are choices that
+          serve the principle.
+        </p>
+        <dl>
+          <dt>System</dt>
+          <dd>
+            Nix expresses builds and system configuration as code. On NixOS, impermanence or
+            preservation makes the choice of persistent state explicit.
+          </dd>
+          <dt>Home</dt>
+          <dd>
+            Git submodules record a collection of repositories and their revisions. Each
+            repository's location follows its remote: <code>~/host/owner/repository/</code>.
+          </dd>
+          <dt>Repositories</dt>
+          <dd>
+            Package and host files determine flake outputs. Shared conventions derive builds and
+            checks from those files, avoiding separate registrations.
+          </dd>
+          <dt>Source</dt>
+          <dd>
+            Canonicalize structures whose order carries no meaning. Comment removal is an additional
+            policy: executable code and declared state carry the specification, so explanatory
+            comments are removed from managed source files.
+          </dd>
+        </dl>
+      </section>
       <div class="overview">
         <figure
           class="tree"
