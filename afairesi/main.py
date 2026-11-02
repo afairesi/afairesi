@@ -1679,11 +1679,6 @@ pkgs.writeTextFile {
 """,
     }
     default = defaults[kind].replace("__DESCRIPTION__", description_literal)
-    if "-" in name:
-        default = default.replace(
-            "baseNameOf ./.",
-            'builtins.replaceStrings [ "-" ] [ "_" ] (baseNameOf ./.)',
-        )
     files: dict[Path, str] = {root / "default.nix": default}
     if kind == "python":
         files[root / "main.py"] = (
@@ -2292,8 +2287,16 @@ def _copy_test_sources(root: Path, workspace: Path) -> None:
         ".ruff_cache",
         "*.pyc",
     )
+    imports = workspace / ".afairesi-python"
+    imports.mkdir()
     for package in detect_packages(root):
         shutil.copytree(package.root, workspace / package.name, ignore=ignored)
+        module = package.name.replace("-", "_")
+        if package.kind == "python":
+            (imports / module).symlink_to(
+                Path("..") / package.name,
+                target_is_directory=True,
+            )
     if (root / "prm").is_dir():
         shutil.copytree(root / "prm", workspace / "prm", ignore=ignored)
 
@@ -2518,6 +2521,8 @@ def _prepare_package_tests(
 ) -> list[str]:
     """Run pytest and package executables against the same isolated source copy."""
     selection = selection or TestSelection()
+    imports = workspace / ".afairesi-python"
+    pythonpath = os.pathsep.join(map(str, (imports, workspace)))
     launcher = workspace / "bin" / name
     launcher.parent.mkdir()
     launcher.write_text(
@@ -2530,7 +2535,7 @@ def _prepare_package_tests(
     (workspace / "package-entry.py").write_text(
         "import importlib, sys\n"
         f"sys.argv[0] = {str(launcher)!r}\n"
-        f"importlib.import_module({name + '.main'!r}).main()\n",
+        f"importlib.import_module({name.replace('-', '_') + '.main'!r}).main()\n",
         encoding="utf-8",
     )
     pytest_arguments = selection.pytest_arguments()
@@ -2559,7 +2564,8 @@ def _prepare_package_tests(
         "os.environ['PATH'] = tools + os.pathsep + os.environ.get('PATH', '')\n"
         "os.environ['PYTHONDONTWRITEBYTECODE'] = '1'\n"
         f"os.environ['GIT_CEILING_DIRECTORIES'] = {str(workspace.parent)!r}\n"
-        f"os.environ['PYTHONPATH'] = {str(workspace)!r}\n"
+        f"sys.path.insert(0, {str(imports)!r})\n"
+        f"os.environ['PYTHONPATH'] = {pythonpath!r}\n"
         "os.environ['HYPOTHESIS_STORAGE_DIRECTORY'] = "
         f"{str(workspace / 'hypothesis')!r}\n"
         "runtime = TemporaryDirectory(prefix='test-runtime-', "

@@ -35,6 +35,8 @@
 !/remove_nix_defaults/
 !/remove_nix_defaults/default.nix
 !/remove_nix_defaults/main.py
+!/remove_nix_defaults/prm/
+!/remove_nix_defaults/prm/**
 !/remove_nix_defaults/test_main.py
 !/uncomment/
 !/uncomment/default.nix

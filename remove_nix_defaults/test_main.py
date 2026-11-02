@@ -151,7 +151,7 @@ def test_cli_removes_pinned_package_defaults(tmp_path: Path) -> None:
 
 
 def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
-    """Resolve option defaults with Nix, rewrite their source, and converge."""
+    """Remove treefmt defaults while retaining module values that cannot be proved."""
     root = tmp_path / "repository-${unbound}"
     root.mkdir()
     dependency = root / "prm/nixpkgs"
@@ -239,6 +239,7 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
         "experimental-features = nix-command flakes\nbuild-users-group =\n"
     )
     command = [os.environ["PACKAGE_E2E_EXECUTABLE"], str(root)]
+    original_configuration = configuration.read_text()
     result = subprocess.run(  # noqa: S603 - Test harness executable with a fixture repository path.
         command,
         env=environment,
@@ -251,7 +252,7 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
         raise AssertionError(result.stderr)
     output = configuration.read_text()
     if (
-        "services.demo" in output
+        output != original_configuration
         or "services.other.enable = true;" not in output
         or 'description = "keep  spacing";' not in output
         or "empty = {};" not in output
@@ -372,8 +373,8 @@ def _treefmt_fixture(root: Path) -> None:
     )
 
 
-def test_cli_preserves_nondefaults_and_shared_host_overrides(tmp_path: Path) -> None:
-    """Remove a file's value only when every consuming host agrees on its default."""
+def test_cli_preserves_module_values_without_host_reevaluation(tmp_path: Path) -> None:
+    """Matching option metadata alone cannot prove a shared assignment redundant."""
     root = tmp_path / "repository"
     _treefmt_fixture(root)
     flake = root / "flake.nix"
@@ -430,8 +431,8 @@ def test_cli_preserves_nondefaults_and_shared_host_overrides(tmp_path: Path) -> 
         if (root / "unused.nix").read_text() != "{ flag = false; }":
             msg = "another input's source location matched a local file"
             raise AssertionError(msg)
-        if "flag" in (root / "disabled.nix").read_text():
-            msg = "matching default retained"
+        if (root / "disabled.nix").read_text() != "{ flag = false; }":
+            msg = "removed an assignment without re-evaluating its host"
             raise AssertionError(msg)
 
 

@@ -1403,7 +1403,7 @@ def test_convergence_respects_excluded_trees() -> None:
         ("python", "snake_case", "é\x08\x0c\x01", True),
         ("python", "dash-library", "Nested library metadata", True),
         ("html", "web-site", "Δ report", False),
-        ("latex", "document", "LaTeX\tresources", False),
+        ("latex", "my-document", "LaTeX\tresources", False),
         ("nix", "my-package", "é", False),
         ("python", "a", "x", False),
     ],
@@ -1494,7 +1494,8 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
             or 'passthru.custom = "preserved";' in definition.read_text(),
             "convergence lost custom package attributes",
         )
-        _expect(actual["name"] == name.replace("-", "_"), actual)
+        expected_name = name.replace("-", "_") if kind == "python" else name
+        _expect(actual["name"] == expected_name, actual)
         _expect(actual["meta"]["description"] == description, actual)
         if kind == "latex":
             _expect(actual["dependencies"] == ["git", "curl", "tex"], actual)
@@ -1630,7 +1631,7 @@ def _check_installed_html_template(
         result = _run(
             root,
             *arguments,
-            executable=str(output / "bin" / name.replace("-", "_")),
+            executable=str(output / "bin" / name),
             environment=environment,
         )
         site, *options = json.loads(result.stdout)
@@ -4141,6 +4142,7 @@ def _campaign_prepare_coverage_flake(
     )
     tests = (
         "import os, subprocess, pytest\n"
+        "from z_last import main as subject\n"
         "from hypothesis import given, example, strategies as st\n"
         "@given(st.just(1))\n"
         "@example(0)\n"
@@ -4151,6 +4153,7 @@ def _campaign_prepare_coverage_flake(
         "    assert value == 1\n"
         "@pytest.mark.parametrize('message', ['ready', 'alternate'])\n"
         "def test_cli(message, monkeypatch):\n"
+        "    assert callable(subject.main)\n"
         "    monkeypatch.setenv('AFAIRESI_COVERAGE_CHOICE', message)\n"
         "    result = "
         "subprocess.run([os.environ['PACKAGE_E2E_EXECUTABLE']],\n"
@@ -5137,6 +5140,7 @@ def test_property_campaigns_generate_cases_in_isolated_sources() -> None:
         )
         tests = (
             "import os, subprocess, sys\n"
+            "from git_example import main as subject\n"
             "from pathlib import Path\n"
             "from hypothesis import given, example, settings, strategies as st\n"
             f"settings.register_profile('package', max_examples={max_examples})\n"
@@ -5147,6 +5151,7 @@ def test_property_campaigns_generate_cases_in_isolated_sources() -> None:
             "    with Path('examples').open('a') as output:\n"
             "        output.write(str(value) + '\\n')\n"
             "def test_cli():\n"
+            "    assert callable(subject.main)\n"
             "    repository = subprocess.run(['git', 'rev-parse', "
             "'--show-toplevel'], capture_output=True, text=True)\n"
             "    assert repository.returncode != 0\n"
@@ -5162,7 +5167,7 @@ def test_property_campaigns_generate_cases_in_isolated_sources() -> None:
             "    assert not (Path.home() / 'sentinel').exists()\n"
             "    child = subprocess.run([sys.executable, '-c', "
             '"import importlib; '
-            "print(importlib.import_module('git-example.main').__file__)\"], "
+            "print(importlib.import_module('git_example.main').__file__)\"], "
             "cwd=Path.home(), capture_output=True, text=True)\n"
             "    assert child.returncode == 0, child.stderr\n"
             "    assert Path(child.stdout.strip()).is_relative_to("

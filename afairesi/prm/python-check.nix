@@ -17,7 +17,7 @@ pkgs.runCommand packageName
   ''
     export HOME="$(mktemp -d)"
     mkdir -p "$out"
-    ln -s "$src" "${packageName}"
+    ln -s "$src" "${builtins.replaceStrings [ "-" ] [ "_" ] packageName}"
     export PYTHONPATH="$PWD:$PYTHONPATH"
     cd "$out"
     "${testEnvironment.python}/bin/python" -c '

@@ -293,7 +293,7 @@ def nixos_removals(
     root: Path,
     candidates: dict[Path, list[Candidate]],
 ) -> dict[Path, set[tuple[str, ...]]]:
-    """Remove a file's value only when all consuming hosts use it as their default."""
+    """Re-evaluate cumulative omissions in every consuming host before removal."""
     if not any(candidates.values()):
         return {}
     rendered = (
@@ -308,23 +308,11 @@ def nixos_removals(
         )
         + " ]"
     )
+    helper = Path(__file__).with_name("prm") / "nixos-removals.nix"
     expression = (
-        "let f = builtins.getFlake (toString (/. + "
-        f"{nix_syntax.quote_string(str(root))})); lib = f.inputs.nixpkgs.lib; "
-        "cs = f.nixosConfigurations or {}; names = builtins.attrNames cs; "
-        "one = candidate: let matches = builtins.concatMap (name: let "
-        "option = lib.attrByPath candidate.path {} cs.${name}.options; "
-        "definitions = option.definitionsWithLocations or []; "
-        'file = "${f.outPath}/${candidate.file}"; '
-        'in if builtins.any (definition: toString (definition.file or "") == file) '
-        "definitions "
-        "then [ (builtins.length definitions == 1 && option ? default && "
-        "builtins.toJSON candidate.value == builtins.toJSON option.default) ] "
-        "else []) names; "
-        "tried = builtins.tryEval "
-        "(matches != [] && builtins.all (match: match) matches); "
-        "in if tried.success && tried.value then [{ inherit (candidate) file path; }] "
-        "else []; in builtins.seq names (builtins.concatMap one " + rendered + ")"
+        f"import (/. + {nix_syntax.quote_string(str(helper))}) {{ "
+        "flake = builtins.getFlake (toString (/. + "
+        f"{nix_syntax.quote_string(str(root))})); candidates = {rendered}; }}"
     )
     removals: dict[Path, set[tuple[str, ...]]] = {}
     for record in cast("list[dict[str, Any]]", _run_nix(expression)):
