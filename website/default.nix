@@ -1,20 +1,29 @@
 { pkgs, ... }:
 let
   pname = baseNameOf ./.;
-  site = pkgs.runCommand "${pname}-site" { } ''
-    mkdir -p "$out"
-    cp ${./index.html} "$out/index.html"
-    for asset in script.js style.css; do
-      if [ -f ${./.}/"$asset" ]; then
-        cp ${./.}/"$asset" "$out/$asset"
-      fi
-    done
-    if [ -d ${./.}/prm ]; then
-      cp -R ${./.}/prm "$out/prm"
-      chmod -R u+w "$out/prm"
-    fi
-    runHook postInstall
-  '';
+  site =
+    pkgs.runCommand "${pname}-site"
+      {
+        postInstall = ''
+          cp ${pkgs.writeText "afairesi-demo.js" ''
+            globalThis.afairesiDemoRecording = ${builtins.toJSON (builtins.readFile ./prm/afairesi-demo.cast)};
+          ''} "$out/prm/afairesi-demo.js"
+        '';
+      }
+      ''
+        mkdir -p "$out"
+        cp ${./index.html} "$out/index.html"
+        for asset in script.js style.css; do
+          if [ -f ${./.}/"$asset" ]; then
+            cp ${./.}/"$asset" "$out/$asset"
+          fi
+        done
+        if [ -d ${./.}/prm ]; then
+          cp -R ${./.}/prm "$out/prm"
+          chmod -R u+w "$out/prm"
+        fi
+        runHook postInstall
+      '';
 in
 pkgs.writeShellApplication {
   meta.description = "An opinionated CLI and Nix flake library for managing a Git-based home directory, repositories, packages, and NixOS configurations.";

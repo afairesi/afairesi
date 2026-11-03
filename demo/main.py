@@ -405,23 +405,19 @@ class Demo:
         self.run("afairesi", "repo", "add", "notes", "html")
         self.recorder.note("Write the first article in notes/prm/first-post.txt.")
         self.write("notes/prm/first-post.txt", POST)
-        self.run(
-            "nix",
-            "run",
-            "../notes-tools#reading_time",
-            "--",
-            "notes/prm/first-post.txt",
-            "--words-per-minute",
-            "100",
+        (self.cwd / "notes/tmp").mkdir()
+        self.shell(
+            "nix run '../notes-tools#reading_time' -- notes/prm/first-post.txt "
+            "--words-per-minute 100 | tee notes/tmp/reading-time.txt",
         )
         self.recorder.note("Add the article and reading-time label to the site.")
-        minutes = (len(POST.split()) + 99) // 100
+        reading_time = (self.cwd / "notes/tmp/reading-time.txt").read_text().strip()
         paragraphs = "".join(f"<p>{text}</p>" for text in POST.split("\n\n"))
         self.write(
             "notes/index.html",
             '<!doctype html>\n<html lang="en"><head><meta charset="utf-8">'
             "<title>Field notes</title></head><body><main><article>"
-            f"<h1>A reproducible notes workspace</h1><p>{minutes} min read</p>"
+            f"<h1>A reproducible notes workspace</h1><p>{reading_time}</p>"
             + paragraphs
             + "</article></main></body></html>\n",
         )
@@ -462,12 +458,6 @@ def record(root: Path, output: Path) -> None:
         ) as error:
             recorder.note(f"Recording stopped: {error}")
             raise
-    recording = json.dumps(output.read_text(encoding="utf-8"))
-    output.with_suffix(".js").write_text(
-        "// Generated from afairesi-demo.cast for playback from local HTML files.\n"
-        f"globalThis.afairesiDemoRecording = {recording};\n",
-        encoding="utf-8",
-    )
 
 
 def main() -> None:

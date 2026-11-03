@@ -6,6 +6,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 from typing import TYPE_CHECKING
@@ -174,3 +175,38 @@ def test_artificial_home_ownership(tmp_path: Path) -> None:
     if sentinel.read_text() != "keep":
         message = "The existing home was modified"
         raise AssertionError(message)
+
+
+def test_website_uses_tool_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Publish the tool's result without recalculating it or including stderr."""
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    nix = binary / "nix"
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.fail("The demo requires Bash")
+    nix.write_text(
+        f'#!{bash}\nif [[ "$1" == run ]]; then\n'
+        "  printf 'warning: diagnostic\\n' >&2\n"
+        "  printf '7 min read\\n'\nfi\n",
+    )
+    nix.chmod(0o755)
+    monkeypatch.setenv("PATH", str(binary) + os.pathsep + os.environ["PATH"])
+    monkeypatch.setattr(Demo, "repository", lambda _self, _name: None)
+    monkeypatch.setattr(Demo, "run", lambda _self, *_arguments: None)
+    stream = io.StringIO()
+    demo = Demo(tmp_path, Recorder(stream, speed=10, idle_limit=0.01))
+    demo.website()
+    page = (tmp_path / "notes/index.html").read_text()
+    if "<p>7 min read</p>" not in page or "warning: diagnostic" in page:
+        raise AssertionError(page)
+    output = "".join(
+        entry[2]
+        for line in stream.getvalue().splitlines()[1:]
+        if (entry := json.loads(line))[1] == "o"
+    )
+    if "warning: diagnostic" not in output or "7 min read" not in output:
+        raise AssertionError(output)
