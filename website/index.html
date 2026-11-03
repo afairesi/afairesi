@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — Satisfy the requirements with the fewest independent decisions. Shared rules derive systems, repositories, builds, and checks from declared inputs."
+      content="afairesi — A CLI and Nix flake library for managing your home directory, repositories, packages, and NixOS configurations."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -30,102 +30,16 @@
       <h1>afairesi</h1>
       <nav aria-label="afairesi links">
         <a href="https://github.com/afairesi/afairesi">Source</a>
+        <a href="https://github.com/pbizopoulos/afairesi-paper">Paper</a>
         <a href="https://github.com/afairesi/afairesi/blob/main/LICENSE">MIT License</a>
       </nav>
     </header>
     <main>
-      <section class="principles" aria-labelledby="principle">
+      <section class="intro" aria-labelledby="principle">
         <h2 id="principle">Satisfy the requirements with the fewest independent decisions.</h2>
         <p>
-          An independent decision is something that must be specified because existing declarations
-          and rules do not determine it. Requirements concern executable behavior and declared
-          state. Shared rules replace repeated choices: similar problems, similar solutions.
-        </p>
-        <p class="inspiration">
-          The inspiration is the method of
-          <a href="https://davidtong.org/pdfs/teaching/classical-dynamics/clas2.pdf"
-            >stationary action</a
-          >: specify constraints and a governing criterion, then derive the rules. Afairesi's
-          criterion is fewer independent design decisions.
-        </p>
-        <div class="derivation">
-          <h3>What follows</h3>
-          <ol>
-            <li>
-              <strong>Derive before declaring.</strong> A determined value needs no independent
-              specification. This gives each independent fact one source of truth.
-            </li>
-            <li>
-              <strong>Share rules.</strong> Replace repeated local choices with common conventions.
-              Count the machinery and exceptions those conventions introduce too.
-            </li>
-            <li>
-              <strong>Normalize repeatably.</strong> Fixed declarations and conventions determine a
-              canonical arrangement. Restoring it again should change nothing. Scoped repairs are
-              implemented; a whole-environment &ldquo;home&rdquo; operation remains a design goal.
-            </li>
-          </ol>
-        </div>
-      </section>
-      <section class="implementation" aria-labelledby="implementation">
-        <h2 id="implementation">Deriving the afairesi rules</h2>
-        <p>
-          For each rule, preserve the requirement, remove independently maintained choices, and
-          account for the convention introduced. The CLI and Nix flake library apply this from
-          system configuration through home metadata to repository, package, and test names.
-        </p>
-        <dl>
-          <dt>Construction</dt>
-          <dd>
-            Builds and hosts need reproducible environments. Nix/NixOS derives them from declared
-            dependencies and configuration, replacing separate setup procedures with shared
-            builders.
-          </dd>
-          <dt>Persistence</dt>
-          <dd>
-            Recovery needs surviving state. Declare it through impermanence or preservation and
-            reconstruct the rest, replacing dependence on a machine's accumulated history.
-          </dd>
-          <dt>Repositories</dt>
-          <dd>
-            Independent histories and recorded revisions motivate Git submodules. Remotes determine
-            <code>~/host/owner/repository/</code>; gitlinks record commits. Updating revisions is
-            separate from restoring the recorded state.
-          </dd>
-          <dt>Discovery</dt>
-          <dd>
-            Conventional package, host, and test files determine outputs and checks. Package
-            directories determine command names. Resource identities and test names remain inputs;
-            their registrations follow shared rules.
-          </dd>
-          <dt>Dependencies</dt>
-          <dd>
-            Tests and development need the package's dependencies. Derive their environments from
-            those dependencies and shared test tools, removing separate dependency lists.
-          </dd>
-          <dt>Tracked state</dt>
-          <dd>
-            Derive repository <code>.gitignore</code> entries from the permitted layout. Use
-            <code>prm/</code> for supporting files and <code>tmp/</code> for temporary data: two
-            shared locations replace repeated placement and tracking decisions.
-          </dd>
-          <dt>Representation</dt>
-          <dd>
-            Shared formatting removes local presentation choices. Sort order-insensitive source,
-            home submodule sections, and whitelist entries. Omit default-valued settings only when
-            their omission preserves behavior under the pinned configuration.
-          </dd>
-          <dt>Comments</dt>
-          <dd>
-            Executable code and declared state carry the specification. Remove independently
-            maintained explanatory comments; tool-interpreted directives must be considered for
-            their behavioral effects.
-          </dd>
-        </dl>
-        <p class="conventions">
-          Nix, alphabetical order, filenames, and the persistence module are chosen realizations.
-          The principle guides their comparison; it does not uniquely select them or prove a global
-          minimum.
+          A CLI and Nix flake library for managing your home directory, repositories, packages, and
+          NixOS configurations. Shared conventions derive builds and checks from your files.
         </p>
       </section>
       <div class="overview">
@@ -146,8 +60,8 @@
             <div class="tree-scope tree-home">
               <span class="tree-scope-label">afairesi home</span>
               <pre><code>~/
-├── .gitignore              <span class="tree-comment"># Managed by the afairesi CLI.</span>
-├── .gitmodules             <span class="tree-comment"># Managed by the afairesi CLI.</span>
+├── .gitignore              <span class="tree-comment"># Managed by afairesi.</span>
+├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span>
 │
 │
 │</code></pre>
@@ -159,12 +73,12 @@
                 <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/repo/</code></summary>
                 <pre><code>    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
-    ├── .gitignore          <span class="tree-comment"># Managed by the afairesi CLI.</span>
+    ├── .gitignore          <span class="tree-comment"># Managed by afairesi.</span>
     ├── flake.nix
     ├── flake.lock
-    ├── prm/                <span class="tree-comment"># Optional supporting files; tracked.</span>
-    ├── tmp/                <span class="tree-comment"># Optional temporary files; ignored.</span>
-    │                       <span class="tree-comment"># prm/ and tmp/ are also available in every package and host.</span></code></pre>
+    ├── prm/                <span class="tree-comment"># Supporting files; tracked.</span>
+    ├── tmp/                <span class="tree-comment"># Temporary files; ignored.</span>
+    │                       <span class="tree-comment"># Both are optional in repos, packages, and hosts.</span></code></pre>
                 <details class="package">
                   <!-- prettier-ignore -->
                   <summary><code><span aria-hidden="true">    ├─<span class="disclosure"></span> </span>html_package/</code></summary>
@@ -180,9 +94,7 @@
                   <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
     │   ├── default.nix
     │   ├── main.py
-    │   ├── test_main.py    <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span>
-    │   ├── prm/            <span class="tree-comment"># Optional supporting files; tracked.</span>
-    │   └── tmp/            <span class="tree-comment"># Optional temporary files; ignored.</span></code></pre>
+    │   └── test_main.py    <span class="tree-comment"># Optional; <span class="tree-command">nix flake check</span>.</span></code></pre>
                 </details>
                 <details class="package">
                   <!-- prettier-ignore -->
@@ -198,7 +110,7 @@
                   <pre><code>    │   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
     │   ├── default.nix
     │   ├── main.lean
-    │   └── test_main.lean  <span class="tree-comment"># Optional tests, run by <span class="tree-command">nix flake check</span>.</span></code></pre>
+    │   └── test_main.lean  <span class="tree-comment"># Optional; <span class="tree-command">nix flake check</span>.</span></code></pre>
                 </details>
                 <details class="package">
                   <!-- prettier-ignore -->
@@ -224,8 +136,8 @@
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
         <p>
-          Use afairesi to generate your flake outputs. Keep your existing inputs for impermanence,
-          preservation, and other modules:
+          In <code>flake.nix</code>, use <code>mkFlake</code> to discover packages and hosts. Keep
+          your existing module inputs:
         </p>
         <pre><code>{
   inputs = {
@@ -239,10 +151,9 @@
     };
 }</code></pre>
         <p>
-          <code>mkFlake</code> discovers <code>my-host/configuration.nix</code> and passes
-          <code>inputs</code> to it automatically. It uses afairesi's nixpkgs input unless you
-          provide your own. Keep your host's hardware imports, platform, and persistence settings,
-          and include the CLI in that module:
+          Add the CLI to <code>my-host/configuration.nix</code>, keeping your hardware imports,
+          platform, and persistence settings. <code>inputs</code> is passed automatically; nixpkgs
+          defaults to afairesi's input:
         </p>
         <pre><code>{ inputs, pkgs, ... }:
 {
@@ -251,20 +162,15 @@
     inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
   ];
 }</code></pre>
-        <p>
-          In a Git repository, stage new configuration files so Nix can see them. Apply from the
-          directory containing your configuration's <code>flake.nix</code>:
-        </p>
+        <p>From the flake directory, stage new files so Nix can see them, then apply:</p>
         <pre><code>git add flake.nix my-host/
 sudo nixos-rebuild switch --flake .#my-host</code></pre>
         <p>
           With
           <a href="https://github.com/nix-community/impermanence">impermanence</a> or
           <a href="https://nix-community.github.io/preservation/examples.html">preservation</a>,
-          keep your home directory on a persistent filesystem or bind-mount the home directory from
-          persistent storage. This keeps <code>~/.git/</code>, <code>~/.gitignore</code>,
-          <code>~/.gitmodules</code>, and repository checkouts together across reboots. Managed
-          files and repository path components must not be symlinks.
+          persist the whole home directory, including Git metadata and checkouts, using a persistent
+          filesystem or bind mount. Managed files and repository paths must not be symlinks.
         </p>
       </details>
       <details class="installation">
@@ -272,9 +178,8 @@ sudo nixos-rebuild switch --flake .#my-host</code></pre>
           <span class="disclosure" aria-hidden="true"></span> Other systems: home and repo
         </summary>
         <p>
-          On other systems with Nix, use <code>afairesi home</code> and
-          <code>afairesi repo</code> independently. Enable these features in
-          <code>~/.config/nix/nix.conf</code>:
+          With Nix, <code>afairesi home</code> and <code>afairesi repo</code> also work without
+          NixOS. Enable flakes in <code>~/.config/nix/nix.conf</code>:
         </p>
         <pre><code>experimental-features = nix-command flakes</code></pre>
         <p>Run without installing:</p>

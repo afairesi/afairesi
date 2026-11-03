@@ -53,52 +53,15 @@ h1 {
 main p {
   max-width: 80ch;
 }
-.principles,
-.implementation {
+.intro {
   max-width: 96ch;
 }
-.principles h2 {
+.intro h2 {
   max-width: 36ch;
   margin: 0 0 12px;
   font-size: clamp(20px, 3vw, 26px);
   font-weight: normal;
   line-height: 1.35;
-}
-.inspiration,
-.conventions {
-  margin-block-start: 12px;
-}
-.derivation,
-.implementation {
-  margin-block-start: 24px;
-}
-.derivation h3,
-.implementation h2 {
-  margin: 0 0 8px;
-  font-size: 14px;
-}
-.derivation ol {
-  max-width: 80ch;
-  margin: 0;
-  padding-inline-start: 3ch;
-}
-.derivation li + li {
-  margin-block-start: 8px;
-}
-.implementation dl {
-  display: grid;
-  grid-template-columns: 14ch minmax(0, 1fr);
-  gap: 8px 16px;
-  margin: 12px 0 0;
-}
-.implementation dt {
-  font-weight: bold;
-}
-.implementation dd {
-  margin: 0;
-}
-.implementation code {
-  overflow-wrap: anywhere;
 }
 .installation {
   margin-block: 12px;
@@ -229,13 +192,6 @@ details[open] > summary .disclosure::before {
   }
   main {
     padding: 16px 0;
-  }
-  .implementation dl {
-    grid-template-columns: minmax(0, 1fr);
-    gap: 4px;
-  }
-  .implementation dd + dt {
-    margin-block-start: 8px;
   }
   .tree {
     font-size: 11px;
