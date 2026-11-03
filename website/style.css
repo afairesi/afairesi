@@ -78,6 +78,9 @@ main p {
 }
 .demo {
   width: 100%;
+  border: 1px solid var(--secondary);
+  border-radius: 6px;
+  overflow: hidden;
 }
 .installation pre {
   max-width: 80ch;
@@ -123,7 +126,11 @@ main {
   margin-block-start: 12px;
 }
 .home-branch > summary {
-  padding-inline-start: 48px;
+  padding-inline-start: 49px;
+}
+.tree-home > pre,
+.tree-repo > .package {
+  padding-inline-start: 4ch;
 }
 .tree-scope-label {
   position: absolute;
@@ -138,7 +145,7 @@ main {
 .tree-system {
   display: flex;
   align-items: center;
-  min-height: 28ch;
+  min-height: 16ch;
 }
 .tree-repo {
   min-height: 16ch;

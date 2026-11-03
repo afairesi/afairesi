@@ -42,6 +42,60 @@
           NixOS configurations. Shared conventions derive builds and checks from your files.
         </p>
       </section>
+      <details class="installation">
+        <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
+        <p>
+          In <code>flake.nix</code>, use <code>mkFlake</code> to discover packages and hosts. Keep
+          your existing module inputs:
+        </p>
+        <pre><code>{
+  inputs = {
+    afairesi.url = "github:afairesi/afairesi";
+    preservation.url = "github:nix-community/preservation";
+  };
+  outputs =
+    inputs:
+    inputs.afairesi.lib.mkFlake {
+      inherit inputs;
+    };
+}</code></pre>
+        <p>
+          Add the CLI to <code>nixos-configuration/configuration.nix</code>, keeping your hardware
+          imports, platform, and persistence settings. <code>inputs</code> is passed automatically;
+          nixpkgs defaults to afairesi's input:
+        </p>
+        <pre><code>{ inputs, pkgs, ... }:
+{
+  nix.settings.experimental-features = [ "nix-command" "flakes" ];
+  environment.systemPackages = [
+    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
+  ];
+}</code></pre>
+        <p>From the flake directory, stage new files so Nix can see them, then apply:</p>
+        <pre><code>git add flake.nix nixos-configuration/
+sudo nixos-rebuild switch --flake .#nixos-configuration</code></pre>
+        <p>
+          With
+          <a href="https://github.com/nix-community/impermanence">impermanence</a> or
+          <a href="https://nix-community.github.io/preservation/examples.html">preservation</a>,
+          persist the whole home directory, including Git metadata and checkouts, using a persistent
+          filesystem or bind mount. Managed files and repository paths must not be symlinks.
+        </p>
+      </details>
+      <details class="installation">
+        <summary>
+          <span class="disclosure" aria-hidden="true"></span> Other systems: home and repo
+        </summary>
+        <p>
+          With Nix, <code>afairesi home</code> and <code>afairesi repo</code> also work without
+          NixOS. Enable flakes in <code>~/.config/nix/nix.conf</code>:
+        </p>
+        <pre><code>experimental-features = nix-command flakes</code></pre>
+        <p>Run without installing:</p>
+        <pre><code>nix run github:afairesi/afairesi -- repo --help</code></pre>
+        <p>Or install for your user (Nix 2.30 or newer):</p>
+        <pre><code>nix profile add github:afairesi/afairesi</code></pre>
+      </details>
       <div class="overview">
         <figure
           class="tree"
@@ -50,16 +104,16 @@
           aria-label="Directory structure and Nix commands"
         >
           <div class="tree-scope tree-system">
-            <span class="tree-scope-label">NixOS with<br />impermanence/preservation</span>
+            <span class="tree-scope-label">NixOS with<br />impermanence</span>
             <pre><code>/
-├── …                       <span class="tree-comment"># Managed by impermanence/preservation</span></code></pre>
+├── …                       <span class="tree-comment"># Managed by impermanence</span></code></pre>
           </div>
           <details class="package home-branch" open>
             <!-- prettier-ignore -->
             <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>home/…/</code></summary>
             <div class="tree-scope tree-home">
               <span class="tree-scope-label">afairesi home</span>
-              <pre><code>~/
+              <pre><code>│
 ├── .gitignore              <span class="tree-comment"># Managed by afairesi.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span>
 │
@@ -120,8 +174,8 @@
                 </details>
                 <details class="package">
                   <!-- prettier-ignore -->
-                  <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>my-host/</code></summary>
-                  <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.my-host.config.system.build.toplevel</span></span>
+                  <summary><code><span aria-hidden="true">    └─<span class="disclosure"></span> </span>nixos-configuration/</code></summary>
+                  <pre><code>        │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.nixos-configuration.config.system.build.toplevel</span></span>
         ├── configuration.nix
         └── hardware-configuration.nix <span class="tree-comment"># Optional hardware configuration.</span></code></pre>
                 </details>
@@ -133,60 +187,6 @@
           <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
         </figure>
       </div>
-      <details class="installation">
-        <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
-        <p>
-          In <code>flake.nix</code>, use <code>mkFlake</code> to discover packages and hosts. Keep
-          your existing module inputs:
-        </p>
-        <pre><code>{
-  inputs = {
-    afairesi.url = "github:afairesi/afairesi";
-    preservation.url = "github:nix-community/preservation";
-  };
-  outputs =
-    inputs:
-    inputs.afairesi.lib.mkFlake {
-      inherit inputs;
-    };
-}</code></pre>
-        <p>
-          Add the CLI to <code>my-host/configuration.nix</code>, keeping your hardware imports,
-          platform, and persistence settings. <code>inputs</code> is passed automatically; nixpkgs
-          defaults to afairesi's input:
-        </p>
-        <pre><code>{ inputs, pkgs, ... }:
-{
-  nix.settings.experimental-features = [ "nix-command" "flakes" ];
-  environment.systemPackages = [
-    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
-  ];
-}</code></pre>
-        <p>From the flake directory, stage new files so Nix can see them, then apply:</p>
-        <pre><code>git add flake.nix my-host/
-sudo nixos-rebuild switch --flake .#my-host</code></pre>
-        <p>
-          With
-          <a href="https://github.com/nix-community/impermanence">impermanence</a> or
-          <a href="https://nix-community.github.io/preservation/examples.html">preservation</a>,
-          persist the whole home directory, including Git metadata and checkouts, using a persistent
-          filesystem or bind mount. Managed files and repository paths must not be symlinks.
-        </p>
-      </details>
-      <details class="installation">
-        <summary>
-          <span class="disclosure" aria-hidden="true"></span> Other systems: home and repo
-        </summary>
-        <p>
-          With Nix, <code>afairesi home</code> and <code>afairesi repo</code> also work without
-          NixOS. Enable flakes in <code>~/.config/nix/nix.conf</code>:
-        </p>
-        <pre><code>experimental-features = nix-command flakes</code></pre>
-        <p>Run without installing:</p>
-        <pre><code>nix run github:afairesi/afairesi -- repo --help</code></pre>
-        <p>Or install for your user (Nix 2.30 or newer):</p>
-        <pre><code>nix profile add github:afairesi/afairesi</code></pre>
-      </details>
     </main>
   </body>
 </html>
