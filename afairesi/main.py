@@ -56,7 +56,7 @@ ROOT_FILES = {
 }
 PRM_NAME = "prm"
 TMP_NAME = "tmp"
-MINIMUM_REMOTE_COMPONENTS = 3
+MINIMUM_REMOTE_COMPONENTS = 2
 RESOURCE_PATH_COMPONENTS = 1
 PYTEST_NO_TESTS_COLLECTED = 5
 
@@ -4069,6 +4069,20 @@ def _python_library(package: Package) -> bool:
     return len(values) == 1 and document.text(values[0]) == "false"
 
 
+def _compact_cli(command: dict[str, Any]) -> dict[str, Any]:
+    """Omit empty command containers while preserving declared argument values."""
+    result = {
+        key: value
+        for key, value in command.items()
+        if key not in {"arguments", "commands"} or value
+    }
+    if "commands" in result:
+        result["commands"] = {
+            name: _compact_cli(child) for name, child in result["commands"].items()
+        }
+    return result
+
+
 def inspect_repository(root: Path) -> dict[str, Any]:
     """Describe root resources by name, with their interfaces and test identifiers."""
     if not (root / "flake.nix").is_file():
@@ -4089,27 +4103,34 @@ def inspect_repository(root: Path) -> dict[str, Any]:
             if _python_library(package):
                 _source(path)
             else:
-                cli = ArgumentDiscovery(path.read_bytes(), str(path)).report()
+                cli = _compact_cli(
+                    ArgumentDiscovery(path.read_bytes(), str(path)).report(),
+                )
         tests = package.root / "test_main.py"
         test_module = _source(tests) if tests.is_file() else None
         description = package_description(package)
-        resources[package.name] = {
-            "type": ["package", "host"] if package.name in resources else "package",
-            "kind": package.kind,
-            "description": description,
-            "cli": cli,
-            "tests": (
-                sorted(
-                    f"{owner}::{definition.name}" if owner else definition.name
-                    for owner, definition in python_test_definitions(test_module)
-                )
-                if test_module is not None
-                else ["test_main.lean"]
-                if package.kind == "lean4"
-                and (package.root / "test_main.lean").is_file()
-                else []
-            ),
+        identifiers = (
+            sorted(
+                f"{owner}::{definition.name}" if owner else definition.name
+                for owner, definition in python_test_definitions(test_module)
+            )
+            if test_module is not None
+            else ["test_main.lean"]
+            if package.kind == "lean4" and (package.root / "test_main.lean").is_file()
+            else []
+        )
+        resource: dict[str, Any] = {
+            "type": [package.kind, "host"]
+            if package.name in host_names
+            else package.kind,
         }
+        if description:
+            resource["description"] = description
+        if cli is not None:
+            resource["cli"] = cli
+        if identifiers:
+            resource["tests"] = identifiers
+        resources[package.name] = resource
     return dict(sorted(resources.items()))
 
 
@@ -4246,7 +4267,11 @@ def _dispatch_inspect_diff(
         left, right = (Path(directory) / name for name in ("before.json", "after.json"))
         left.write_text(json.dumps(before), encoding="utf-8")
         right.write_text(json.dumps(after), encoding="utf-8")
-        completed = run(["jd", str(left), str(right)], check=False)
+        completed = run(
+            ["jd", left.name, right.name],
+            cwd=Path(directory),
+            check=False,
+        )
     if completed.returncode not in {0, 1}:
         sys.stderr.write(completed.stderr)
         raise SystemExit(completed.returncode)
@@ -4304,6 +4329,7 @@ def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
     difference = commands.add_parser(
         "diff",
         help="diff inspected interfaces in jd format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Print a jd-compatible structural diff of repository inspections. "
             "Compare the index with tracked working-tree sources by default, "
@@ -4311,6 +4337,14 @@ def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
             "Accept REV1..REV2 and REV1...REV2 (from their merge base). "
             "Untracked files and implementation-only changes are omitted. "
             "Inspect source without executing it or changing Git state."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  afairesi repo inspect diff --cached | less\n"
+            "  afairesi repo inspect diff --cached | jd -t jd2patch | jless\n"
+            "  afairesi repo inspect diff --cached > change.jd\n"
+            "  jd -p change.jd before.json\n"
+            "\nFor patching, before.json must contain the baseline inspection."
         ),
     )
     difference.add_argument("revisions", nargs="*", metavar="REV")
@@ -4390,6 +4424,9 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         description=(
             "Print JSON describing hosts, packages, CLI arguments, "
             "and test identifiers. "
+            "Resource type is the package kind or 'host'. "
+            "Empty optional fields are omitted; for Python packages, cli: {} "
+            "denotes an executable without arguments. "
             "Fail if CLI declarations cannot be resolved reliably. "
             "Inspect source without executing it."
         ),

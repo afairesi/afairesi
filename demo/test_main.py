@@ -18,16 +18,23 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 
-def test_terminal_recording_and_nonzero_exit(tmp_path: Path) -> None:
-    """Capture real terminal output, Unicode, and diagnostics before failing."""
+def test_terminal_recording_and_nonzero_exit(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Capture output and chapter timing, retaining diagnostics before failing."""
     stream = io.StringIO()
     recorder = Recorder(stream, speed=2, idle_limit=0.1)
+    recorder.marker("Terminal output")
     recorder.command(
         [sys.executable, "-c", "import os; print(os.isatty(1)); print('日本語')"],
         tmp_path,
         dict(os.environ),
         timeout=5,
     )
+    pause = 3.0
+    recorder.hold(pause)
+    recorder.marker("Failed command")
     with pytest.raises(RuntimeError, match="exited 7"):
         recorder.command(
             [sys.executable, "-c", "import sys; print('diagnostic'); sys.exit(7)"],
@@ -38,13 +45,19 @@ def test_terminal_recording_and_nonzero_exit(tmp_path: Path) -> None:
     header, *events = [json.loads(line) for line in stream.getvalue().splitlines()]
     if (header["version"], header["width"]) != (2, 100):
         raise AssertionError(header)
-    if not all(event[1] == "o" for event in events):
-        raise AssertionError(events)
+    markers = [event for event in events if event[1] == "m"]
+    if [event[2] for event in markers] != ["Terminal output", "Failed command"]:
+        raise AssertionError(markers)
+    if markers[0][0] != 0 or markers[1][0] < pause:
+        raise AssertionError(markers)
     if [event[0] for event in events] != sorted(event[0] for event in events):
         raise AssertionError(events)
-    output = "".join(event[2] for event in events)
+    output = "".join(event[2] for event in events if event[1] == "o")
     if "True\r\n日本語\r\n" not in output or "diagnostic\r\n" not in output:
         raise AssertionError(output)
+    if capsys.readouterr().out != output:
+        message = "Chapter markers changed the displayed terminal output"
+        raise AssertionError(message)
 
 
 def test_timeout_stops_descendants(tmp_path: Path) -> None:
@@ -119,7 +132,6 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
     demo.start_home()
     demo.register_repository("notes-tools")
     demo.register_repository("notes-site")
-    demo.home_scene()
     if not (demo.home / ".git").is_dir():
         message = "No isolated Git home was created"
         raise AssertionError(message)

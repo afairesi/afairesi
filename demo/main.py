@@ -97,9 +97,13 @@ class Recorder:
         sys.stdout.flush()
 
     def note(self, text: str) -> None:
-        """Add an explicitly narrated chapter caption."""
+        """Explain fixture edits that are not shown as terminal commands."""
         self.output(f"\r\n\x1b[1;33m# {text}\x1b[0m\r\n")
         self.hold(max(3.0, len(text.split()) / 3))
+
+    def marker(self, label: str) -> None:
+        """Add a chapter to the playback timeline without terminal output."""
+        self.emit_json([round(self.elapsed, 6), "m", label])
 
     def hold(self, seconds: float) -> None:
         """Leave the current screen visible before the next playback event."""
@@ -225,10 +229,8 @@ class Demo:
             "accept-flake-config = false\n",
         )
 
-    def run(self, *arguments: str, explain: str | None = None) -> None:
+    def run(self, *arguments: str) -> None:
         """Record one real command in the current repository."""
-        if explain is not None:
-            self.recorder.note(explain)
         self.recorder.command(
             arguments,
             self.cwd,
@@ -247,12 +249,9 @@ class Demo:
         source: str,
         *,
         browse: bool = False,
-        explain: str | None = None,
         terminal_input: Sequence[tuple[float, bytes]] = (),
     ) -> None:
         """Record a fixed pipeline and briefly navigate an interactive JSON viewer."""
-        if explain is not None:
-            self.recorder.note(explain)
         self.recorder.command(
             ["bash", "-o", "pipefail", "-c", source],
             self.cwd,
@@ -266,20 +265,13 @@ class Demo:
 
     def tree(self) -> None:
         """Show the source layout without opening file contents or generated data."""
-        self.shell(
-            "tree -a --gitignore -I .git --noreport",
-            explain="Show the source tree; Git metadata and ignored files are hidden.",
-        )
+        self.shell("tree -a --gitignore -I .git --noreport")
 
     def start_home(self) -> None:
         """Initialize the artificial home before creating repositories inside it."""
+        self.recorder.marker("Initialize home")
         self.cwd = self.home
-        self.run(
-            "afairesi",
-            "home",
-            "init",
-            explain=f"Set up the notes workspace in {self.home}.",
-        )
+        self.run("afairesi", "home", "init")
 
     def cd(self, directory: Path) -> None:
         """Show and perform directory changes between project steps."""
@@ -308,26 +300,14 @@ class Demo:
                 check=True,
                 timeout=30,
             )
-        self.cd(self.home)
-        self.run(
-            "afairesi",
-            "home",
-            "add",
-            remote,
-            explain=f"Clone and register {name} under ~/github.com/afairesi/.",
-        )
+        self.run("afairesi", "home", "add", remote)
         self.cd(self.home / "github.com" / "afairesi" / name)
         self.repositories.append(self.cwd)
 
     def repository(self, name: str) -> None:
         """Create an afairesi flake inside a repository registered in the home."""
         self.register_repository(name)
-        self.run(
-            "afairesi",
-            "repo",
-            "init",
-            explain=f"Initialize {name} with an afairesi flake.",
-        )
+        self.run("afairesi", "repo", "init")
 
     def write_tool(self, *, adjustable: bool) -> None:
         """Prepare the article tool and tests without printing source code."""
@@ -405,15 +385,9 @@ class Demo:
 
     def python(self) -> None:
         """Create and verify the complete reading-time tool in one pass."""
+        self.recorder.marker("Build reading-time tool")
         self.repository("notes-tools")
-        self.run(
-            "afairesi",
-            "repo",
-            "add",
-            "reading_time",
-            "python",
-            explain="Create the tool that estimates article reading time.",
-        )
+        self.run("afairesi", "repo", "add", "reading_time", "python")
         self.recorder.note("Implement the tool and its reading-speed tests.")
         self.write_tool(adjustable=True)
         self.write(
@@ -425,38 +399,23 @@ class Demo:
                 '"Estimate reading time for notes."',
             ),
         )
-        self.run(
-            "afairesi",
-            "repo",
-            "fix",
-            explain="Stage the tool and tests under the repository policy.",
-        )
         self.shell("nix fmt && nix flake check")
         self.run("git", "add", ".")
+        self.recorder.marker("Inspect tool interface")
+        self.shell("afairesi repo inspect | jless", browse=True)
         self.shell(
-            "afairesi repo inspect | jless",
+            "afairesi repo inspect diff --cached | jd -t jd2patch | jless",
             browse=True,
-            explain="Review the tool's public interface.",
-        )
-        self.shell(
-            "afairesi repo inspect diff --cached",
-            explain="Check the new interface before committing.",
         )
         self.run("git", "commit", "-m", "Add tested article reading-time tool")
 
     def website(self) -> None:
         """Use the tool from a second repository to publish the first article."""
+        self.recorder.marker("Build notes website")
         self.repository("notes-site")
-        self.run(
-            "afairesi",
-            "repo",
-            "add",
-            "notes",
-            "html",
-            explain="Create the companion website for our notes.",
-        )
+        self.run("afairesi", "repo", "add", "notes", "html")
+        self.recorder.note("Write the first article in notes/prm/first-post.txt.")
         self.write("notes/prm/first-post.txt", POST)
-        self.recorder.note("Estimate the first article at 100 words per minute.")
         self.run(
             "nix",
             "run",
@@ -477,24 +436,21 @@ class Demo:
             + paragraphs
             + "</article></main></body></html>\n",
         )
-        self.run(
-            "afairesi",
-            "repo",
-            "fix",
-            explain="Stage the article and website together.",
-        )
         self.shell("nix fmt && nix build .#notes")
         self.run("git", "commit", "-am", "Publish the first note with its reading time")
 
     def home_scene(self) -> None:
         """Show the completed home with both repositories registered as submodules."""
+        self.recorder.marker("Save workspace")
         self.cd(self.home)
+        self.run("git", "status")
         self.run(
             "git",
             "add",
             *(str(p.relative_to(self.home)) for p in self.repositories),
         )
         self.run("git", "commit", "-m", "Track the reading-time tool and notes site")
+        self.run("git", "submodule", "foreach", "nix fmt && nix flake check")
         self.tree()
 
 
@@ -508,7 +464,6 @@ def record(root: Path, output: Path) -> None:
             demo.python()
             demo.website()
             demo.home_scene()
-            recorder.note("Workspace ready.")
             recorder.output("\r\n", pause=2.0)
         except (
             OSError,
@@ -536,6 +491,7 @@ def main() -> None:
             "git",
             "nix",
             "bash",
+            "jd",
             "jless",
             "tree",
         )

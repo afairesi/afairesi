@@ -1367,7 +1367,7 @@ def test_lean4_convergence_preserves_sources_and_explicit_package_options(
         _expect((package / "test_main.lean").read_text() == tests, tests)
         _expect("lean-example/test_main.lean" in _git(root, "ls-files"), repaired)
         report = import_module("afairesi.main").inspect_repository(root)
-        _expect(report["lean-example"]["kind"] == "lean4", report)
+        _expect(report["lean-example"]["type"] == "lean4", report)
         _expect(report["lean-example"]["description"] == "Lean proofs", report)
         _expect(report["lean-example"]["tests"] == ["test_main.lean"], report)
 
@@ -2080,19 +2080,26 @@ def _home_test_home_repository(root: Path) -> Path:
 
 
 @pytest.mark.parametrize(
-    "remote",
+    ("remote", "relative"),
     [
-        "https://example.test/team/project.git",
-        "ssh://git@example.test/team/project.git",
-        "git@example.test:team/project.git",
+        ("https://example.test/team/project.git", "example.test/team/project"),
+        ("ssh://git@example.test/team/project.git", "example.test/team/project"),
+        ("git@example.test:team/project.git", "example.test/team/project"),
+        ("https://example.test/project.git", "example.test/project"),
+        ("git@example.test:project.git", "example.test/project"),
+        (
+            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
+            "git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux",
+        ),
     ],
 )
 def test_add_registers_existing_content_without_creating_commits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote: str,
+    relative: str,
 ) -> None:
-    """Add an existing remote from any directory without creating commits."""
+    """Preserve the full remote path at any depth without creating commits."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
@@ -2129,16 +2136,14 @@ def test_add_registers_existing_content_without_creating_commits(
         "Home policy",
     )
     head = _git(home, "rev-parse", "HEAD")
-    relative = "example.test/team/project"
     result = _home_test_run(tmp_path, "add", remote)
     checkout = home / relative
     ignore = (home / ".gitignore").read_text(encoding="utf-8")
     _expect(ignore.splitlines()[1:] == sorted(ignore.splitlines()[1:]), ignore)
-    for pattern in (
-        "!/example.test/",
-        "!/example.test/team/",
-        "!/example.test/team/project",
-    ):
+    patterns = {f"!/{relative}"} | {
+        f"!/{parent}/" for parent in Path(relative).parents if parent != Path()
+    }
+    for pattern in patterns:
         if ignore.splitlines().count(pattern) != 1:
             raise AssertionError(ignore)
     if _git(home, "show", ":.gitignore") != ignore:
@@ -3976,7 +3981,7 @@ def test_fresh_python_scaffold_passes_formatting() -> None:
         _expect("argparse" not in formatted, "empty parser in generated package")
         _run(root, str(source), executable=sys.executable)
         report = inspection_subject.inspect_repository(root)["example"]["cli"]
-        _expect(report == {"arguments": [], "commands": {}}, report)
+        _expect(report == {}, report)
 
 
 def test_web_formatting_preserves_literal_line_breaks() -> None:
@@ -5586,7 +5591,7 @@ def test_empty_cli(tmp_path: Path, source: str) -> None:
     (tmp_path / "example/main.py").write_text(source)
     completed = _run(tmp_path, "inspect", str(tmp_path))
     resource = json.loads(completed.stdout)["example"]
-    _expect(resource["cli"] == report, resource)
+    _expect(resource["cli"] == {}, resource)
     _expect(resource["tests"] == ["test_default_output"], resource)
 
 
@@ -6449,9 +6454,9 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
     }
     _expect(before == after, "inspection wrote to the repository")
     _expect(list(report) == ["example", "laptop", "library"], report)
-    _expect(report["example"]["type"] == "package", report)
+    _expect(report["example"]["type"] == "python", report)
     _expect(
-        set(report["example"]) == {"type", "kind", "description", "cli", "tests"},
+        set(report["example"]) == {"type", "description", "cli", "tests"},
         report,
     )
     _expect("packages" not in report and "hosts" not in report, report)
@@ -6460,11 +6465,10 @@ def test_inspection_is_read_only(tmp_path: Path) -> None:
         "wrong hosts",
     )
     _expect(
-        report["library"]["cli"] is None,
-        "non-Python package has CLI metadata",
+        report["library"] == {"type": "nix"},
+        "empty optional fields leaked into the package inventory",
     )
     _expect(report["example"]["tests"] == ["test_default_output"], report)
-    _expect(report["library"]["tests"] == [], report)
     _expect(report["example"]["description"] == "Example", report)
 
 
@@ -6489,10 +6493,8 @@ in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
     _expect(
         report
         == {
-            "type": "package",
-            "kind": "python",
+            "type": "python",
             "description": "Python library",
-            "cli": None,
             "tests": ["test_default_output"],
         },
         report,
@@ -6516,7 +6518,6 @@ in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
         report["cli"]
         == {
             "arguments": [{"names": ["--output"], "default": "result"}],
-            "commands": {},
         },
         report,
     )
@@ -6540,8 +6541,50 @@ def test_inspection_preserves_package_and_host_in_one_directory(tmp_path: Path) 
     _inspection_repository(tmp_path)
     (tmp_path / "example/configuration.nix").touch()
     resource = inspection_subject.inspect_repository(tmp_path)["example"]
-    _expect(resource["type"] == ["package", "host"], resource)
-    _expect(resource["kind"] == "python", resource)
+    _expect(resource["type"] == ["python", "host"], resource)
+
+
+def test_inspection_compacts_commands_without_losing_declared_values(
+    tmp_path: Path,
+) -> None:
+    """Keep empty commands, aliases, and literal defaults when pruning containers."""
+    _inspection_repository(tmp_path)
+    (tmp_path / "example/main.py").write_text("""
+import argparse
+cli = argparse.ArgumentParser()
+commands = cli.add_subparsers()
+commands.add_parser('empty', aliases=['e'])
+run = commands.add_parser('run')
+run.add_argument('--values', default=[])
+run.add_argument('--mapping', default={})
+run.add_argument('--optional', default=None)
+run.add_argument('--enabled', default=False)
+run.add_argument('--count', default=0)
+run.add_argument('--name', default='')
+run.set_defaults(internal=None)
+""")
+    report = inspection_subject.inspect_repository(tmp_path)["example"]["cli"]
+    _expect(
+        report
+        == {
+            "commands": {
+                "empty": {},
+                "e": {},
+                "run": {
+                    "arguments": [
+                        {"names": ["--values"], "default": []},
+                        {"names": ["--mapping"], "default": {}},
+                        {"names": ["--optional"], "default": None},
+                        {"names": ["--enabled"], "default": False},
+                        {"names": ["--count"], "default": 0},
+                        {"names": ["--name"], "default": ""},
+                    ],
+                    "defaults": {"internal": None},
+                },
+            },
+        },
+        report,
+    )
 
 
 def test_inspection_omits_docstrings_and_test_implementation(tmp_path: Path) -> None:
@@ -6911,13 +6954,18 @@ def _inspection_diff_description(root: Path, description: str) -> None:
     )
 
 
-def _inspection_apply_diff(before: dict[str, Any], difference: str) -> dict[str, Any]:
+def _inspection_apply_diff(
+    before: dict[str, Any],
+    difference: str,
+    *,
+    diff_format: str = "jd",
+) -> dict[str, Any]:
     """Use jd itself to verify that an emitted patch reconstructs the inspection."""
     with TemporaryDirectory(prefix="afairesi-jd-patch-") as directory:
         patch = Path(directory) / "change.jd"
         patch.write_text(difference)
         completed = subprocess.run(  # noqa: S603 - Fixed jd executable; patch is a temporary fixture file.
-            ["jd", "-p", str(patch)],  # noqa: S607
+            ["jd", "-f", diff_format, "-p", str(patch)],  # noqa: S607
             input=json.dumps(before),
             capture_output=True,
             text=True,
@@ -7016,6 +7064,32 @@ def test_inspection_diff_covers_structural_and_nested_cli_changes(
     _expect(_inspection_apply_diff(before, completed.stdout) == after, completed)
 
 
+def test_inspection_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
+    """Translate native diff stdin to JSON Patch for JSON viewers and patching."""
+    before = _inspection_diff_repository(tmp_path)
+    _inspection_diff_description(tmp_path, "Changed")
+    difference = _run(tmp_path, "inspect", "diff").stdout
+    translated = subprocess.run(
+        ["jd", "-t", "jd2patch"],  # noqa: S607
+        input=difference,
+        capture_output=True,
+        text=True,
+        check=True,
+        timeout=10,
+    )
+    _expect(isinstance(json.loads(translated.stdout), list), translated)
+    _expect(
+        _inspection_apply_diff(before, translated.stdout, diff_format="patch")
+        == inspection_subject.inspect_repository(tmp_path),
+        translated,
+    )
+    _expect("afairesi-inspect-diff-" not in difference, difference)
+    _expect(
+        _run(tmp_path, "inspect", "diff").stdout == difference,
+        "temporary snapshot paths made identical diffs unstable",
+    )
+
+
 def test_inspection_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None:
     """Exclude the other branch's changes and ignore malformed working sources."""
     base = _inspection_diff_repository(tmp_path)
@@ -7091,6 +7165,9 @@ def test_inspection_diff_help_and_explicit_repository_selection(tmp_path: Path) 
     """Describe diffs outside Git while retaining positional path inspection."""
     help_output = _run(tmp_path, "inspect", "diff", "--help").stdout
     _expect("--cached" in help_output and "jd-compatible" in help_output, help_output)
+    _expect("--color" not in help_output, help_output)
+    _expect("| less" in help_output, help_output)
+    _expect("| jd -t jd2patch | jless" in help_output, help_output)
     _expect(not list(tmp_path.iterdir()), "help wrote files")
     root = tmp_path / "diff"
     root.mkdir()

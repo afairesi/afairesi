@@ -70,7 +70,7 @@
               <span class="tree-scope-label">afairesi repo</span>
               <details class="package" open>
                 <!-- prettier-ignore -->
-                <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/you/repo/</code></summary>
+                <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/&lt;user&gt;/&lt;repo&gt;/</code></summary>
                 <pre><code>    │                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
     │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
     ├── .gitignore          <span class="tree-comment"># Managed by afairesi.</span>
@@ -133,6 +133,21 @@
           <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
         </figure>
       </div>
+      <details class="installation">
+        <summary><span class="disclosure" aria-hidden="true"></span> Repository paths</summary>
+        <p>
+          Repositories live at <code>~/&lt;remote-hostname&gt;/&lt;repository-path&gt;</code>. The
+          full remote path is preserved, with a trailing <code>.git</code> removed. GitHub uses
+          <code>&lt;user&gt;/&lt;repo&gt;</code>; other hosts can use any path depth. For example,
+          the
+          <a href="https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git"
+            >Linux kernel repository</a
+          >
+          maps to:
+        </p>
+        <pre><code>https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+~/git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux</code></pre>
+      </details>
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
         <p>

@@ -8,6 +8,7 @@
     pkgs.bash
     pkgs.coreutils
     pkgs.git
+    pkgs.jd-diff-patch
     pkgs.jless
     pkgs.nix
     pkgs.tree
