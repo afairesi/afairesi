@@ -6438,6 +6438,33 @@ def test_default_output(): pass
     (library / "default.nix").write_text("{}")
 
 
+@pytest.mark.parametrize("directory", [".git", "prm", "tmp"])
+def test_resource_discovery_excludes_storage_directories(
+    tmp_path: Path,
+    directory: str,
+) -> None:
+    """Keep stored package and host markers out of inventories and whitelists."""
+    _inspection_repository(tmp_path)
+    before = inspection_subject.inspect_repository(tmp_path)
+    packages = inspection_subject.detect_packages(tmp_path)
+    allowed = inspection_subject.allowed_paths(tmp_path, packages)
+    storage = tmp_path / directory
+    storage.mkdir()
+    (storage / "default.nix").write_text("{}")
+    (storage / "configuration.nix").write_text("{}")
+    (storage / "main.py").write_text("def main(): pass\n")
+    _expect(
+        inspection_subject.inspect_repository(tmp_path) == before,
+        "storage contents were reported as resources",
+    )
+    discovered, issues = inspection_subject.inspect_structure(tmp_path)
+    _expect(discovered == packages and not issues, issues)
+    _expect(
+        inspection_subject.allowed_paths(tmp_path, discovered) == allowed,
+        "storage contents changed the managed file whitelist",
+    )
+
+
 def test_inspection_is_read_only(tmp_path: Path) -> None:
     """Inspect source containing failing statements without executing or writing."""
     _inspection_repository(tmp_path)

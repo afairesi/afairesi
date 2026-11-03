@@ -282,27 +282,39 @@ def _package_kind(name: str, markers: set[str]) -> str:
     return matches[0] if matches else "nix"
 
 
-def detect_packages(root: Path) -> list[Package]:
-    """Detect supported packages from unambiguous marker files."""
+def resource_directories(root: Path) -> list[Path]:
+    """List resource directories, excluding storage trees and Git metadata."""
     if not root.is_dir():
         return []
-    result: list[Package] = []
-    for package_root in sorted(
+    return sorted(
         path
         for path in root.iterdir()
         if path.is_dir()
         and not path.is_symlink()
-        and path.name not in {PRM_NAME, TMP_NAME}
-        and (
-            (path / "default.nix").is_file()
-            or any((path / marker).is_file() for marker in KIND_MARKERS.values())
-        )
-    ):
+        and path.name not in {".git", PRM_NAME, TMP_NAME}
+    )
+
+
+def detect_hosts(root: Path) -> list[Path]:
+    """Detect hosts under the same directory rules as packages."""
+    return [
+        path
+        for path in resource_directories(root)
+        if (path / "configuration.nix").is_file()
+    ]
+
+
+def detect_packages(root: Path) -> list[Package]:
+    """Detect supported packages from unambiguous marker files."""
+    result: list[Package] = []
+    for package_root in resource_directories(root):
         markers = {
             marker
             for marker in KIND_MARKERS.values()
             if (package_root / marker).is_file()
         }
+        if not markers and not (package_root / "default.nix").is_file():
+            continue
         result.append(
             Package(
                 package_root.name,
@@ -343,11 +355,6 @@ def validate_python_package_names(packages: list[Package]) -> None:
         modules[module] = package.name
 
 
-def validate_host_name(name: str) -> None:
-    """Apply the shared resource naming conventions to hosts."""
-    validate_name(name)
-
-
 def package_files(package: Package) -> set[Path]:
     """Return permitted regular files for a package kind."""
     relative = Path() / package.name
@@ -376,18 +383,12 @@ def required_package_files(package: Package) -> set[Path]:
 def allowed_paths(root: Path, packages: list[Package]) -> set[Path]:
     """Compute the repository whitelist represented by .gitignore."""
     allowed = {Path(item) for item in ROOT_FILES if (root / item).exists()}
-    if root.is_dir():
-        for host in root.iterdir():
-            if (
-                host.is_dir()
-                and not host.is_symlink()
-                and (host / "configuration.nix").exists()
-            ):
-                validate_host_name(host.name)
-                allowed.add(Path() / host.name / "configuration.nix")
-                hardware = Path() / host.name / "hardware-configuration.nix"
-                if (root / hardware).exists():
-                    allowed.add(hardware)
+    for host in detect_hosts(root):
+        validate_name(host.name)
+        allowed.add(Path(host.name) / "configuration.nix")
+        hardware = Path(host.name) / "hardware-configuration.nix"
+        if (root / hardware).exists():
+            allowed.add(hardware)
     for package in packages:
         allowed.update(
             path for path in package_files(package) if (root / path).exists()
@@ -1831,7 +1832,7 @@ def add_package(
 
 def add_host(root: Path, name: str) -> None:
     """Create a host and stage its canonical configuration."""
-    validate_host_name(name)
+    validate_name(name)
     relative = Path() / name / "configuration.nix"
     path = root / relative
     if path.parent.exists():
@@ -1899,12 +1900,7 @@ def _parse_resource_path(
     name = path.name
     if kind is None and root is not None:
         kind = "package" if (root / path / "default.nix").is_file() else "host"
-    if kind == "host":
-        validate_host_name(name)
-    elif kind == "package":
-        validate_name(name)
-    else:
-        validate_name(name)
+    validate_name(name)
     return kind or "package", name, path
 
 
@@ -4088,13 +4084,7 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
-    host_names = {
-        host.name
-        for host in root.iterdir()
-        if host.is_dir()
-        and not host.is_symlink()
-        and (host / "configuration.nix").is_file()
-    }
+    host_names = {host.name for host in detect_hosts(root)}
     resources: dict[str, Any] = {name: {"type": "host"} for name in host_names}
     for package in detect_packages(root):
         cli = None

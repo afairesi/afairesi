@@ -27,7 +27,14 @@ def test_terminal_recording_and_nonzero_exit(
     recorder = Recorder(stream, speed=2, idle_limit=0.1)
     recorder.marker("Terminal output")
     recorder.command(
-        [sys.executable, "-c", "import os; print(os.isatty(1)); print('日本語')"],
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os; print(os.isatty(1)); print('日本語'); "
+                "size = os.get_terminal_size(1); print(f'{size.columns}x{size.lines}')"
+            ),
+        ],
         tmp_path,
         dict(os.environ),
         timeout=5,
@@ -55,6 +62,9 @@ def test_terminal_recording_and_nonzero_exit(
     output = "".join(event[2] for event in events if event[1] == "o")
     if "True\r\n日本語\r\n" not in output or "diagnostic\r\n" not in output:
         raise AssertionError(output)
+    if f"{header['width']}x{header['height']}\r\n" not in output:
+        message = "Recorded dimensions differ from the command's terminal"
+        raise AssertionError(message)
     if capsys.readouterr().out != output:
         message = "Chapter markers changed the displayed terminal output"
         raise AssertionError(message)

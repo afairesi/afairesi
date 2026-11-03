@@ -28,6 +28,8 @@ if TYPE_CHECKING:
     from typing import TextIO
 
 RUNTIME_DIR = Path.home() / "github.com/afairesi/afairesi/demo/tmp"
+TERMINAL_COLUMNS = 100
+TERMINAL_ROWS = 30
 
 POST = """A small notes site should be easy to maintain. I keep the articles and the
 tools that help publish them in separate repositories, so each project has a
@@ -74,8 +76,8 @@ class Recorder:
         self.emit_json(
             {
                 "version": 2,
-                "width": 100,
-                "height": 30,
+                "width": TERMINAL_COLUMNS,
+                "height": TERMINAL_ROWS,
                 "timestamp": int(time.time()),
                 "title": "afairesi: build a reading-time tool and notes site",
                 "env": {"TERM": "xterm-256color"},
@@ -127,7 +129,11 @@ class Recorder:
         process = None
         output_lines = 0
         try:
-            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+            fcntl.ioctl(
+                slave,
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", TERMINAL_ROWS, TERMINAL_COLUMNS, 0, 0),
+            )
             process = subprocess.Popen(  # noqa: S603 - Explicit demo argv, never shell input.
                 arguments,
                 cwd=cwd,
@@ -198,7 +204,6 @@ class Demo:
         recorder: Recorder,
     ) -> None:
         """Prepare private Git configuration and identities."""
-        self.root = root
         self.recorder = recorder
         self.cwd = root
         self.repositories: list[Path] = []
@@ -285,7 +290,7 @@ class Demo:
 
     def register_repository(self, name: str) -> None:
         """Register an empty local seed through the normal hosted-URL workflow."""
-        seed = self.root / ".remotes" / name
+        seed = self.home / ".remotes" / name
         seed.mkdir(parents=True)
         remote = f"https://github.com/afairesi/{name}.git"
         for arguments in (
@@ -309,14 +314,8 @@ class Demo:
         self.register_repository(name)
         self.run("afairesi", "repo", "init")
 
-    def write_tool(self, *, adjustable: bool) -> None:
+    def write_tool(self) -> None:
         """Prepare the article tool and tests without printing source code."""
-        option = (
-            '    parser.add_argument("--words-per-minute", type=int, default=200)\n'
-            if adjustable
-            else ""
-        )
-        rate = "options.words_per_minute" if adjustable else "200"
         self.write(
             "reading_time/main.py",
             "#!/usr/bin/env python3\n# Copyright (c) 2026- Demo authors\n"
@@ -332,20 +331,22 @@ class Demo:
             '    """Read an article and print its estimated reading time."""\n'
             "    parser = argparse.ArgumentParser(description=__doc__)\n"
             '    parser.add_argument("path", type=Path)\n'
-            + option
-            + "    options = parser.parse_args()\n"
+            '    parser.add_argument("--words-per-minute", type=int, default=200)\n'
+            "    options = parser.parse_args()\n"
             "    try:\n"
             "        words = len(options.path.read_text().split())\n"
-            f"        minutes = reading_minutes(words, {rate})\n"
+            "        minutes = reading_minutes(words, options.words_per_minute)\n"
             "    except (OSError, ValueError) as error:\n"
             "        parser.error(str(error))\n"
             '    sys.stdout.write(f"{minutes} min read\\n")\n\n\n'
             'if __name__ == "__main__":\n    main()\n',
         )
-        tests = (
+        self.write(
+            "reading_time/test_main.py",
             "# Copyright (c) 2026- Demo authors\n"
             '"""Check reading-time estimates and command line behavior."""\n'
-            "import pytest\nfrom reading_time.main import reading_minutes\n\n\n"
+            "import sys\nfrom pathlib import Path\nimport pytest\n"
+            "from reading_time.main import main, reading_minutes\n\n\n"
             "@pytest.mark.parametrize(\n"
             '    ("words", "expected"), [(0, 0), (1, 1), (200, 1), (201, 2)],\n'
             ")\n"
@@ -354,34 +355,22 @@ class Demo:
             "    if reading_minutes(words) != expected:\n"
             '        message = "Incorrect reading time"\n'
             "        raise AssertionError(message)\n"
+            "\n\ndef test_reading_speed(\n"
+            "    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,\n"
+            "    capsys: pytest.CaptureFixture[str],\n"
+            ") -> None:\n"
+            '    """Use the requested reading speed in the CLI output."""\n'
+            '    article = tmp_path / "article.txt"\n'
+            '    article.write_text("one two three four")\n'
+            "    arguments = [\n"
+            '        "reading_time", str(article), "--words-per-minute", "2",\n'
+            "    ]\n"
+            '    monkeypatch.setattr(sys, "argv", arguments)\n'
+            "    main()\n"
+            '    if capsys.readouterr().out != "2 min read\\n":\n'
+            '        message = "The reading speed option was ignored"\n'
+            "        raise AssertionError(message)\n",
         )
-        if adjustable:
-            tests = tests.replace(
-                "import pytest\n",
-                "import sys\nfrom pathlib import Path\nimport pytest\n",
-            )
-            tests = tests.replace(
-                "import reading_minutes\n",
-                "import main, reading_minutes\n",
-            )
-            tests += (
-                "\n\ndef test_reading_speed(\n"
-                "    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,\n"
-                "    capsys: pytest.CaptureFixture[str],\n"
-                ") -> None:\n"
-                '    """Use the requested reading speed in the CLI output."""\n'
-                '    article = tmp_path / "article.txt"\n'
-                '    article.write_text("one two three four")\n'
-                "    arguments = [\n"
-                '        "reading_time", str(article), "--words-per-minute", "2",\n'
-                "    ]\n"
-                '    monkeypatch.setattr(sys, "argv", arguments)\n'
-                "    main()\n"
-                '    if capsys.readouterr().out != "2 min read\\n":\n'
-                '        message = "The reading speed option was ignored"\n'
-                "        raise AssertionError(message)\n"
-            )
-        self.write("reading_time/test_main.py", tests)
 
     def python(self) -> None:
         """Create and verify the complete reading-time tool in one pass."""
@@ -389,7 +378,7 @@ class Demo:
         self.repository("notes-tools")
         self.run("afairesi", "repo", "add", "reading_time", "python")
         self.recorder.note("Implement the tool and its reading-speed tests.")
-        self.write_tool(adjustable=True)
+        self.write_tool()
         self.write(
             "reading_time/default.nix",
             (self.cwd / "reading_time/default.nix")
