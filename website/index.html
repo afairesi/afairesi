@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — A CLI and Nix flake library for managing your home directory, repositories, packages, and NixOS configurations."
+      content="afairesi — A design principle for satisfying requirements with the fewest independent decisions. Implemented as a CLI and Nix flake library for managing your home directory, repositories, packages, and NixOS configurations."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -38,18 +38,19 @@
       <section class="intro" aria-labelledby="principle">
         <h2 id="principle">Declare what matters. Derive the rest.</h2>
         <p>
-          A CLI and Nix flake library for managing your home directory, repositories, packages, and
-          NixOS configurations.
+          A design principle for satisfying requirements with the fewest independent decisions.
+          Implemented as a CLI and Nix flake library for managing your home directory, repositories,
+          packages, and NixOS configurations.
         </p>
       </section>
       <details class="installation">
-        <summary><span class="disclosure" aria-hidden="true"></span> Install on NixOS</summary>
-        <p>As a library (<code>flake.nix</code>):</p>
+        <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
+        <p>Requirements: NixOS with Preservation and Git.</p>
+        <p>Add the input to <code>flake.nix</code>:</p>
         <pre><code>{
   inputs.afairesi.url = "github:afairesi/afairesi";
-  outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
 }</code></pre>
-        <p>As a CLI (your NixOS configuration):</p>
+        <p>Add the CLI to your NixOS configuration:</p>
         <pre><code>{ inputs, pkgs, ... }:
 {
   environment.systemPackages = [
