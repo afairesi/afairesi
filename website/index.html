@@ -47,18 +47,33 @@
       </section>
       <details class="installation">
         <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
-        <p>Requirements: NixOS with Preservation and Git.</p>
-        <p>Add the input to <code>flake.nix</code>:</p>
+        <p>
+          Requirements: Git and Nix with flakes enabled on Linux or Apple Silicon macOS. NixOS with
+          Preservation is used for the full system layout shown below.
+        </p>
+        <p>Use this <code>flake.nix</code> to derive packages, checks, and hosts:</p>
         <pre><code>{
   inputs.afairesi.url = "github:afairesi/afairesi";
+  outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
 }</code></pre>
-        <p>Add the CLI to your NixOS configuration:</p>
+        <p>
+          To install the CLI on a host managed by this flake, add to its
+          <code>configuration.nix</code> (<code>mkFlake</code> supplies <code>inputs</code>):
+        </p>
         <pre><code>{ inputs, pkgs, ... }:
 {
   environment.systemPackages = [
     inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
   ];
 }</code></pre>
+        <p>Or start a shell with the CLI:</p>
+        <pre><code>nix shell github:afairesi/afairesi</code></pre>
+        <p>In an empty Git worktree, generate the flake above and add a package:</p>
+        <pre><code>afairesi repo init
+afairesi repo add example python</code></pre>
+        <p>To manage hosted repositories as home submodules:</p>
+        <pre><code>afairesi home init
+afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
       </details>
       <div class="overview">
         <figure

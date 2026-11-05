@@ -867,30 +867,6 @@ def _meta_description(source: str) -> str | None:
     return nix_syntax.string_value(document, matches[0]) if len(matches) == 1 else None
 
 
-def _template_binding(document: nix_syntax.Document, name: str) -> Node | None:
-    """Find an outer template binding without interpreting comments or inner scopes."""
-    container = document.root
-    while container.type in {"function_expression", "parenthesized_expression"}:
-        child = container.child_by_field_name(
-            "body" if container.type == "function_expression" else "expression",
-        )
-        if child is None:
-            return None
-        container = child
-    if container.type != "let_expression":
-        return None
-    bindings = nix_syntax.binding_set(container)
-    return next(
-        (
-            binding.child_by_field_name("expression")
-            for binding in ([] if bindings is None else bindings.named_children)
-            if (attrpath := binding.child_by_field_name("attrpath")) is not None
-            and nix_syntax.static_attrpath(document, attrpath) == (name,)
-        ),
-        None,
-    )
-
-
 def _nix_binding_edits(
     document: nix_syntax.Document,
     container: Node,
@@ -1025,12 +1001,14 @@ def _shared_package_required_edits(
     package: Package,
     source: str,
 ) -> dict[str, list[tuple[int, int, bytes]]]:
-    """Enforce shared language constructors while retaining custom attributes."""
+    """Enforce shared constructors while retaining custom attributes."""
     document = nix_syntax.parse(source)
     _scope, body = _package_body(document)
     argument = body.child_by_field_name("argument")
     function = body.child_by_field_name("function")
     language, builder = {
+        "html": ("HTML", "mkHtmlPackage"),
+        "latex": ("LaTeX", "mkLatexPackage"),
         "python": ("Python", "mkPythonPackage"),
         "lean4": ("Lean 4", "mkLean4Package"),
     }[package.kind]
@@ -1048,7 +1026,9 @@ def _shared_package_required_edits(
     edits = {
         "pkgs": _nix_binding_edits(document, argument, ("pkgs",), "pkgs"),
         "src": _nix_binding_edits(document, argument, ("src",), "./."),
-        "executable": _nix_binding_edits(
+    }
+    if package.kind in {"python", "lean4"}:
+        edits["executable"] = _nix_binding_edits(
             document,
             argument,
             ("executable",),
@@ -1057,8 +1037,7 @@ def _shared_package_required_edits(
             or source_python_has_main(read_regular(package.root / "main.py"))
             else "false",
             overwrite=package.kind == "python",
-        ),
-    }
+        )
     outer = document.root
     while outer.type == "parenthesized_expression":
         outer = cast("Node", outer.child_by_field_name("expression"))
@@ -1097,102 +1076,15 @@ def _canonical_shared_default(package: Package, source: str) -> str:
 
 
 def canonical_package_default(package: Package) -> str | None:
-    """Render a package definition while retaining package-specific fields."""
+    """Render a shared package definition while retaining package-specific fields."""
     if package.kind == "nix":
         return None
     source = read_regular(package.root / "default.nix")
     if source is None:
-        rendered = scaffold(package.kind, package.name, None)[
+        source = scaffold(package.kind, package.name, None)[
             Path() / package.name / "default.nix"
         ]
-        return (
-            _canonical_shared_default(package, rendered)
-            if package.kind in {"python", "lean4"}
-            else rendered
-        )
-    if package.kind in {"python", "lean4"}:
-        return _canonical_shared_default(package, source)
-    document = nix_syntax.parse(source, str(package.root / "default.nix"))
-    scope, body = _package_body(document)
-    function = body.child_by_field_name("function")
-    argument = body.child_by_field_name("argument")
-    constructor = {
-        "html": "pkgs.writeShellApplication",
-        "latex": "pkgs.stdenv.mkDerivation",
-    }[package.kind]
-    if (
-        body.type != "apply_expression"
-        or function is None
-        or nix_syntax.compact(document.text(function)) != constructor
-        or argument is None
-        or argument.type not in {"attrset_expression", "rec_attrset_expression"}
-    ):
-        msg = f"{package.kind} package must call {constructor} with an attribute set"
-        raise CommandError(msg)
-    rendered = scaffold(package.kind, package.name, package_description(package))[
-        Path() / package.name / "default.nix"
-    ]
-    template = nix_syntax.parse(rendered)
-    _template_scope, template_body = _package_body(template)
-    template_argument = template_body.child_by_field_name("argument")
-    if template_argument is None:
-        msg = "Package scaffold omitted its attributes"
-        raise AssertionError(msg)
-    required = (
-        ("name", "text")
-        if package.kind == "html"
-        else ("pname", "buildPhase", "installPhase", "src", "strictDeps")
-    )
-    defaults = ("runtimeInputs",) if package.kind == "html" else ("nativeBuildInputs",)
-    edits = []
-    for name in (*required, *defaults):
-        value = (
-            "pname"
-            if name == "pname"
-            else template.text(
-                _attrset_expression(template, template_argument, (name,))[0],
-            )
-        )
-        edits.extend(
-            _nix_binding_edits(
-                document,
-                argument,
-                (name,),
-                value,
-                overwrite=name not in defaults,
-            ),
-        )
-    bindings = _canonical_template_bindings(package, document, template)
-    if scope is None:
-        declarations = " ".join(f"{name} = {value};" for name, value in bindings)
-        edits.append(
-            (body.start_byte, body.start_byte, f"let {declarations} in ".encode()),
-        )
-    else:
-        for name, value in bindings:
-            edits.extend(_nix_binding_edits(document, scope, (name,), value))
-    return cast("bytes", nix_syntax.apply_edits(source.encode(), edits)).decode()
-
-
-def _canonical_template_bindings(
-    package: Package,
-    document: nix_syntax.Document,
-    template: nix_syntax.Document,
-) -> list[tuple[str, str]]:
-    """Collect required local names while preserving existing site bindings."""
-    pname = _template_binding(template, "pname")
-    if pname is None:
-        msg = "Package scaffold omitted its name"
-        raise AssertionError(msg)
-    bindings = [("pname", template.text(pname))]
-    if package.kind == "html":
-        site = _template_binding(template, "site")
-        if site is None:
-            msg = "HTML scaffold omitted its site"
-            raise AssertionError(msg)
-        if _template_binding(document, "site") is None:
-            bindings.append(("site", template.text(site)))
-    return bindings
+    return _canonical_shared_default(package, source)
 
 
 def _write_managed_nix(
@@ -1445,6 +1337,8 @@ def _flake_resource_issues(root: Path) -> list[str]:
         "buildPythonApplication": (1, "NAME/default.nix"),
         "derivation": (1, "NAME/default.nix"),
         "mkDerivation": (1, "NAME/default.nix"),
+        "mkHtmlPackage": (1, "NAME/default.nix"),
+        "mkLatexPackage": (1, "NAME/default.nix"),
         "mkLean4Package": (1, "NAME/default.nix"),
         "mkPythonPackage": (1, "NAME/default.nix"),
         "nixosSystem": (1, "NAME/configuration.nix"),
@@ -1601,74 +1495,18 @@ def scaffold(
   src = ./.;
 }
 """,
-        "html": """{ pkgs, ... }:
-let
-  pname = baseNameOf ./.;
-  site = pkgs.runCommand "${pname}-site" { } ''
-    mkdir -p "$out"
-    cp ${./index.html} "$out/index.html"
-    for asset in script.js style.css; do
-      if [ -f ${./.}/"$asset" ]; then
-        cp ${./.}/"$asset" "$out/$asset"
-      fi
-    done
-    if [ -d ${./.}/prm ]; then
-      cp -R ${./.}/prm "$out/prm"
-      chmod -R u+w "$out/prm"
-    fi
-    runHook postInstall
-  '';
-in
-pkgs.writeShellApplication {
+        "html": """{ inputs, pkgs, ... }:
+(inputs.afairesi or inputs.self).lib.mkHtmlPackage {
+  inherit pkgs;
   meta.description = __DESCRIPTION__;
-  name = pname;
-  runtimeInputs = [ pkgs.http-server ]
-    ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux [ pkgs.xdg-utils ];
-  text = ''
-    open_args=()
-    if [[ -n "''${DISPLAY:-}" || -n "''${WAYLAND_DISPLAY:-}" ]]; then
-      open_args=(-o /)
-    fi
-    server_args=()
-    for argument in "$@"; do
-      case "$argument" in
-        --no-open)
-          open_args=()
-          ;;
-        -o|--o|-o=*|--o=*|--no-o)
-          open_args=()
-          server_args+=("$argument")
-          ;;
-        -h|--help)
-          printf '%s\\n' 'Desktop runs open the browser; --no-open disables this.'
-          server_args+=("$argument")
-          ;;
-        *)
-          server_args+=("$argument")
-          ;;
-      esac
-    done
-    exec http-server ${site} "''${open_args[@]}" "''${server_args[@]}"
-  '';
+  src = ./.;
 }
 """,
-        "latex": """{ pkgs, ... }:
-let
-  pname = baseNameOf ./.;
-in
-pkgs.stdenv.mkDerivation {
-  inherit pname;
-  buildPhase = ''
-    latexmk -pdf ms.tex
-  '';
-  installPhase = ''
-    install -Dm644 ms.pdf "$out/ms.pdf"
-  '';
+        "latex": """{ inputs, pkgs, ... }:
+(inputs.afairesi or inputs.self).lib.mkLatexPackage {
+  inherit pkgs;
   meta.description = __DESCRIPTION__;
-  nativeBuildInputs = [ pkgs.texliveFull ];
   src = ./.;
-  strictDeps = true;
-  version = "0.0.0";
 }
 """,
         "nix": """{ pkgs, ... }:
@@ -4569,7 +4407,7 @@ def _converge_home_modules(root: Path, *, dry_run: bool) -> bool:
 
 def _render_home_ignore(patterns: list[str]) -> str:
     """Render the home whitelist with sorted entries after its ignore-all rule."""
-    return "\n".join(["*", *sorted(patterns)]) + "\n"
+    return "\n".join(["*", *sorted(set(patterns))]) + "\n"
 
 
 def _home_ignore_source(root: Path) -> str:

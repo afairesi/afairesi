@@ -1,4 +1,6 @@
 {
+  mkHtmlPackage = import ./html-package.nix;
+  mkLatexPackage = import ./latex-package.nix;
   mkLean4Package = import ./lean4-package.nix;
   mkPythonPackage = import ./python-package.nix;
   mkCoverage = import ./coverage.nix;

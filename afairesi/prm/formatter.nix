@@ -31,6 +31,7 @@ let
   pythonPackageNames = if enableMypy then packageNamesFor "main.py" else [ ];
   rawFormatter = treefmtEval.config.build.wrapper;
   treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
+    enableDefaultExcludes = false;
     programs = {
       actionlint = {
         enable = true;
@@ -140,11 +141,7 @@ let
         };
         remove-empty-lines = {
           command = inputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines;
-          includes = [
-            ".gitignore"
-            "LICENSE"
-            "flake.lock"
-          ];
+          includes = [ ".gitignore" ];
           priority = 2;
         };
         ruff-check.options = [

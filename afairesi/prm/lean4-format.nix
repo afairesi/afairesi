@@ -42,6 +42,9 @@ pkgs.writeShellApplication {
       export PACKAGE_E2E_EXECUTABLE=${pkgs.lib.getExe packageDrv}
     ''}
     format_status=0
+    for relative in "''${files[@]}"; do
+      (cd "$workspace" && lake env lean --run ${./lean4-uncomment.lean} "$relative") || format_status=$?
+    done
     lean-fmt format --root "$workspace" --no-cache "''${files[@]}" || format_status=$?
     for relative in "''${files[@]}"; do
       if ! cmp -s "$workspace/$relative" "$source_root/$relative"; then

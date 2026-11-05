@@ -191,9 +191,26 @@ pkgs.runCommand "afairesi-consumer-contract"
     chmod -R u+w formatted
     cd formatted
     touch flake.nix
+    printf '%s\n' '-- ordinary explanation' '/- outer /- nested -/ explanation -/' >> lean-example/main.lean
+    cat >> lean-example/main.lean <<'LEAN'
+    example : String := "-- literal /- literal"
+    example : String := r#""-- raw literal /- literal"#
+    example : String := s!"{("-- interpolation")} /- text"
+    example : Nat := 1 /- inline explanation -/ + 2
+    LEAN
+    sed -i 's/$/\r/' lean-example/main.lean
+    cp lean-example/prm/Support.lean expected-support.lean
     treefmt --no-cache {lean-example,test_main}/{main,test_main}.lean
     treefmt --no-cache --fail-on-change {lean-example,test_main}/{main,test_main}.lean
     grep -F -- '-- lean-fmt: ignore[FMT005]' lean-example/main.lean
+    ! grep -F 'ordinary explanation' lean-example/main.lean
+    ! grep -F 'nested -/ explanation' lean-example/main.lean
+    ! grep -F 'inline explanation' lean-example/main.lean
+    grep -F '"-- literal /- literal"' lean-example/main.lean
+    grep -F 'r#""-- raw literal /- literal"#' lean-example/main.lean
+    grep -F '"-- interpolation"' lean-example/main.lean
+    grep -F '/-- Print the dependency value' lean-example/main.lean
+    cmp expected-support.lean lean-example/prm/Support.lean
     grep -F 'set_option linter.missingDocs false in' test_main/main.lean
     cp test_main/main.lean expected-main.lean
     cp ${consumerSource}/test_main/main.lean test_main/main.lean

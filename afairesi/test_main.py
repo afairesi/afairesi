@@ -152,7 +152,7 @@ def _make_source_package(root: Path, name: str, source: str) -> Path:
 
 
 def _fixture_git(root: Path, *arguments: str) -> str:
-    """Run fixture Git commands with a local identity and no signing."""
+    """Run fixture Git commands without signing or background maintenance."""
     return _git(
         root,
         "-c",
@@ -161,6 +161,8 @@ def _fixture_git(root: Path, *arguments: str) -> str:
         "user.email=test@example.invalid",
         "-c",
         "commit.gpgsign=false",
+        "-c",
+        "maintenance.auto=false",
         *arguments,
     )
 
@@ -1447,41 +1449,29 @@ def test_generated_templates_evaluate_metadata_preserve_scopes_and_install_asset
                 f"(let {binding} = [ pkgs.inner ]; in [ pkgs.git ]) ++ [ pkgs.curl ]"
             )
             dependency = "pkgs.http-server" if kind == "html" else "pkgs.texliveFull"
-            source = (
-                source.replace(
-                    f"{binding} = [ {dependency} ]",
-                    f"{binding} = {expression} ++ [ {dependency} ]",
-                )
-                .replace(
-                    "let\n",
-                    f"let\n  # {binding} = [ pkgs.fromComment ];\n"
-                    f"  ignored = let {binding} = [ pkgs.fromNested ]; in null;\n",
-                    1,
-                )
-                .replace(
-                    "  meta.description =",
-                    '  passthru.custom = "preserved";\n  meta.description =',
-                )
+            source = source.replace(
+                "  meta.description =",
+                f"  {binding} = {expression} ++ [ {dependency} ];\n"
+                '  passthru.custom = "preserved";\n  meta.description =',
             )
             if kind == "html":
                 resource = root / "prm/source.bin"
                 resource.parent.mkdir()
                 resource.write_bytes(b"copied resource")
                 source = source.replace(
-                    'pkgs.runCommand "${pname}-site" { }',
-                    (
-                        'pkgs.runCommand "${pname}-site" { postInstall = '
-                        "let postInstall = \"inner\"; in ''cp "
-                        "${../prm/source.bin} \"$out/prm/copied.bin\"''; }"
-                    ),
+                    "  meta.description =",
+                    '  postInstall = let postInstall = "inner"; in '
+                    "''cp ${../prm/source.bin} \"$out/prm/copied.bin\"'';\n"
+                    "  meta.description =",
                 )
             else:
                 source = source.replace(
                     f"{binding} = {expression} ++ [ {dependency} ];",
                     f"inherit {binding};",
                 ).replace(
-                    "let\n",
-                    f"let\n  {binding} = {expression} ++ [ {dependency} ];\n",
+                    "(inputs.afairesi or inputs.self)",
+                    f"let {binding} = {expression} ++ [ {dependency} ]; "
+                    "in (inputs.afairesi or inputs.self)",
                     1,
                 )
         definition.write_text(source)
@@ -3752,6 +3742,8 @@ def test_home_sorts_gitmodules_and_preserves_settings(
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     _home_test_run(tmp_path, "init")
+    ignore = home / ".gitignore"
+    ignore.write_text(ignore.read_text() + "!/extra\n!/extra\n!/.gitignore\n")
     prefix = "# Home repositories\n"
     last = (
         '[submodule "zzz"] # retained comment\n'
@@ -3777,6 +3769,10 @@ def test_home_sorts_gitmodules_and_preserves_settings(
     expected = prefix + first + other + last
     _expect(modules.read_text() == expected, modules.read_text())
     _expect(_git(home, "show", ":.gitmodules") == expected, modules)
+    patterns = ignore.read_text().splitlines()
+    _expect(len(patterns) == len(set(patterns)), patterns)
+    _expect(patterns.count("!/extra") == 1, patterns)
+    _expect(_git(home, "show", ":.gitignore") == ignore.read_text(), ignore)
     before = _snapshot(home)
     _home_test_run(tmp_path, command)
     _expect(_snapshot(home) == before, "repeated command changed home state")
@@ -4003,6 +3999,40 @@ def test_web_formatting_preserves_literal_line_breaks() -> None:
         )
         _expect("`first\n\nsecond`" in script.read_text(), script.read_text())
         _expect("first\n\nsecond" in html.read_text(), html.read_text())
+
+
+def test_formatting_normalizes_gitignore_and_preserves_metadata_and_storage() -> None:
+    """Remove blank lines only from the whitelist and exclude storage files."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "site", "html")
+        metadata = {
+            ".gitignore": "*\n\n!/.gitignore\n",
+            "LICENSE": "first\n\nsecond\n",
+            "flake.lock": "{\n\n}\n",
+        }
+        for name, source in metadata.items():
+            (root / name).write_text(source)
+        excluded = ("prm", "tmp", "site/prm", "site/tmp")
+        supporting_source = "# Explanation\nvalue=  1\n"
+        for name in excluded:
+            directory = root / name
+            directory.mkdir(parents=True)
+            (directory / "main.py").write_text(supporting_source)
+        _run(
+            root,
+            "--no-cache",
+            *metadata,
+            *(f"{name}/main.py" for name in excluded),
+            executable="treefmt",
+        )
+        for name, source in metadata.items():
+            expected = "*\n!/.gitignore\n" if name == ".gitignore" else source
+            _expect((root / name).read_text() == expected, name)
+        for name in excluded:
+            _expect(
+                (root / name / "main.py").read_text() == supporting_source,
+                name,
+            )
 
 
 _campaign_run = partial(_run, scope=("repo", "test"))
