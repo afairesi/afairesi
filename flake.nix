@@ -9,10 +9,8 @@
   outputs =
     inputs:
     let
+      inherit ((import ./afairesi_nix/main.nix inputs)) lib;
       flake = lib.mkFlake { inherit inputs; };
-      lib = (import ./afairesi/prm/builders.nix) // {
-        mkFlake = import ./afairesi/prm/mk-flake.nix inputs;
-      };
     in
     flake
     // {

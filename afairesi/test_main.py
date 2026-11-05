@@ -31,6 +31,16 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
+def _nix_source() -> Path:
+    """Locate the Nix library in the checkout or the isolated check environment."""
+    return Path(
+        os.environ.get(
+            "AFAIRESI_NIX_SOURCE",
+            str(Path(__file__).resolve().parents[1] / "afairesi_nix"),
+        ),
+    )
+
+
 def _run(
     root: Path,
     *arguments: str,
@@ -371,8 +381,8 @@ def _template_expression(root: Path, name: str) -> str:
         + ")) // attrs; }; "
         + f"package = import {root / name / 'default.nix'} "
         + "{ inherit pkgs; "
-        + "inputs.self.lib = import "
-        + f"{Path(__file__).with_name('prm') / 'builders.nix'}; "
+        + "inputs.self.lib = (import "
+        + f"{_nix_source() / 'main.nix'} {{}}).lib; "
         + "}; in "
     )
 
@@ -424,8 +434,8 @@ def _check_launcher_environment(
         "python = python // { withPackages = select: { selected = select { "
         'hypothesis = "hypothesis"; pytest = "pytest"; }; }; }; '
         f"meta = {metadata}; }}; "
-        f"lib = import {Path(__file__).with_name('prm') / 'builders.nix'}; "
-        f"in import {Path(__file__).with_name('prm') / 'python-check.nix'} {{ "
+        f"nixLibrary = import {_nix_source() / 'main.nix'} {{}}; "
+        "lib = nixLibrary.lib; in nixLibrary.pythonCheck { "
         "pkgs = checkPkgs; inherit packageDrv; "
         "testEnvironment = lib.mkTestEnvironment { "
         "pkgs = checkPkgs; inherit packageDrv; }; "
@@ -501,6 +511,69 @@ def test_create_stages_the_requested_resource_and_whitelist(
         for path in staged:
             _expect(_git(root, "show", f":{path}") == (root / path).read_text(), path)
         _expect(_git(root, "rev-parse", "HEAD") == head, "create committed changes")
+
+
+@pytest.mark.parametrize("implementation", [False, True])
+@pytest.mark.parametrize("tests", [False, True])
+def test_nix_optional_sources_survive_repair_and_rename(
+    *,
+    implementation: bool,
+    tests: bool,
+) -> None:
+    """Keep all four optional-file combinations without evaluating Nix source."""
+    with _fresh_repository() as root:
+        _run(root, "add", "example", "nix")
+        files = {"default.nix": (root / "example/default.nix").read_text()}
+        for name, enabled in (("main.nix", implementation), ("test_main.nix", tests)):
+            if enabled:
+                files[name] = 'throw "source validation must not evaluate this"\n'
+                (root / "example" / name).write_text(files[name])
+        _repair_flake(root)
+        _run(root, "mv", "example", "renamed")
+        _repair_flake(root)
+        _expect(
+            {path.name: path.read_text() for path in (root / "renamed").iterdir()}
+            == files,
+            "repair or rename changed the optional Nix sources",
+        )
+        _expect(
+            set(_git(root, "ls-files", "--", "renamed").splitlines())
+            == {f"renamed/{name}" for name in files},
+            "optional Nix sources were not tracked",
+        )
+        report = json.loads(_run(root, "inspect").stdout)["renamed"]
+        _expect(report["type"] == "nix", report)
+        _expect(report.get("tests", []) == (["test_main.nix"] if tests else []), report)
+
+
+@pytest.mark.parametrize("filename", ["main.nix", "test_main.nix"])
+def test_nix_optional_sources_are_syntax_checked(filename: str) -> None:
+    """Reject malformed optional Nix files during source validation."""
+    with _fresh_repository() as root:
+        _run(root, "add", "example", "nix")
+        (root / "example" / filename).write_text("{ invalid = ; }\n")
+        result = _repair_flake(root, code=1)
+        _expect(f"example/{filename}:" in result.stderr, result)
+        _expect("parse error" in result.stderr, result)
+
+
+def test_nix_implementation_requires_a_default_and_rejects_mixed_sources() -> None:
+    """Discover Nix source, restore its package definition, and reject mixed kinds."""
+    with _fresh_repository() as root:
+        package = root / "example"
+        package.mkdir()
+        (package / "main.nix").write_text("{ answer = 42; }\n")
+        _repair_flake(root)
+        _expect((package / "default.nix").is_file(), "missing Nix package definition")
+        _expect(
+            not (package / "test_main.nix").exists(),
+            "repair created optional tests",
+        )
+        (package / "main.py").touch()
+        before = _snapshot(root)
+        result = _repair_flake(root, code=1)
+        _expect("ambiguous project markers" in result.stderr, result)
+        _expect(_snapshot(root) == before, "ambiguous Nix sources changed state")
 
 
 @pytest.mark.parametrize(
@@ -3965,6 +4038,45 @@ def test_package_rename_and_repair_accept_local_origins(remote_kind: str) -> Non
         _preview(root, "fix")
 
 
+@pytest.mark.parametrize("filename", ["main.nix", "test_main.nix"])
+def test_nix_optional_sources_are_formatted(filename: str) -> None:
+    """Apply Nix formatting to optional sources and leave supporting files intact."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", "nix")
+        source = root / "example" / filename
+        original = "{z=2;a=1;}\n"
+        source.write_text(original)
+        supporting = root / "example/prm" / filename
+        supporting.parent.mkdir()
+        supporting.write_text(original)
+        _run(
+            root,
+            "--no-cache",
+            f"example/{filename}",
+            f"example/prm/{filename}",
+            executable="treefmt",
+        )
+        _expect(source.read_text() != original, "optional Nix source was not formatted")
+        _expect(supporting.read_text() == original, "supporting source was formatted")
+        _run(
+            root,
+            "--no-cache",
+            "--fail-on-change",
+            f"example/{filename}",
+            executable="treefmt",
+        )
+        result = _run(
+            root,
+            "eval",
+            "--json",
+            "--file",
+            str(source),
+            executable="nix",
+            environment=_nix_environment(root),
+        )
+        _expect(json.loads(result.stdout) == {"a": 1, "z": 2}, result)
+
+
 def test_fresh_python_scaffold_passes_formatting() -> None:
     """Accept generated Python under the bundled lint and formatting rules."""
     with _fresh_repository() as root:
@@ -4065,8 +4177,7 @@ def _campaign_prepare_runner_flake(
     """Provide an offline flake backed by this check's real Python environment."""
     _campaign_make_runner_target(root, source, tests, name=name)
     builders = root / "prm/builders"
-    shutil.copytree(Path(__file__).with_name("prm"), builders)
-    shutil.copyfile(Path(__file__).with_name("main.py"), builders.parent / "main.py")
+    shutil.copytree(_nix_source(), builders)
     environment = dict(os.environ)
     store = root.parent / "nix"
     environment["NIX_REMOTE"] = (
@@ -4084,7 +4195,8 @@ def _campaign_prepare_runner_flake(
         timeout=30,
     ).stdout
     (root / "flake.nix").write_text(
-        "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
+        "{ outputs = _: let nixLibrary = import ./prm/builders/main.nix "
+        "{ self.outPath = ./prm; }; lib = nixLibrary.lib; "
         "pkgs = { lib = { concatMap = f: xs: builtins.concatLists (map f xs); "
         'makeBinPath = _: ""; }; writeText = builtins.toFile; }; '
         f"packageDrv.python.withPackages = _ : {json.dumps(sys.prefix)}; "
@@ -4162,8 +4274,9 @@ def _campaign_prepare_coverage_flake(
     if bash is None:
         message = "coverage fixtures require bash"
         raise AssertionError(message)
-    shutil.copytree(Path(__file__).with_name("prm"), root / "prm/builders")
-    shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/main.py")
+    shutil.copytree(_nix_source(), root / "prm/builders")
+    (root / "prm/afairesi").mkdir()
+    shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/afairesi/main.py")
     name = "z-last"
     _run(root, "add", f"{name}", "python")
     package = root / name
@@ -4226,7 +4339,7 @@ def _campaign_prepare_coverage_flake(
         f"withPackages = _: {json.dumps(sys.prefix)}; }}; }};"
     )
     expression = (
-        "import ./prm/builders/python-check.nix { inherit pkgs; "
+        "nixLibrary.pythonCheck { inherit pkgs; "
         f"packageName = {json.dumps(name)}; "
         f"packageDrv = packages.{json.dumps(name)}; "
         "testEnvironment = lib.mkTestEnvironment { inherit pkgs; "
@@ -4240,7 +4353,8 @@ def _campaign_prepare_coverage_flake(
     )
     _repair_flake(root)
     (root / "flake.nix").write_text(
-        "{ outputs = _: let lib = import ./prm/builders/builders.nix; "
+        "{ outputs = _: let nixLibrary = import ./prm/builders/main.nix "
+        "{ self.outPath = ./prm; }; lib = nixLibrary.lib; "
         f"system = {json.dumps(system)}; "
         "mkCheck = name: attrs: script: let build = current: (builtins.derivation { "
         "inherit system; inherit (current) name src PACKAGE_E2E_EXECUTABLE; "
@@ -5554,7 +5668,7 @@ def test_formatter_discovery_only_uses_available_packages(
         (directory / marker).touch()
         if name != "orphan":
             (directory / "default.nix").write_text("{}")
-    formatter = Path(__file__).with_name("prm") / "formatter.nix"
+    nix_library = _nix_source() / "main.nix"
     selection = (
         "module.programs.mypy.directories"
         if kind == "python"
@@ -5577,7 +5691,9 @@ def test_formatter_discovery_only_uses_available_packages(
       inputs.treefmt-nix.lib.evalModule = _: module: {{
         config.build.wrapper = {selection};
       }};
-      formatter = import {formatter} {{ inherit inputs pkgs self; }};
+      formatter = (import {nix_library} inputs).formatter {{
+        inherit inputs pkgs self;
+      }};
       in builtins.attrNames formatter.passthru.raw"""
     result = _run(
         tmp_path,

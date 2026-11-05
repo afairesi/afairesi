@@ -7,9 +7,13 @@
 !/afairesi/
 !/afairesi/default.nix
 !/afairesi/main.py
-!/afairesi/prm/
-!/afairesi/prm/**
 !/afairesi/test_main.py
+!/afairesi_nix/
+!/afairesi_nix/default.nix
+!/afairesi_nix/main.nix
+!/afairesi_nix/prm/
+!/afairesi_nix/prm/**
+!/afairesi_nix/test_main.nix
 !/alphabetize_nix/
 !/alphabetize_nix/default.nix
 !/alphabetize_nix/main.py

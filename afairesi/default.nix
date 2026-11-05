@@ -47,14 +47,14 @@ in
   executable = true;
   meta.description = "afairesi CLI for creating and maintaining repositories, packages, and hosts in the afairesi computing environment.";
   passthru = {
+    checkEnv.AFAIRESI_NIX_SOURCE = ../afairesi_nix;
     checkInputs = [
       python.pkgs.coverage
-      (import ./prm/formatter.nix {
+      ((import ../afairesi_nix/main.nix inputs).formatter {
         inherit inputs pkgs;
         enableMypy = false;
       }).passthru.raw
     ];
-    tests.consumer-contract = import ./prm/consumer-contract.nix { inherit inputs pkgs; };
   };
   postFixup = ''
     touch "$out/${python.sitePackages}/$pname/py.typed"

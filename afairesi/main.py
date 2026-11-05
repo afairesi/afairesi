@@ -44,6 +44,7 @@ KIND_MARKERS = {
     "html": "index.html",
     "latex": "ms.tex",
     "lean4": "main.lean",
+    "nix": "main.nix",
     "python": "main.py",
 }
 ROOT_FILES = {
@@ -363,7 +364,7 @@ def package_files(package: Package) -> set[Path]:
         "html": {"index.html", "script.js", "style.css"},
         "latex": {"ms.tex", "ms.bib"},
         "lean4": {"main.lean", "test_main.lean"},
-        "nix": set(),
+        "nix": {"main.nix", "test_main.nix"},
     }[package.kind]
     return {relative / "default.nix", *(relative / item for item in kind_files)}
 
@@ -374,7 +375,7 @@ def required_package_files(package: Package) -> set[Path]:
         "html": {"script.js", "style.css"},
         "latex": set(),
         "lean4": {"test_main.lean"},
-        "nix": set(),
+        "nix": {"main.nix", "test_main.nix"},
         "python": {"test_main.py"},
     }[package.kind]
     return {path for path in package_files(package) if path.name not in optional}
@@ -1077,13 +1078,15 @@ def _canonical_shared_default(package: Package, source: str) -> str:
 
 def canonical_package_default(package: Package) -> str | None:
     """Render a shared package definition while retaining package-specific fields."""
-    if package.kind == "nix":
-        return None
     source = read_regular(package.root / "default.nix")
+    if package.kind == "nix" and source is not None:
+        return None
     if source is None:
         source = scaffold(package.kind, package.name, None)[
             Path() / package.name / "default.nix"
         ]
+    if package.kind == "nix":
+        return source
     return _canonical_shared_default(package, source)
 
 
@@ -1438,9 +1441,10 @@ def validate_flake_source(root: Path) -> list[Package]:
         raise CommandError(msg)
     for package in packages:
         if package.kind == "nix":
-            default = package.root / "default.nix"
-            if default.is_file():
-                nix_syntax.parse(default.read_bytes(), str(default))
+            for relative in sorted(package_files(package)):
+                source = root / relative
+                if source.is_file():
+                    nix_syntax.parse(source.read_bytes(), str(source))
     return packages
 
 
@@ -3945,6 +3949,8 @@ def inspect_repository(root: Path) -> dict[str, Any]:
             if test_module is not None
             else ["test_main.lean"]
             if package.kind == "lean4" and (package.root / "test_main.lean").is_file()
+            else ["test_main.nix"]
+            if package.kind == "nix" and (package.root / "test_main.nix").is_file()
             else []
         )
         resource: dict[str, Any] = {
@@ -4208,8 +4214,8 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="create and stage a package or host",
         description=(
             "Create and stage a package or host. "
-            "Generate checks from test_main.py, test_main.lean, and host "
-            "configurations. Store supporting files under prm/."
+            "Generate checks from test_main.py, test_main.lean, test_main.nix, "
+            "and host configurations. Store supporting files under prm/."
         ),
     )
     create.add_argument(

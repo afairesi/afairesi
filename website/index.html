@@ -145,7 +145,9 @@ afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
                       <!-- prettier-ignore -->
                       <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>nix_package/</code></summary>
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
-│   └── default.nix</code></pre>
+│   ├── default.nix
+│   ├── main.nix        <span class="tree-comment"># Optional library or implementation.</span>
+│   └── test_main.nix   <span class="tree-comment"># Optional; returns a check derivation.</span></code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -160,6 +162,14 @@ afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
             </details>
           </div>
         </figure>
+        <p>
+          Nix packages require <code>default.nix</code>. The optional <code>main.nix</code> and
+          <code>test_main.nix</code> filenames are Afairesi conventions. Import
+          <code>main.nix</code> explicitly where needed. <code>test_main.nix</code> returns a check
+          derivation for <code>nix flake check</code>; its function can request <code>inputs</code>,
+          <code>pkgs</code>, <code>system</code>, <code>pname</code>, and
+          <code>packageDrv</code> (the package being tested).
+        </p>
         <figure class="demo">
           <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
         </figure>

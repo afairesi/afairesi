@@ -1,49 +1,5 @@
 { inputs, pkgs }:
 let
-  consumerSource = ./consumer-contract;
-  consumer = inputs.self.lib.mkFlake {
-    inputs = {
-      self = consumer // {
-        outPath = consumerSource;
-      };
-      afairesi = inputs.self;
-    };
-    systems = pkgs.lib.unique [
-      pkgs.stdenv.hostPlatform.system
-      "x86_64-linux"
-    ];
-    nixpkgs.config = {
-      allowUnfree = true;
-      cudaSupport = true;
-    };
-    nixpkgs.overlays = [ (_: _: { afairesiContract = true; }) ];
-  };
-  system = pkgs.stdenv.hostPlatform.system;
-  package = consumer.packages.${system}.example;
-  leanExample = consumer.packages.${system}.lean-example;
-  leanLibrary = consumer.packages.${system}.test_main;
-  vmCoverage = inputs.self.lib.mkCoverage {
-    check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
-    packageDrv = package;
-  };
-  descriptionless = inputs.self.lib.mkFlake {
-    inputs = {
-      self = {
-        outPath = ./consumer-contract;
-        packages.${system}.example = package.overridePythonAttrs (attributes: {
-          meta = builtins.removeAttrs attributes.meta [ "description" ];
-        });
-      };
-      afairesi = inputs.self;
-    };
-    systems = [ system ];
-  };
-  empty = inputs.self.lib.mkFlake {
-    inputs.self = empty // {
-      outPath = consumerSource + "/unavailable";
-    };
-    systems = [ system ];
-  };
   accepts =
     attributes:
     (builtins.tryEval (
@@ -51,7 +7,7 @@ let
         {
           inherit pkgs;
           executable = true;
-          src = ./consumer-contract/example;
+          src = ./prm/consumer-contract/example;
         }
         // attributes
       )
@@ -63,11 +19,57 @@ let
         {
           inherit pkgs;
           executable = true;
-          src = ./consumer-contract/lean-example;
+          src = ./prm/consumer-contract/lean-example;
         }
         // attributes
       )
     )).success;
+  consumer = inputs.self.lib.mkFlake {
+    inputs = {
+      afairesi = inputs.self;
+      self = consumer // {
+        outPath = consumerSource;
+      };
+    };
+    nixpkgs = {
+      config = {
+        allowUnfree = true;
+        cudaSupport = true;
+      };
+      overlays = [ (_: _: { afairesiContract = true; }) ];
+    };
+    systems = pkgs.lib.unique [
+      pkgs.stdenv.hostPlatform.system
+      "x86_64-linux"
+    ];
+  };
+  consumerSource = ./prm/consumer-contract;
+  descriptionless = inputs.self.lib.mkFlake {
+    inputs = {
+      afairesi = inputs.self;
+      self = {
+        packages.${system}.example = package.overridePythonAttrs (attributes: {
+          meta = builtins.removeAttrs attributes.meta [ "description" ];
+        });
+        outPath = ./prm/consumer-contract;
+      };
+    };
+    systems = [ system ];
+  };
+  empty = inputs.self.lib.mkFlake {
+    inputs.self = empty // {
+      outPath = consumerSource + "/unavailable";
+    };
+    systems = [ system ];
+  };
+  leanExample = consumer.packages.${system}.lean-example;
+  leanLibrary = consumer.packages.${system}.test_main;
+  package = consumer.packages.${system}.example;
+  system = pkgs.stdenv.hostPlatform.system;
+  vmCoverage = inputs.self.lib.mkCoverage {
+    check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
+    packageDrv = package;
+  };
 in
 assert
   package.consumerConfig == {
@@ -105,6 +107,14 @@ assert
   == consumer.packages.${system}.native.passthru.tests.contract;
 assert consumer.checks.${system}.devshell-example-test == consumer.devShells.${system}.example-test;
 assert !(consumer.packages.${system} ? unavailable);
+assert !(consumer.checks.${system} ? unavailable);
+assert !(consumer.checks.${system} ? orphan);
+assert consumer.checks.${system} ? nix-library;
+assert consumer.checks.${system} ? nix-tests;
+assert !(consumer.checks.${system} ? nix-untested);
+assert !(consumer.checks.${system} ? native);
+assert !(consumer.devShells.${system} ? nix-library-test);
+assert !(consumer.legacyPackages.${system} ? nix-library-coverage);
 assert consumer.packages.${system}.native.example == package;
 assert consumer.nixosConfigurations.example.pkgs.config.allowUnfree;
 assert consumer.nixosConfigurations.example.pkgs.config.cudaSupport;
@@ -160,12 +170,15 @@ pkgs.runCommand "afairesi-consumer-contract"
       consumer.legacyPackages.${system}.example-coverage
       consumer.checks.${system}.pkgs-native
       consumer.checks.${system}.pkgs-native-contract
+      consumer.checks.${system}.nix-library
+      consumer.checks.${system}.nix-tests
       consumer.checks.${system}.lean-example
       consumer.checks.${system}.test_main
       consumer.formatter.${system}.passthru.raw
     ];
   }
   ''
+    test "$(cat ${consumer.packages.${system}.nix-untested})" = untested
     unset AFAIRESI_CONSUMER_HOOK
     expected=$(printf '%s\n' loaded "['two words', '--flag']")
     actual=$(${consumer.apps.${system}.example.program} 'two words' --flag)
