@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="afairesi — A design principle for minimizing independent decisions by prescribing how lasting data is organized and deriving the computing environment from that data. Implemented as a Git-tracked directory convention for your home, repositories, packages, and NixOS configurations, with a CLI that maintains the structure and a Nix flake library that derives builds, checks, and development environments."
+      content="Satisfy the requirements with the fewest independent decisions. Afairesi applies this through a directory convention and CLI for your home and projects, and a Nix library that derives builds, checks, development environments, and NixOS systems."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -27,7 +27,10 @@
   </head>
   <body>
     <header class="top">
-      <h1>afairesi</h1>
+      <hgroup>
+        <h1>afairesi</h1>
+        <p class="subtitle"><span lang="el">αφαίρεση</span> — subtraction, abstraction</p>
+      </hgroup>
       <nav aria-label="afairesi links">
         <a href="https://github.com/afairesi/afairesi">Source</a>
         <a href="https://github.com/pbizopoulos/afairesi-paper">Paper</a>
@@ -35,17 +38,37 @@
       </nav>
     </header>
     <main>
-      <section class="intro" aria-labelledby="principle">
-        <h2 id="principle">One convention. Fewer decisions.</h2>
+      <p>
+        Satisfy the requirements with the fewest independent decisions. Afairesi applies this
+        through a directory convention and CLI for your home and projects, and a Nix library that
+        derives builds, checks, development environments, and NixOS systems.
+      </p>
+      <details class="guide">
+        <summary><span class="disclosure" aria-hidden="true"></span> Design principle</summary>
         <p>
-          A design principle for minimizing independent decisions by prescribing how lasting data is
-          organized and deriving the computing environment from that data. Implemented as a
-          Git-tracked directory convention for your home, repositories, packages, and NixOS
-          configurations, with a CLI that maintains the structure and a Nix flake library that
-          derives builds, checks, and development environments.
+          Compare designs against fixed requirements, scope, and shared mechanisms. Requirements
+          include the variations and recovery obligations the system must support. An independent
+          decision is a commitment that must be specified or revised separately because no enforced
+          derivation supplies it. Copies requiring separate maintenance each count; generated values
+          add no authority.
         </p>
-      </section>
-      <details class="installation">
+        <p>
+          Count shared policies, new mechanisms, and exceptions alongside resource declarations.
+          Bundling choices into a file or library does not eliminate them. Remove, share, or derive
+          a decision when doing so satisfies the requirements with fewer independent commitments
+          overall.
+        </p>
+        <p>
+          Ownership, shared organization, and automatic integration depend on the requirements.
+          Distinct preservation needs justify distinguishing data lifetimes. Repeatable repair also
+          requires a fixed normalization policy; complete automated conformance checks require
+          decidable rules. These are conditional design rules, not universal consequences or a proof
+          of minimality. The
+          <a href="https://github.com/pbizopoulos/afairesi-paper">paper</a> defines the accounting
+          model and derives the implementation rules.
+        </p>
+      </details>
+      <details class="guide">
         <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
         <p>
           Requirements: Git and Nix with flakes enabled on Linux or Apple Silicon macOS. NixOS with
@@ -56,6 +79,7 @@
   inputs.afairesi.url = "github:afairesi/afairesi";
   outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
 }</code></pre>
+        <p>Development shells are generated for Python and Lean4 packages.</p>
         <p>
           To install the CLI on a host managed by this flake, add to its
           <code>configuration.nix</code> (<code>mkFlake</code> supplies <code>inputs</code>):
@@ -74,7 +98,21 @@ afairesi repo add example python</code></pre>
         <p>To manage hosted repositories as home submodules:</p>
         <pre><code>afairesi home init
 afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
+        <p>
+          Nix packages require <code>default.nix</code>. The optional <code>main.nix</code> and
+          <code>test_main.nix</code> filenames are Afairesi conventions. Import
+          <code>main.nix</code> explicitly where needed. <code>test_main.nix</code> returns a check
+          derivation for <code>nix flake check</code>; its function can request <code>inputs</code>,
+          <code>pkgs</code>, <code>system</code>, <code>pname</code>, and
+          <code>packageDrv</code> (the package being tested).
+        </p>
       </details>
+      <p>
+        <code>nix fmt</code> repairs repository structure, stages changes, removes files outside the
+        permitted layout, and applies formatting and potentially behavior-changing fixes. Keep
+        supporting files in <code>prm/</code> and temporary data in <code>tmp/</code>; review the
+        diff and run <code>nix flake check</code> afterward.
+      </p>
       <div class="overview">
         <figure
           class="tree"
@@ -174,14 +212,6 @@ afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
             </details>
           </div>
         </figure>
-        <p>
-          Nix packages require <code>default.nix</code>. The optional <code>main.nix</code> and
-          <code>test_main.nix</code> filenames are Afairesi conventions. Import
-          <code>main.nix</code> explicitly where needed. <code>test_main.nix</code> returns a check
-          derivation for <code>nix flake check</code>; its function can request <code>inputs</code>,
-          <code>pkgs</code>, <code>system</code>, <code>pname</code>, and
-          <code>packageDrv</code> (the package being tested).
-        </p>
         <figure class="demo">
           <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
         </figure>

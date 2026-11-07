@@ -53,20 +53,11 @@ code {
 h1 {
   font: inherit;
 }
-.installation p {
+.guide p {
   max-width: 80ch;
+  margin-block: 8px;
 }
-.intro {
-  container-type: inline-size;
-}
-.intro h2 {
-  margin: 0 0 12px;
-  font-size: min(26px, 4.3cqi);
-  font-weight: normal;
-  line-height: 1.35;
-  white-space: nowrap;
-}
-.installation {
+.guide {
   margin-block: 12px;
 }
 .overview {
@@ -89,7 +80,7 @@ h1 {
 #demo-player {
   width: 100%;
 }
-.installation pre {
+.guide pre {
   max-width: 80ch;
   margin-block: 8px;
   padding: 12px 16px;
@@ -110,6 +101,10 @@ h1 {
   display: flex;
   margin-inline-start: auto;
   gap: 12px;
+  font-size: 12px;
+}
+.subtitle {
+  color: var(--secondary);
   font-size: 12px;
 }
 main {
@@ -170,7 +165,7 @@ summary::-webkit-details-marker {
 summary:hover {
   background: color-mix(in srgb, var(--ink) 8%, transparent);
 }
-.installation > :not(summary) {
+.guide > :not(summary) {
   margin-inline-start: 2ch;
 }
 .disclosure::before {
