@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Satisfy the requirements with the fewest independent decisions. Afairesi applies this through a directory convention and CLI for your home and projects, and a Nix library that derives builds, checks, development environments, and NixOS systems."
+      content="Afairesi organizes your computing environment, from NixOS and persistent state to your home, repositories, packages, and tests, around one principle: satisfy the requirements with the fewest independent decisions."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>afairesi</title>
@@ -39,79 +39,15 @@
     </header>
     <main>
       <p>
-        Satisfy the requirements with the fewest independent decisions. Afairesi applies this
-        through a directory convention and CLI for your home and projects, and a Nix library that
-        derives builds, checks, development environments, and NixOS systems.
+        Afairesi organizes your computing environment around one principle: satisfy the requirements
+        with the fewest independent decisions.
       </p>
-      <details class="guide">
-        <summary><span class="disclosure" aria-hidden="true"></span> Design principle</summary>
-        <p>
-          Compare designs against fixed requirements, scope, and shared mechanisms. Requirements
-          include the variations and recovery obligations the system must support. An independent
-          decision is a commitment that must be specified or revised separately because no enforced
-          derivation supplies it. Copies requiring separate maintenance each count; generated values
-          add no authority.
-        </p>
-        <p>
-          Count shared policies, new mechanisms, and exceptions alongside resource declarations.
-          Bundling choices into a file or library does not eliminate them. Remove, share, or derive
-          a decision when doing so satisfies the requirements with fewer independent commitments
-          overall.
-        </p>
-        <p>
-          Ownership, shared organization, and automatic integration depend on the requirements.
-          Distinct preservation needs justify distinguishing data lifetimes. Repeatable repair also
-          requires a fixed normalization policy; complete automated conformance checks require
-          decidable rules. These are conditional design rules, not universal consequences or a proof
-          of minimality. The
-          <a href="https://github.com/pbizopoulos/afairesi-paper">paper</a> defines the accounting
-          model and derives the implementation rules.
-        </p>
-      </details>
-      <details class="guide">
-        <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
-        <p>
-          Requirements: Git and Nix with flakes enabled on Linux or Apple Silicon macOS. NixOS with
-          Preservation is used for the full system layout shown below.
-        </p>
-        <p>Use this <code>flake.nix</code> to derive packages, checks, and hosts:</p>
-        <pre><code>{
-  inputs.afairesi.url = "github:afairesi/afairesi";
-  outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
-}</code></pre>
-        <p>Development shells are generated for Python and Lean4 packages.</p>
-        <p>
-          To install the CLI on a host managed by this flake, add to its
-          <code>configuration.nix</code> (<code>mkFlake</code> supplies <code>inputs</code>):
-        </p>
-        <pre><code>{ inputs, pkgs, ... }:
-{
-  environment.systemPackages = [
-    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
-  ];
-}</code></pre>
-        <p>Or start a shell with the CLI:</p>
-        <pre><code>nix shell github:afairesi/afairesi</code></pre>
-        <p>In an empty Git worktree, generate the flake above and add a package:</p>
-        <pre><code>afairesi repo init
-afairesi repo add example python</code></pre>
-        <p>To manage hosted repositories as home submodules:</p>
-        <pre><code>afairesi home init
-afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
-        <p>
-          Nix packages require <code>default.nix</code>. The optional <code>main.nix</code> and
-          <code>test_main.nix</code> filenames are Afairesi conventions. Import
-          <code>main.nix</code> explicitly where needed. <code>test_main.nix</code> returns a check
-          derivation for <code>nix flake check</code>; its function can request <code>inputs</code>,
-          <code>pkgs</code>, <code>system</code>, <code>pname</code>, and
-          <code>packageDrv</code> (the package being tested).
-        </p>
-      </details>
       <p>
-        <code>nix fmt</code> repairs repository structure, stages changes, removes files outside the
-        permitted layout, and applies formatting and potentially behavior-changing fixes. Keep
-        supporting files in <code>prm/</code> and temporary data in <code>tmp/</code>; review the
-        diff and run <code>nix flake check</code> afterward.
+        NixOS defines the system, Preservation keeps declared state across reboots, and Git records
+        your home's repository collection. Within repositories, directory names and conventional
+        files identify packages, hosts, and tests. Afairesi's CLI maintains this structure, and its
+        Nix library derives builds and checks from the project files. Python and Lean4 packages also
+        receive development environments.
       </p>
       <div class="overview">
         <figure
@@ -216,6 +152,71 @@ afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
           <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
         </figure>
       </div>
+      <p>
+        <code>nix fmt</code> repairs repository structure, stages changes, removes files outside the
+        permitted layout, and applies formatting and potentially behavior-changing fixes. Keep
+        supporting files in <code>prm/</code> and temporary data in <code>tmp/</code>; review the
+        diff and run <code>nix flake check</code> afterward.
+      </p>
+      <details class="guide">
+        <summary><span class="disclosure" aria-hidden="true"></span> Design principle</summary>
+        <p>
+          The structure above replaces repeated choices with shared rules. A repository's remote URL
+          determines its location in your home. A package directory supplies its name, and a
+          conventional test file registers its check. Python and Lean4 test and development
+          environments reuse the package's dependencies.
+        </p>
+        <p>
+          An independent decision is something you must choose or maintain separately. Deriving a
+          value removes that maintenance; keeping two editable copies means keeping them in sync.
+          Shared rules also have a cost, including their implementation and exceptions. Use them
+          when they reduce the total choices you maintain while preserving the behavior, variation,
+          and recovery your environment needs.
+        </p>
+        <p>
+          The <a href="https://github.com/pbizopoulos/afairesi-paper">paper</a> explains the
+          environment's requirements, the choices behind this structure, and its limitations.
+        </p>
+      </details>
+      <details class="guide">
+        <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
+        <p>
+          The full environment shown above uses NixOS with Preservation. The CLI and project tools
+          require Git and Nix with flakes enabled on Linux or Apple Silicon macOS.
+        </p>
+        <p>Use this <code>flake.nix</code> to derive packages, checks, and hosts:</p>
+        <pre><code>{
+  inputs.afairesi.url = "github:afairesi/afairesi";
+  outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
+}</code></pre>
+        <p>Development shells are generated for Python and Lean4 packages.</p>
+        <p>
+          To install the CLI on a host managed by this flake, add to its
+          <code>configuration.nix</code> (<code>mkFlake</code> supplies <code>inputs</code>):
+        </p>
+        <pre><code>{ inputs, pkgs, ... }:
+{
+  environment.systemPackages = [
+    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
+  ];
+}</code></pre>
+        <p>Or start a shell with the CLI:</p>
+        <pre><code>nix shell github:afairesi/afairesi</code></pre>
+        <p>To manage hosted repositories as home submodules:</p>
+        <pre><code>afairesi home init
+afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
+        <p>In an empty Git worktree, generate the flake above and add a package:</p>
+        <pre><code>afairesi repo init
+afairesi repo add example python</code></pre>
+        <p>
+          Nix packages require <code>default.nix</code>. The optional <code>main.nix</code> and
+          <code>test_main.nix</code> filenames are Afairesi conventions. Import
+          <code>main.nix</code> explicitly where needed. <code>test_main.nix</code> returns a check
+          derivation for <code>nix flake check</code>; its function can request <code>inputs</code>,
+          <code>pkgs</code>, <code>system</code>, <code>pname</code>, and
+          <code>packageDrv</code> (the package being tested).
+        </p>
+      </details>
     </main>
   </body>
 </html>

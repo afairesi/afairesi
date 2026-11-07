@@ -110,6 +110,9 @@ h1 {
 main {
   padding: 20px 0 18px;
 }
+main > p + p {
+  margin-block-start: 12px;
+}
 .tree {
   font-size: 12px;
   line-height: 1.5;
