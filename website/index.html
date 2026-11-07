@@ -5,10 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Afairesi organizes your computing environment, from NixOS and persistent state to your home, repositories, packages, and tests, around one principle: satisfy the requirements with the fewest independent decisions."
+      content="Afairesi is a computing environment designed to minimize independent decisions across the system, persistent state, your home, repositories, packages, and tests."
     />
     <meta name="theme-color" content="#fdf6e3" />
-    <title>afairesi</title>
+    <title>Afairesi — A computing environment designed to minimize independent decisions</title>
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23fdf6e3'/%3E%3Cpath d='M8 16h16' stroke='%23586e75' stroke-width='2'/%3E%3C/svg%3E"
@@ -29,7 +29,7 @@
     <header class="top">
       <hgroup>
         <h1>afairesi</h1>
-        <p class="subtitle"><span lang="el">αφαίρεση</span> — subtraction, abstraction</p>
+        <p class="subtitle">A computing environment designed to minimize independent decisions.</p>
       </hgroup>
       <nav aria-label="afairesi links">
         <a href="https://github.com/afairesi/afairesi">Source</a>
@@ -39,8 +39,8 @@
     </header>
     <main>
       <p>
-        Afairesi organizes your computing environment around one principle: satisfy the requirements
-        with the fewest independent decisions.
+        Afairesi brings the system, your home directory, repositories, packages, and tests into one
+        structure. The aim is to reduce what must be decided and maintained independently.
       </p>
       <p>
         NixOS defines the system, Preservation keeps declared state across reboots, and Git records
@@ -161,10 +161,14 @@
       <details class="guide">
         <summary><span class="disclosure" aria-hidden="true"></span> Design principle</summary>
         <p>
-          The structure above replaces repeated choices with shared rules. A repository's remote URL
-          determines its location in your home. A package directory supplies its name, and a
-          conventional test file registers its check. Python and Lean4 test and development
-          environments reuse the package's dependencies.
+          Afairesi (<span lang="el">αφαίρεση</span>, subtraction or abstraction) names the project's
+          intent: reduce separately maintained choices. Its guiding principle is to satisfy the
+          requirements with the fewest independent decisions.
+        </p>
+        <p>
+          A repository's remote URL determines its location in your home. A package directory
+          supplies its name, and a conventional test file registers its check. Python and Lean4 test
+          and development environments reuse the package's dependencies.
         </p>
         <p>
           An independent decision is something you must choose or maintain separately. Deriving a
