@@ -66,7 +66,7 @@
               <div class="tree-scope tree-home">
                 <span class="tree-scope-label">afairesi home</span>
                 <pre><code>│
-├── .gitignore              <span class="tree-comment"># Shared policy: *.</span>
+├── .gitignore              <span class="tree-comment"># Optional, user-owned.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span>
 │</code></pre>
                 <details class="package repo-branch" open>
@@ -76,7 +76,7 @@
                     <span class="tree-scope-label">afairesi repo</span>
                     <pre><code>│                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
 │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
-├── .gitignore          <span class="tree-comment"># Shared policy: *.</span>
+├── .gitignore          <span class="tree-comment"># Optional, repository-owned.</span>
 ├── flake.nix
 ├── flake.lock
 ├── …                   <span class="tree-comment"># Supporting files can live anywhere.</span>
@@ -144,8 +144,9 @@
         </figure>
       </div>
       <p>
-        Home and projects share a one-line <code>.gitignore</code>: <code>*</code>. Select new files
-        with <code>git add -f -- PATH</code>; stage tracked edits with <code>git add -u</code>.
+        Git determines source membership. Select new files with <code>git add -- PATH</code>; use
+        <code>-f</code> when deliberately tracking an ignored file. Each repository owns its
+        optional <code>.gitignore</code>; Afairesi leaves its contents and staging untouched.
         Afairesi stages the files it creates. The <code>default.nix</code> constructor selects the
         package type; supporting files can live anywhere.
       </p>
@@ -160,9 +161,15 @@
         <summary><span class="disclosure" aria-hidden="true"></span> Tracking and cleanup</summary>
         <p>
           Builds and checks use tracked working files, including tests added by hand. Untracked
-          files are hidden from ordinary <code>git status</code>. Search tracked source with
-          <code>git grep</code>; ignore-aware tools may hide it. Neither <code>prm/</code> nor
-          <code>tmp/</code> has special meaning.
+          files stay outside those inputs whether or not Git ignores them. Search tracked source
+          with <code>git grep</code>.
+        </p>
+        <p>
+          A repository can keep disposable artifacts in <code>tmp/</code> directories and add
+          <code>tmp/</code> to its own <code>.gitignore</code>. This pattern covers that directory
+          name at any depth. Tools that write caches elsewhere may need additional patterns.
+          Directory names have no special meaning to Afairesi; tracking determines membership. A
+          home repository can independently choose <code>*</code> for explicit file admission.
         </p>
         <p>From a project root, preview untracked files to remove, including ignored files:</p>
         <pre><code>git clean -ndx</code></pre>
@@ -178,6 +185,7 @@
           Afairesi (<span lang="el">αφαίρεση</span>, subtraction or abstraction) favors declaring
           each essential fact once and deriving the rest. Git owns source membership and history;
           Preservation declares persistent state; Afairesi derives builds, checks, and environments.
+          Ignore rules belong to each repository's workflow.
         </p>
         <p>
           Conventions should remove more decisions than their implementation and exceptions

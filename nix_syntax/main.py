@@ -4,7 +4,6 @@
 
 from __future__ import annotations
 
-import argparse
 import contextlib
 import json
 import os
@@ -203,36 +202,3 @@ def write_if_changed(path: Path, contents: str) -> None:
     finally:
         with contextlib.suppress(FileNotFoundError):
             temporary_path.unlink()
-
-
-def main() -> None:
-    """Parse selected Nix files and report syntax errors without changing them."""
-    parser = argparse.ArgumentParser(
-        description=__doc__,
-        epilog="Example: nix_syntax flake.nix */default.nix",
-    )
-    parser.add_argument(
-        "files",
-        nargs="+",
-        metavar="FILE",
-        help="Nix files to validate",
-    )
-    status = 0
-    for argument in parser.parse_args().files:
-        completed = subprocess.run(  # noqa: S603 - Fixed parser command; filenames follow "--".
-            ["nix-instantiate", "--parse", "--", argument],  # noqa: S607
-            stdout=subprocess.DEVNULL,
-            check=False,
-        )
-        if not status and completed.returncode:
-            status = (
-                completed.returncode
-                if completed.returncode >= 0
-                else 128 - completed.returncode
-            )
-    if status:
-        raise SystemExit(status)
-
-
-if __name__ == "__main__":
-    main()

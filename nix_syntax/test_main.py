@@ -1,10 +1,9 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Validate complete Nix documents through the packaged command."""
+"""Check Nix parsing and literal decoding through the shared library."""
 
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from typing import TYPE_CHECKING
 
@@ -39,103 +38,6 @@ def _isolated_nix_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     """Run native commands against a private store without host configuration."""
     monkeypatch.setenv("NIX_REMOTE", f"local?root={tmp_path / 'store'}")
     monkeypatch.setenv("NIX_CONFIG", "build-users-group =\n")
-
-
-def test_cli_validates_files_and_reports_each_failure(tmp_path: Path) -> None:
-    """Accept valid Unicode Nix, report malformed and missing files, and never edit."""
-    valid = tmp_path / "valid.nix"
-    valid.write_text(
-        '{ "é"."a b" = "${toString 1}"; f = { x, ... }: x; }',
-        encoding="utf-8",
-    )
-    invalid = tmp_path / "invalid.nix"
-    invalid.write_text("{ invalid = ; }", encoding="utf-8")
-    missing = tmp_path / "missing.nix"
-    originals = {path: path.read_bytes() for path in (valid, invalid)}
-    for paths, code in [([valid], 0), ([invalid, valid, missing], 1)]:
-        result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-            [os.environ["PACKAGE_E2E_EXECUTABLE"], *map(str, paths)],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-        if result.returncode != code or result.stdout:
-            raise AssertionError(result)
-        if code and not all(str(path) in result.stderr for path in (invalid, missing)):
-            raise AssertionError(result.stderr)
-        if not code and result.stderr:
-            raise AssertionError(result.stderr)
-    if any(path.read_bytes() != source for path, source in originals.items()):
-        message = "validation modified an input"
-        raise AssertionError(message)
-
-
-def _parse_with_native_and_cli(
-    path: Path,
-) -> tuple[subprocess.CompletedProcess[bytes], subprocess.CompletedProcess[bytes]]:
-    """Run both parsers with identical input and process settings."""
-    native = subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
-        ["nix-instantiate", "--parse", "--", str(path)],  # noqa: S607
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    actual = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
-        capture_output=True,
-        check=False,
-        timeout=10,
-    )
-    return native, actual
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        b"{ z = 1; a = 2; }",
-        b"{ duplicate = 1; duplicate = 2; }",
-        b"{ a = 1; a.b = 2; }",
-        b"{ missing = undefined; }",
-        b"({ a, a }: a)",
-        b"{ broken = ; }",
-        b"# only a comment\n",
-        b"let x = 3; in rec { a = x; b = a; }",
-        b'"a\r\nb"',
-        b'"\xff"',
-    ],
-)
-def test_cli_matches_native_parser(tmp_path: Path, source: bytes) -> None:
-    """Native Nix determines acceptance, error text, and exit status."""
-    path = tmp_path / "expression with spaces.nix"
-    path.write_bytes(source)
-    native, actual = _parse_with_native_and_cli(path)
-    if (actual.returncode, actual.stderr, actual.stdout) != (
-        native.returncode,
-        native.stderr,
-        b"",
-    ) or path.read_bytes() != source:
-        raise AssertionError((native, actual))
-
-
-@pytest.mark.parametrize("kind", ["missing", "directory", "symlink"])
-def test_cli_uses_native_file_resolution(tmp_path: Path, kind: str) -> None:
-    """Delegate missing paths, directory defaults, and links to Nix."""
-    path = tmp_path / kind
-    if kind == "directory":
-        path.mkdir()
-        (path / "default.nix").write_text("{}")
-    elif kind == "symlink":
-        target = tmp_path / "target.nix"
-        target.write_text("{}")
-        path.symlink_to(target)
-    native, actual = _parse_with_native_and_cli(path)
-    if (actual.returncode, actual.stderr, actual.stdout) != (
-        native.returncode,
-        native.stderr,
-        b"",
-    ):
-        raise AssertionError((native, actual))
 
 
 @pytest.mark.parametrize(

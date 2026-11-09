@@ -51,12 +51,10 @@ SHARED_CONSTRUCTORS = {
 ROOT_FILES = {
     ".forgejo/workflows/workflow.yml",
     ".github/workflows/workflow.yml",
-    ".gitignore",
     "LICENSE",
     "flake.lock",
     "flake.nix",
 }
-GITIGNORE = "*\n"
 MINIMUM_REMOTE_COMPONENTS = 2
 RESOURCE_PATH_COMPONENTS = 1
 PYTEST_NO_TESTS_COLLECTED = 5
@@ -425,11 +423,6 @@ def managed_paths(root: Path, packages: list[Package]) -> set[Path]:
 def beneath(path: Path, trees: set[Path]) -> bool:
     """Return whether path is a tree or lies beneath one."""
     return any(path == tree or tree in path.parents for tree in trees)
-
-
-def _converge_ignore(root: Path, *, dry_run: bool = False) -> bool:
-    """Apply the same fixed opt-in tracking policy at every repository level."""
-    return write_managed(root, Path(".gitignore"), GITIGNORE, dry_run=dry_run)
 
 
 def validate_flake_layout(
@@ -906,7 +899,7 @@ def _write_managed_nix(
     """Write a Nix template only when its formatted structure differs."""
     current = read_regular(root / relative)
     if current is not None and relative not in source_paths(root):
-        msg = f"{relative}: untracked file; select it with git add -f before repair"
+        msg = f"{relative}: untracked file; select it with git add before repair"
         raise CommandError(msg)
     if current is not None and nix_syntax.compact(current) == nix_syntax.compact(
         source,
@@ -1090,11 +1083,9 @@ def converge_flake(
     *,
     dry_run: bool,
 ) -> list[Package]:
-    """Converge required files, structure, templates, and tracking policy."""
+    """Converge required files, structure, and templates."""
     missing = [
-        name
-        for name in (".gitignore", "flake.nix", "flake.lock")
-        if not (root / name).is_file()
+        name for name in ("flake.nix", "flake.lock") if not (root / name).is_file()
     ]
     if missing:
         raise CommandError("missing required file: " + missing[0])
@@ -1107,7 +1098,6 @@ def converge_flake(
     if issues:
         raise CommandError("\n".join(issues))
     changed = _converge_packages(root, packages, dry_run=dry_run)
-    changed |= _converge_ignore(root, dry_run=dry_run)
     changed |= _converge_file_modes(
         root,
         managed_paths(root, packages),
@@ -1128,14 +1118,9 @@ def validate_flake_source(root: Path) -> list[Package]:
     packages, issues = inspect_structure(root)
     paths = source_paths(root)
     issues.extend(_flake_resource_issues(root))
-    for required in (".gitignore", "flake.lock", "flake.nix"):
+    for required in ("flake.lock", "flake.nix"):
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
-    expected_ignore = GITIGNORE
-    if read_regular(root / ".gitignore") != expected_ignore:
-        issues.append(
-            ".gitignore: must contain the shared tracking policy: *",
-        )
     for package in packages:
         issues.extend(_source_package_issues(root, package))
     if issues:
@@ -1283,39 +1268,6 @@ def remove_empty_directories(directories: list[Path]) -> None:
             directory.rmdir()
 
 
-@contextlib.contextmanager
-def preserve_ignore_on_error(root: Path) -> Iterator[None]:
-    """Restore the ignore policy and its staged entry after a failed operation."""
-    path = root / ".gitignore"
-    read_regular(path)
-    snapshot = (
-        (path.read_bytes(), stat.S_IMODE(path.stat().st_mode))
-        if path.exists()
-        else None
-    )
-    arguments = ["ls-files", "--stage", "-z", "--", ".gitignore"]
-    indexed = git(root, arguments).stdout
-    try:
-        yield
-    except BaseException:
-        if snapshot is None:
-            path.unlink(missing_ok=True)
-        else:
-            contents, mode = snapshot
-            path.write_bytes(contents)
-            path.chmod(mode)
-        if git(root, arguments).stdout != indexed:
-            if indexed:
-                run(
-                    ["git", "update-index", "-z", "--index-info"],
-                    cwd=root,
-                    input_source=indexed,
-                )
-            else:
-                git(root, ["update-index", "--force-remove", "--", ".gitignore"])
-        raise
-
-
 def add_package(
     root: Path,
     kind: str,
@@ -1343,18 +1295,14 @@ def add_package(
     directories = missing_directories(root, [relative])
     created: list[Path] = []
     try:
-        with preserve_ignore_on_error(root):
-            for relative, source in files.items():
-                path = root / relative
-                path.parent.mkdir(parents=True, exist_ok=True)
-                created.append(path)
-                path.write_text(source, encoding="utf-8")
-                path.chmod(0o755 if path.name == "main.py" else 0o644)
-            _converge_ignore(root)
-            generated = [str(path.relative_to(root)) for path in created] + [
-                ".gitignore",
-            ]
-            git(root, ["add", "--force", "--", *generated])
+        for relative, source in files.items():
+            path = root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            created.append(path)
+            path.write_text(source, encoding="utf-8")
+            path.chmod(0o755 if path.name == "main.py" else 0o644)
+        generated = [str(path.relative_to(root)) for path in created]
+        git(root, ["add", "--force", "--", *generated])
     except BaseException:
         for path in reversed(created):
             path.unlink(missing_ok=True)
@@ -1372,20 +1320,9 @@ def add_host(root: Path, name: str) -> None:
         raise CommandError(msg)
     directories = missing_directories(root, [relative.parent])
     try:
-        with preserve_ignore_on_error(root):
-            path.parent.mkdir(parents=True)
-            path.write_text("{ ... }: { }\n", encoding="utf-8")
-            _converge_ignore(root)
-            git(
-                root,
-                [
-                    "add",
-                    "--force",
-                    "--",
-                    str(relative),
-                    ".gitignore",
-                ],
-            )
+        path.parent.mkdir(parents=True)
+        path.write_text("{ ... }: { }\n", encoding="utf-8")
+        git(root, ["add", "--force", "--", str(relative)])
     except BaseException:
         path.unlink(missing_ok=True)
         remove_empty_directories(directories)
@@ -1514,10 +1451,9 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
     )
     git(root, ["add", "--force", "--", "flake.nix"])
     run([executable, "flake", "lock"], cwd=root, capture_output=False)
-    _converge_ignore(root)
-    git(root, ["add", "--force", "--", ".gitignore", "flake.lock"])
+    git(root, ["add", "--force", "--", "flake.lock"])
     run([executable, "fmt"], cwd=root, capture_output=False)
-    git(root, ["add", "--", ".gitignore", "flake.lock", "flake.nix"])
+    git(root, ["add", "--", "flake.lock", "flake.nix"])
 
 
 def initialize_repository() -> None:
@@ -3741,7 +3677,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
             "Create and stage a package or host. "
             "Generate checks from test_main.py, test_main.lean, test_main.nix, "
             "and host configurations. "
-            "Track supporting files explicitly with git add -f."
+            "Track supporting files explicitly with git add."
         ),
     )
     create.add_argument(
@@ -3760,7 +3696,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         help="fix and stage tracked flake structure",
         description=(
             "Fix and stage tracked flake structure, preserving local files. "
-            "Track supporting files explicitly with git add -f. "
+            "Track supporting files explicitly with git add. "
             "Cleanup is separate: preview untracked project files with "
             "git clean -ndx; remove them with git clean -fdx. "
             "Format tracked sources with nix fmt; validate with nix flake check."
@@ -3983,7 +3919,6 @@ def converge_home(root: Path, *, dry_run: bool) -> list[dict[str, str]]:
         if actual != expected and (root / expected).exists():
             msg = f"target already exists: {expected}"
             raise CommandError(msg)
-    read_regular(root / ".gitignore")
     for repository, expected in zip(repositories, repair_paths, strict=True):
         _converge_home_submodule(
             root,
@@ -3991,7 +3926,6 @@ def converge_home(root: Path, *, dry_run: bool) -> list[dict[str, str]]:
             expected,
             dry_run=dry_run,
         )
-    _converge_ignore(root, dry_run=dry_run)
     _converge_home_modules(root, dry_run=dry_run)
     return repositories
 
@@ -4025,14 +3959,12 @@ def remove_home_submodule(
 
 
 def initialize_home() -> None:
-    """Initialize and stage the canonical home policy without cleaning."""
+    """Initialize and stage home submodule metadata without cleaning."""
     root = Path.home()
     if repository_type(root, "home") != "home":
         msg = "cannot initialize a flake repository as a home repository"
         raise CommandError(msg)
-    read_regular(root / ".gitignore")
     run(["git", "init", "--", str(root)], capture_output=False)
-    _converge_ignore(root)
     if not (root / ".gitmodules").exists():
         write_managed(root, Path(".gitmodules"), "", dry_run=False)
     _converge_home_modules(root, dry_run=False)
@@ -4104,7 +4036,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         help="add and stage a submodule",
         description=(
             "Add a submodule at $HOME/<remote-hostname>/<repository-path>. "
-            "Stage its registration; use the shared opt-in tracking policy."
+            "Stage its registration."
         ),
     )
     add.add_argument("remote", metavar="REMOTE", help="hosted Git repository URL")
@@ -4118,7 +4050,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         "fix",
         help="fix and stage home repository structure",
         description=(
-            "Fix and stage the shared tracking policy and submodule layout. "
+            "Fix and stage the submodule layout. "
             "Move submodules to <remote-hostname>/<repository-path>."
         ),
     )
@@ -4130,9 +4062,9 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     commands.add_parser(
         "init",
-        help="initialize the home repository and stage its tracking policy",
+        help="initialize the home repository and stage its submodule metadata",
         description=(
-            "Initialize the home repository and stage its .gitignore tracking policy."
+            "Initialize the home repository and stage its .gitmodules metadata."
         ),
     )
     remove = commands.add_parser(

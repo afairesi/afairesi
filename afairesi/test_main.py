@@ -510,7 +510,7 @@ def _check_launcher_environment(
         ("host", {"configuration.nix"}),
     ],
 )
-def test_create_stages_the_requested_resource_and_whitelist(
+def test_create_stages_only_the_requested_resource(
     kind: str,
     filenames: set[str],
 ) -> None:
@@ -526,7 +526,7 @@ def test_create_stages_the_requested_resource_and_whitelist(
             {path.name for path in resource.iterdir()} == filenames,
             "wrong resource files",
         )
-        staged = {f"{relative}/{name}" for name in filenames} | {".gitignore"}
+        staged = {f"{relative}/{name}" for name in filenames}
         _expect(not (root / "checks").exists(), "creation wrote check wrappers")
         if kind != "host":
             descriptions = {
@@ -983,7 +983,7 @@ def test_repair_preserves_supporting_symlinks_without_following_targets(
 
 
 @pytest.mark.parametrize("command", ["mv", "rm"])
-@pytest.mark.parametrize("invalid", ["tests", "whitelist"])
+@pytest.mark.parametrize("invalid", ["tests", "flake"])
 def test_resource_changes_validate_metadata_before_mutation(
     command: str,
     invalid: str,
@@ -997,8 +997,8 @@ def test_resource_changes_validate_metadata_before_mutation(
         if invalid == "tests":
             _write_fixture_source(root / "other/test_main.py", "def test_broken(:\n")
         else:
-            (root / ".gitignore").unlink()
-            (root / ".gitignore").symlink_to("LICENSE")
+            (root / "flake.nix").unlink()
+            (root / "flake.nix").symlink_to("LICENSE")
         before = _snapshot(root)
         arguments = ("renamed",) if command == "mv" else ()
         _run(root, command, "example", *arguments, code=1)
@@ -1024,13 +1024,13 @@ def test_removal_can_delete_a_package_with_invalid_test_source() -> None:
 
 
 @pytest.mark.parametrize("kind", ["python", "host"])
-def test_failed_creation_restores_the_whitelist_and_index(kind: str) -> None:
-    """Restore distinct staged and working whitelist contents after Git add fails."""
+def test_failed_creation_preserves_ignore_rules_and_index(kind: str) -> None:
+    """Preserve distinct staged and working ignore rules after Git add fails."""
     with _fresh_repository() as root:
         ignore = root / ".gitignore"
-        ignore.write_text("# staged whitelist\n")
+        ignore.write_text("# staged rules\ntmp/\n")
         _git(root, "add", ".gitignore")
-        ignore.write_text("# working whitelist\n")
+        ignore.write_text("# working rules\n\ntmp/\nresult\n")
         ignore.chmod(0o600)
         (root / ".git/index.lock").touch()
         before = _snapshot(root)
@@ -1440,7 +1440,7 @@ def test_lean4_convergence_preserves_sources_and_explicit_package_options(
     *,
     executable: bool,
 ) -> None:
-    """Repair Lean bindings and whitelist tests while preserving library choices."""
+    """Repair Lean bindings and test registration while preserving library choices."""
     with _fresh_repository() as root:
         _run(root, "add", "lean-example", "lean4")
         package = root / "lean-example"
@@ -2208,11 +2208,7 @@ def test_add_registers_existing_content_without_creating_commits(
     head = _git(home, "rev-parse", "HEAD")
     result = _home_test_run(tmp_path, "add", remote)
     checkout = home / relative
-    ignore = (home / ".gitignore").read_text(encoding="utf-8")
-    _expect(ignore == "*\n", ignore)
-    if _git(home, "show", ":.gitignore") != ignore:
-        message = "add REMOTE did not stage the home whitelist"
-        raise AssertionError(message)
+    _expect(not (home / ".gitignore").exists(), "add REMOTE created ignore rules")
     if (checkout / "LICENSE").read_text() != "existing repository":
         raise AssertionError(result.stdout + result.stderr)
     if _git(home, "rev-parse", "HEAD") != head:
@@ -2237,9 +2233,7 @@ def test_add_registers_existing_content_without_creating_commits(
         raise AssertionError(message)
     repeated = _home_test_run(tmp_path, "add", remote, code=1)
     _expect("already exists in the index" in repeated.stderr, repeated)
-    if (home / ".gitignore").read_text(encoding="utf-8") != ignore:
-        message = "repeated add changed the home whitelist"
-        raise AssertionError(message)
+    _expect(not (home / ".gitignore").exists(), "repeated add created ignore rules")
 
 
 def _local_init(root: Path, *, code: int = 0) -> subprocess.CompletedProcess[str]:
@@ -2330,7 +2324,7 @@ def test_local_init_stages_files_without_committing_or_requiring_home(
         "    git ls-files --error-unmatch flake.nix >/dev/null || exit 7\n"
         "    printf '{}\\n' > flake.lock\n"
         "else\n"
-        "    git ls-files --error-unmatch .gitignore flake.lock >/dev/null || exit 8\n"
+        "    git ls-files --error-unmatch flake.lock >/dev/null || exit 8\n"
         "    printf '\\n' >> flake.nix\n"
         "fi\n",
     )
@@ -2360,7 +2354,8 @@ def test_local_init_stages_files_without_committing_or_requiring_home(
         == {"packages": "preserved", "formatter": "automatic"},
         outputs,
     )
-    files = {".gitignore", "flake.lock", "flake.nix"}
+    files = {"flake.lock", "flake.nix"}
+    _expect(not (root / ".gitignore").exists(), "initialization created ignore rules")
     _expect(set(_git(root, "ls-files").splitlines()) == files, "wrong staged files")
     for name in files:
         _expect(_git(root, "show", f":{name}") == (root / name).read_text(), name)
@@ -2434,8 +2429,7 @@ def test_local_init_rolls_back_failed_nix_commands_and_can_retry(
     )
     _local_init(root)
     _expect(
-        set(_git(root, "ls-files").splitlines())
-        == {".gitignore", "flake.lock", "flake.nix"},
+        set(_git(root, "ls-files").splitlines()) == {"flake.lock", "flake.nix"},
         "initialization could not be retried",
     )
 
@@ -2561,27 +2555,27 @@ def _home_test_check_home_commits(
     _git(root, "add", relative)
 
 
-def _home_test_check_home_whitelist(home_repository: Path) -> None:
-    """Repair missing whitelist entries for a registered home submodule."""
+def _home_test_check_home_ignore_rules(home_repository: Path) -> None:
+    """Preserve local and staged ignore rules when repairing home submodules."""
     root = home_repository
     ignore = root / ".gitignore"
-    expected = ignore.read_text(encoding="utf-8")
-    ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n", encoding="utf-8")
+    expected = "# Local policy\n\ntmp/\n"
+    ignore.write_text(expected, encoding="utf-8")
     before = _git(root, "show", ":.gitignore")
     preview = _home_test_run(root, "fix", "--dry-run")
-    if "would write '.gitignore'" not in preview.stdout:
+    if ".gitignore" in preview.stdout:
         raise AssertionError(preview.stdout)
     if (
-        ignore.read_text(encoding="utf-8") == expected
+        ignore.read_text(encoding="utf-8") != expected
         or _git(root, "show", ":.gitignore") != before
     ):
-        message = "dry-run changed the home whitelist"
+        message = "dry-run changed home ignore rules"
         raise AssertionError(message)
     _home_test_run(root, "fix")
     if ignore.read_text(encoding="utf-8") != expected:
         raise AssertionError(ignore.read_text(encoding="utf-8"))
-    if _git(root, "show", ":.gitignore") != expected:
-        message = "convergence did not stage the repaired whitelist"
+    if _git(root, "show", ":.gitignore") != before:
+        message = "convergence staged home ignore rules"
         raise AssertionError(message)
     _home_test_run(root, "fix", "--dry-run")
 
@@ -2610,6 +2604,7 @@ def _home_test_check_home_move(
 ) -> None:
     """Move dirty submodules safely and reject collisions before mutation."""
     root = home_repository
+    ignore_before = (root / ".gitignore").read_text()
     relative = "forge.example/owner/demo"
     checkout = root / relative
     source = checkout / "LICENSE"
@@ -2686,8 +2681,8 @@ def _home_test_check_home_move(
         raise AssertionError(message)
     _home_test_run(root, "fix", "--dry-run")
     _expect(
-        (root / ".gitignore").read_text() == "*\n",
-        "rename changed shared policy",
+        (root / ".gitignore").read_text() == ignore_before,
+        "rename changed home ignore rules",
     )
 
 
@@ -2701,16 +2696,9 @@ def _home_test_history_snapshot(root: Path) -> dict[Path, bytes]:
     }
 
 
-def _git_rule_snapshot(
-    root: Path,
-    *,
-    allow_whitelist_edits: bool = False,
-) -> dict[str, object]:
-    """Compare native Git state, allowing only afairesi's root whitelist edits."""
-    files, index, refs, config = _snapshot(
-        root,
-        exclude=(".gitignore",) if allow_whitelist_edits else (),
-    )
+def _git_rule_snapshot(root: Path) -> dict[str, object]:
+    """Compare native Git state, including repository-owned ignore rules."""
+    files, index, refs, config = _snapshot(root)
     contents = cast("dict[str, tuple[int, int, bytes]]", files)
     root_bytes = os.fsencode(root)
     modules = {}
@@ -2748,14 +2736,7 @@ def _git_rule_snapshot(
             for path, (kind, mode, value) in contents.items()
             if ".git" not in Path(path).parts[:-1]
         },
-        "index": [
-            record
-            for record in cast("str", index).split("\0")
-            if record
-            and not (
-                allow_whitelist_edits and record.partition("\t")[2] == ".gitignore"
-            )
-        ],
+        "index": [record for record in cast("str", index).split("\0") if record],
         "refs": refs,
         "config": cast("str", config).replace(str(root), "<ROOT>"),
         "modules": modules,
@@ -2770,12 +2751,10 @@ def _git_rule_snapshot(
 def _expect_git_rule_state(
     native: Path,
     wrapped: Path,
-    *,
-    allow_whitelist_edits: bool,
 ) -> None:
     """Report the state fields that diverge from the native Git oracle."""
-    expected = _git_rule_snapshot(native, allow_whitelist_edits=allow_whitelist_edits)
-    actual = _git_rule_snapshot(wrapped, allow_whitelist_edits=allow_whitelist_edits)
+    expected = _git_rule_snapshot(native)
+    actual = _git_rule_snapshot(wrapped)
     differences = {
         key: {"git": expected[key], "afairesi": actual[key]}
         for key in expected
@@ -2881,7 +2860,6 @@ def test_home_rm_matches_native_git(
     _expect_git_rule_state(
         native,
         wrapped,
-        allow_whitelist_edits=expected.returncode == 0,
     )
 
 
@@ -2948,12 +2926,11 @@ def test_repo_mv_matches_native_git(
     _expect_git_rule_state(
         native,
         wrapped,
-        allow_whitelist_edits=expected.returncode == 0,
     )
 
 
 @pytest.mark.parametrize("branch", ["main", "trunk"])
-def test_init_home_stages_policy_without_cleaning_or_committing(
+def test_init_home_stages_metadata_without_cleaning_or_committing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     branch: str,
@@ -2972,17 +2949,9 @@ def test_init_home_stages_policy_without_cleaning_or_committing(
         _git(home, "branch", "--show-current").strip() == branch,
         "home initialization changed Git's initial branch",
     )
-    expected = "*\n"
+    _expect(not (home / ".gitignore").exists(), "home init created ignore rules")
     _expect(
-        (home / ".gitignore").read_text() == expected,
-        "wrong home policy",
-    )
-    _expect(
-        _git(home, "show", ":.gitignore") == expected,
-        "policy was not staged",
-    )
-    _expect(
-        _git(home, "ls-files").splitlines() == [".gitignore", ".gitmodules"],
+        _git(home, "ls-files").splitlines() == [".gitmodules"],
         "home data was staged",
     )
     _expect(
@@ -3041,11 +3010,11 @@ def test_home_initialization_rejects_invalid_state_without_creating_files(
         _expect("fatal:" in result.stderr, result)
 
 
-def test_failed_add_restores_home_whitelist_and_staging(
+def test_failed_add_preserves_home_ignore_rules_and_staging(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Restore whitelist, staging, and directories after submodule add failure."""
+    """Preserve ignore rules, staging, and directories after submodule add failure."""
     home = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     remote = "https://example.test/team/missing.git"
@@ -3131,7 +3100,7 @@ def test_home_repair_preserves_missing_checkouts(
     destination: str,
     state: str,
 ) -> None:
-    """Repair the whitelist without initializing or relocating missing checkouts."""
+    """Preserve missing checkouts, their registrations, and local ignore rules."""
     root = _home_test_home_repository(tmp_path)
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
@@ -3165,8 +3134,8 @@ def test_home_repair_preserves_missing_checkouts(
     history = root / ".git/modules" / relative
     history_before = _home_test_history_snapshot(history)
     ignore = root / ".gitignore"
-    expected_ignore = ignore.read_text()
-    ignore.write_text("*\n!/.gitignore\n!/.gitmodules\n")
+    expected_ignore = "# Local policy\n\ntmp/\n"
+    ignore.write_text(expected_ignore)
     before = _snapshot(root)
     _home_test_run(root, "fix", "--dry-run")
     _expect(
@@ -3180,7 +3149,7 @@ def test_home_repair_preserves_missing_checkouts(
     )
     _expect(
         ignore.read_text() == expected_ignore,
-        "repair failed to restore whitelist",
+        "repair changed ignore rules",
     )
     _expect(
         (root / ".gitmodules").read_bytes() == modules_before,
@@ -3416,7 +3385,7 @@ def test_home_repair_preserves_dirty_submodules() -> None:
             "flake repair changed home state",
         )
         _home_test_check_home_commits(root)
-        _home_test_check_home_whitelist(root)
+        _home_test_check_home_ignore_rules(root)
         _home_test_check_home_settings(root)
         _home_test_check_home_move(root)
         modules = root / ".gitmodules"
@@ -3459,22 +3428,34 @@ def test_home_repair_targets_home_from_any_working_directory(
         "outside": outside,
     }[location]
     ignore = home / ".gitignore"
-    expected = "*\n"
-    ignore.write_text("*\n!/zzz\n!/.gitmodules\n!/aaa\n!/.gitignore\n")
+    expected = "# Home policy\n\ntmp/\n"
+    ignore.write_text(expected)
+    indexed = _git(home, "show", ":.gitignore")
+    modules = home / ".gitmodules"
+    existing_modules = modules.read_text()
+    first_module = (
+        '[submodule "aaa"]\npath = forge.example/owner/aaa\n'
+        "url = git@forge.example:owner/aaa\n"
+    )
+    modules.write_text(existing_modules + first_module)
     before = _snapshot(home)
     checkout_before = _snapshot(checkout)
     flake_before = _snapshot(flake)
     preview = _home_test_run(cwd, "fix", "--dry-run")
-    _expect("would write '.gitignore'" in preview.stdout, preview)
+    _expect("would write '.gitmodules'" in preview.stdout, preview)
     _expect(
         _snapshot(home) == before,
         "home repair preview changed state",
     )
     _home_test_run(cwd, "fix")
-    _expect(ignore.read_text() == expected, "home whitelist was not repaired")
     _expect(
-        _git(home, "show", ":.gitignore") == expected,
-        "repair was not staged",
+        _git(home, "show", ":.gitmodules") == first_module + existing_modules,
+        "repair did not stage sorted submodules",
+    )
+    _expect(ignore.read_text() == expected, "home ignore rules changed")
+    _expect(
+        _git(home, "show", ":.gitignore") == indexed,
+        "repair staged ignore rules",
     )
     _expect(
         _snapshot(checkout) == checkout_before,
@@ -3523,7 +3504,7 @@ def test_home_submodule_removal_stages_metadata_and_preserves_shared_paths(
     name: str,
     location: str,
 ) -> None:
-    """Preview and remove a repository together with its owned whitelist entries."""
+    """Remove and stage a submodule while preserving ignore rules and shared paths."""
     root = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(root))
     relative = "forge.example/owner/demo"
@@ -3791,7 +3772,8 @@ def test_home_sorts_gitmodules_and_preserves_settings(
     monkeypatch.setenv("HOME", str(home))
     _home_test_run(tmp_path, "init")
     ignore = home / ".gitignore"
-    ignore.write_text(ignore.read_text() + "!/extra\n!/extra\n!/.gitignore\n")
+    ignore_rules = "# Local policy\n\ntmp/\ntmp/\n"
+    ignore.write_text(ignore_rules)
     prefix = "# Home repositories\n"
     last = (
         '[submodule "zzz"] # retained comment\n'
@@ -3817,50 +3799,80 @@ def test_home_sorts_gitmodules_and_preserves_settings(
     expected = prefix + first + other + last
     _expect(modules.read_text() == expected, modules.read_text())
     _expect(_git(home, "show", ":.gitmodules") == expected, modules)
-    patterns = ignore.read_text().splitlines()
-    _expect(len(patterns) == len(set(patterns)), patterns)
-    _expect(patterns == ["*"], patterns)
-    _expect(_git(home, "show", ":.gitignore") == ignore.read_text(), ignore)
+    _expect(ignore.read_text() == ignore_rules, "home command changed ignore rules")
+    _expect(".gitignore" not in _git(home, "ls-files").splitlines(), ignore)
     before = _snapshot(home)
     _home_test_run(tmp_path, command)
     _expect(_snapshot(home) == before, "repeated command changed home state")
 
 
-def test_home_and_project_share_tracking_policy(
+@pytest.mark.parametrize("policy", [None, "", "# Artifacts\n\ntmp/\n", "*\n"])
+@pytest.mark.parametrize("tracked", [False, True])
+def test_home_and_project_preserve_user_ignore_rules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    policy: str | None,
+    *,
+    tracked: bool,
 ) -> None:
-    """Use one stable policy before and after resource registration at both levels."""
+    """Leave ignore rules, their modes, and their index entries under user control."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    _home_test_run(tmp_path, "init")
     with _fresh_repository() as root:
-        _fixture_add(root, "prm", "python")
-        _fixture_add(root, "tmp", "nix")
-        expected = "*\n"
-        _expect(
-            (home / ".gitignore").read_text()
-            == (root / ".gitignore").read_text()
-            == expected,
-            expected,
-        )
+        _git(root, "rm", "--force", ".gitignore")
+        _git(home, "init", "--quiet")
+        for directory in (home, root):
+            ignore = directory / ".gitignore"
+            mode = 0o755
+            if policy is not None:
+                if tracked:
+                    ignore.write_text("# Staged rules\nresult\n")
+                    _git(directory, "add", "--force", ".gitignore")
+                ignore.write_text(policy)
+                ignore.chmod(mode)
+            indexed = _git(directory, "ls-files", "--stage", "--", ".gitignore")
+            if directory == home:
+                for command in ("init", "fix", "init"):
+                    _home_test_run(tmp_path, command)
+            else:
+                _run(root, "add", "prm", "python")
+                _run(root, "add", "tmp", "nix")
+                _run(root, "add", "host", "host")
+                _preview_flake_repair(root)
+                _run(root, "fix")
+                _check_flake_source(root)
+                _run(root, "mv", "prm", "renamed")
+                _fixture_git(root, "commit", "-qm", "Resources")
+                _run(root, "rm", "renamed")
+                _check_flake_source(root)
+            _expect(
+                (ignore.read_text() if ignore.exists() else None) == policy,
+                "command changed ignore rules",
+            )
+            if policy is not None:
+                _expect(stat.S_IMODE(ignore.stat().st_mode) == mode, ignore)
+            _expect(
+                _git(directory, "ls-files", "--stage", "--", ".gitignore") == indexed,
+                "command staged ignore rules",
+            )
         _expect(
             (home / ".gitmodules").read_text() == "",
             "empty home lacks registration metadata",
         )
         _expect(
             {p.name for p in import_module("afairesi.main").detect_packages(root)}
-            == {"prm", "tmp"},
+            == {"tmp"},
             "reserved directory names remain",
         )
 
 
-def test_tracking_policy_skips_local_trees_and_allows_nested_sources() -> None:
-    """Keep Git status out of local caches while retaining explicit source selection."""
+def test_user_ignore_rules_skip_artifacts_and_allow_normal_git_add() -> None:
+    """Let repositories ignore tmp at any depth and admit sources with normal Git."""
     with _fresh_repository() as root:
+        (root / ".gitignore").write_text("tmp/\n")
         _fixture_add(root, "example", "python")
-        private = root / "cache/private"
+        private = root / "example/tmp/private"
         private.mkdir(parents=True)
         private.chmod(0)
         try:
@@ -3872,14 +3884,18 @@ def test_tracking_policy_skips_local_trees_and_allows_nested_sources() -> None:
                 executable="git",
             )
             _expect(not result.stderr, result.stderr)
-            _git(root, "check-ignore", "--quiet", "--no-index", "cache/")
+            for relative in ("tmp/", "example/tmp/"):
+                _git(root, "check-ignore", "--quiet", "--no-index", relative)
         finally:
             private.chmod(0o700)
         source = root / "assets/nested/source.txt"
         source.parent.mkdir(parents=True)
         source.write_text("selected source")
-        _run(root, "add", "--", "assets/nested/source.txt", executable="git", code=1)
-        _run(root, "add", "--force", "--", "assets/nested/source.txt", executable="git")
+        _expect(
+            "assets/" in _git(root, "status", "--porcelain"),
+            "new source hidden from Git status",
+        )
+        _run(root, "add", "--", "assets/nested/source.txt", executable="git")
         _expect(
             _git(root, "show", ":assets/nested/source.txt") == "selected source",
             "nested source was not staged",
@@ -4164,7 +4180,7 @@ def test_formatting_transforms_tracked_sources_without_repair_or_staging() -> No
             local.read_text() == "# Keep this comment\nVALUE=  2\n",
             "local file changed",
         )
-        _expect(ignore.read_text() == "*\n!*/\n", "formatter changed ignore rules")
+        _expect(ignore.read_text() == "*\n\n!*/\n", "formatter changed ignore rules")
         _expect(
             _git(root, "diff", "--cached", "--binary") == staged,
             "formatter staged changes",
@@ -4225,7 +4241,7 @@ def test_formatting_normalizes_metadata_and_supporting_sources() -> None:
             executable="treefmt",
         )
         expected_metadata = {
-            ".gitignore": "*\n!*/\n",
+            ".gitignore": metadata[".gitignore"],
             "LICENSE": metadata["LICENSE"],
             "flake.lock": metadata["flake.lock"],
         }

@@ -4,8 +4,8 @@ let
 in
 (inputs.afairesi or inputs.self).lib.mkPythonPackage {
   inherit pkgs;
-  executable = true;
-  meta.description = "Parse, validate, and rewrite Nix source files";
+  executable = false;
+  meta.description = "Shared Nix parsing and rewriting helpers";
   propagatedBuildInputs = [
     pkgs.nix
     (python.pkgs.tree-sitter-language-pack.overridePythonAttrs (previous: {

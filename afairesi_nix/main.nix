@@ -49,11 +49,6 @@ let
             "--ignore-path"
             "/dev/null"
           ];
-          remove-empty-lines = {
-            command = afairesiInputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines;
-            includes = [ ".gitignore" ];
-            priority = 2;
-          };
           uncomment = {
             command = afairesiInputs.self.packages.${pkgs.stdenv.system}.uncomment;
             includes = [

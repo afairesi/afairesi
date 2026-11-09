@@ -256,7 +256,7 @@ pkgs.runCommand "afairesi-consumer-contract"
     assert "ordinary explanation" not in source
     assert source.index("a = 1;") < source.index("z = 2;")
     assert "retained = false;" in source
-    assert Path(".gitignore").read_text() == "*\n!*/\n"
+    assert Path(".gitignore").read_text() == "*\n\n!*/\n"
     assert Path("supporting/data.json").stat().st_mtime == 1
     assert Path("supporting/ordered.nix").stat().st_mtime == 1
     for name in ["supporting/data.json", "flake.lock"]:
