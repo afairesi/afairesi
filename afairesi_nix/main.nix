@@ -445,7 +445,7 @@ let
             ) (hostsFor system))
             (lib.mapAttrs' (name: shell: lib.nameValuePair "devshell-${name}" shell) self.devShells.${system})
             {
-              formatter = self.formatter.${system}.passthru.tests.check or self.formatter.${system};
+              formatter = self.formatter.${system}.passthru.tests.check;
               lint =
                 (lint {
                   inherit self;

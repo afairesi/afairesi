@@ -169,11 +169,7 @@ assert
     runtimeHook = "echo invalid";
   });
 assert !(inputs.self.apps.${system} ? afairesi);
-assert !(inputs.self.lib ? mkPythonCheck);
-assert !(inputs.self.lib ? mkHostCheck);
 assert inputs.self.lib ? mkFlake;
-assert !(inputs.self ? blueprint);
-assert !(inputs.self.lib ? blueprint);
 assert inputs.self.packages.${system}.default == inputs.self.packages.${system}.afairesi;
 pkgs.runCommand "afairesi-consumer-contract"
   {

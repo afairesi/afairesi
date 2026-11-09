@@ -58,15 +58,14 @@
         >
           <div class="tree-scope tree-system">
             <span class="tree-scope-label">NixOS with<br />Preservation</span>
-            <pre><code>/                           <span class="tree-comment"># Managed by Preservation</span>
-├── …</code></pre>
+            <pre><code>/                           <span class="tree-comment"># Managed by Preservation</span></code></pre>
             <details class="package home-branch" open>
               <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>home/…/                 <span class="tree-comment"># Persistent</span></code></summary>
+              <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>home/&lt;user&gt;/            <span class="tree-comment"># Persistent</span></code></summary>
               <div class="tree-scope tree-home">
                 <span class="tree-scope-label">afairesi home</span>
                 <pre><code>│
-├── .gitignore              <span class="tree-comment"># Optional, user-owned.</span>
+├── .gitignore              <span class="tree-comment"># Home allowlist.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span>
 │</code></pre>
                 <details class="package repo-branch" open>
@@ -76,18 +75,15 @@
                     <span class="tree-scope-label">afairesi repo</span>
                     <pre><code>│                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
 │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
-├── .gitignore          <span class="tree-comment"># Optional, repository-owned.</span>
 ├── flake.nix
 ├── flake.lock
-├── …                   <span class="tree-comment"># Supporting files can live anywhere.</span>
 │</code></pre>
                     <details class="package">
                       <!-- prettier-ignore -->
                       <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>html_package/</code></summary>
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
 │   ├── default.nix
-│   ├── index.html
-│   └── …</code></pre>
+│   └── index.html</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -95,16 +91,14 @@
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
 │   ├── default.nix
 │   ├── main.py
-│   ├── test_main.py    <span class="tree-comment"># Optional.</span>
-│   └── …</code></pre>
+│   └── test_main.py    <span class="tree-comment"># Optional.</span></code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
                       <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>latex_package/</code></summary>
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
 │   ├── default.nix
-│   ├── ms.tex
-│   └── …</code></pre>
+│   └── ms.tex</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -112,8 +106,7 @@
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
 │   ├── default.nix
 │   ├── main.lean
-│   ├── test_main.lean  <span class="tree-comment"># Optional.</span>
-│   └── …</code></pre>
+│   └── test_main.lean  <span class="tree-comment"># Optional.</span></code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -121,16 +114,14 @@
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
 │   ├── default.nix
 │   ├── main.nix        <span class="tree-comment"># Optional; library or implementation.</span>
-│   ├── test_main.nix   <span class="tree-comment"># Optional; returns a check derivation.</span>
-│   └── …</code></pre>
+│   └── test_main.nix   <span class="tree-comment"># Optional; returns a check derivation.</span></code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
                       <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>nixos-configuration/</code></summary>
                       <pre><code>    │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.nixos-configuration.config.system.build.toplevel</span></span>
     ├── configuration.nix
-    ├── hardware-configuration.nix <span class="tree-comment"># Optional.</span>
-    └── …</code></pre>
+    └── hardware-configuration.nix <span class="tree-comment"># Optional.</span></code></pre>
                     </details>
                   </div>
                 </details>
@@ -145,10 +136,9 @@
       </div>
       <p>
         Git determines source membership. Select new files with <code>git add -- PATH</code>; use
-        <code>-f</code> when deliberately tracking an ignored file. Each repository owns its
-        optional <code>.gitignore</code>; Afairesi leaves its contents and staging untouched.
-        Afairesi stages the files it creates. The <code>default.nix</code> constructor selects the
-        package type; supporting files can live anywhere.
+        <code>-f</code> when deliberately tracking an ignored file. Afairesi stages the files it
+        creates. The <code>default.nix</code> constructor selects the package type; supporting files
+        can live anywhere.
       </p>
       <p>
         <code>afairesi repo fix</code> repairs and stages structure. <code>nix fmt</code> formats
@@ -167,9 +157,16 @@
         <p>
           A repository can keep disposable artifacts in <code>tmp/</code> directories and add
           <code>tmp/</code> to its own <code>.gitignore</code>. This pattern covers that directory
-          name at any depth. Tools that write caches elsewhere may need additional patterns.
-          Directory names have no special meaning to Afairesi; tracking determines membership. A
-          home repository can independently choose <code>*</code> for explicit file admission.
+          name at any depth. Tools that write caches elsewhere may need additional patterns. Project
+          ignore rules remain under your control; tracking determines membership.
+        </p>
+        <p>
+          Home commands maintain <code>~/.gitignore</code> as an allowlist: <code>*</code> ignores
+          new files, with exceptions for <code>.gitignore</code>, <code>.gitmodules</code>, and
+          registered submodule directories and their parents. These exceptions follow
+          <code>.gitmodules</code> when repositories are added, moved, or removed. Add personal
+          exceptions below them, including any parent directories. Afairesi preserves personal rules
+          and their staging while updating its structural rules.
         </p>
         <p>From a project root, preview untracked files to remove, including ignored files:</p>
         <pre><code>git clean -ndx</code></pre>
@@ -185,7 +182,8 @@
           Afairesi (<span lang="el">αφαίρεση</span>, subtraction or abstraction) favors declaring
           each essential fact once and deriving the rest. Git owns source membership and history;
           Preservation declares persistent state; Afairesi derives builds, checks, and environments.
-          Ignore rules belong to each repository's workflow.
+          The home allowlist follows submodule registrations; project ignore rules belong to each
+          repository's workflow.
         </p>
         <p>
           Conventions should remove more decisions than their implementation and exceptions

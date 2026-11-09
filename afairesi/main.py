@@ -1082,7 +1082,7 @@ def converge_flake(
     root: Path,
     *,
     dry_run: bool,
-) -> list[Package]:
+) -> None:
     """Converge required files, structure, and templates."""
     missing = [
         name for name in ("flake.nix", "flake.lock") if not (root / name).is_file()
@@ -1108,12 +1108,11 @@ def converge_flake(
         },
         dry_run=dry_run,
     )
-    if dry_run and changed:
-        return packages
-    return validate_flake_source(root)
+    if not (dry_run and changed):
+        validate_flake_source(root)
 
 
-def validate_flake_source(root: Path) -> list[Package]:
+def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     packages, issues = inspect_structure(root)
     paths = source_paths(root)
@@ -1133,7 +1132,6 @@ def validate_flake_source(root: Path) -> list[Package]:
                 source = root / relative
                 if source.is_file():
                     nix_syntax.parse(source.read_bytes(), str(source))
-    return packages
 
 
 def _source_package_issues(root: Path, package: Package) -> list[str]:
@@ -1407,16 +1405,15 @@ def rename_resource(
     git(root, ["mv", "--", str(source_relative), str(destination_relative)])
 
 
-def require_nix_flakes() -> str:
+def require_nix_flakes() -> None:
     """Check the effective Nix features before initialization changes files."""
-    executable = "nix"
     try:
         completed = run(
-            [executable, "config", "show", "experimental-features"],
+            ["nix", "config", "show", "experimental-features"],
             check=False,
         )
     except FileNotFoundError as error:
-        msg = f"Nix executable not found: {executable}; install Nix to use repo init"
+        msg = "Nix executable not found: nix; install Nix to use repo init"
         raise CommandError(msg) from error
     if completed.returncode != 0:
         msg = f"could not check Nix features: {completed.stderr.strip()}"
@@ -1432,12 +1429,10 @@ def require_nix_flakes() -> str:
             "in your Nix configuration"
         )
         raise CommandError(msg)
-    return executable
 
 
-def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
+def initialize_flake(root: Path) -> None:
     """Scaffold and format a new flake in an existing repository directory."""
-    executable = nix_executable or require_nix_flakes()
     (root / "flake.nix").write_text(
         "{\n"
         '  inputs.afairesi.url = "github:afairesi/afairesi";\n'
@@ -1450,9 +1445,9 @@ def initialize_flake(root: Path, *, nix_executable: str | None = None) -> None:
         encoding="utf-8",
     )
     git(root, ["add", "--force", "--", "flake.nix"])
-    run([executable, "flake", "lock"], cwd=root, capture_output=False)
+    run(["nix", "flake", "lock"], cwd=root, capture_output=False)
     git(root, ["add", "--force", "--", "flake.lock"])
-    run([executable, "fmt"], cwd=root, capture_output=False)
+    run(["nix", "fmt"], cwd=root, capture_output=False)
     git(root, ["add", "--", "flake.lock", "flake.nix"])
 
 
@@ -1468,7 +1463,7 @@ def initialize_repository() -> None:
     ):
         msg = "repo init requires an empty Git worktree; existing files are preserved"
         raise CommandError(msg)
-    executable = require_nix_flakes()
+    require_nix_flakes()
     index = Path(
         git(
             root,
@@ -1481,7 +1476,7 @@ def initialize_repository() -> None:
         else None
     )
     try:
-        initialize_flake(root, nix_executable=executable)
+        initialize_flake(root)
     except BaseException:
         for path in root.iterdir():
             if path.name == ".git":
@@ -3379,6 +3374,7 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
+    paths = source_paths(root)
     host_names = {host.name for host in detect_hosts(root)}
     resources: dict[str, Any] = {name: {"type": "host"} for name in host_names}
     for package in detect_packages(root):
@@ -3394,7 +3390,7 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         tests = package.root / "test_main.py"
         test_module = (
             _source(tests)
-            if tests.relative_to(root) in source_paths(root) and tests.is_file()
+            if tests.relative_to(root) in paths and tests.is_file()
             else None
         )
         description = package_description(package)
@@ -3406,11 +3402,11 @@ def inspect_repository(root: Path) -> dict[str, Any]:
             if test_module is not None
             else ["test_main.lean"]
             if package.kind == "lean4"
-            and Path(package.name) / "test_main.lean" in source_paths(root)
+            and Path(package.name) / "test_main.lean" in paths
             and (package.root / "test_main.lean").is_file()
             else ["test_main.nix"]
             if package.kind == "nix"
-            and Path(package.name) / "test_main.nix" in source_paths(root)
+            and Path(package.name) / "test_main.nix" in paths
             and (package.root / "test_main.nix").is_file()
             else []
         )
@@ -3606,14 +3602,13 @@ def _dispatch_inspect(
 
 
 def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
-    """Keep path inspection available alongside Git-style structural diffs."""
+    """Configure repository selection and Git-style structural diffs."""
     inspection.add_argument(
         "--repository",
         metavar="PATH_OR_REMOTE",
         help=(
             "repository directory or Git URL (default: current repository); "
-            "also accepted as 'inspect PATH_OR_REMOTE'; relative paths use the "
-            "Git root, or the current directory outside Git"
+            "relative paths use the Git root, or the current directory outside Git"
         ),
     )
     commands = inspection.add_subparsers(
@@ -3832,11 +3827,11 @@ def home_submodules(
     return repositories
 
 
-def _converge_home_modules(root: Path, *, dry_run: bool) -> bool:
+def _converge_home_modules(root: Path, *, dry_run: bool) -> None:
     """Sort submodule sections while preserving their settings and other sections."""
     source = read_regular(root / ".gitmodules")
     if source is None:
-        return False
+        return
     headers = list(
         re.finditer(
             r'(?m)^[ \t]*\[((?:[^"\]\n]|"(?:\\.|[^"\\\n])*")+)\]'
@@ -3857,45 +3852,122 @@ def _converge_home_modules(root: Path, *, dry_run: bool) -> bool:
             r'(?i:submodule)[ \t]+"((?:\\.|[^"\\])*)"',
             header.group(1),
         )
-        if match:
-            name = re.sub(r'\\(["\\])', r"\1", match.group(1))
-        elif header.group(1).lower().startswith("submodule."):
-            name = header.group(1)[len("submodule.") :].lower()
-        else:
+        if match is None:
             continue
+        name = re.sub(r'\\(["\\])', r"\1", match.group(1))
         positions.append(index)
         submodules.append((name, sections[index]))
     ordered = sorted(submodules, key=lambda section: section[0])
     if ordered == submodules:
-        return False
+        return
     for position, (_, section) in zip(positions, ordered, strict=True):
         sections[position] = section if section.endswith("\n") else section + "\n"
     updated = source[: headers[0].start()] + "".join(sections)
-    return write_managed(root, Path(".gitmodules"), updated, dry_run=dry_run)
+    write_managed(root, Path(".gitmodules"), updated, dry_run=dry_run)
 
 
-def _converge_home_submodule(
+def _home_ignore_rules(paths: list[Path]) -> set[str]:
+    """Allow home metadata and literal submodule directories at every depth."""
+    rules = {"*", "!/.gitignore", "!/.gitmodules"}
+    for path in paths:
+        if path.is_absolute() or ".." in path.parts or not path.parts:
+            msg = f"invalid home submodule path: {path}"
+            raise CommandError(msg)
+        for depth in range(1, len(path.parts) + 1):
+            relative = Path(*path.parts[:depth]).as_posix()
+            if "\n" in relative or "\r" in relative:
+                msg = f"invalid home submodule path: {path}"
+                raise CommandError(msg)
+            escaped = re.sub(r"([\\*?\[\] ])", r"\\\1", relative)
+            rules.add(f"!/{escaped}/")
+    return rules
+
+
+def _home_ignore_previous_paths(root: Path) -> list[Path]:
+    """Recognize prior submodule exceptions from staged and committed gitlinks."""
+    records = git(root, ["ls-files", "--stage", "-z"]).stdout
+    committed = git(root, ["ls-tree", "-r", "-z", "HEAD"], check=False)
+    if committed.returncode == 0:
+        records += committed.stdout
+    return [
+        Path(record.partition("\t")[2])
+        for record in records.split("\0")
+        if record.startswith("160000 ")
+    ]
+
+
+def _home_ignore_source(source: str, required: set[str], owned: set[str]) -> str:
+    """Refresh structural exceptions without markers, retaining personal rules."""
+    personal = [
+        line
+        for line in source.splitlines(keepends=True)
+        if line.rstrip("\r\n") not in owned
+    ]
+    retained = {
+        rule
+        for rule in owned - required
+        if rule.endswith("/") and any(line.startswith(rule) for line in personal)
+    }
+    updated = "*\n" + "".join(
+        rule + "\n" for rule in sorted((required | retained) - {"*"})
+    )
+    return updated + "".join(personal)
+
+
+def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
+    """Read regular working and staged ignore files before changing home structure."""
+    source = read_regular(root / ".gitignore")
+    if not (root / ".git").exists():
+        return source, "100644", None
+    entries = git(root, ["ls-files", "--stage", "-z", "--", ".gitignore"]).stdout
+    mode = "100644"
+    indexed = None
+    if entries:
+        fields = entries.split("\t", 1)[0].split()
+        if fields[2] != "0" or fields[0] not in {"100644", "100755"}:
+            msg = ".gitignore: index must contain a regular file without conflicts"
+            raise CommandError(msg)
+        mode = fields[0]
+        indexed = git(root, ["cat-file", "blob", fields[1]]).stdout
+    return source, mode, indexed
+
+
+def _converge_home_ignore(
     root: Path,
-    repository: dict[str, str],
-    expected: Path,
+    required: set[str],
+    previous: set[str],
+    state: tuple[str | None, str, str | None],
     *,
     dry_run: bool,
-) -> bool:
-    """Converge one home submodule record and checkout."""
-    actual = Path(repository["path"])
-    if actual == expected or not (root / actual / ".git").exists():
-        return False
-    report_change(f"move '{actual}' to '{expected}'", dry_run=dry_run)
-    arguments = ["mv"]
+) -> None:
+    """Update working and staged allowlists independently to retain personal edits."""
+    source, mode, indexed = state
+    owned = required | previous
+    updated = _home_ignore_source(source or "", required, owned)
+    staged = _home_ignore_source(indexed or "", required, owned)
+    if source == updated and indexed == staged:
+        return
+    report_change("write '.gitignore'", dry_run=dry_run)
     if dry_run:
-        arguments.append("--dry-run")
-    else:
-        (root / expected).parent.mkdir(parents=True, exist_ok=True)
-    git(root, [*arguments, "--", str(actual), str(expected)])
-    return True
+        return
+    if source != updated:
+        (root / ".gitignore").write_text(updated, encoding="utf-8")
+    if indexed != staged:
+        blob = run(
+            ["git", "hash-object", "-w", "--stdin"], cwd=root, input_source=staged
+        )
+        git(
+            root,
+            [
+                "update-index",
+                "--add",
+                "--cacheinfo",
+                f"{mode},{blob.stdout.strip()},.gitignore",
+            ],
+        )
 
 
-def converge_home(root: Path, *, dry_run: bool) -> list[dict[str, str]]:
+def converge_home(root: Path, *, dry_run: bool) -> None:
     """Converge a canonical home repository."""
     repositories = home_submodules(root)
     actual_paths = [Path(repository["path"]) for repository in repositories]
@@ -3919,15 +3991,25 @@ def converge_home(root: Path, *, dry_run: bool) -> list[dict[str, str]]:
         if actual != expected and (root / expected).exists():
             msg = f"target already exists: {expected}"
             raise CommandError(msg)
-    for repository, expected in zip(repositories, repair_paths, strict=True):
-        _converge_home_submodule(
-            root,
-            repository,
-            expected,
-            dry_run=dry_run,
-        )
+    ignore_state = _home_ignore_state(root)
+    previous_rules = _home_ignore_rules(
+        actual_paths + _home_ignore_previous_paths(root)
+    )
+    required_rules = _home_ignore_rules(repair_paths)
+    for actual, expected in zip(actual_paths, repair_paths, strict=True):
+        if actual == expected or not (root / actual / ".git").exists():
+            continue
+        report_change(f"move '{actual}' to '{expected}'", dry_run=dry_run)
+        arguments = ["mv"]
+        if dry_run:
+            arguments.append("--dry-run")
+        else:
+            (root / expected).parent.mkdir(parents=True, exist_ok=True)
+        git(root, [*arguments, "--", str(actual), str(expected)])
     _converge_home_modules(root, dry_run=dry_run)
-    return repositories
+    _converge_home_ignore(
+        root, required_rules, previous_rules, ignore_state, dry_run=dry_run
+    )
 
 
 def remove_home_submodule(
@@ -3947,6 +4029,10 @@ def remove_home_submodule(
     ):
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
+    ignore_state = _home_ignore_state(root)
+    previous_paths = [Path(repository["path"]) for repository in repositories]
+    previous_paths += _home_ignore_previous_paths(root)
+    previous_rules = _home_ignore_rules(previous_paths)
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
@@ -3956,18 +4042,43 @@ def remove_home_submodule(
         capture_output=False,
     )
     _converge_home_modules(root, dry_run=False)
+    _converge_home_ignore(
+        root,
+        _home_ignore_rules(
+            [
+                Path(repository["path"])
+                for repository in home_submodules(root, require_url=False)
+            ]
+        ),
+        previous_rules,
+        ignore_state,
+        dry_run=False,
+    )
 
 
 def initialize_home() -> None:
-    """Initialize and stage home submodule metadata without cleaning."""
+    """Initialize and stage home submodule metadata and the home allowlist."""
     root = Path.home()
     if repository_type(root, "home") != "home":
         msg = "cannot initialize a flake repository as a home repository"
         raise CommandError(msg)
+    ignore_state = _home_ignore_state(root)
     run(["git", "init", "--", str(root)], capture_output=False)
     if not (root / ".gitmodules").exists():
         write_managed(root, Path(".gitmodules"), "", dry_run=False)
     _converge_home_modules(root, dry_run=False)
+    _converge_home_ignore(
+        root,
+        _home_ignore_rules(
+            [
+                Path(repository["path"])
+                for repository in home_submodules(root, require_url=False)
+            ]
+        ),
+        _home_ignore_rules(_home_ignore_previous_paths(root)),
+        ignore_state,
+        dry_run=False,
+    )
 
 
 def _require_home_repository() -> Path:
@@ -4012,6 +4123,8 @@ def initialize_submodule(
     if storage.exists() and not force:
         msg = f"retained Git history exists for {relative}; use --force to reuse it"
         raise CommandError(msg)
+    ignore_state = _home_ignore_state(home)
+    previous_rules = _home_ignore_rules(_home_ignore_previous_paths(home))
     try:
         run(
             [*arguments, "--", remote, relative.as_posix()],
@@ -4019,6 +4132,18 @@ def initialize_submodule(
             capture_output=False,
         )
         _converge_home_modules(home, dry_run=False)
+        _converge_home_ignore(
+            home,
+            _home_ignore_rules(
+                [
+                    Path(repository["path"])
+                    for repository in home_submodules(home, require_url=False)
+                ]
+            ),
+            previous_rules,
+            ignore_state,
+            dry_run=False,
+        )
     except BaseException:
         remove_empty_directories(directories)
         raise
@@ -4036,7 +4161,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         help="add and stage a submodule",
         description=(
             "Add a submodule at $HOME/<remote-hostname>/<repository-path>. "
-            "Stage its registration."
+            "Stage its registration and home allowlist exceptions."
         ),
     )
     add.add_argument("remote", metavar="REMOTE", help="hosted Git repository URL")
@@ -4051,7 +4176,8 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         help="fix and stage home repository structure",
         description=(
             "Fix and stage the submodule layout. "
-            "Move submodules to <remote-hostname>/<repository-path>."
+            "Move submodules to <remote-hostname>/<repository-path> and update "
+            "the home allowlist."
         ),
     )
     fix_home.add_argument(
@@ -4062,16 +4188,19 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     commands.add_parser(
         "init",
-        help="initialize the home repository and stage its submodule metadata",
+        help="initialize home submodule metadata and the home allowlist",
         description=(
-            "Initialize the home repository and stage its .gitmodules metadata."
+            "Initialize the home repository and stage its .gitmodules metadata "
+            "and structural .gitignore rules. "
+            "Preserve personal ignore rules and staging."
         ),
     )
     remove = commands.add_parser(
         "rm",
         help="remove and stage a submodule",
         description=(
-            "Remove a submodule with git rm. Stage the updated submodule registration."
+            "Remove a submodule with git rm. Stage the updated submodule registration "
+            "and home allowlist exceptions."
         ),
     )
     remove.add_argument(
@@ -4196,14 +4325,7 @@ def check_source_main() -> None:
     options = cli.parse_args()
     try:
         validate_flake_source(options.source.resolve())
-    except (
-        CommandError,
-        OSError,
-        SyntaxError,
-        UnicodeError,
-        ValueError,
-        nix_syntax.NixSyntaxError,
-    ) as error:
+    except (CommandError, OSError, SyntaxError, ValueError) as error:
         sys.stderr.write((f"error: {error}") + "\n")
         raise SystemExit(1) from error
 
@@ -4253,14 +4375,7 @@ def _dispatch_workspace_command(
 def main() -> None:
     """Dispatch repository and home commands."""
     cli = parser()
-    arguments = sys.argv[1:]
-    if arguments[:2] == ["repo", "inspect"] and arguments[2:]:
-        target, *remaining = arguments[2:]
-        if target == "--" and len(remaining) == 1:
-            arguments = [*arguments[:2], "--repository", remaining[0]]
-        elif target != "diff" and not target.startswith("-"):
-            arguments = [*arguments[:2], "--repository", *arguments[2:]]
-    options = cli.parse_args(arguments)
+    options = cli.parse_args()
     _validate_resource_arguments(cli, options)
     try:
         _dispatch_workspace_command(options, cli)
@@ -4276,9 +4391,7 @@ def main() -> None:
         subprocess.TimeoutExpired,
         OSError,
         SyntaxError,
-        UnicodeError,
         ValueError,
-        nix_syntax.NixSyntaxError,
     ) as error:
         sys.stderr.write((f"error: {error}") + "\n")
         raise SystemExit(1) from error
