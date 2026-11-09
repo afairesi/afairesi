@@ -222,7 +222,7 @@ def test_cli_removes_defaults_and_preserves_overrides(tmp_path: Path) -> None:
         'description = "keep  spacing"; empty = {}; }',
         encoding="utf-8",
     )
-    scratch = root / "tmp/invalid.nix"
+    scratch = tmp_path / "scratch/invalid.nix"
     scratch.parent.mkdir()
     scratch.write_text("{ broken = ; }", encoding="utf-8")
     formatter = root / "formatter.nix"
@@ -602,3 +602,24 @@ def test_cli_preserves_native_evaluation_errors(tmp_path: Path, value: str) -> N
         or path.read_text() != source
     ):
         raise AssertionError((native, actual))
+
+
+def test_repository_scan_respects_tracking_without_reserved_directories(
+    tmp_path: Path,
+) -> None:
+    """Select tracked Nix inputs in any directory and skip local scratch files."""
+    subprocess.run(["git", "init", "--quiet", str(tmp_path)], check=True)  # noqa: S603, S607
+    selected = []
+    for directory in ("prm", "tmp", "assets"):
+        path = tmp_path / directory / "input.nix"
+        path.parent.mkdir()
+        path.write_text("{}\n")
+        selected.append(path)
+    subprocess.run(  # noqa: S603 - Fixed Git command and fixture paths.
+        ["git", "-C", str(tmp_path), "add", "--", *map(str, selected)],  # noqa: S607
+        check=True,
+    )
+    (tmp_path / "local.nix").write_text("{ invalid = ; }")
+    if remove_nix_defaults.find_nix_files(tmp_path) != sorted(selected):
+        message = "scanner ignored tracking or assigned meaning to directory names"
+        raise AssertionError(message)

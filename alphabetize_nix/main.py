@@ -176,7 +176,21 @@ def _render_key(key: str) -> str:
 
 
 def _render_set(bindings: list[Binding]) -> str:
-    return "{ " + " ".join(_render_binding(binding) for binding in bindings) + " }"
+    inherited = []
+    assignments = []
+    for binding in bindings:
+        if (
+            binding.path is not None
+            and len(binding.path) == 1
+            and binding.value == binding.path[0]
+            and _render_key(binding.path[0]) == binding.path[0]
+        ):
+            inherited.append(binding.path[0])
+        else:
+            assignments.append(_render_binding(binding))
+    if inherited:
+        assignments.insert(0, "inherit " + " ".join(inherited) + ";")
+    return "{ " + " ".join(assignments) + " }"
 
 
 def render_node(document: nix_syntax.Document, node: Node) -> str:

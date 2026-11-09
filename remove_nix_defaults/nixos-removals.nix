@@ -1,17 +1,21 @@
-{ flake, candidates }:
+{ candidates, flake }:
 let
+  attempt =
+    removals: candidate:
+    let
+      checked = builtins.tryEval (eligible candidate && preserves proposed);
+      proposed = removals ++ [ candidate ];
+    in
+    if checked.success && checked.value then proposed else removals;
   configurations = flake.nixosConfigurations or { };
-  names = builtins.attrNames configurations;
-  lib = flake.inputs.nixpkgs.lib;
-  location = candidate: "${flake.outPath}/${candidate.file}";
-  definitions =
-    configuration: candidate:
-    (lib.attrByPath candidate.path { } configuration.options).definitionsWithLocations or [ ];
   consumes =
     configuration: candidate:
     builtins.any (definition: toString (definition.file or "") == location candidate) (
       definitions configuration candidate
     );
+  definitions =
+    configuration: candidate:
+    (lib.attrByPath candidate.path { } configuration.options).definitionsWithLocations or [ ];
   eligible =
     candidate:
     let
@@ -29,12 +33,15 @@ let
       && option ? default
       && builtins.toJSON candidate.value == builtins.toJSON option.default
     ) matches;
+  lib = flake.inputs.nixpkgs.lib;
+  location = candidate: "${flake.outPath}/${candidate.file}";
+  names = builtins.attrNames configurations;
   omit =
     path: attributes:
     let
       name = builtins.head path;
-      rest = builtins.tail path;
       nested = omit rest attributes.${name};
+      rest = builtins.tail path;
     in
     if rest == [ ] then
       builtins.removeAttrs attributes [ name ]
@@ -42,33 +49,14 @@ let
       builtins.removeAttrs attributes [ name ]
     else
       attributes // { ${name} = nested; };
-  replacement =
-    removals: file:
-    args@{ config, ... }:
-    let
-      original = import file;
-      parameters = builtins.mapAttrs (name: _: args.${name} or config._module.args.${name}) (
-        builtins.functionArgs original
-      );
-      value = if builtins.isFunction original then original (args // parameters) else original;
-      stripped = builtins.foldl' (
-        attributes: candidate:
-        omit ((if attributes ? config then [ "config" ] else [ ]) ++ candidate.path) attributes
-      ) value (builtins.filter (candidate: location candidate == file) removals);
-    in
-    stripped
-    // {
-      _file = file;
-      key = "${file}:afairesi-omitted";
-    };
   preserves =
     removals:
     builtins.all (
       name:
       let
         configuration = configurations.${name};
-        relevant = builtins.filter (consumes configuration) removals;
         files = lib.unique (map location relevant);
+        relevant = builtins.filter (consumes configuration) removals;
         updated = configuration.extendModules {
           modules = [
             {
@@ -88,13 +76,25 @@ let
           ) == builtins.toJSON (lib.attrByPath candidate.path (throw "missing omitted option") updated.config)
       ) relevant
     ) names;
-  attempt =
-    removals: candidate:
+  replacement =
+    removals: file:
+    args@{ config, ... }:
     let
-      proposed = removals ++ [ candidate ];
-      checked = builtins.tryEval (eligible candidate && preserves proposed);
+      original = import file;
+      parameters = builtins.mapAttrs (name: _: args.${name} or config._module.args.${name}) (
+        builtins.functionArgs original
+      );
+      stripped = builtins.foldl' (
+        attributes: candidate:
+        omit ((if attributes ? config then [ "config" ] else [ ]) ++ candidate.path) attributes
+      ) value (builtins.filter (candidate: location candidate == file) removals);
+      value = if builtins.isFunction original then original (args // parameters) else original;
     in
-    if checked.success && checked.value then proposed else removals;
+    stripped
+    // {
+      _file = file;
+      key = "${file}:afairesi-omitted";
+    };
 in
 builtins.seq names (
   map (candidate: { inherit (candidate) file path; }) (builtins.foldl' attempt [ ] candidates)

@@ -18,7 +18,7 @@ import nix_syntax
 
 if TYPE_CHECKING:
     from tree_sitter import Node
-SKIPPED_DIRECTORIES = {".agents", ".codex", ".git", "prm", "result", "target", "tmp"}
+SKIPPED_DIRECTORIES = {".agents", ".codex", ".git", "result", "target"}
 Literal = None | bool | int | float | str | list["Literal"] | dict[str, "Literal"]
 Candidate = tuple[tuple[str, ...], Literal]
 PACKAGE_BUILDERS = {
@@ -40,7 +40,21 @@ def find_flake_root(path: Path) -> Path | None:
 
 
 def find_nix_files(root: Path) -> list[Path]:
-    """Find regular Nix files without following ignored trees or links."""
+    """Find tracked Nix files, or exported sources, without following links."""
+    if (root / ".git").exists():
+        tracked = subprocess.run(  # noqa: S603 - Fixed Git executable and repository path.
+            ["git", "-C", str(root), "ls-files", "-z"],  # noqa: S607
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        return sorted(
+            root / name
+            for name in tracked.stdout.split("\0")
+            if name.endswith(".nix")
+            and (root / name).is_file()
+            and not (root / name).is_symlink()
+        )
     result: list[Path] = []
     for directory, names, files in os.walk(root, followlinks=False):
         names[:] = [
@@ -308,7 +322,7 @@ def nixos_removals(
         )
         + " ]"
     )
-    helper = Path(__file__).with_name("prm") / "nixos-removals.nix"
+    helper = Path(__file__).with_name("nixos-removals.nix")
     expression = (
         f"import (/. + {nix_syntax.quote_string(str(helper))}) {{ "
         "flake = builtins.getFlake (toString (/. + "

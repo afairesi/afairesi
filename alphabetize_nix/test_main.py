@@ -93,6 +93,14 @@ def test_fuzz_preserves_values_and_converges(bindings: dict[str, int]) -> None:
         ),
         ("{ b.z = 1; b.x = 2; a = 1; }", "{ a = 1; b = { x = 2; z = 1; }; }"),
         ("{ passthru = { inherit python; }; }", "{ passthru.python = python; }"),
+        (
+            "{ passthru = { inherit z a; value = 1; }; }",
+            "{ passthru = { inherit a z; value = 1; }; }",
+        ),
+        (
+            "{ a.z = z; a.x = x; }",
+            "{ a = { inherit x z; }; }",
+        ),
         ("{ a = 1; a.b = 2; }", "{ a = 1; a.b = 2; }"),
         ("{ a = rec { inherit python; }; }", "{ a = rec { inherit python; }; }"),
         (
@@ -137,6 +145,9 @@ def test_cli_formats_and_converges(tmp_path: Path, source: str, expected: str) -
         "[ { z = 3; a = 1; } { b = 2; a = 0; } ]",
         "({ z ? 3, a ? z, ... }: [ z a ]) {}",
         "let python = 7; in { passthru = { inherit python; }; }",
+        "let x = 7; z = 8; in { a.z = z; a.x = x; }",
+        "let x = 7; in rec { x = 9; a = { inherit x; y = 1; }; }",
+        "let x = 7; in { a = rec { inherit x; y = x; }; }",
         "rec { z = 3; a = { x = z; y = 1; }; }",
         "{ b.z = 1; b.x = 2; a = 1; }",
         "# leading comment\n{ z = 3; a = 1; }\n# trailing comment\n",

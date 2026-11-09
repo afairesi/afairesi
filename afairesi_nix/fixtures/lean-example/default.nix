@@ -11,7 +11,7 @@ inputs.afairesi.lib.mkLean4Package {
   meta.description = "Lean executable consumer contract";
   passthru.checkInputs = [ pkgs.hello ];
   preBuild = ''
-    substituteInPlace prm/Support.lean --replace-fail '"before-build"' '"resource"'
+    substituteInPlace Support.lean --replace-fail '"before-build"' '"resource"'
   '';
   runtimeHook = ''
     export AFAIRESI_LEAN4_HOOK=loaded

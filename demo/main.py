@@ -27,7 +27,10 @@ if TYPE_CHECKING:
     from collections.abc import Iterator, Sequence
     from typing import TextIO
 
-RUNTIME_DIR = Path.home() / "github.com/afairesi/afairesi/demo/tmp"
+RUNTIME_DIR = (
+    Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
+    / "afairesi/demo"
+)
 TERMINAL_COLUMNS = 100
 TERMINAL_ROWS = 30
 
@@ -388,8 +391,9 @@ class Demo:
                 '"Estimate reading time for notes."',
             ),
         )
+        self.run("git", "add", "--force", "reading_time/test_main.py")
         self.shell("nix fmt && nix flake check")
-        self.run("git", "add", ".")
+        self.run("git", "add", "-u")
         self.recorder.marker("Inspect tool interface")
         self.shell("afairesi repo inspect | jless", browse=True)
         self.shell(
@@ -403,15 +407,16 @@ class Demo:
         self.recorder.marker("Build notes website")
         self.repository("notes-site")
         self.run("afairesi", "repo", "add", "notes", "html")
-        self.recorder.note("Write the first article in notes/prm/first-post.txt.")
-        self.write("notes/prm/first-post.txt", POST)
-        (self.cwd / "notes/tmp").mkdir()
+        self.recorder.note("Write the first article in notes/articles/first-post.txt.")
+        self.write("notes/articles/first-post.txt", POST)
+        self.run("git", "add", "--force", "notes/articles/first-post.txt")
+        (self.cwd / "reports").mkdir()
         self.shell(
-            "nix run '../notes-tools#reading_time' -- notes/prm/first-post.txt "
-            "--words-per-minute 100 | tee notes/tmp/reading-time.txt",
+            "nix run '../notes-tools#reading_time' -- notes/articles/first-post.txt "
+            "--words-per-minute 100 | tee reports/reading-time.txt",
         )
         self.recorder.note("Add the article and reading-time label to the site.")
-        reading_time = (self.cwd / "notes/tmp/reading-time.txt").read_text().strip()
+        reading_time = (self.cwd / "reports/reading-time.txt").read_text().strip()
         paragraphs = "".join(f"<p>{text}</p>" for text in POST.split("\n\n"))
         self.write(
             "notes/index.html",

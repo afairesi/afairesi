@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Afairesi is a computing environment designed to minimize independent decisions across the system, persistent state, your home, repositories, packages, and tests."
+      content="Afairesi is a computing environment designed to minimize independent decisions across the system, persistent state, home directory, repositories, packages, and tests."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>Afairesi — A computing environment designed to minimize independent decisions</title>
@@ -22,7 +22,7 @@
       src="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.min.js"
       defer
     ></script>
-    <script src="prm/afairesi-demo.js" defer></script>
+    <script src="afairesi-demo.js" defer></script>
     <script src="script.js" defer></script>
   </head>
   <body>
@@ -39,15 +39,15 @@
     </header>
     <main>
       <p>
-        Afairesi brings the system, your home directory, repositories, packages, and tests into one
-        structure. The aim is to reduce what must be decided and maintained independently.
+        Afairesi applies one principle across your system, persistent state, home directory,
+        repositories, packages, and tests: satisfy the requirements with the fewest independent
+        decisions.
       </p>
       <p>
-        NixOS defines the system, Preservation keeps declared state across reboots, and Git records
-        your home's repository collection. Within repositories, directory names and conventional
-        files identify packages, hosts, and tests. Afairesi's CLI maintains this structure, and its
-        Nix library derives builds and checks from the project files. Python and Lean4 packages also
-        receive development environments.
+        NixOS defines the system, Preservation retains declared state, and Git records source and
+        repository revisions. Afairesi derives checkout locations from remotes, package names from
+        directories, and builds, checks, and development environments from tracked sources and
+        dependencies.
       </p>
       <div class="overview">
         <figure
@@ -66,7 +66,7 @@
               <div class="tree-scope tree-home">
                 <span class="tree-scope-label">afairesi home</span>
                 <pre><code>│
-├── .gitignore              <span class="tree-comment"># Managed by afairesi.</span>
+├── .gitignore              <span class="tree-comment"># Shared policy: *.</span>
 ├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span>
 │</code></pre>
                 <details class="package repo-branch" open>
@@ -76,11 +76,10 @@
                     <span class="tree-scope-label">afairesi repo</span>
                     <pre><code>│                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
 │                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
-├── .gitignore          <span class="tree-comment"># Managed by afairesi.</span>
+├── .gitignore          <span class="tree-comment"># Shared policy: *.</span>
 ├── flake.nix
 ├── flake.lock
-├── prm/                <span class="tree-comment"># Optional; supporting files; tracked.</span>
-├── tmp/                <span class="tree-comment"># Optional; temporary files; ignored.</span>
+├── …                   <span class="tree-comment"># Supporting files can live anywhere.</span>
 │</code></pre>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -88,10 +87,7 @@
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
 │   ├── default.nix
 │   ├── index.html
-│   ├── script.js      <span class="tree-comment"># Optional.</span>
-│   ├── style.css      <span class="tree-comment"># Optional.</span>
-│   ├── prm/           <span class="tree-comment"># Optional; supporting files; tracked.</span>
-│   └── tmp/           <span class="tree-comment"># Optional; temporary files; ignored.</span></code></pre>
+│   └── …</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -100,8 +96,7 @@
 │   ├── default.nix
 │   ├── main.py
 │   ├── test_main.py    <span class="tree-comment"># Optional.</span>
-│   ├── prm/           <span class="tree-comment"># Optional; supporting files; tracked.</span>
-│   └── tmp/           <span class="tree-comment"># Optional; temporary files; ignored.</span></code></pre>
+│   └── …</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -109,9 +104,7 @@
                       <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
 │   ├── default.nix
 │   ├── ms.tex
-│   ├── ms.bib
-│   ├── prm/           <span class="tree-comment"># Optional; supporting files; tracked.</span>
-│   └── tmp/           <span class="tree-comment"># Optional; temporary files; ignored.</span></code></pre>
+│   └── …</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -120,8 +113,7 @@
 │   ├── default.nix
 │   ├── main.lean
 │   ├── test_main.lean  <span class="tree-comment"># Optional.</span>
-│   ├── prm/           <span class="tree-comment"># Optional; supporting files; tracked.</span>
-│   └── tmp/           <span class="tree-comment"># Optional; temporary files; ignored.</span></code></pre>
+│   └── …</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -130,8 +122,7 @@
 │   ├── default.nix
 │   ├── main.nix        <span class="tree-comment"># Optional; library or implementation.</span>
 │   ├── test_main.nix   <span class="tree-comment"># Optional; returns a check derivation.</span>
-│   ├── prm/           <span class="tree-comment"># Optional; supporting files; tracked.</span>
-│   └── tmp/           <span class="tree-comment"># Optional; temporary files; ignored.</span></code></pre>
+│   └── …</code></pre>
                     </details>
                     <details class="package">
                       <!-- prettier-ignore -->
@@ -139,8 +130,7 @@
                       <pre><code>    │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.nixos-configuration.config.system.build.toplevel</span></span>
     ├── configuration.nix
     ├── hardware-configuration.nix <span class="tree-comment"># Optional.</span>
-    ├── prm/           <span class="tree-comment"># Optional; supporting files; tracked.</span>
-    └── tmp/           <span class="tree-comment"># Optional; temporary files; ignored.</span></code></pre>
+    └── …</code></pre>
                     </details>
                   </div>
                 </details>
@@ -150,54 +140,63 @@
         </figure>
         <figure class="demo">
           <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
+          <figcaption>Earlier workflow recording.</figcaption>
         </figure>
       </div>
       <p>
-        <code>nix fmt</code> repairs repository structure, stages changes, removes files outside the
-        permitted layout, and applies formatting and potentially behavior-changing fixes. Keep
-        supporting files in <code>prm/</code> and temporary data in <code>tmp/</code>; review the
-        diff and run <code>nix flake check</code> afterward.
+        Home and projects share a one-line <code>.gitignore</code>: <code>*</code>. Select new files
+        with <code>git add -f -- PATH</code>; stage tracked edits with <code>git add -u</code>.
+        Afairesi stages the files it creates. The <code>default.nix</code> constructor selects the
+        package type; supporting files can live anywhere.
       </p>
+      <p>
+        <code>afairesi repo fix</code> repairs and stages structure. <code>nix fmt</code> formats
+        tracked sources by file type, removes ordinary comments, and sorts Nix bindings.
+        <code>nix flake check</code> validates structure, formatting, lint, types, tests, and builds
+        without changing working files. Every repository inherits the same formatting and lint
+        policy; no configuration is needed.
+      </p>
+      <details class="guide">
+        <summary><span class="disclosure" aria-hidden="true"></span> Tracking and cleanup</summary>
+        <p>
+          Builds and checks use tracked working files, including tests added by hand. Untracked
+          files are hidden from ordinary <code>git status</code>. Search tracked source with
+          <code>git grep</code>; ignore-aware tools may hide it. Neither <code>prm/</code> nor
+          <code>tmp/</code> has special meaning.
+        </p>
+        <p>From a project root, preview untracked files to remove, including ignored files:</p>
+        <pre><code>git clean -ndx</code></pre>
+        <p>
+          Remove them with <code>git clean -fdx</code>. Tracked edits survive; cleanup neither
+          restores a revision nor cleans tracked submodules. Persistent application state follows
+          its Preservation declarations.
+        </p>
+      </details>
       <details class="guide">
         <summary><span class="disclosure" aria-hidden="true"></span> Design principle</summary>
         <p>
-          Afairesi (<span lang="el">αφαίρεση</span>, subtraction or abstraction) names the project's
-          intent: reduce separately maintained choices. Its guiding principle is to satisfy the
-          requirements with the fewest independent decisions.
+          Afairesi (<span lang="el">αφαίρεση</span>, subtraction or abstraction) favors declaring
+          each essential fact once and deriving the rest. Git owns source membership and history;
+          Preservation declares persistent state; Afairesi derives builds, checks, and environments.
         </p>
         <p>
-          A repository's remote URL determines its location in your home. A package directory
-          supplies its name, and a conventional test file registers its check. Python and Lean4 test
-          and development environments reuse the package's dependencies.
-        </p>
-        <p>
-          An independent decision is something you must choose or maintain separately. Deriving a
-          value removes that maintenance; keeping two editable copies means keeping them in sync.
-          Shared rules also have a cost, including their implementation and exceptions. Use them
-          when they reduce the total choices you maintain while preserving the behavior, variation,
-          and recovery your environment needs.
-        </p>
-        <p>
-          The <a href="https://github.com/pbizopoulos/afairesi-paper">paper</a> explains the
-          environment's requirements, the choices behind this structure, and its limitations.
+          Conventions should remove more decisions than their implementation and exceptions
+          introduce, while preserving required behavior. The
+          <a href="https://github.com/pbizopoulos/afairesi-paper">paper</a> explains the tradeoffs.
         </p>
       </details>
       <details class="guide">
         <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
         <p>
-          The full environment shown above uses NixOS with Preservation. The CLI and project tools
-          require Git and Nix with flakes enabled on Linux or Apple Silicon macOS.
+          The CLI requires Git and Nix with flakes on Linux or Apple Silicon macOS. The full
+          environment uses NixOS with Preservation.
         </p>
         <p>Use this <code>flake.nix</code> to derive packages, checks, and hosts:</p>
         <pre><code>{
   inputs.afairesi.url = "github:afairesi/afairesi";
   outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
 }</code></pre>
-        <p>Development shells are generated for Python and Lean4 packages.</p>
-        <p>
-          To install the CLI on a host managed by this flake, add to its
-          <code>configuration.nix</code> (<code>mkFlake</code> supplies <code>inputs</code>):
-        </p>
+        <p>Install the CLI in a host's <code>configuration.nix</code>:</p>
         <pre><code>{ inputs, pkgs, ... }:
 {
   environment.systemPackages = [
@@ -209,16 +208,18 @@
         <p>To manage hosted repositories as home submodules:</p>
         <pre><code>afairesi home init
 afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
-        <p>In an empty Git worktree, generate the flake above and add a package:</p>
+        <p>In an empty Git worktree, create a project and package:</p>
         <pre><code>afairesi repo init
 afairesi repo add example python</code></pre>
         <p>
-          Nix packages require <code>default.nix</code>. The optional <code>main.nix</code> and
-          <code>test_main.nix</code> filenames are Afairesi conventions. Import
-          <code>main.nix</code> explicitly where needed. <code>test_main.nix</code> returns a check
-          derivation for <code>nix flake check</code>; its function can request <code>inputs</code>,
-          <code>pkgs</code>, <code>system</code>, <code>pname</code>, and
-          <code>packageDrv</code> (the package being tested).
+          Python and HTML builds include supporting files from the package source, excluding
+          conventional tests and build metadata. Lean modules live beside <code>main.lean</code>.
+          Nix packages may import <code>main.nix</code>; <code>test_main.nix</code> returns a check
+          derivation. Python and Lean4 packages receive development shells.
+        </p>
+        <p>
+          Campaign reports are kept in <code>$XDG_STATE_HOME/afairesi</code>, defaulting to
+          <code>~/.local/state/afairesi</code>.
         </p>
       </details>
     </main>

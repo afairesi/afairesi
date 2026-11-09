@@ -2,226 +2,92 @@ afairesiInputs:
 let
   formatter =
     {
-      enableMypy ? true,
       inputs,
       pkgs,
       self ? inputs.self,
     }:
-    let
-      formatterPython = pkgs.python3.withPackages (_: [
-        inputs.self.packages.${pkgs.stdenv.system}.afairesi
-      ]);
-      lean4PackageNames = packageNamesFor "main.lean";
-      nixFiles = [
-        "flake.nix"
-        "*/default.nix"
-        "*/main.nix"
-        "*/test_main.nix"
-        "*/configuration.nix"
-        "*/hardware-configuration.nix"
-      ];
-      packageNamesFor =
-        marker:
-        builtins.attrNames (
-          pkgs.lib.filterAttrs (
-            name: _:
-            builtins.pathExists (self.outPath + "/${name}/default.nix")
-            && builtins.pathExists (self.outPath + "/${name}/${marker}")
-          ) self.packages.${pkgs.stdenv.system}
-        );
-      pythonFiles = [
-        "*/main.py"
-        "*/test_main.py"
-      ];
-      pythonPackageNames = if enableMypy then packageNamesFor "main.py" else [ ];
-      rawFormatter = treefmtEval.config.build.wrapper;
+    mkTreefmtTool {
+      inherit pkgs self;
       treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
         enableDefaultExcludes = false;
         programs = {
-          actionlint = {
-            enable = true;
-            includes = workflowFiles;
-            priority = 6;
-          };
-          deadnix = {
-            enable = true;
-            includes = nixFiles;
-            priority = 3;
-          };
-          mypy = {
-            directories = pkgs.lib.genAttrs pythonPackageNames (
-              name:
-              let
-                environment = inputs.self.lib.mkTestEnvironment {
-                  inherit pkgs;
-                  packageDrv = self.packages.${pkgs.stdenv.system}.${name};
-                };
-              in
-              {
-                directory = "";
-                modules = [ "${name}" ];
-                options = [
-                  "--python-executable=${environment.python}/bin/python"
-                  "--cache-dir=${name}/tmp/.mypy_cache"
-                  "--exclude=/(prm|tmp)/"
-                  "--no-namespace-packages"
-                  "--ignore-missing-imports"
-                  "--strict"
-                ];
-              }
-            );
-            enable = enableMypy;
-          };
-          nixfmt = {
-            enable = true;
-            includes = nixFiles;
-            priority = 5;
-          };
           oxfmt = {
             enable = true;
-            includes = workflowFiles ++ [
-              "*/style.css"
-              "*/index.html"
-              "*/script.js"
-            ];
             priority = 5;
-          };
-          ruff-check = {
-            enable = true;
-            extendSelect = [ "ALL" ];
-            includes = pythonFiles;
-            priority = 3;
           };
           ruff-format = {
             enable = true;
-            includes = pythonFiles;
             priority = 5;
-          };
-          statix = {
-            enable = true;
-            includes = nixFiles;
-            priority = 3;
           };
           texfmt = {
             enable = true;
-            includes = [ "*/ms.tex" ];
             priority = 5;
-          };
-          yamllint = {
-            enable = true;
-            includes = workflowFiles;
-            priority = 6;
           };
         };
         projectRootFile = "flake.nix";
-        settings = {
-          formatter = {
-            alphabetize-nix = {
-              command = inputs.self.packages.${pkgs.stdenv.system}.alphabetize_nix;
-              includes = nixFiles;
-              priority = 4;
-            };
-            bibtex-tidy = {
-              command = pkgs.bibtex-tidy;
-              includes = [ "*/ms.bib" ];
-              options = [
-                "--duplicates"
-                "--no-align"
-                "--no-wrap"
-                "--sort"
-                "--sort-fields"
-                "--v2"
+        settings.formatter = {
+          alphabetize-nix = {
+            command = mkFileFormatter {
+              inherit pkgs;
+              name = "format-nix";
+              runtimeInputs = [
+                afairesiInputs.self.packages.${pkgs.stdenv.system}.alphabetize_nix
+                afairesiInputs.self.packages.${pkgs.stdenv.system}.uncomment
+                pkgs.nixfmt
               ];
-              priority = 5;
+              text = ''
+                nixfmt < "$temporary" > /dev/null
+                uncomment --no-gitignore "$temporary"
+                alphabetize_nix "$temporary"
+                nixfmt "$temporary"
+              '';
             };
-            oxlint = {
-              command = pkgs.oxlint;
-              includes = [ "*/script.js" ];
-              options = [
-                "--fix-dangerously"
-                "-D"
-                "all"
-              ];
-              priority = 3;
-            };
-            remove-empty-lines = {
-              command = inputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines;
-              includes = [ ".gitignore" ];
-              priority = 2;
-            };
-            ruff-check.options = [
-              "--cache-dir=tmp/.ruff_cache"
-              "--per-file-ignores=test_main.py:INP001"
-              "--unsafe-fixes"
-            ];
-            ruff-format.options = [ "--cache-dir=tmp/.ruff_cache" ];
-            uncomment = {
-              command = inputs.self.packages.${pkgs.stdenv.system}.uncomment;
-              includes = [
-                ".gitignore"
-                "LICENSE"
-                "flake.lock"
-              ]
-              ++ nixFiles
-              ++ pythonFiles
-              ++ [
-                "*/index.html"
-                "*/script.js"
-                "*/style.css"
-                "*/ms.tex"
-                "*/ms.bib"
-              ]
-              ++ workflowFiles;
-              priority = 1;
-            };
-          }
-          // pkgs.lib.genAttrs (map (name: "mypy-${name}") pythonPackageNames) (_: {
-            priority = 6;
-          })
-          // pkgs.lib.genAttrs' lean4PackageNames (name: {
-            name = "lean4-${name}";
-            value = {
-              command = mkLean4Format {
-                inherit pkgs;
-                packageDrv = self.packages.${pkgs.stdenv.system}.${name};
-                packageName = name;
-              };
-              includes = [ "${name}/*.lean" ];
-              priority = 5;
-            };
-          });
-          global.excludes = [ "{prm,tmp,*/prm,*/tmp}/**" ];
-        };
-      };
-      workflowFiles = [
-        ".github/workflows/workflow.yml"
-        ".forgejo/workflows/workflow.yml"
-      ];
-      wrapper = pkgs.writeShellApplication {
-        name = "treefmt";
-        runtimeInputs = [
-          pkgs.git
-          pkgs.nix
-        ];
-        text = ''
-          ${formatterPython}/bin/python -c 'from afairesi import formatter_main; formatter_main()'
-          exec ${rawFormatter}/bin/treefmt "$@"
-        '';
-      };
-    in
-    wrapper
-    // {
-      passthru = wrapper.passthru // {
-        raw = rawFormatter;
-        tests.check = (treefmtEval.config.build.check self.outPath).overrideAttrs (previous: {
-          buildCommand = ''
-            ${formatterPython}/bin/python -c 'from afairesi import formatter_main; formatter_main()' --source ${self.outPath}
-          ''
-          + previous.buildCommand;
-          nativeBuildInputs = (previous.nativeBuildInputs or [ ]) ++ [
-            pkgs.git
-            pkgs.nix
+            includes = [ "*.nix" ];
+            priority = 5;
+          };
+          oxfmt.options = [
+            "--ignore-path"
+            "/dev/null"
           ];
+          remove-empty-lines = {
+            command = afairesiInputs.self.packages.${pkgs.stdenv.system}.remove_empty_lines;
+            includes = [ ".gitignore" ];
+            priority = 2;
+          };
+          uncomment = {
+            command = afairesiInputs.self.packages.${pkgs.stdenv.system}.uncomment;
+            includes = [
+              "*.py"
+              "*.pyi"
+              "*.html"
+              "*.js"
+              "*.jsx"
+              "*.mjs"
+              "*.cjs"
+              "*.ts"
+              "*.tsx"
+              "*.css"
+              "*.scss"
+              "*.vue"
+              "*.yaml"
+              "*.yml"
+              "*.jsonc"
+              "*.json5"
+            ];
+            options = [ "--no-gitignore" ];
+            priority = 1;
+          };
+        }
+        // pkgs.lib.genAttrs' (packageNamesFor self pkgs "lean4") (name: {
+          name = "lean4-${name}";
+          value = {
+            command = mkLean4Tool {
+              inherit pkgs;
+              packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+              packageName = name;
+            };
+            includes = [ "${name}/*.lean" ];
+          };
         });
       };
     };
@@ -238,6 +104,119 @@ let
         sha256 = "1f0g05sdgk5axvpwxi52vm54v0dflvy11gxp2sp7x6v49q01x24c";
       };
       version = "4.35.0";
+    };
+  lint =
+    {
+      inputs,
+      pkgs,
+      self ? inputs.self,
+    }:
+    let
+      pythonPackageNames = packageNamesFor self pkgs "python";
+      pythonSources =
+        name:
+        builtins.filter (path: builtins.pathExists (self.outPath + "/${path}")) [
+          "${name}/main.py"
+          "${name}/test_main.py"
+        ];
+    in
+    mkTreefmtTool {
+      inherit pkgs self;
+      treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
+        programs = {
+          actionlint.enable = true;
+          mypy = {
+            directories = pkgs.lib.genAttrs pythonPackageNames (
+              name:
+              let
+                environment = mkTestEnvironment {
+                  inherit pkgs;
+                  packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+                };
+              in
+              {
+                directory = "";
+                modules = pythonSources name;
+                options = [
+                  "--python-executable=${environment.python}/bin/python"
+                  "--no-namespace-packages"
+                  "--ignore-missing-imports"
+                  "--strict"
+                ];
+              }
+            );
+            enable = true;
+          };
+          yamllint.enable = true;
+        };
+        projectRootFile = "flake.nix";
+        settings.formatter = {
+          deadnix = {
+            command = pkgs.deadnix;
+            includes = [ "*.nix" ];
+            options = [ "--fail" ];
+          };
+          oxlint = {
+            command = pkgs.oxlint;
+            includes = [
+              "*.js"
+              "*.jsx"
+              "*.mjs"
+              "*.cjs"
+              "*.ts"
+              "*.tsx"
+            ];
+            options = [
+              "-D"
+              "all"
+              "-A"
+              "unicorn/empty-brace-spaces"
+            ];
+          };
+          ruff-check = {
+            command = pkgs.ruff;
+            includes = [
+              "*.py"
+              "*.pyi"
+            ];
+            options = [
+              "check"
+              "--no-fix"
+              "--extend-select=ALL"
+              "--extend-ignore=W191,E111,E114,E117,D203,D206,D300,Q000,Q001,Q002,Q003,Q004,COM812,COM819"
+              "--per-file-ignores=test_main.py:INP001"
+            ];
+          };
+          statix = {
+            command = pkgs.writeShellApplication {
+              name = "statix-check";
+              runtimeInputs = [ pkgs.statix ];
+              text = ''
+                for file in "$@"; do
+                  statix check --unrestricted "$file"
+                done
+              '';
+            };
+            includes = [ "*.nix" ];
+          };
+        }
+        // pkgs.lib.genAttrs' pythonPackageNames (name: {
+          name = "mypy-${name}";
+          value.includes = pkgs.lib.mkForce [ "${name}/*.py" ];
+        })
+        // pkgs.lib.genAttrs' (packageNamesFor self pkgs "lean4") (name: {
+          name = "lean4-${name}";
+          value = {
+            command = mkLean4Tool {
+              inherit pkgs;
+              check = true;
+              packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+              packageName = name;
+            };
+            includes = [ "${name}/*.lean" ];
+          };
+        });
+      };
     };
   mkCoverage =
     { check, packageDrv }:
@@ -277,7 +256,6 @@ let
             ${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}
         omit =
             */test_main.py
-            */prm/*
         EOF
         export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
       ''
@@ -291,6 +269,35 @@ let
       '';
       name = "${previous.name}-coverage";
     });
+  mkFileFormatter =
+    {
+      name,
+      pkgs,
+      runtimeInputs,
+      text,
+    }:
+    pkgs.writeShellApplication {
+      inherit name;
+      runtimeInputs = runtimeInputs ++ [
+        pkgs.coreutils
+        pkgs.diffutils
+      ];
+      text = ''
+        workspace=$(mktemp -d)
+        trap 'rm -rf "$workspace"' EXIT
+        for source in "$@"; do
+          if [ -L "$source" ]; then
+            continue
+          fi
+          temporary="$workspace/$(basename "$source")"
+          cp "$source" "$temporary"
+          ${text}
+          if ! cmp -s "$source" "$temporary"; then
+            cat "$temporary" > "$source"
+          fi
+        done
+      '';
+    };
   mkFlake =
     {
       inputs,
@@ -307,13 +314,7 @@ let
         marker:
         builtins.attrNames (
           lib.filterAttrs (
-            name: type:
-            type == "directory"
-            && !(builtins.elem name [
-              "prm"
-              "tmp"
-            ])
-            && builtins.pathExists (source + "/${name}/${marker}")
+            name: type: type == "directory" && builtins.pathExists (source + "/${name}/${marker}")
           ) (if builtins.pathExists source then builtins.readDir source else { })
         );
       environments = lib.genAttrs systems (
@@ -331,9 +332,7 @@ let
         lib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
           self.nixosConfigurations or { }
         );
-      lean4Names = builtins.filter (
-        name: builtins.pathExists (source + "/${name}/main.lean")
-      ) packageNames;
+      lean4Names = system: packageNamesFor self packageSets.${system} "lean4";
       lib = repositoryInputs.nixpkgs.lib;
       mergeChecks =
         groups:
@@ -344,19 +343,8 @@ let
           ) "Afairesi generated check names collide";
           result // group
         ) { } groups;
-      moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) pythonNames;
-      namesFor =
-        system:
-        builtins.filter (name: builtins.hasAttr name self.packages.${system}) (pythonNames ++ lean4Names);
-      nixNames = builtins.filter (
-        name:
-        !(builtins.any (marker: builtins.pathExists (source + "/${name}/${marker}")) [
-          "main.py"
-          "main.lean"
-          "index.html"
-          "ms.tex"
-        ])
-      ) packageNames;
+      namesFor = system: pythonNames system ++ lean4Names system;
+      nixNames = system: packageNamesFor self packageSets.${system} "nix";
       packageNames = discover "default.nix";
       packageSets = lib.genAttrs systems (
         system:
@@ -369,9 +357,7 @@ let
             overlays = nixpkgs.overlays or [ ];
           }
       );
-      pythonNames = builtins.filter (
-        name: builtins.pathExists (source + "/${name}/main.py")
-      ) packageNames;
+      pythonNames = system: packageNamesFor self packageSets.${system} "python";
       repositoryInputs = {
         inherit (afairesiInputs) nixpkgs;
       }
@@ -386,21 +372,15 @@ let
         );
       testedLean4Names =
         system:
-        builtins.filter (
-          name: builtins.elem name lean4Names && builtins.pathExists (source + "/${name}/test_main.lean")
-        ) (namesFor system);
+        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.lean")) (
+          lean4Names system
+        );
       testedNames =
         system:
-        builtins.filter (
-          name: builtins.elem name pythonNames && builtins.pathExists (source + "/${name}/test_main.py")
-        ) (namesFor system);
+        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.py")) (pythonNames system);
       testedNixNames =
         system:
-        builtins.filter (
-          name:
-          builtins.hasAttr name self.packages.${system}
-          && builtins.pathExists (source + "/${name}/test_main.nix")
-        ) nixNames;
+        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.nix")) (nixNames system);
     in
     {
       apps = lib.genAttrs systems (
@@ -471,6 +451,17 @@ let
             (lib.mapAttrs' (name: shell: lib.nameValuePair "devshell-${name}" shell) self.devShells.${system})
             {
               formatter = self.formatter.${system}.passthru.tests.check or self.formatter.${system};
+              lint =
+                (lint {
+                  inherit self;
+                  inputs = afairesiInputs;
+                  pkgs = packageSets.${system};
+                }).passthru.tests.check;
+              structure = sourceCheck {
+                inputs = afairesiInputs;
+                pkgs = packageSets.${system};
+                src = source;
+              };
             }
           ]
           ++ lib.mapAttrsToList (
@@ -525,26 +516,34 @@ let
             )
           ];
           specialArgs = {
-            hostName = hostName;
+            inherit hostName;
             inputs = repositoryInputs;
           };
         }
       );
       packages = lib.genAttrs systems (
         system:
+        let
+          moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) (
+            builtins.attrNames (
+              lib.filterAttrs (_: package: (package.afairesiKind or "nix") == "python") packages
+            )
+          );
+          packages = supported system (
+            lib.genAttrs packageNames (
+              pname:
+              lib.callPackageWith {
+                inherit system pname;
+                inputs = repositoryInputs;
+                pkgs = packageSets.${system};
+              } (source + "/${pname}/default.nix") { }
+            )
+          );
+        in
         assert lib.assertMsg (
           builtins.length (lib.unique moduleNames) == builtins.length moduleNames
         ) "Afairesi Python packages have colliding installed module names";
-        supported system (
-          lib.genAttrs packageNames (
-            pname:
-            lib.callPackageWith {
-              inherit system pname;
-              inputs = repositoryInputs;
-              pkgs = packageSets.${system};
-            } (source + "/${pname}/default.nix") { }
-          )
-        )
+        packages
       );
     };
   mkHostCheck =
@@ -667,16 +666,13 @@ let
           }
           ''
             mkdir -p "$out"
-            cp ${src}/index.html "$out/index.html"
-            for asset in script.js style.css; do
-              if [ -f ${src}/"$asset" ]; then
-                cp ${src}/"$asset" "$out/$asset"
-              fi
+            for asset in ${pkgs.lib.escapeShellArgs (builtins.attrNames (builtins.readDir src))}; do
+              case "$asset" in
+                default.nix|test_main.*|.gitignore|.git) continue ;;
+              esac
+              cp -R "${src}/$asset" "$out/$asset"
             done
-            if [ -d ${src}/prm ]; then
-              cp -R ${src}/prm "$out/prm"
-              chmod -R u+w "$out/prm"
-            fi
+            chmod -R u+w "$out"
             runHook postInstall
           '';
     in
@@ -694,6 +690,9 @@ let
       ]
       // {
         name = pname;
+        passthru = (arguments.passthru or { }) // {
+          afairesiKind = "html";
+        };
         text = ''
           open_args=()
           if [[ -n "''${DISPLAY:-}" || -n "''${WAYLAND_DISPLAY:-}" ]]; then
@@ -738,6 +737,9 @@ let
         installPhase = ''
           install -Dm644 ms.pdf "$out/ms.pdf"
         '';
+        passthru = (arguments.passthru or { }) // {
+          afairesiKind = "latex";
+        };
         pname = baseNameOf src;
         strictDeps = true;
       }
@@ -766,72 +768,6 @@ let
         lake lean test_main.lean
         mkdir -p "$out"
       '';
-  mkLean4Format =
-    {
-      packageDrv,
-      packageName,
-      pkgs,
-    }:
-    let
-      leanPath = pkgs.lib.makeSearchPath ".lake/build/lib/lean" (
-        pkgs.lib.concatMap (
-          dependency: [ dependency ] ++ (dependency.allLeanDeps or [ ])
-        ) testEnvironment.dependencies
-      );
-      testEnvironment = mkTestEnvironment { inherit pkgs packageDrv; };
-    in
-    pkgs.writeShellApplication {
-      name = "lean4-format-${packageName}";
-      runtimeInputs = testEnvironment.dependencies ++ [
-        (leanFmt { inherit pkgs; })
-        packageDrv.lean4
-        pkgs.coreutils
-        pkgs.diffutils
-      ];
-      text = ''
-        source_root="$PWD/${packageName}"
-        workspace=$(mktemp -d)
-        trap 'rm -rf "$workspace"' EXIT
-        cp -R ${packageDrv}/. "$workspace"
-        chmod -R u+w "$workspace"
-        printf '%s\n' 'leanprover/lean4:v${packageDrv.lean4.version}' > "$workspace/lean-toolchain"
-        files=()
-        declare -A original_hashes=()
-        for source in "$@"; do
-          relative=$(realpath --relative-to="$source_root" "$source")
-          cp "$source" "$workspace/$relative"
-          original_hashes["$relative"]=$(sha256sum "$workspace/$relative" | cut -d ' ' -f1)
-          files+=("$relative")
-        done
-        export LEAN_PATH=${pkgs.lib.escapeShellArg leanPath}
-        export LEAN_SYSROOT=${packageDrv.lean4}
-        export LEAN_CC=${pkgs.stdenv.cc}/bin/cc
-        export LAKE_NO_CACHE=1
-        ${pkgs.lib.optionalString (packageDrv.meta ? mainProgram) ''
-          export PACKAGE_E2E_EXECUTABLE=${pkgs.lib.getExe packageDrv}
-        ''}
-        format_status=0
-        for relative in "''${files[@]}"; do
-          (cd "$workspace" && lake env lean --run ${./prm/lean4-uncomment.lean} "$relative") || format_status=$?
-        done
-        lean-fmt format --root "$workspace" --no-cache "''${files[@]}" || format_status=$?
-        for relative in "''${files[@]}"; do
-          if ! cmp -s "$workspace/$relative" "$source_root/$relative"; then
-            current_hash=$(sha256sum "$source_root/$relative" | cut -d ' ' -f1) || current_hash=""
-            if [ "$current_hash" != "''${original_hashes[$relative]}" ]; then
-              printf 'File changed while formatting; rerun formatter: %s\n' "$source_root/$relative" >&2
-              format_status=1
-              continue
-            fi
-            cp "$workspace/$relative" "$source_root/$relative"
-          fi
-        done
-        if [ "$format_status" -ne 0 ]; then
-          exit "$format_status"
-        fi
-        lean-fmt check --root "$workspace" --no-cache --select all "''${files[@]}"
-      '';
-    };
   mkLean4Package =
     arguments@{
       executable,
@@ -896,6 +832,9 @@ let
           // pkgs.lib.optionalAttrs executable { mainProgram = pname; };
         passthru =
           (arguments.passthru or { })
+          // {
+            afairesiKind = "lean4";
+          }
           // pkgs.lib.optionalAttrs (arguments ? runtimeHook) { inherit (arguments) runtimeHook; };
         postBuild = ''
           ${arguments.postBuild or ""}
@@ -906,12 +845,85 @@ let
           cp ${lakefile} lakefile.toml
           mkdir -p .lake/src
           ln -s ../../main.lean ${pkgs.lib.escapeShellArg ".lake/src/${pname}.lean"}
-          if [ -d prm ]; then
-            ln -s ../../prm ${pkgs.lib.escapeShellArg ".lake/src/${pname}"}
-          fi
+          ln -s ../.. ${pkgs.lib.escapeShellArg ".lake/src/${pname}"}
         '';
       }
     );
+  mkLean4Tool =
+    {
+      check ? false,
+      packageDrv,
+      packageName,
+      pkgs,
+    }:
+    let
+      leanPath = pkgs.lib.makeSearchPath ".lake/build/lib/lean" (
+        pkgs.lib.concatMap (
+          dependency: [ dependency ] ++ (dependency.allLeanDeps or [ ])
+        ) testEnvironment.dependencies
+      );
+      testEnvironment = mkTestEnvironment { inherit pkgs packageDrv; };
+    in
+    pkgs.writeShellApplication {
+      name = "lean4-${if check then "check" else "format"}-${packageName}";
+      runtimeInputs = testEnvironment.dependencies ++ [
+        (leanFmt { inherit pkgs; })
+        packageDrv.lean4
+        pkgs.coreutils
+        pkgs.diffutils
+      ];
+      text = ''
+        source_root="$PWD/${packageName}"
+        workspace=$(mktemp -d)
+        trap 'rm -rf "$workspace"' EXIT
+        cp -R ${packageDrv}/. "$workspace"
+        chmod -R u+w "$workspace"
+        printf '%s\n' 'leanprover/lean4:v${packageDrv.lean4.version}' > "$workspace/lean-toolchain"
+        files=()
+        ${pkgs.lib.optionalString (!check) "declare -A original_hashes=()"}
+        for source in "$@"; do
+          relative=$(realpath --relative-to="$source_root" "$source")
+          mkdir -p "$(dirname "$workspace/$relative")"
+          cp "$source" "$workspace/$relative"
+          ${pkgs.lib.optionalString (!check) ''
+            original_hashes["$relative"]=$(sha256sum "$workspace/$relative" | cut -d ' ' -f1)
+          ''}
+          files+=("$relative")
+        done
+        export LEAN_PATH=${pkgs.lib.escapeShellArg leanPath}
+        export LEAN_SYSROOT=${packageDrv.lean4}
+        export LEAN_CC=${pkgs.stdenv.cc}/bin/cc
+        export LAKE_NO_CACHE=1
+        ${pkgs.lib.optionalString (packageDrv.meta ? mainProgram) ''
+          export PACKAGE_E2E_EXECUTABLE=${pkgs.lib.getExe packageDrv}
+        ''}
+      ''
+      + (
+        if check then
+          ''
+            lean-fmt check --root "$workspace" --no-cache --select all "''${files[@]}"
+          ''
+        else
+          ''
+            format_status=0
+            lean-fmt format --root "$workspace" --no-cache "''${files[@]}" || format_status=$?
+            for relative in "''${files[@]}"; do
+              if ! cmp -s "$workspace/$relative" "$source_root/$relative"; then
+                current_hash=$(sha256sum "$source_root/$relative" | cut -d ' ' -f1) || current_hash=""
+                if [ "$current_hash" != "''${original_hashes[$relative]}" ]; then
+                  printf 'File changed while formatting; rerun formatter: %s\n' "$source_root/$relative" >&2
+                  format_status=1
+                  continue
+                fi
+                cp "$workspace/$relative" "$source_root/$relative"
+              fi
+            done
+            if [ "$format_status" -ne 0 ]; then
+              exit "$format_status"
+            fi
+          ''
+      );
+    };
   mkPythonPackage =
     arguments@{
       executable,
@@ -991,9 +1003,12 @@ let
             printf '%s\n' '#!${python.interpreter}' "from $pname import main" 'main()' > "$out/bin/${cliName}"
             chmod 755 "$out/bin/${cliName}"
           ''}
-          if [ -d prm ]; then
-            cp -R prm/ "$out/${python.sitePackages}/$pname/"
-          fi
+          for asset in ${pkgs.lib.escapeShellArgs (builtins.attrNames (builtins.readDir src))}; do
+            case "$asset" in
+              main.py|default.nix|test_main.py|.gitignore|.git) continue ;;
+            esac
+            cp -R "$asset" "$out/${python.sitePackages}/$pname/"
+          done
           ${python.interpreter} -m compileall -q --invalidation-mode unchecked-hash \
             "$out/${python.sitePackages}/$pname/__init__.py"
           runHook postInstall
@@ -1005,6 +1020,7 @@ let
           (arguments.passthru or { })
           // {
             inherit python;
+            afairesiKind = "python";
           }
           // pkgs.lib.optionalAttrs (arguments ? runtimeHook) { inherit (arguments) runtimeHook; };
         pyproject = false;
@@ -1055,6 +1071,44 @@ let
           packages = dependencies ++ [ python ];
         };
       };
+  mkTreefmtTool =
+    {
+      pkgs,
+      self,
+      treefmtEval,
+    }:
+    let
+      raw = treefmtEval.config.build.wrapper;
+      wrapper = pkgs.writeShellApplication {
+        name = "treefmt";
+        runtimeInputs = [ pkgs.git ];
+        text = ''
+          exec ${raw}/bin/treefmt --walk git "$@"
+        '';
+      };
+    in
+    wrapper
+    // {
+      passthru = wrapper.passthru // {
+        inherit raw;
+        tests.check = (treefmtEval.config.build.check self.outPath).overrideAttrs (previous: {
+          buildCommand =
+            builtins.replaceStrings
+              [ "git add ." "treefmt --no-cache" ]
+              [ "git add --force -- ." "treefmt --no-cache --walk git" ]
+              previous.buildCommand;
+        });
+      };
+    };
+  packageNamesFor =
+    self: pkgs: kind:
+    builtins.attrNames (
+      pkgs.lib.filterAttrs (
+        name: package:
+        builtins.pathExists (self.outPath + "/${name}/default.nix")
+        && (package.afairesiKind or "nix") == kind
+      ) self.packages.${pkgs.stdenv.system}
+    );
   pythonCheck =
     {
       packageDrv,
@@ -1092,16 +1146,31 @@ let
         ' -p no:cacheprovider --import-mode=importlib --durations=10 --maxfail=1 \
           "$src/test_main.py" "''${afairesi_pytest_args[@]}"
       '';
+  sourceCheck =
+    {
+      inputs,
+      pkgs,
+      src,
+    }:
+    let
+      python = pkgs.python3.withPackages (_: [ inputs.self.packages.${pkgs.stdenv.system}.afairesi ]);
+    in
+    pkgs.runCommand "afairesi-structure-check" { } ''
+      ${python}/bin/python -c 'from afairesi import check_source_main; check_source_main()' ${src}
+      touch "$out"
+    '';
 in
 {
-  inherit formatter pythonCheck;
+  inherit formatter lint pythonCheck;
   lib = {
-    mkCoverage = mkCoverage;
-    mkFlake = mkFlake;
-    mkHtmlPackage = mkHtmlPackage;
-    mkLatexPackage = mkLatexPackage;
-    mkLean4Package = mkLean4Package;
-    mkPythonPackage = mkPythonPackage;
-    mkTestEnvironment = mkTestEnvironment;
+    inherit
+      mkCoverage
+      mkFlake
+      mkHtmlPackage
+      mkLatexPackage
+      mkLean4Package
+      mkPythonPackage
+      mkTestEnvironment
+      ;
   };
 }

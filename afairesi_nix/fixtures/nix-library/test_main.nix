@@ -1,4 +1,10 @@
-{ inputs, pkgs, pname, system, packageDrv }:
+{
+  inputs,
+  packageDrv,
+  pkgs,
+  pname,
+  system,
+}:
 assert pname == "nix-library";
 assert system == pkgs.stdenv.hostPlatform.system;
 assert packageDrv == inputs.self.packages.${system}.${pname};

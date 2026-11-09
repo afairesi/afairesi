@@ -4,8 +4,8 @@
   meta.description = "Afairesi: a computing environment designed to minimize independent decisions.";
   postInstall = ''
     cp ${pkgs.writeText "afairesi-demo.js" ''
-      globalThis.afairesiDemoRecording = ${builtins.toJSON (builtins.readFile ./prm/afairesi-demo.cast)};
-    ''} "$out/prm/afairesi-demo.js"
+      globalThis.afairesiDemoRecording = ${builtins.toJSON (builtins.readFile ./afairesi-demo.cast)};
+    ''} "$out/afairesi-demo.js"
   '';
   src = ./.;
 }

@@ -7,7 +7,7 @@ let
         {
           inherit pkgs;
           executable = true;
-          src = ./prm/consumer-contract/example;
+          src = ./fixtures/example;
         }
         // attributes
       )
@@ -19,7 +19,7 @@ let
         {
           inherit pkgs;
           executable = true;
-          src = ./prm/consumer-contract/lean-example;
+          src = ./fixtures/lean-example;
         }
         // attributes
       )
@@ -43,7 +43,7 @@ let
       "x86_64-linux"
     ];
   };
-  consumerSource = ./prm/consumer-contract;
+  consumerSource = ./fixtures;
   descriptionless = inputs.self.lib.mkFlake {
     inputs = {
       afairesi = inputs.self;
@@ -51,7 +51,7 @@ let
         packages.${system}.example = package.overridePythonAttrs (attributes: {
           meta = builtins.removeAttrs attributes.meta [ "description" ];
         });
-        outPath = ./prm/consumer-contract;
+        outPath = ./fixtures;
       };
     };
     systems = [ system ];
@@ -64,6 +64,12 @@ let
   };
   leanExample = consumer.packages.${system}.lean-example;
   leanLibrary = consumer.packages.${system}.test_main;
+  lintTool = (import ./main.nix inputs).lint {
+    inherit inputs pkgs;
+    self = consumer // {
+      outPath = consumerSource;
+    };
+  };
   package = consumer.packages.${system}.example;
   system = pkgs.stdenv.hostPlatform.system;
   vmCoverage = inputs.self.lib.mkCoverage {
@@ -78,6 +84,8 @@ assert
     cudaSupport = true;
   };
 assert package.meta.mainProgram == "example";
+assert package.afairesiKind == "python";
+assert leanExample.afairesiKind == "lean4";
 assert consumer.checks.${system} ? example;
 assert consumer.checks.${system} ? lean-example;
 assert consumer.checks.${system} ? test_main;
@@ -123,7 +131,12 @@ assert consumer.nixosConfigurations.example.config.networking.hostName == "examp
 assert (consumer.checks.${system} ? nixos-example) == (system == "x86_64-linux");
 assert empty.packages.${system} == { };
 assert builtins.attrNames empty.formatter == [ system ];
-assert builtins.attrNames empty.checks.${system} == [ "formatter" ];
+assert
+  builtins.attrNames empty.checks.${system} == [
+    "formatter"
+    "lint"
+    "structure"
+  ];
 assert empty.apps.${system} == { };
 assert empty.devShells.${system} == { };
 assert empty.legacyPackages.${system} == { };
@@ -178,6 +191,7 @@ pkgs.runCommand "afairesi-consumer-contract"
     ];
   }
   ''
+    cmp ${package.src}/ms.tex ${package}/${package.python.sitePackages}/example/ms.tex
     test "$(cat ${consumer.packages.${system}.nix-untested})" = untested
     unset AFAIRESI_CONSUMER_HOOK
     expected=$(printf '%s\n' loaded "['two words', '--flag']")
@@ -204,6 +218,77 @@ pkgs.runCommand "afairesi-consumer-contract"
     chmod -R u+w formatted
     cd formatted
     touch flake.nix
+    mkdir -p supporting fixtures
+    printf '%s\n' '# Keep this explanation' 'import os' 'value=  1' > supporting/extra.py
+    cp supporting/extra.py expected-extra.py
+    if ${lintTool.passthru.raw}/bin/treefmt --no-cache supporting/extra.py > lint-failure.log 2>&1; then
+      exit 1
+    fi
+    grep -F F401 lint-failure.log
+    cmp expected-extra.py supporting/extra.py
+    cp supporting/extra.py fixtures/extra.py
+    cp supporting/extra.py fixtures/source.py.txt
+    treefmt --no-cache supporting/extra.py fixtures/extra.py fixtures/source.py.txt
+    ! grep -F '# Keep this explanation' supporting/extra.py
+    grep -F 'import os' supporting/extra.py
+    grep -F 'value = 1' supporting/extra.py
+    cmp supporting/extra.py fixtures/extra.py
+    cmp expected-extra.py fixtures/source.py.txt
+    cat > supporting/ordered.nix <<'NIX'
+    # ordinary explanation
+    {
+      z = 2;
+      a = 1;
+      retained = false;
+    }
+    NIX
+    printf '%s\n' '*' "" '!*/' > .gitignore
+    printf '%s\n' '{' '"value": "first\nsecond",' '"items": [1, 2]' '}' > supporting/data.json
+    cp supporting/data.json flake.lock
+    cp flake.lock expected-lock
+    treefmt --no-cache supporting/ordered.nix supporting/data.json flake.lock .gitignore
+    touch -d @1 supporting/data.json supporting/ordered.nix
+    treefmt --no-cache --fail-on-change supporting/ordered.nix supporting/data.json flake.lock .gitignore
+    ${pkgs.python3}/bin/python - <<'PY'
+    from pathlib import Path
+    import json
+    source = Path("supporting/ordered.nix").read_text()
+    assert "ordinary explanation" not in source
+    assert source.index("a = 1;") < source.index("z = 2;")
+    assert "retained = false;" in source
+    assert Path(".gitignore").read_text() == "*\n!*/\n"
+    assert Path("supporting/data.json").stat().st_mtime == 1
+    assert Path("supporting/ordered.nix").stat().st_mtime == 1
+    for name in ["supporting/data.json", "flake.lock"]:
+        text = Path(name).read_text()
+        assert "\n" in text
+        assert json.loads(text) == {"value": "first\nsecond", "items": [1, 2]}
+    PY
+    cmp expected-lock flake.lock
+    cat > supporting/parse.js <<'JS'
+    /* oxlint-disable eslint/no-empty */
+    export const parse = (input) => {
+      try { return JSON.parse(input); } catch {
+        // ordinary explanation
+      } finally {
+        JSON.stringify(input);
+      }
+      return false;
+    };
+    JS
+    treefmt --no-cache supporting/parse.js
+    ${lintTool.passthru.raw}/bin/treefmt --no-cache supporting/parse.js
+    printf '%s\n' '{ broken = ; } # ordinary explanation' > supporting/broken.nix
+    cp supporting/broken.nix expected-broken.nix
+    if treefmt --no-cache supporting/broken.nix > broken-format.log 2>&1; then
+      exit 1
+    fi
+    cmp expected-broken.nix supporting/broken.nix
+    if ${lintTool.passthru.raw}/bin/treefmt --no-cache fixtures/extra.py > fixture-lint.log 2>&1; then
+      exit 1
+    fi
+    grep -F F401 fixture-lint.log
+    cmp supporting/extra.py fixtures/extra.py
     printf '%s\n' '-- ordinary explanation' '/- outer /- nested -/ explanation -/' >> lean-example/main.lean
     cat >> lean-example/main.lean <<'LEAN'
     example : String := "-- literal /- literal"
@@ -212,18 +297,21 @@ pkgs.runCommand "afairesi-consumer-contract"
     example : Nat := 1 /- inline explanation -/ + 2
     LEAN
     sed -i 's/$/\r/' lean-example/main.lean
-    cp lean-example/prm/Support.lean expected-support.lean
-    treefmt --no-cache {lean-example,test_main}/{main,test_main}.lean
-    treefmt --no-cache --fail-on-change {lean-example,test_main}/{main,test_main}.lean
+    mkdir -p lean-example/Nested
+    printf '%s\n' '/-- A supporting constant. -/' 'def extra:Nat:=42' > lean-example/Nested/Extra.lean
+    cp lean-example/Nested/Extra.lean expected-extra.lean
+    treefmt --no-cache {lean-example,test_main}/{main,test_main}.lean lean-example/Nested/Extra.lean
+    treefmt --no-cache --fail-on-change {lean-example,test_main}/{main,test_main}.lean lean-example/Nested/Extra.lean
+    ! cmp -s expected-extra.lean lean-example/Nested/Extra.lean
+    grep -F '/-- A supporting constant. -/' lean-example/Nested/Extra.lean
     grep -F -- '-- lean-fmt: ignore[FMT005]' lean-example/main.lean
-    ! grep -F 'ordinary explanation' lean-example/main.lean
-    ! grep -F 'nested -/ explanation' lean-example/main.lean
-    ! grep -F 'inline explanation' lean-example/main.lean
+    grep -F 'ordinary explanation' lean-example/main.lean
+    grep -F 'nested -/ explanation' lean-example/main.lean
+    grep -F 'inline explanation' lean-example/main.lean
     grep -F '"-- literal /- literal"' lean-example/main.lean
     grep -F 'r#""-- raw literal /- literal"#' lean-example/main.lean
     grep -F '"-- interpolation"' lean-example/main.lean
     grep -F '/-- Print the dependency value' lean-example/main.lean
-    cmp expected-support.lean lean-example/prm/Support.lean
     grep -F 'set_option linter.missingDocs false in' test_main/main.lean
     cp test_main/main.lean expected-main.lean
     cp ${consumerSource}/test_main/main.lean test_main/main.lean

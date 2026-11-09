@@ -1,4 +1,4 @@
-{ pkgs, package }:
+{ package, pkgs }:
 pkgs.runCommand "remove-nix-defaults-modules"
   {
     nativeBuildInputs = [

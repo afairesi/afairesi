@@ -52,8 +52,7 @@ in
       python.pkgs.coverage
       ((import ../afairesi_nix/main.nix inputs).formatter {
         inherit inputs pkgs;
-        enableMypy = false;
-      }).passthru.raw
+      })
     ];
   };
   postFixup = ''

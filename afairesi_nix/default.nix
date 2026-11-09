@@ -4,8 +4,7 @@ pkgs.stdenvNoCC.mkDerivation {
   installPhase = ''
     runHook preInstall
     mkdir -p "$out"
-    cp main.nix "$out/main.nix"
-    cp -R prm "$out/prm"
+    cp main.nix "$out/"
     runHook postInstall
   '';
   meta.description = "Nix library for Afairesi packages, checks, formatters, and hosts";
