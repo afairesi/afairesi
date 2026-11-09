@@ -104,13 +104,11 @@ def git(
     arguments: list[str],
     *,
     check: bool = True,
-    capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run Git in a selected repository."""
     return run(
         ["git", "-C", str(root), *arguments],
         check=check,
-        capture_output=capture_output,
     )
 
 
@@ -420,16 +418,7 @@ def managed_paths(root: Path, packages: list[Package]) -> set[Path]:
     return managed
 
 
-def beneath(path: Path, trees: set[Path]) -> bool:
-    """Return whether path is a tree or lies beneath one."""
-    return any(path == tree or tree in path.parents for tree in trees)
-
-
-def validate_flake_layout(
-    root: Path,
-    *,
-    removing: Path | None = None,
-) -> None:
+def validate_flake_layout(root: Path) -> None:
     """Validate tracked conventional files without examining local-only trees."""
     paths = source_paths(root)
     conventional = {
@@ -456,7 +445,6 @@ def validate_flake_layout(
         tests = package.root / "test_main.py"
         if (
             package.kind == "python"
-            and package.root.relative_to(root) != removing
             and tests.relative_to(root) in paths
             and tests.is_file()
         ):
@@ -1327,84 +1315,6 @@ def add_host(root: Path, name: str) -> None:
         raise
 
 
-def remove_resource(
-    root: Path,
-    value: str,
-    *,
-    force: bool = False,
-) -> None:
-    """Remove a canonical package or host and stage its related metadata."""
-    kind, name, relative = _parse_resource_path(value, root)
-    resource_root = root / relative
-    marker = "default.nix" if kind == "package" else "configuration.nix"
-    if not resource_root.is_dir() or not (resource_root / marker).is_file():
-        msg = f"{kind} does not exist: {name}"
-        raise CommandError(msg)
-    arguments = ["rm", "-r"]
-    if force:
-        arguments.append("--force")
-    git(root, [*arguments, "--", str(relative)], capture_output=False)
-
-
-def _parse_resource_path(
-    value: str,
-    root: Path | None = None,
-    *,
-    kind: str | None = None,
-) -> tuple[str, str, Path]:
-    """Parse one root resource name and infer existing resources from markers."""
-    path = Path(value)
-    if (
-        path.is_absolute()
-        or len(path.parts) != RESOURCE_PATH_COMPONENTS
-        or value != path.name
-        or path.name == ".git"
-    ):
-        msg = f"resource path must be a root directory name: {value}"
-        raise CommandError(msg)
-    name = path.name
-    if kind is None and root is not None:
-        kind = "package" if (root / path / "default.nix").is_file() else "host"
-    validate_name(name)
-    return kind or "package", name, path
-
-
-def rename_resource(
-    root: Path,
-    source: str,
-    destination: str,
-) -> None:
-    """Rename one canonical package or host and stage its related metadata."""
-    source_kind, source_name, source_relative = _parse_resource_path(source, root)
-    _, _, destination_relative = _parse_resource_path(
-        destination,
-        kind=source_kind,
-    )
-    source_path = root / source_relative
-    destination_path = root / destination_relative
-    marker = "default.nix" if source_kind == "package" else "configuration.nix"
-    if not source_path.is_dir() or not (source_path / marker).is_file():
-        msg = f"{source_kind} does not exist: {source_name}"
-        raise CommandError(msg)
-    if destination_path.exists():
-        msg = f"destination already exists: {destination_relative}"
-        raise CommandError(msg)
-    packages = detect_packages(root)
-    validate_python_package_names(
-        [
-            Package(destination_relative.name, package.kind, destination_path)
-            if package.root == source_path
-            else package
-            for package in packages
-        ],
-    )
-    report_change(
-        f"move '{source_relative}' to '{destination_relative}'",
-        dry_run=False,
-    )
-    git(root, ["mv", "--", str(source_relative), str(destination_relative)])
-
-
 def require_nix_flakes() -> None:
     """Check the effective Nix features before initialization changes files."""
     try:
@@ -2138,10 +2048,11 @@ def _run_test_repository(
 ) -> bool:
     """Run each Python package, continuing after failures and summarizing results."""
     packages = _python_test_packages(root)
+    paths = source_paths(root)
     outcomes: dict[str, str] = {}
     for package in packages:
         if (
-            Path(package.name) / "test_main.py" not in source_paths(root)
+            Path(package.name) / "test_main.py" not in paths
             or not (package / "test_main.py").is_file()
         ):
             outcomes[package.name] = "skipped"
@@ -2269,11 +2180,12 @@ def _run_coverage(target: Path) -> bool:
     else:
         _test_target_root(target)
         packages = [target]
+    paths = source_paths(target) if repository else set()
     outcomes: dict[str, str] = {}
     for package in packages:
         try:
             if repository and (
-                Path(package.name) / "test_main.py" not in source_paths(target)
+                Path(package.name) / "test_main.py" not in paths
                 or not (package / "test_main.py").is_file()
                 or not has_python_tests(package / "test_main.py")
             ):
@@ -3725,43 +3637,6 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     _configure_inspect_parser(inspection)
-    move = commands.add_parser(
-        "mv",
-        help="rename and stage a package or host",
-        description=(
-            "Rename and stage a package or host. "
-            "Move the resource directory with git mv and preserve unstaged edits."
-        ),
-    )
-    move.add_argument(
-        "source",
-        metavar="SOURCE",
-        help="existing directory name at the flake root",
-    )
-    move.add_argument(
-        "destination",
-        metavar="DESTINATION",
-        help="new directory name at the flake root",
-    )
-    remove = commands.add_parser(
-        "rm",
-        help="remove and stage a package or host",
-        description=(
-            "Remove a tracked package or host directory with git rm. "
-            "Untracked and ignored files remain."
-        ),
-    )
-    remove.add_argument(
-        "resource",
-        metavar="RESOURCE",
-        help="existing directory name at the flake root",
-    )
-    remove.add_argument(
-        "-f",
-        "--force",
-        action="store_true",
-        help="pass --force to git rm",
-    )
     testing = commands.add_parser(
         "test",
         help="run tests and measure coverage or performance",
@@ -3770,12 +3645,8 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     _configure_test_parser(testing)
 
 
-def home_submodules(
-    root: Path,
-    *,
-    require_url: bool = True,
-) -> list[dict[str, str]]:
-    """Read submodule records using Git's configuration parser."""
+def home_submodule_paths(root: Path) -> list[Path]:
+    """Read registered paths and validate fields with Git's configuration parser."""
     modules = root / ".gitmodules"
     if not modules.exists():
         return []
@@ -3814,56 +3685,15 @@ def home_submodules(
             msg = f'submodule "{match.group(1)}": duplicate {match.group(2)} field'
             raise CommandError(msg)
         fields[match.group(2)] = value
-    repositories = []
-    for name, fields in sorted(grouped.items()):
-        required = {"path", "url"} if require_url else {"path"}
-        if not required.issubset(fields):
-            suffix = "path and one URL" if require_url else "path"
-            msg = f'submodule "{name}": must have exactly one {suffix}'
+    paths = []
+    for name, fields in grouped.items():
+        if "path" not in fields:
+            msg = f'submodule "{name}": must have exactly one path'
             raise CommandError(
                 msg,
             )
-        repositories.append({"name": name, **fields})
-    return repositories
-
-
-def _converge_home_modules(root: Path, *, dry_run: bool) -> None:
-    """Sort submodule sections while preserving their settings and other sections."""
-    source = read_regular(root / ".gitmodules")
-    if source is None:
-        return
-    headers = list(
-        re.finditer(
-            r'(?m)^[ \t]*\[((?:[^"\]\n]|"(?:\\.|[^"\\\n])*")+)\]'
-            r"[ \t]*(?:[#;][^\n]*)?(?:\n|$)",
-            source,
-        ),
-    )
-    sections = [
-        source[header.start() : headers[index + 1].start()]
-        if index + 1 < len(headers)
-        else source[header.start() :]
-        for index, header in enumerate(headers)
-    ]
-    submodules = []
-    positions = []
-    for index, header in enumerate(headers):
-        match = re.fullmatch(
-            r'(?i:submodule)[ \t]+"((?:\\.|[^"\\])*)"',
-            header.group(1),
-        )
-        if match is None:
-            continue
-        name = re.sub(r'\\(["\\])', r"\1", match.group(1))
-        positions.append(index)
-        submodules.append((name, sections[index]))
-    ordered = sorted(submodules, key=lambda section: section[0])
-    if ordered == submodules:
-        return
-    for position, (_, section) in zip(positions, ordered, strict=True):
-        sections[position] = section if section.endswith("\n") else section + "\n"
-    updated = source[: headers[0].start()] + "".join(sections)
-    write_managed(root, Path(".gitmodules"), updated, dry_run=dry_run)
+        paths.append(Path(fields["path"]))
+    return paths
 
 
 def _home_ignore_rules(paths: list[Path]) -> set[str]:
@@ -3937,8 +3767,6 @@ def _converge_home_ignore(
     required: set[str],
     previous: set[str],
     state: tuple[str | None, str, str | None],
-    *,
-    dry_run: bool,
 ) -> None:
     """Update working and staged allowlists independently to retain personal edits."""
     source, mode, indexed = state
@@ -3947,9 +3775,7 @@ def _converge_home_ignore(
     staged = _home_ignore_source(indexed or "", required, owned)
     if source == updated and indexed == staged:
         return
-    report_change("write '.gitignore'", dry_run=dry_run)
-    if dry_run:
-        return
+    report_change("write '.gitignore'", dry_run=False)
     if source != updated:
         (root / ".gitignore").write_text(updated, encoding="utf-8")
     if indexed != staged:
@@ -3967,51 +3793,6 @@ def _converge_home_ignore(
         )
 
 
-def converge_home(root: Path, *, dry_run: bool) -> None:
-    """Converge a canonical home repository."""
-    repositories = home_submodules(root)
-    actual_paths = [Path(repository["path"]) for repository in repositories]
-    expected_paths = [
-        canonical_remote_path(repository["url"]) for repository in repositories
-    ]
-    if len(set(expected_paths)) != len(expected_paths):
-        msg = "duplicate canonical repository path"
-        raise CommandError(msg)
-    if len(set(actual_paths)) != len(actual_paths):
-        msg = "duplicate configured repository path"
-        raise CommandError(msg)
-    repair_paths = [
-        expected if (root / actual / ".git").exists() else actual
-        for actual, expected in zip(actual_paths, expected_paths, strict=True)
-    ]
-    if len(set(repair_paths)) != len(repair_paths):
-        msg = "canonical repository path conflicts with a missing checkout registration"
-        raise CommandError(msg)
-    for actual, expected in zip(actual_paths, repair_paths, strict=True):
-        if actual != expected and (root / expected).exists():
-            msg = f"target already exists: {expected}"
-            raise CommandError(msg)
-    ignore_state = _home_ignore_state(root)
-    previous_rules = _home_ignore_rules(
-        actual_paths + _home_ignore_previous_paths(root)
-    )
-    required_rules = _home_ignore_rules(repair_paths)
-    for actual, expected in zip(actual_paths, repair_paths, strict=True):
-        if actual == expected or not (root / actual / ".git").exists():
-            continue
-        report_change(f"move '{actual}' to '{expected}'", dry_run=dry_run)
-        arguments = ["mv"]
-        if dry_run:
-            arguments.append("--dry-run")
-        else:
-            (root / expected).parent.mkdir(parents=True, exist_ok=True)
-        git(root, [*arguments, "--", str(actual), str(expected)])
-    _converge_home_modules(root, dry_run=dry_run)
-    _converge_home_ignore(
-        root, required_rules, previous_rules, ignore_state, dry_run=dry_run
-    )
-
-
 def remove_home_submodule(
     root: Path,
     value: str,
@@ -4020,19 +3801,12 @@ def remove_home_submodule(
 ) -> None:
     """Remove a registered home submodule and stage its registration change."""
     relative = Path(value)
-    repositories = home_submodules(root, require_url=False)
-    if (
-        relative.is_absolute()
-        or ".." in relative.parts
-        or relative.as_posix()
-        not in {repository["path"] for repository in repositories}
-    ):
+    paths = home_submodule_paths(root)
+    if relative.is_absolute() or ".." in relative.parts or relative not in paths:
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
     ignore_state = _home_ignore_state(root)
-    previous_paths = [Path(repository["path"]) for repository in repositories]
-    previous_paths += _home_ignore_previous_paths(root)
-    previous_rules = _home_ignore_rules(previous_paths)
+    previous_rules = _home_ignore_rules(paths + _home_ignore_previous_paths(root))
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
@@ -4041,23 +3815,16 @@ def remove_home_submodule(
         cwd=root,
         capture_output=False,
     )
-    _converge_home_modules(root, dry_run=False)
     _converge_home_ignore(
         root,
-        _home_ignore_rules(
-            [
-                Path(repository["path"])
-                for repository in home_submodules(root, require_url=False)
-            ]
-        ),
+        _home_ignore_rules(home_submodule_paths(root)),
         previous_rules,
         ignore_state,
-        dry_run=False,
     )
 
 
 def initialize_home() -> None:
-    """Initialize and stage home submodule metadata and the home allowlist."""
+    """Initialize home metadata and refresh the staged home allowlist."""
     root = Path.home()
     if repository_type(root, "home") != "home":
         msg = "cannot initialize a flake repository as a home repository"
@@ -4066,18 +3833,11 @@ def initialize_home() -> None:
     run(["git", "init", "--", str(root)], capture_output=False)
     if not (root / ".gitmodules").exists():
         write_managed(root, Path(".gitmodules"), "", dry_run=False)
-    _converge_home_modules(root, dry_run=False)
     _converge_home_ignore(
         root,
-        _home_ignore_rules(
-            [
-                Path(repository["path"])
-                for repository in home_submodules(root, require_url=False)
-            ]
-        ),
+        _home_ignore_rules(home_submodule_paths(root)),
         _home_ignore_rules(_home_ignore_previous_paths(root)),
         ignore_state,
-        dry_run=False,
     )
 
 
@@ -4111,7 +3871,7 @@ def initialize_submodule(
     home = _require_home_repository()
     validate_managed_path(home, relative)
     directories = missing_directories(home, [relative.parent])
-    if any(beneath(path, {relative}) for path in _tracked_paths(home)):
+    if any(path.is_relative_to(relative) for path in _tracked_paths(home)):
         msg = f"{relative}: already exists in the index"
         raise CommandError(msg)
     arguments = ["git", "submodule", "add", "--force"]
@@ -4131,18 +3891,11 @@ def initialize_submodule(
             cwd=home,
             capture_output=False,
         )
-        _converge_home_modules(home, dry_run=False)
         _converge_home_ignore(
             home,
-            _home_ignore_rules(
-                [
-                    Path(repository["path"])
-                    for repository in home_submodules(home, require_url=False)
-                ]
-            ),
+            _home_ignore_rules(home_submodule_paths(home)),
             previous_rules,
             ignore_state,
-            dry_run=False,
         )
     except BaseException:
         remove_empty_directories(directories)
@@ -4171,27 +3924,13 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         action="store_true",
         help="pass --force to git submodule add, including reuse of retained Git data",
     )
-    fix_home = commands.add_parser(
-        "fix",
-        help="fix and stage home repository structure",
-        description=(
-            "Fix and stage the submodule layout. "
-            "Move submodules to <remote-hostname>/<repository-path> and update "
-            "the home allowlist."
-        ),
-    )
-    fix_home.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview structural changes without modifying files or staging",
-    )
     commands.add_parser(
         "init",
-        help="initialize home submodule metadata and the home allowlist",
+        help="initialize the home repository and refresh its allowlist",
         description=(
-            "Initialize the home repository and stage its .gitmodules metadata "
-            "and structural .gitignore rules. "
+            "Initialize the home repository and create .gitmodules if missing. "
+            "Refresh and stage structural .gitignore rules from registered paths. "
+            "Run again to refresh the allowlist after native Git changes. "
             "Preserve personal ignore rules and staging."
         ),
     )
@@ -4222,8 +3961,6 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         initialize_home()
     elif options.command == "add":
         initialize_submodule(options.remote, force=options.force)
-    elif options.command == "fix":
-        converge_home(_require_home_repository(), dry_run=options.dry_run)
     elif options.command == "rm":
         root = _require_home_repository()
         remove_home_submodule(
@@ -4267,50 +4004,37 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _dispatch_create(root: Path, options: argparse.Namespace) -> None:
-    """Create the selected package or host resource."""
-    kind, name, _relative = _parse_resource_path(
-        options.resource,
-        kind="host" if options.type == "host" else "package",
-    )
-    if kind == "host":
-        add_host(root, name)
-        return
-    add_package(root, options.type, name)
-
-
-def _validate_resource_arguments(
+def _validate_add_arguments(
     cli: argparse.ArgumentParser,
     options: argparse.Namespace,
 ) -> None:
-    """Reject invalid resource arguments before discovering the repository."""
-    if options.scope != "repo" or options.command not in {"add", "mv", "rm"}:
+    """Reject invalid creation arguments before discovering the repository."""
+    if options.scope != "repo" or options.command != "add":
         return
+    path = Path(options.resource)
+    if (
+        path.is_absolute()
+        or len(path.parts) != RESOURCE_PATH_COMPONENTS
+        or options.resource != path.name
+        or path.name == ".git"
+    ):
+        cli.error(f"resource path must be a root directory name: {options.resource}")
     try:
-        if options.command == "mv":
-            _parse_resource_path(options.source)
-            _parse_resource_path(options.destination)
-        else:
-            _parse_resource_path(
-                options.resource,
-                kind=("host" if options.type == "host" else "package")
-                if options.command == "add"
-                else None,
-            )
+        validate_name(path.name)
     except CommandError as error:
         cli.error(str(error))
 
 
-def _require_flake_repository(
-    message: str,
-    *,
-    removing: Path | None = None,
-) -> Path:
+def _require_flake_repository() -> Path:
     """Select the current repository and require flake lifecycle commands."""
     root = repository_root()
     if repository_type(root) != "flake":
-        raise CommandError(message)
-    validate_flake_layout(root, removing=removing)
+        msg = (
+            "afairesi repo commands require a flake repository; "
+            "use afairesi home for home"
+        )
+        raise CommandError(msg)
+    validate_flake_layout(root)
     return root
 
 
@@ -4350,24 +4074,12 @@ def _dispatch_workspace_command(
     if options.command == "test":
         _dispatch_test_command(options, cli)
         return
-    root = _require_flake_repository(
-        "afairesi repo commands require a flake repository; use afairesi home for home",
-        removing=Path(options.resource) if options.command == "rm" else None,
-    )
+    root = _require_flake_repository()
     if options.command == "add":
-        _dispatch_create(root, options)
-    elif options.command == "rm":
-        remove_resource(
-            root,
-            options.resource,
-            force=options.force,
-        )
-    elif options.command == "mv":
-        rename_resource(
-            root,
-            options.source,
-            options.destination,
-        )
+        if options.type == "host":
+            add_host(root, options.resource)
+        else:
+            add_package(root, options.type, options.resource)
     elif options.command == "fix":
         converge_flake(root, dry_run=options.dry_run)
 
@@ -4376,7 +4088,7 @@ def main() -> None:
     """Dispatch repository and home commands."""
     cli = parser()
     options = cli.parse_args()
-    _validate_resource_arguments(cli, options)
+    _validate_add_arguments(cli, options)
     try:
         _dispatch_workspace_command(options, cli)
     except subprocess.CalledProcessError as error:

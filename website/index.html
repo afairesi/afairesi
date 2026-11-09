@@ -137,8 +137,10 @@
       <p>
         Git determines source membership. Select new files with <code>git add -- PATH</code>; use
         <code>-f</code> when deliberately tracking an ignored file. Afairesi stages the files it
-        creates. The <code>default.nix</code> constructor selects the package type; supporting files
-        can live anywhere.
+        creates. Rename or remove resources from the project root with
+        <code>git mv -- OLD NEW</code> or <code>git rm -r -- NAME</code>. The
+        <code>default.nix</code> constructor selects the package type; supporting files can live
+        anywhere.
       </p>
       <p>
         <code>afairesi repo fix</code> repairs and stages structure. <code>nix fmt</code> formats
@@ -164,9 +166,10 @@
           Home commands maintain <code>~/.gitignore</code> as an allowlist: <code>*</code> ignores
           new files, with exceptions for <code>.gitignore</code>, <code>.gitmodules</code>, and
           registered submodule directories and their parents. These exceptions follow
-          <code>.gitmodules</code> when repositories are added, moved, or removed. Add personal
-          exceptions below them, including any parent directories. Afairesi preserves personal rules
-          and their staging while updating its structural rules.
+          <code>.gitmodules</code> when repositories are added or removed. After manual Git changes,
+          run <code>afairesi home init</code> to refresh the allowlist using the declared paths. Add
+          personal exceptions below them, including any parent directories. Afairesi preserves
+          personal rules and their staging while updating its structural rules.
         </p>
         <p>From a project root, preview untracked files to remove, including ignored files:</p>
         <pre><code>git clean -ndx</code></pre>
