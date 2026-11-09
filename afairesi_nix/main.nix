@@ -37,7 +37,7 @@ let
               ];
               text = ''
                 nixfmt < "$temporary" > /dev/null
-                uncomment --no-gitignore "$temporary"
+                uncomment --config ${pkgs.writeText "uncomment.toml" ""} --no-gitignore "$temporary"
                 alphabetize_nix "$temporary"
                 nixfmt "$temporary"
               '';
@@ -46,9 +46,23 @@ let
             priority = 5;
           };
           oxfmt.options = [
+            "--config"
+            "${pkgs.writeText "oxfmt.json" (
+              builtins.toJSON {
+                endOfLine = "lf";
+                insertFinalNewline = true;
+                printWidth = 100;
+                singleQuote = false;
+                tabWidth = 2;
+                useTabs = false;
+              }
+            )}"
+            "--disable-nested-config"
             "--ignore-path"
             "/dev/null"
           ];
+          ruff-format.options = [ "--isolated" ];
+          texfmt.options = [ "--noconfig" ];
           uncomment = {
             command = afairesiInputs.self.packages.${pkgs.stdenv.system}.uncomment;
             includes = [
@@ -68,8 +82,15 @@ let
               "*.yml"
               "*.jsonc"
               "*.json5"
+              "*.tex"
+              "*.sty"
+              "*.cls"
             ];
-            options = [ "--no-gitignore" ];
+            options = [
+              "--config"
+              "${pkgs.writeText "uncomment.toml" ""}"
+              "--no-gitignore"
+            ];
             priority = 1;
           };
         }
@@ -133,6 +154,7 @@ let
                 directory = "";
                 modules = pythonSources name;
                 options = [
+                  "--config-file=${pkgs.writeText "mypy.ini" "[mypy]\n"}"
                   "--python-executable=${environment.python}/bin/python"
                   "--no-namespace-packages"
                   "--ignore-missing-imports"
@@ -142,10 +164,17 @@ let
             );
             enable = true;
           };
-          yamllint.enable = true;
+          yamllint = {
+            enable = true;
+            settings.extends = "default";
+          };
         };
         projectRootFile = "flake.nix";
         settings.formatter = {
+          actionlint.options = [
+            "-config-file"
+            "${pkgs.writeText "actionlint.yaml" "{}"}"
+          ];
           deadnix = {
             command = pkgs.deadnix;
             includes = [ "*.nix" ];
@@ -162,6 +191,10 @@ let
               "*.tsx"
             ];
             options = [
+              "--config"
+              "${pkgs.writeText "oxlint.json" "{}"}"
+              "--disable-nested-config"
+              "--no-ignore"
               "-D"
               "all"
               "-A"
@@ -176,6 +209,7 @@ let
             ];
             options = [
               "check"
+              "--isolated"
               "--no-fix"
               "--extend-select=ALL"
               "--extend-ignore=W191,E111,E114,E117,D203,D206,D300,Q000,Q001,Q002,Q003,Q004,COM812,COM819"
@@ -188,7 +222,7 @@ let
               runtimeInputs = [ pkgs.statix ];
               text = ''
                 for file in "$@"; do
-                  statix check --unrestricted "$file"
+                  statix check --config ${pkgs.writeText "statix.toml" ""} --unrestricted "$file"
                 done
               '';
             };
@@ -931,6 +965,9 @@ let
       pname = builtins.replaceStrings [ "-" ] [ "_" ] cliName;
       python = pkgs.python3;
     in
+    assert
+      !(builtins.pathExists (src + "/__init__.py"))
+      || throw "mkPythonPackage reserves __init__.py for main.py; move initialization into main.py";
     assert
       (
         builtins.match "[a-zA-Z_][a-zA-Z0-9_]*" pname != null

@@ -30,10 +30,13 @@ from cosmic_ray.work_item import WorkerOutcome, WorkItem, WorkResult
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-HOME_IGNORE = "*\n!/.gitignore\n!/.gitmodules\n"
+HOME_IGNORE_PREFIX = "# afairesi: home allowlist\n*\n!/.gitignore\n!/.gitmodules\n"
+HOME_IGNORE_SUFFIX = "# afairesi: end home allowlist\n"
+HOME_IGNORE = HOME_IGNORE_PREFIX + HOME_IGNORE_SUFFIX
 HOME_SUBMODULE_IGNORE = (
-    HOME_IGNORE
+    HOME_IGNORE_PREFIX
     + "!/forge.example/\n!/forge.example/owner/\n!/forge.example/owner/demo/\n"
+    + HOME_IGNORE_SUFFIX
 )
 
 
@@ -1304,6 +1307,48 @@ def test_untracked_definition_does_not_resolve_ambiguous_sources() -> None:
         rejected = _repair_flake(root, code=1)
         _expect("ambiguous project markers" in rejected.stderr, rejected)
         _expect(_snapshot(root) == before, "untracked definition changed state")
+
+
+@pytest.mark.parametrize("kind", ["html", "latex", "lean4", "nix"])
+def test_inspection_selects_tests_by_package_kind(kind: str) -> None:
+    """Supporting Python files never replace another package kind's test report."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", kind)
+        package = root / "example"
+        _write_fixture_source(package / "test_main.py", "not valid python!")
+        _write_fixture_source(package / "test_main.lean", "example : 1 = 1 := rfl\n")
+        _write_fixture_source(package / "test_main.nix", "{}\n")
+        report = json.loads(_run(root, "inspect").stdout)["example"]
+        expected = {"lean4": ["test_main.lean"], "nix": ["test_main.nix"]}.get(kind, [])
+        _expect(report.get("tests", []) == expected, report)
+
+
+def test_python_initializer_collision_is_rejected_before_build() -> None:
+    """Reject a selected initializer without changing source or installing over main."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", "python")
+        initializer = root / "example/__init__.py"
+        initializer.write_text('"""Personal initialization."""\n')
+        _preview_flake_repair(root)
+        _git(root, "add", "example/__init__.py")
+        before = _snapshot(root)
+        for result in (_repair_flake(root, code=1), _check_flake_source(root, code=1)):
+            _expect("__init__.py: reserved" in result.stderr, result)
+        result = _run(
+            root,
+            "eval",
+            "--impure",
+            "--json",
+            "--expr",
+            _template_expression(root, "example") + "package.meta",
+            executable="nix",
+            environment=_nix_environment(root),
+            code=1,
+        )
+        _expect("reserves __init__.py" in result.stderr, result)
+        _expect(
+            _snapshot(root, exclude=("tmp",)) == before, "rejection changed sources"
+        )
 
 
 def test_convergence_respects_excluded_trees() -> None:
@@ -2604,11 +2649,14 @@ def test_home_reinitialization_preserves_missing_checkouts(
     )
 
 
+@pytest.mark.parametrize("committed", [False, True])
 @pytest.mark.parametrize("url", ["git@mirror.example:team/other", "../other", None])
 def test_home_reinitialization_refreshes_native_moves(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     url: str | None,
+    *,
+    committed: bool,
 ) -> None:
     """Refresh the allowlist after Git moves while preserving declared paths."""
     root = _home_test_home_repository(tmp_path / "home")
@@ -2625,6 +2673,8 @@ def test_home_reinitialization_refreshes_native_moves(
     else:
         _git(root, "config", "--file", ".gitmodules", key, url)
     _git(root, "add", ".gitmodules")
+    if committed:
+        _fixture_git(root, "commit", "-qm", "Move repository")
     checkout = root / relative
     (checkout / "LICENSE").write_text("local edits")
     (checkout / "untracked").write_text("local data")
@@ -2641,7 +2691,9 @@ def test_home_reinitialization_refreshes_native_moves(
         _git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
         "initialization changed the submodule commit",
     )
-    expected = HOME_IGNORE + "!/projects/\n!/projects/demo/\n"
+    expected = (
+        HOME_IGNORE_PREFIX + "!/projects/\n!/projects/demo/\n" + HOME_IGNORE_SUFFIX
+    )
     _expect((root / ".gitignore").read_text() == expected, "stale allowlist")
     _expect(_git(root, "show", ":.gitignore") == expected, "allowlist was not staged")
 
@@ -3089,7 +3141,7 @@ def test_home_allowlist_admits_only_selected_paths(
     _expect(_snapshot(home) == before, "repeated repair changed allowlist state")
 
 
-@pytest.mark.parametrize("command", ["rm", "native"])
+@pytest.mark.parametrize("command", ["rm", "native", "committed", "legacy-committed"])
 def test_home_allowlist_removal_preserves_shared_personal_parents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3099,6 +3151,12 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
     home = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     ignore = home / ".gitignore"
+    if command == "legacy-committed":
+        ignore.write_text(
+            ignore.read_text()
+            .removeprefix("# afairesi: home allowlist\n")
+            .removesuffix(HOME_IGNORE_SUFFIX)
+        )
     personal = (
         "# Personal files\n!/forge.example/personal/\n"
         "!/forge.example/personal/staged.txt\n"
@@ -3109,12 +3167,14 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
     local = "!/forge.example/personal/working.txt\n"
     ignore.write_text(ignore.read_text() + local)
     relative = "forge.example/owner/demo"
-    if command == "native":
+    if command in {"native", "committed", "legacy-committed"}:
         _git(home, "rm", "-r", "--", relative)
+        if command in {"committed", "legacy-committed"}:
+            _fixture_git(home, "commit", "-qm", "Remove repository")
         _home_test_run(tmp_path, "init")
     else:
         _home_test_run(tmp_path, "rm", relative)
-    expected = HOME_IGNORE + "!/forge.example/\n" + personal
+    expected = HOME_IGNORE_PREFIX + "!/forge.example/\n" + HOME_IGNORE_SUFFIX + personal
     _expect(
         ignore.read_text() == expected + local,
         "removal lost personal rules or retained stale rules",
@@ -3226,6 +3286,34 @@ def test_home_cli_exposes_only_home_lifecycle_commands(
     ):
         _home_test_run(tmp_path, *arguments, code=2)
     _expect(not list(tmp_path.iterdir()), "invalid requests created files")
+
+
+@pytest.mark.parametrize("command", ["init", "add", "rm"])
+@pytest.mark.parametrize("staged", [False, True])
+def test_home_rejects_malformed_allowlist_before_mutation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    *,
+    staged: bool,
+) -> None:
+    """Require intact ownership markers before changing home metadata or checkouts."""
+    root = _home_test_home_repository(tmp_path / "home")
+    monkeypatch.setenv("HOME", str(root))
+    ignore = root / ".gitignore"
+    ignore.write_text(HOME_IGNORE_PREFIX)
+    if staged:
+        _git(root, "add", ".gitignore")
+        ignore.write_text(HOME_SUBMODULE_IGNORE)
+    arguments = {
+        "init": (),
+        "add": ("https://forge.example/team/other.git",),
+        "rm": ("forge.example/owner/demo",),
+    }[command]
+    before = _snapshot(root)
+    result = _home_test_run(root, command, *arguments, code=1)
+    _expect("malformed afairesi home allowlist" in result.stderr, result)
+    _expect(_snapshot(root) == before, "invalid markers caused partial changes")
 
 
 def test_home_commands_reject_flake_repositories_without_changes(
@@ -3486,6 +3574,53 @@ def test_supporting_assets_are_not_managed_files(
                 bool(path.stat().st_mode & 0o111), "repair changed supporting file mode"
             )
             _expect(path.read_text() == "supporting file\n", "repair changed asset")
+
+
+@pytest.mark.parametrize("tracked", [False, True])
+def test_formatting_ignores_repository_tool_configuration(*, tracked: bool) -> None:
+    """Selected sources receive the same policy with tracked or local tool settings."""
+    with _fresh_repository() as root:
+        files = {
+            "flake.nix": "{}\n",
+            "example.py": '# ordinary explanation\nvalue = "hello"\n',
+            "site/example.js": (
+                "// ordinary explanation\nexport const value = () => {\n"
+                '  return "hello";\n};\n'
+            ),
+            "paper/ms.tex": (
+                "\\documentclass{article}\n% ordinary explanation\n"
+                "\\begin{document}\nHello.\n\\end{document}\n"
+            ),
+        }
+        for name, source in files.items():
+            path = root / name
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(source)
+        _git(root, "add", ".")
+        _run(root, "--no-cache", executable="treefmt")
+        expected = {name: (root / name).read_bytes() for name in files}
+        configs = {
+            "pyproject.toml": '[tool.ruff.format]\nquote-style = "single"\n',
+            ".oxfmtrc.json": '{"singleQuote": true, "semi": false}\n',
+            "site/.oxfmtrc.json": '{"singleQuote": true, "semi": false}\n',
+            ".uncomment.toml": 'preserve_patterns = ["ordinary explanation"]\n',
+            "tex-fmt.toml": "wraplen = 10\n",
+            ".editorconfig": (
+                "root = true\n[*]\nindent_style = tab\nindent_size = 8\n"
+                "end_of_line = crlf\ninsert_final_newline = false\n"
+                "max_line_length = 20\n"
+            ),
+        }
+        for name, source in configs.items():
+            (root / name).write_text(source)
+        if tracked:
+            _git(root, "add", "--force", *configs)
+        for name, source in files.items():
+            (root / name).write_text(source)
+        _run(root, "--no-cache", executable="treefmt")
+        for name, content in expected.items():
+            _expect((root / name).read_bytes() == content, name)
+            _expect(b"ordinary explanation" not in content, name)
 
 
 def test_formatting_normalizes_metadata_and_supporting_sources() -> None:

@@ -144,10 +144,11 @@
       </p>
       <p>
         <code>afairesi repo fix</code> repairs and stages structure. <code>nix fmt</code> formats
-        tracked sources by file type, removes ordinary comments, and sorts Nix bindings.
-        <code>nix flake check</code> validates structure, formatting, lint, types, tests, and builds
-        without changing working files. Every repository inherits the same formatting and lint
-        policy; no configuration is needed.
+        tracked sources by file type, removes ordinary comments in languages supported by the
+        comment-removal tool, and sorts Nix bindings. <code>nix flake check</code> validates
+        structure, formatting, lint, types, tests, and builds without changing working files. Every
+        repository inherits the same formatting and lint policy; local formatter and linter
+        configuration files do not override it.
       </p>
       <details class="guide">
         <summary><span class="disclosure" aria-hidden="true"></span> Tracking and cleanup</summary>
@@ -167,9 +168,11 @@
           new files, with exceptions for <code>.gitignore</code>, <code>.gitmodules</code>, and
           registered submodule directories and their parents. These exceptions follow
           <code>.gitmodules</code> when repositories are added or removed. After manual Git changes,
-          run <code>afairesi home init</code> to refresh the allowlist using the declared paths. Add
-          personal exceptions below them, including any parent directories. Afairesi preserves
-          personal rules and their staging while updating its structural rules.
+          run <code>afairesi home init</code> to refresh the allowlist using the declared paths,
+          including after committing a move or removal. The generated rules have explicit start and
+          end markers so their ownership survives commits and clones. Add personal exceptions
+          outside that block, including any parent directories. Afairesi preserves personal rules
+          and their staging while updating its structural rules.
         </p>
         <p>From a project root, preview untracked files to remove, including ignored files:</p>
         <pre><code>git clean -ndx</code></pre>
@@ -222,9 +225,12 @@ afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
 afairesi repo add example python</code></pre>
         <p>
           Python and HTML builds include supporting files from the package source, excluding
-          conventional tests and build metadata. Lean modules live beside <code>main.lean</code>.
-          Nix packages may import <code>main.nix</code>; <code>test_main.nix</code> returns a check
-          derivation. Python and Lean4 packages receive development shells.
+          conventional tests and build metadata. A Python package's top-level
+          <code>__init__.py</code> is reserved for the installed <code>main.py</code>; put package
+          initialization in <code>main.py</code>. Nested Python packages can have their own
+          <code>__init__.py</code>. Lean modules live beside <code>main.lean</code>. Nix packages
+          may import <code>main.nix</code>; <code>test_main.nix</code> returns a check derivation.
+          Python and Lean4 packages receive development shells.
         </p>
         <p>
           Campaign reports are kept in <code>$XDG_STATE_HOME/afairesi</code>, defaulting to

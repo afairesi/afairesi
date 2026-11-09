@@ -62,6 +62,26 @@ let
     };
     systems = [ system ];
   };
+  latexPackage = inputs.self.lib.mkLatexPackage {
+    inherit pkgs;
+    src =
+      pkgs.runCommand "latex-scaffold"
+        {
+          nativeBuildInputs = [
+            inputs.self.packages.${system}.afairesi
+            pkgs.git
+          ];
+        }
+        ''
+          mkdir repository
+          cd repository
+          git init --quiet
+          touch flake.nix flake.lock
+          git add flake.nix flake.lock
+          afairesi repo add example latex
+          cp -R example "$out"
+        '';
+  };
   leanExample = consumer.packages.${system}.lean-example;
   leanLibrary = consumer.packages.${system}.test_main;
   lintTool = (import ./main.nix inputs).lint {
@@ -187,6 +207,7 @@ pkgs.runCommand "afairesi-consumer-contract"
     ];
   }
   ''
+    head -c 5 ${latexPackage}/ms.pdf | grep -F '%PDF-'
     cmp ${package.src}/ms.tex ${package}/${package.python.sitePackages}/example/ms.tex
     test "$(cat ${consumer.packages.${system}.nix-untested})" = untested
     unset AFAIRESI_CONSUMER_HOOK
@@ -215,12 +236,23 @@ pkgs.runCommand "afairesi-consumer-contract"
     cd formatted
     touch flake.nix
     mkdir -p supporting fixtures
+    cat > pyproject.toml <<'TOML'
+    [tool.ruff.lint]
+    ignore = ["ALL"]
+    TOML
+    printf '%s\n' '{"rules":{"no-empty-function":"off"}}' > .oxlintrc.json
+    printf '%s\n' 'supporting/' > .eslintignore
     printf '%s\n' '# Keep this explanation' 'import os' 'value=  1' > supporting/extra.py
     cp supporting/extra.py expected-extra.py
     if ${lintTool.passthru.raw}/bin/treefmt --no-cache supporting/extra.py > lint-failure.log 2>&1; then
       exit 1
     fi
     grep -F F401 lint-failure.log
+    printf '%s\n' 'export const empty = () => {};' > supporting/empty.js
+    if ${lintTool.passthru.raw}/bin/treefmt --no-cache supporting/empty.js > js-lint.log 2>&1; then
+      exit 1
+    fi
+    grep -F no-empty-function js-lint.log
     cmp expected-extra.py supporting/extra.py
     cp supporting/extra.py fixtures/extra.py
     cp supporting/extra.py fixtures/source.py.txt

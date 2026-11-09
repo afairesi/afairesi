@@ -58,6 +58,8 @@ ROOT_FILES = {
 MINIMUM_REMOTE_COMPONENTS = 2
 RESOURCE_PATH_COMPONENTS = 1
 PYTEST_NO_TESTS_COLLECTED = 5
+HOME_IGNORE_START = "# afairesi: home allowlist"
+HOME_IGNORE_END = "# afairesi: end home allowlist"
 
 
 class CommandError(RuntimeError):
@@ -290,38 +292,33 @@ def _package_kind(name: str, markers: set[str], definition: str | None) -> str:
     return matches[0] if matches else "nix"
 
 
-def resource_directories(root: Path) -> list[Path]:
+def resource_directories(root: Path, paths: set[Path]) -> list[Path]:
     """List top-level source directories without traversing local files."""
-    if not root.is_dir():
-        return []
+    directories = {
+        root / path.parts[0]
+        for path in paths
+        if len(path.parts) > 1 and path.parts[0] != ".git"
+    }
     return sorted(
-        {
-            root / path.parts[0]
-            for path in source_paths(root)
-            if len(path.parts) > 1
-            and path.parts[0] != ".git"
-            and (root / path.parts[0]).is_dir()
-            and not (root / path.parts[0]).is_symlink()
-        },
+        path for path in directories if path.is_dir() and not path.is_symlink()
     )
 
 
-def detect_hosts(root: Path) -> list[Path]:
+def detect_hosts(root: Path, paths: set[Path]) -> list[Path]:
     """Detect hosts under the same directory rules as packages."""
-    paths = source_paths(root)
     return [
         path
-        for path in resource_directories(root)
+        for path in resource_directories(root, paths)
         if Path(path.name) / "configuration.nix" in paths
         and (path / "configuration.nix").is_file()
     ]
 
 
-def detect_packages(root: Path) -> list[Package]:
+def detect_packages(root: Path, paths: set[Path] | None = None) -> list[Package]:
     """Detect declared packages, falling back to unambiguous entrypoint files."""
     result: list[Package] = []
-    paths = source_paths(root)
-    for package_root in resource_directories(root):
+    paths = source_paths(root) if paths is None else paths
+    for package_root in resource_directories(root, paths):
         markers = {
             marker
             for marker in KIND_MARKERS.values()
@@ -400,11 +397,10 @@ def required_package_files(package: Package) -> set[Path]:
     return {path for path in package_files(package) if path.name not in optional}
 
 
-def managed_paths(root: Path, packages: list[Package]) -> set[Path]:
+def managed_paths(root: Path, packages: list[Package], paths: set[Path]) -> set[Path]:
     """Select tracked conventional files whose structure Afairesi manages."""
-    paths = source_paths(root)
     managed = {Path(item) for item in ROOT_FILES} & paths
-    for host in detect_hosts(root):
+    for host in detect_hosts(root, paths):
         validate_name(host.name)
         managed.update(
             {
@@ -440,7 +436,7 @@ def validate_flake_layout(root: Path) -> None:
             and relative.name in conventional
         ):
             validate_managed_path(root, relative)
-    packages = detect_packages(root)
+    packages = detect_packages(root, paths)
     for package in packages:
         tests = package.root / "test_main.py"
         if (
@@ -451,20 +447,22 @@ def validate_flake_layout(root: Path) -> None:
             has_python_tests(tests)
 
 
-def inspect_structure(root: Path) -> tuple[list[Package], list[str]]:
+def inspect_structure(
+    root: Path, paths: set[Path] | None = None
+) -> tuple[list[Package], list[str]]:
     """Validate recognized tracked resources, permitting arbitrary supporting files."""
-    packages = detect_packages(root)
-    paths = source_paths(root)
+    paths = source_paths(root) if paths is None else paths
+    packages = detect_packages(root, paths)
     issues: list[str] = []
     for package in packages:
         validate_name(package.name)
-        issues.extend(_python_source_issues(package))
+        issues.extend(_python_source_issues(package, paths))
         issues.extend(
             f"{relative}: missing required tracked regular file"
             for relative in sorted(required_package_files(package))
             if relative not in paths or not (root / relative).is_file()
         )
-    for relative in sorted(managed_paths(root, packages)):
+    for relative in sorted(managed_paths(root, packages, paths)):
         path = root / relative
         if path.is_symlink():
             issues.append(
@@ -566,11 +564,16 @@ def python_test_definitions(
     return result
 
 
-def _python_source_issues(package: Package) -> list[str]:
+def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
     """Check source contracts without importing or executing package code."""
     if package.kind != "python":
         return []
     issues = []
+    if Path(package.name) / "__init__.py" in paths:
+        issues.append(
+            f"{package.name}/__init__.py: reserved for the installed main.py; "
+            "move initialization into main.py"
+        )
     source = read_regular(package.root / "main.py")
     if source is not None:
         module = ast.parse(source, filename=str(package.root / "main.py"))
@@ -601,10 +604,7 @@ def _python_source_issues(package: Package) -> list[str]:
         ):
             issues.append(prefix + "main must be callable; the executable calls main()")
     tests = package.root / "test_main.py"
-    if (
-        tests.relative_to(package.root.parent) in source_paths(package.root.parent)
-        and tests.is_file()
-    ):
+    if tests.relative_to(package.root.parent) in paths and tests.is_file():
         has_python_tests(tests)
     return issues
 
@@ -793,7 +793,7 @@ def _package_body(document: nix_syntax.Document) -> Node:
 def _shared_package_required_edits(
     package: Package,
     source: str,
-) -> dict[str, list[tuple[int, int, bytes]]]:
+) -> list[tuple[int, int, bytes]]:
     """Enforce shared constructors while retaining custom attributes."""
     document = nix_syntax.parse(source)
     body = _package_body(document)
@@ -811,20 +811,22 @@ def _shared_package_required_edits(
     ):
         msg = f"{language} package must call the shared {builder} constructor"
         raise CommandError(msg)
-    edits = {
-        "pkgs": _nix_binding_edits(document, argument, ("pkgs",), "pkgs"),
-        "src": _nix_binding_edits(document, argument, ("src",), "./."),
-    }
+    edits = [
+        *_nix_binding_edits(document, argument, ("pkgs",), "pkgs"),
+        *_nix_binding_edits(document, argument, ("src",), "./."),
+    ]
     if package.kind in {"python", "lean4"}:
-        edits["executable"] = _nix_binding_edits(
-            document,
-            argument,
-            ("executable",),
-            "true"
-            if package.kind == "lean4"
-            or source_python_has_main(read_regular(package.root / "main.py"))
-            else "false",
-            overwrite=package.kind == "python",
+        edits.extend(
+            _nix_binding_edits(
+                document,
+                argument,
+                ("executable",),
+                "true"
+                if package.kind == "lean4"
+                or source_python_has_main(read_regular(package.root / "main.py"))
+                else "false",
+                overwrite=package.kind == "python",
+            ),
         )
     outer = document.root
     while outer.type == "parenthesized_expression":
@@ -841,26 +843,20 @@ def _shared_package_required_edits(
     }
     missing = [name for name in ("inputs", "pkgs") if name not in names]
     if missing:
-        edits["function arguments"] = [
+        edits.append(
             (
                 formals.start_byte + 1,
                 formals.start_byte + 1,
                 (" " + ", ".join(missing) + ",").encode(),
             ),
-        ]
+        )
     return edits
 
 
 def _canonical_shared_default(package: Package, source: str) -> str:
     """Repair required language bindings without removing custom attributes."""
     edits = _shared_package_required_edits(package, source)
-    return cast(
-        "bytes",
-        nix_syntax.apply_edits(
-            source.encode(),
-            [edit for changes in edits.values() for edit in changes],
-        ),
-    ).decode()
+    return cast("bytes", nix_syntax.apply_edits(source.encode(), edits)).decode()
 
 
 def canonical_package_default(package: Package) -> str | None:
@@ -1077,18 +1073,19 @@ def converge_flake(
     ]
     if missing:
         raise CommandError("missing required file: " + missing[0])
-    packages = detect_packages(root)
+    paths = source_paths(root)
+    packages = detect_packages(root, paths)
     issues = _flake_resource_issues(root)
     for package in packages:
         validate_name(package.name)
-        issues.extend(_python_source_issues(package))
+        issues.extend(_python_source_issues(package, paths))
         canonical_package_default(package)
     if issues:
         raise CommandError("\n".join(issues))
     changed = _converge_packages(root, packages, dry_run=dry_run)
     changed |= _converge_file_modes(
         root,
-        managed_paths(root, packages),
+        managed_paths(root, packages, source_paths(root)),
         {
             Path(package.name) / "main.py"
             for package in packages
@@ -1102,8 +1099,8 @@ def converge_flake(
 
 def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
-    packages, issues = inspect_structure(root)
     paths = source_paths(root)
+    packages, issues = inspect_structure(root, paths)
     issues.extend(_flake_resource_issues(root))
     for required in ("flake.lock", "flake.nix"):
         if not (root / required).is_file():
@@ -1215,7 +1212,8 @@ pkgs.writeTextFile {
         files[root / "index.html"] = "<!doctype html><html><body></body></html>\n"
     elif kind == "latex":
         files[root / "ms.tex"] = (
-            "\\documentclass{article}\n\\begin{document}\n\\end{document}\n"
+            "\\documentclass{article}\n\\begin{document}\n"
+            "Hello, world.\n\\end{document}\n"
         )
     return files
 
@@ -3287,9 +3285,9 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
     paths = source_paths(root)
-    host_names = {host.name for host in detect_hosts(root)}
+    host_names = {host.name for host in detect_hosts(root, paths)}
     resources: dict[str, Any] = {name: {"type": "host"} for name in host_names}
-    for package in detect_packages(root):
+    for package in detect_packages(root, paths):
         cli = None
         if package.kind == "python":
             path = package.root / "main.py"
@@ -3302,7 +3300,9 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         tests = package.root / "test_main.py"
         test_module = (
             _source(tests)
-            if tests.relative_to(root) in paths and tests.is_file()
+            if package.kind == "python"
+            and tests.relative_to(root) in paths
+            and tests.is_file()
             else None
         )
         description = package_description(package)
@@ -3719,34 +3719,77 @@ def _home_ignore_previous_paths(root: Path) -> list[Path]:
     committed = git(root, ["ls-tree", "-r", "-z", "HEAD"], check=False)
     if committed.returncode == 0:
         records += committed.stdout
-    return [
+    paths = [
         Path(record.partition("\t")[2])
         for record in records.split("\0")
         if record.startswith("160000 ")
     ]
+    if HOME_IGNORE_START not in (read_regular(root / ".gitignore") or ""):
+        history = git(
+            root,
+            [
+                "log",
+                "--format=",
+                "--raw",
+                "--no-renames",
+                "--diff-filter=D",
+                "-z",
+                "HEAD",
+                "--",
+            ],
+            check=False,
+        )
+        deleted = history.stdout.split("\0")
+        paths.extend(
+            Path(deleted[index + 1])
+            for index, record in enumerate(deleted[:-1])
+            if record.lstrip("\n").startswith(":160000 ")
+        )
+    return paths
+
+
+def _home_ignore_parts(source: str) -> tuple[list[str], set[str] | None]:
+    """Separate personal rules from a persistent, explicitly owned rule block."""
+    lines = source.splitlines(keepends=True)
+    starts = [
+        i for i, line in enumerate(lines) if line.rstrip("\r\n") == HOME_IGNORE_START
+    ]
+    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == HOME_IGNORE_END]
+    if not starts and not ends:
+        return lines, None
+    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
+        msg = ".gitignore: malformed afairesi home allowlist block"
+        raise CommandError(msg)
+    start, end = starts[0], ends[0]
+    return lines[:start] + lines[end + 1 :], {
+        line.rstrip("\r\n") for line in lines[start + 1 : end]
+    }
 
 
 def _home_ignore_source(source: str, required: set[str], owned: set[str]) -> str:
-    """Refresh structural exceptions without markers, retaining personal rules."""
-    personal = [
-        line
-        for line in source.splitlines(keepends=True)
-        if line.rstrip("\r\n") not in owned
-    ]
+    """Refresh owned exceptions while preserving personal rules and parent access."""
+    personal, managed = _home_ignore_parts(source)
+    if managed is None:
+        personal = [line for line in personal if line.rstrip("\r\n") not in owned]
+    else:
+        owned = owned | managed
     retained = {
         rule
         for rule in owned - required
         if rule.endswith("/") and any(line.startswith(rule) for line in personal)
     }
-    updated = "*\n" + "".join(
-        rule + "\n" for rule in sorted((required | retained) - {"*"})
+    updated = (
+        HOME_IGNORE_START
+        + "\n*\n"
+        + "".join(rule + "\n" for rule in sorted((required | retained) - {"*"}))
     )
-    return updated + "".join(personal)
+    return updated + HOME_IGNORE_END + "\n" + "".join(personal)
 
 
 def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
     """Read regular working and staged ignore files before changing home structure."""
     source = read_regular(root / ".gitignore")
+    _home_ignore_parts(source or "")
     if not (root / ".git").exists():
         return source, "100644", None
     entries = git(root, ["ls-files", "--stage", "-z", "--", ".gitignore"]).stdout
@@ -3759,6 +3802,7 @@ def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
             raise CommandError(msg)
         mode = fields[0]
         indexed = git(root, ["cat-file", "blob", fields[1]]).stdout
+        _home_ignore_parts(indexed)
     return source, mode, indexed
 
 

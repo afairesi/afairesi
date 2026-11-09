@@ -257,7 +257,6 @@ class Demo:
         source: str,
         *,
         browse: bool = False,
-        terminal_input: Sequence[tuple[float, bytes]] = (),
     ) -> None:
         """Record a fixed pipeline and briefly navigate an interactive JSON viewer."""
         self.recorder.command(
@@ -265,9 +264,7 @@ class Demo:
             self.cwd,
             self.environment,
             timeout=120,
-            terminal_input=(
-                ((2, b"j"), (4, b"l"), (6, b"q")) if browse else terminal_input
-            ),
+            terminal_input=((2, b"j"), (4, b"l"), (6, b"q")) if browse else (),
             display=source,
         )
 

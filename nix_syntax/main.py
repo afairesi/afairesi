@@ -32,7 +32,6 @@ class Document:
 
     source: bytes
     tree: Tree
-    path: str = "<expression>"
 
     @property
     def root(self) -> Node:
@@ -59,7 +58,7 @@ def parse(source: str | bytes, path: str = "<expression>") -> Document:
         row, column = parse_error.start_point
         msg = f"{path}:{row + 1}:{column + 1}: parse error"
         raise NixSyntaxError(msg)
-    return Document(encoded, tree, path)
+    return Document(encoded, tree)
 
 
 def _first_error(node: Node) -> Node:
