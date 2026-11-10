@@ -603,8 +603,8 @@ def test_nix_optional_sources_are_syntax_checked(filename: str) -> None:
         _expect("parse error" in result.stderr, result)
 
 
-def test_nix_implementation_requires_a_default_and_rejects_mixed_sources() -> None:
-    """Discover Nix source, restore its package definition, and reject mixed kinds."""
+def test_missing_nix_definitions_require_unambiguous_source_markers() -> None:
+    """Infer missing definitions only from unambiguous source markers."""
     with _fresh_repository() as root:
         package = root / "example"
         package.mkdir()
@@ -616,6 +616,7 @@ def test_nix_implementation_requires_a_default_and_rejects_mixed_sources() -> No
             "repair created optional tests",
         )
         _write_fixture_source(package / "main.py", "")
+        (package / "default.nix").unlink()
         before = _snapshot(root)
         result = _repair_flake(root, code=1)
         _expect("ambiguous project markers" in result.stderr, result)
@@ -1221,7 +1222,7 @@ def test_lean4_convergence_preserves_sources_and_explicit_package_options(
         definition = package / "default.nix"
         definition.write_text(
             "{ ... }: (inputs.afairesi or inputs.self).lib.mkLean4Package {\n"
-            f"executable = {str(executable).lower()}; src = ./wrong;\n"
+            f"executable = {str(executable).lower()};\n"
             'meta.description = "Lean proofs"; passthru.custom = "preserved";\n}\n',
         )
         source = "def answer : Nat := 42\n"
@@ -1263,18 +1264,32 @@ def test_lean4_detection_repairs_missing_defaults_and_rejects_ambiguous_sources(
 
 
 @pytest.mark.parametrize("kind", ["html", "latex", "lean4", "python"])
-def test_declared_package_kind_allows_supporting_entrypoint_names(kind: str) -> None:
+@pytest.mark.parametrize(
+    "constructor",
+    [
+        "inputs.self.lib.BUILDER",
+        "inputs.afairesi.lib.BUILDER",
+        "(inputs.afairesi or inputs.self).lib.BUILDER",
+        "let lib = inputs.self.lib; in lib.BUILDER",
+        "let build = inputs.self.lib.BUILDER; in build",
+    ],
+)
+def test_declared_package_kind_allows_supporting_entrypoint_names(
+    kind: str,
+    constructor: str,
+) -> None:
     """Keep the declared build kind when supporting files resemble entrypoints."""
     subject = import_module("afairesi.main")
     with _fresh_repository() as root:
         _fixture_add(root, "example", kind)
         package = root / "example"
         definition = package / "default.nix"
+        builder = subject.PACKAGE_BUILDERS[kind]
         definition.write_text(
             definition.read_text().replace(
-                "(inputs.afairesi or inputs.self)",
-                "let dependency = (inputs.afairesi or inputs.self).lib."
-                "mkHtmlPackage {}; in (inputs.afairesi or inputs.self)",
+                f"(inputs.afairesi or inputs.self).lib.{builder}",
+                "let dependency = inputs.self.lib.mkHtmlPackage {}; in "
+                + constructor.replace("BUILDER", builder),
                 1,
             ),
         )
@@ -1639,25 +1654,91 @@ def test_application_runtime_paths_are_unrestricted(
     _expect(not issues, issues)
 
 
-def test_python_packages_require_the_shared_constructor() -> None:
-    """Reject unsupported builders before convergence changes repository state."""
+@pytest.mark.parametrize(
+    "expression",
+    [
+        "pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
+        (
+            "let args = { inherit pkgs; src = ./.; executable = true; }; "
+            "in inputs.self.lib.mkPythonPackage args"
+        ),
+        (
+            "with inputs.self.lib; "
+            "mkPythonPackage { inherit pkgs; src = ./.; executable = true; }"
+        ),
+        "import ./builder.nix { inherit inputs pkgs; }",
+    ],
+)
+def test_source_validation_accepts_expressions_requiring_manual_repair(
+    expression: str,
+) -> None:
+    """Accept Nix expressions without rewriting builders or evaluating source."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", "python")
+        definition = root / "example/default.nix"
+        definition.write_text("{ inputs, pkgs, ... }: " + expression + "\n")
+        _git(root, "add", ".")
+        before = _snapshot(root)
+        _check_flake_source(root)
+        for arguments in ((), ("--dry-run",)):
+            result = _repair_flake(root, *arguments)
+            _expect("automatic repair unavailable" in result.stderr, result)
+            _expect(_snapshot(root) == before, "manual definition changed repository")
+
+
+def test_equivalent_package_bindings_are_valid_and_preserved() -> None:
+    """Evaluate aliases and inherited settings without normalizing their spelling."""
     with _fresh_repository() as root:
         _fixture_add(root, "example", "python")
         definition = root / "example/default.nix"
         definition.write_text(
-            "{ pkgs, ... }: pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
+            "{ inputs, pkgs, ... }: let\n"
+            "  lib = inputs.self.lib;\n"
+            "  packageSet = pkgs;\n"
+            "  source = ./.;\n"
+            "  executable = true;\n"
+            "in lib.mkPythonPackage {\n"
+            "  pkgs = packageSet; src = source; inherit executable;\n"
+            '  meta.description = "Equivalent definition";\n'
+            "}\n",
         )
         _git(root, "add", ".")
         before = _snapshot(root)
-        result = _repair_flake(root, code=1)
-        _expect("shared mkPythonPackage constructor" in result.stderr, result)
-        _expect(_snapshot(root) == before, "unsupported builder changed repository")
-        (root / "example/ms.tex").touch()
-        _git(root, "add", "--force", "example/ms.tex")
+        _check_flake_source(root)
+        _repair_flake(root)
+        _preview_flake_repair(root)
+        _expect(_snapshot(root) == before, "equivalent bindings were rewritten")
+        evaluated = _evaluated_template(root, "example", _nix_environment(root))
+        _expect(evaluated["meta"]["description"] == "Equivalent definition", evaluated)
+        _expect(evaluated["meta"]["mainProgram"] == "example", evaluated)
+
+
+def test_source_validation_still_rejects_malformed_nix() -> None:
+    """Separate expression flexibility from Nix syntax errors."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", "python")
+        (root / "example/default.nix").write_text("{ inputs, pkgs, ... }: (\n")
         before = _snapshot(root)
-        result = _repair_flake(root, code=1)
-        _expect("ambiguous project markers" in result.stderr, result)
-        _expect(_snapshot(root) == before, "ambiguous markers changed repository")
+        result = _check_flake_source(root, code=1)
+        _expect("parse error" in result.stderr, result)
+        _expect(_snapshot(root) == before, "syntax validation changed repository")
+
+
+def test_opaque_package_definitions_allow_supporting_language_markers() -> None:
+    """Keep opaque definitions generic when source markers cannot identify a kind."""
+    with _fresh_repository() as root:
+        _fixture_add(root, "example", "python")
+        (root / "example/default.nix").write_text(
+            "{ inputs, pkgs, ... }: import ./builder.nix { inherit inputs pkgs; }\n",
+        )
+        _write_fixture_source(root / "example/ms.tex", "Supporting LaTeX")
+        _git(root, "add", ".")
+        before = _snapshot(root)
+        _check_flake_source(root)
+        _repair_flake(root)
+        _expect(_snapshot(root) == before, "opaque definition was rewritten")
+        subject = import_module("afairesi.main")
+        _expect(subject.detect_packages(root)[0].kind == "nix", "guessed a language")
 
 
 @pytest.mark.parametrize(

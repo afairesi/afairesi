@@ -1,5 +1,5 @@
 { inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkPythonPackage {
+inputs.self.lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   meta.description = "Record an afairesi walkthrough as an asciinema cast";

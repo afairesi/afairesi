@@ -42,17 +42,16 @@ KIND_MARKERS = {
     "nix": "main.nix",
     "python": "main.py",
 }
-SHARED_CONSTRUCTORS = {
-    "html": ("HTML", "mkHtmlPackage"),
-    "latex": ("LaTeX", "mkLatexPackage"),
-    "python": ("Python", "mkPythonPackage"),
-    "lean4": ("Lean 4", "mkLean4Package"),
+PACKAGE_BUILDERS = {
+    "html": "mkHtmlPackage",
+    "latex": "mkLatexPackage",
+    "python": "mkPythonPackage",
+    "lean4": "mkLean4Package",
 }
 ROOT_FILES = {
     "flake.lock",
     "flake.nix",
 }
-MINIMUM_REMOTE_COMPONENTS = 2
 RESOURCE_PATH_COMPONENTS = 1
 PYTEST_NO_TESTS_COLLECTED = 5
 HOME_IGNORE_START = "# afairesi: home allowlist"
@@ -254,7 +253,7 @@ def canonical_remote_path(remote: str) -> Path:
     host, remote_path = hosted_remote(remote)
     remote_path = remote_path.removesuffix(".git")
     components = [host, *remote_path.split("/")]
-    if len(components) < MINIMUM_REMOTE_COMPONENTS or any(
+    if any(
         not re.fullmatch(r"[A-Za-z0-9._-]+", component) or component in {".", ".."}
         for component in components
     ):
@@ -269,21 +268,21 @@ def canonical_remote_path(remote: str) -> Path:
 
 
 def _package_kind(name: str, markers: set[str], definition: str | None) -> str:
-    """Prefer the declared constructor, inferring missing definitions from markers."""
+    """Use recognizable builders or source markers without evaluating Nix."""
     if definition:
         with contextlib.suppress(nix_syntax.NixSyntaxError):
             document = nix_syntax.parse(definition)
             body = _package_body(document)
             function = body.child_by_field_name("function")
             if body.type == "apply_expression" and function is not None:
-                constructor = nix_syntax.compact(document.text(function))
-                for kind, (_language, builder) in SHARED_CONSTRUCTORS.items():
-                    if constructor == nix_syntax.compact(
-                        f"(inputs.afairesi or inputs.self).lib.{builder}",
-                    ):
+                constructor = _resource_constructor(document, function)
+                for kind, builder in PACKAGE_BUILDERS.items():
+                    if constructor == builder:
                         return kind
     matches = [kind for kind, marker in KIND_MARKERS.items() if marker in markers]
     if len(matches) > 1:
+        if definition is not None:
+            return "nix"
         msg = f"{name}: has ambiguous project markers: {', '.join(matches)}"
         raise CommandError(msg)
     return matches[0] if matches else "nix"
@@ -666,7 +665,7 @@ def _package_binding_edits(
     name: str,
     value: str,
     *,
-    overwrite: bool = True,
+    overwrite: bool,
 ) -> list[tuple[int, int, bytes]]:
     """Set one package attribute, retaining unrelated fields and inherited names."""
     bindings = nix_syntax.binding_set(container)
@@ -679,26 +678,18 @@ def _package_binding_edits(
             and expression is not None
             and nix_syntax.static_attrpath(document, attrpath) == (name,)
         ):
-            if not overwrite or nix_syntax.compact(
-                document.text(expression),
-            ) == nix_syntax.compact(value):
+            if not overwrite or document.text(expression) == value:
                 return []
             return [(expression.start_byte, expression.end_byte, value.encode())]
-    inherited = [
-        (binding, attr)
+    if any(
+        document.text(attr) == name
         for binding in children
         if (attrs := binding.child_by_field_name("attrs")) is not None
         for attr in attrs.named_children
-        if document.text(attr) == name
-    ]
-    if (inherited and not overwrite) or (
-        value == name and any(binding.type == "inherit" for binding, _ in inherited)
     ):
         return []
-    edits = [(attr.start_byte, attr.end_byte, b"") for _, attr in inherited]
     offset = container.end_byte - 1
-    edits.append((offset, offset, f"\n  {name} = {value};\n".encode()))
-    return edits
+    return [(offset, offset, f"\n  {name} = {value};\n".encode())]
 
 
 def source_python_has_main(source: str | None) -> bool:
@@ -755,28 +746,30 @@ def _package_body(document: nix_syntax.Document) -> Node:
 
 def _shared_package_required_edits(
     package: Package,
-    source: str,
-) -> list[tuple[int, int, bytes]]:
-    """Enforce shared constructors while retaining custom attributes."""
-    document = nix_syntax.parse(source)
+    document: nix_syntax.Document,
+) -> list[tuple[int, int, bytes]] | None:
+    """Repair recognizable builder calls with literal package attributes."""
     body = _package_body(document)
     argument = body.child_by_field_name("argument")
     function = body.child_by_field_name("function")
-    language, builder = SHARED_CONSTRUCTORS[package.kind]
-    constructor = f"(inputs.afairesi or inputs.self).lib.{builder}"
+    builder = PACKAGE_BUILDERS[package.kind]
     if (
         body.type != "apply_expression"
         or function is None
-        or nix_syntax.compact(document.text(function))
-        != nix_syntax.compact(constructor)
+        or _resource_constructor(document, function) != builder
         or argument is None
         or argument.type not in {"attrset_expression", "rec_attrset_expression"}
     ):
-        msg = f"{language} package must call the shared {builder} constructor"
-        raise CommandError(msg)
+        return None
+    outer = document.root
+    while outer.type == "parenthesized_expression":
+        outer = cast("Node", outer.child_by_field_name("expression"))
+    formals = outer.child_by_field_name("formals")
+    if formals is None:
+        return None
     edits = [
-        *_package_binding_edits(document, argument, "pkgs", "pkgs"),
-        *_package_binding_edits(document, argument, "src", "./."),
+        *_package_binding_edits(document, argument, "pkgs", "pkgs", overwrite=False),
+        *_package_binding_edits(document, argument, "src", "./.", overwrite=False),
     ]
     if package.kind in {"python", "lean4"}:
         edits.extend(
@@ -788,16 +781,17 @@ def _shared_package_required_edits(
                 if package.kind == "lean4"
                 or source_python_has_main(read_regular(package.root / "main.py"))
                 else "false",
-                overwrite=package.kind == "python",
+                overwrite=package.kind == "python"
+                and any(
+                    document.text(value) in {"true", "false"}
+                    for value in _attrset_expression(
+                        document, argument, ("executable",)
+                    )
+                ),
             ),
         )
-    outer = document.root
-    while outer.type == "parenthesized_expression":
-        outer = cast("Node", outer.child_by_field_name("expression"))
-    formals = outer.child_by_field_name("formals")
-    if formals is None:
-        msg = f"{language} package must accept inputs and pkgs arguments"
-        raise CommandError(msg)
+    if not edits:
+        return []
     names = {
         document.text(name)
         for child in formals.named_children
@@ -816,24 +810,22 @@ def _shared_package_required_edits(
     return edits
 
 
-def _canonical_shared_default(package: Package, source: str) -> str:
-    """Repair required language bindings without removing custom attributes."""
-    edits = _shared_package_required_edits(package, source)
-    return cast("bytes", nix_syntax.apply_edits(source.encode(), edits)).decode()
-
-
 def canonical_package_default(package: Package) -> str | None:
-    """Render a shared package definition while retaining package-specific fields."""
+    """Create missing definitions or repair supported expressions conservatively."""
     source = read_regular(package.root / "default.nix")
-    if package.kind == "nix" and source is not None:
-        return None
     if source is None:
         source = scaffold(package.kind, package.name, None)[
             Path() / package.name / "default.nix"
         ]
+        if package.kind == "nix":
+            return source
+    document = nix_syntax.parse(source, str(package.root / "default.nix"))
     if package.kind == "nix":
-        return source
-    return _canonical_shared_default(package, source)
+        return None
+    edits = _shared_package_required_edits(package, document)
+    if edits is None:
+        return None
+    return cast("bytes", nix_syntax.apply_edits(document.source, edits)).decode()
 
 
 def _write_managed_nix(
@@ -867,6 +859,11 @@ def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) ->
                 relative,
                 expected_default,
                 dry_run=dry_run,
+            )
+        elif package.kind != "nix":
+            sys.stderr.write(
+                f"{package.name}/default.nix: automatic repair unavailable for this "
+                "expression; leaving it unchanged. Edit it manually if needed.\n"
             )
         expected_files = scaffold(
             package.kind,
@@ -1068,33 +1065,16 @@ def validate_flake_source(root: Path) -> None:
     for required in ("flake.lock", "flake.nix"):
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
-    for package in packages:
-        issues.extend(_source_package_issues(root, package))
     if issues:
         formatted_issues = "\n".join(f"  - {issue}" for issue in issues)
         msg = f"repository layout validation failed:\n{formatted_issues}"
         raise CommandError(msg)
     for package in packages:
-        if package.kind == "nix":
-            for relative in sorted(package_files(package) & paths):
+        for relative in sorted(package_files(package) & paths):
+            if relative.name == "default.nix" or package.kind == "nix":
                 source = root / relative
                 if source.is_file():
                     nix_syntax.parse(source.read_bytes(), str(source))
-
-
-def _source_package_issues(root: Path, package: Package) -> list[str]:
-    """Return source-only package-template issues."""
-    issues: list[str] = []
-    relative = Path() / package.name / "default.nix"
-    actual = read_regular(root / relative)
-    expected = canonical_package_default(package)
-    if (
-        expected is not None
-        and actual is not None
-        and nix_syntax.compact(actual) != nix_syntax.compact(expected)
-    ):
-        issues.append(f"{relative}: differs from its canonical package template")
-    return issues
 
 
 def scaffold(
@@ -1606,10 +1586,6 @@ def _fuzz_plugin(max_examples: int) -> object:
     class FuzzTests:
         """Apply a small default budget and collect test_fuzz_* cases only."""
 
-        def __init__(self, max_examples: int) -> None:
-            """Set the example budget used when tests do not override settings."""
-            self.max_examples = max_examples
-
         @pytest.hookimpl(tryfirst=True)
         def pytest_load_initial_conftests(self) -> None:
             """Load defaults before package plugins and test modules are imported."""
@@ -1617,7 +1593,7 @@ def _fuzz_plugin(max_examples: int) -> object:
 
             settings.register_profile(
                 "afairesi-fuzz",
-                max_examples=self.max_examples,
+                max_examples=max_examples,
                 print_blob=True,
             )
             settings.load_profile("afairesi-fuzz")
@@ -1646,7 +1622,7 @@ def _fuzz_plugin(max_examples: int) -> object:
             items[:] = selected
             config.hook.pytest_deselected(items=deselected)
 
-    return FuzzTests(max_examples)
+    return FuzzTests()
 
 
 def _prepare_package_tests(
@@ -1654,11 +1630,10 @@ def _prepare_package_tests(
     name: str,
     environment: TestEnvironment,
     *,
-    selection: TestSelection | None = None,
+    selection: TestSelection,
     performance: bool = False,
 ) -> list[str]:
     """Run pytest and package executables against the same isolated source copy."""
-    selection = selection or TestSelection()
     project = workspace / "source"
     imports = workspace / ".afairesi-python"
     imports.mkdir()
@@ -2991,16 +2966,18 @@ class ArgumentDiscovery:
                 self._error(call, "unsupported parser method may change the CLI")
             if not passed:
                 continue
-            if self._function(call.func) is not None:
-                self._check_helper_binding(call, passed)
+            if (key := self._function(call.func)) is not None:
+                self._check_helper_binding(self.functions[key], call, passed)
                 continue
             self._error(call, "external helper receiving a parser cannot be inspected")
 
-    def _check_helper_binding(self, call: ast.Call, passed: set[int]) -> None:
+    def _check_helper_binding(
+        self,
+        function: ast.FunctionDef | ast.AsyncFunctionDef,
+        call: ast.Call,
+        passed: set[int],
+    ) -> None:
         """Require forwarded parsers to bind to explicit helper parameters."""
-        if (key := self._function(call.func)) is None:
-            return
-        function = self.functions[key]
         parameters = function.args.posonlyargs + function.args.args
         for index in passed:
             if index < len(call.args):
@@ -3138,12 +3115,11 @@ class ArgumentDiscovery:
         self,
         result: dict[str, Any],
         call: ast.Call,
+        receiver: ast.expr,
         roots: set[str],
     ) -> None:
         """Attach a declaration only when its parser and argument names are known."""
-        if not isinstance(call.func, ast.Attribute):
-            return
-        contexts = self._resolve(call.func.value)
+        contexts = self._resolve(receiver)
         if not contexts:
             if self.has_argparse:
                 self._error(call, "cannot resolve the argument parser")
@@ -3201,7 +3177,7 @@ class ArgumentDiscovery:
                 for path in sorted(paths):
                     _command_node(result, path)
             if call.func.attr == "add_argument":
-                self._report_argument(result, call, roots)
+                self._report_argument(result, call, call.func.value, roots)
         if not self.argument_free and not any(
             self._qualified(call.func) == "argparse.ArgumentParser"
             for _scope, call in self.calls

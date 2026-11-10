@@ -1,5 +1,5 @@
 { inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkHtmlPackage {
+inputs.self.lib.mkHtmlPackage {
   inherit pkgs;
   meta.description = "Afairesi: a computing environment designed to minimize independent decisions.";
   postInstall = ''

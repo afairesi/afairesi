@@ -2,7 +2,7 @@
 let
   python = pkgs.python3;
 in
-(inputs.afairesi or inputs.self).lib.mkPythonPackage {
+inputs.self.lib.mkPythonPackage {
   inherit pkgs;
   executable = false;
   meta.description = "Shared Nix parsing and rewriting helpers";

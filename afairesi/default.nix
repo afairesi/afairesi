@@ -42,7 +42,7 @@ let
   };
   python = pkgs.python3;
 in
-(inputs.afairesi or inputs.self).lib.mkPythonPackage {
+inputs.self.lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   meta.description = "afairesi CLI for creating and maintaining repositories, packages, and hosts in the afairesi computing environment.";

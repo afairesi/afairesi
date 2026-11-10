@@ -759,7 +759,6 @@ let
       }
       // builtins.removeAttrs arguments [ "pkgs" ]
       // {
-        inherit src;
         buildPhase = ''
           latexmk -pdf ms.tex
         '';
@@ -854,7 +853,7 @@ let
         "runtimeHook"
       ]
       // {
-        inherit pname src leanDeps;
+        inherit pname leanDeps;
         leanPackageName = module;
         meta =
           builtins.removeAttrs (arguments.meta or { }) [ "mainProgram" ]
@@ -1026,7 +1025,7 @@ let
         "runtimeHook"
       ]
       // {
-        inherit pname src;
+        inherit pname;
         installPhase = ''
           runHook preInstall
           install -Dm644 main.py "$out/${python.sitePackages}/$pname/__init__.py"
