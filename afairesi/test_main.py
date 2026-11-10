@@ -805,7 +805,7 @@ def test_creation_rejects_symlinks_without_writing_outside_the_repository(
 
 @pytest.mark.parametrize(
     "relative",
-    [".github", "example/main.py", "example/default.nix"],
+    ["example", "example/main.py", "example/default.nix"],
 )
 @pytest.mark.parametrize("dry_run", [False, True])
 def test_repair_rejects_source_symlinks_before_changing_state(
@@ -826,10 +826,6 @@ def test_repair_rejects_source_symlinks_before_changing_state(
             "def test_example(): pass\n",
         )
         _run(root, "fix")
-        workflow = root / ".github/workflows/workflow.yml"
-        workflow.parent.mkdir(parents=True, exist_ok=True)
-        workflow.write_text("name: Fixture\n")
-        _git(root, "add", "--force", "--", ".github")
         path = root / relative
         if path.is_dir():
             shutil.rmtree(path)
@@ -1045,7 +1041,7 @@ def test_flake_resource_ownership_rejects_parallel_definitions(
 @pytest.mark.parametrize(
     "composition",
     [
-        "base // { formatter = inputs.afairesi.lib.mkFormatter { inherit inputs; }; }",
+        "base // { formatter.x86_64-linux = pkgs.nixfmt; }",
         (
             "base // { packages = builtins.mapAttrs "
             "(_: packages: packages // { default = packages.foo; }) base.packages; }"
@@ -3015,6 +3011,8 @@ def test_home_initialization_preserves_gitmodules_and_personal_rules(
         ("# Artifacts\n\ntmp/\n", True),
         ("*\n", False),
         ("*\n", True),
+        ("*\n!/.gitignore\n!/.gitmodules\n!/forge.example/\n", False),
+        ("*\n!/.gitignore\n!/.gitmodules\n!/forge.example/\n", True),
     ],
 )
 def test_home_and_project_preserve_user_ignore_rules(
@@ -3052,7 +3050,7 @@ def test_home_and_project_preserve_user_ignore_rules(
                 _check_flake_source(root)
             expected = policy
             if directory == home:
-                expected = HOME_IGNORE + (policy or "").removeprefix("*\n")
+                expected = HOME_IGNORE + (policy or "")
             _expect(
                 (ignore.read_text() if ignore.exists() else None) == expected,
                 "command changed personal ignore rules",
@@ -3141,7 +3139,7 @@ def test_home_allowlist_admits_only_selected_paths(
     _expect(_snapshot(home) == before, "repeated repair changed allowlist state")
 
 
-@pytest.mark.parametrize("command", ["rm", "native", "committed", "legacy-committed"])
+@pytest.mark.parametrize("command", ["rm", "native", "committed"])
 def test_home_allowlist_removal_preserves_shared_personal_parents(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3151,12 +3149,6 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
     home = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     ignore = home / ".gitignore"
-    if command == "legacy-committed":
-        ignore.write_text(
-            ignore.read_text()
-            .removeprefix("# afairesi: home allowlist\n")
-            .removesuffix(HOME_IGNORE_SUFFIX)
-        )
     personal = (
         "# Personal files\n!/forge.example/personal/\n"
         "!/forge.example/personal/staged.txt\n"
@@ -3167,9 +3159,9 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
     local = "!/forge.example/personal/working.txt\n"
     ignore.write_text(ignore.read_text() + local)
     relative = "forge.example/owner/demo"
-    if command in {"native", "committed", "legacy-committed"}:
+    if command in {"native", "committed"}:
         _git(home, "rm", "-r", "--", relative)
-        if command in {"committed", "legacy-committed"}:
+        if command == "committed":
             _fixture_git(home, "commit", "-qm", "Remove repository")
         _home_test_run(tmp_path, "init")
     else:

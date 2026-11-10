@@ -49,9 +49,6 @@ SHARED_CONSTRUCTORS = {
     "lean4": ("Lean 4", "mkLean4Package"),
 }
 ROOT_FILES = {
-    ".forgejo/workflows/workflow.yml",
-    ".github/workflows/workflow.yml",
-    "LICENSE",
     "flake.lock",
     "flake.nix",
 }
@@ -663,78 +660,44 @@ def _meta_description(source: str) -> str | None:
     return nix_syntax.string_value(document, matches[0]) if len(matches) == 1 else None
 
 
-def _nix_binding_edits(
+def _package_binding_edits(
     document: nix_syntax.Document,
     container: Node,
-    path: tuple[str, ...],
+    name: str,
     value: str,
     *,
     overwrite: bool = True,
 ) -> list[tuple[int, int, bytes]]:
-    """Set a scoped binding, retaining unrelated fields and inherited names."""
-    while container.type == "parenthesized_expression" or (
-        container.type == "binary_expression"
-        and document.text(container.child_by_field_name("operator")) == "//"
-    ):
-        container = cast(
-            "Node",
-            container.child_by_field_name(
-                "expression"
-                if container.type == "parenthesized_expression"
-                else "right",
-            ),
-        )
-    assignment = f"{'.'.join(path)} = {value};"
-    if container.type not in {
-        "attrset_expression",
-        "rec_attrset_expression",
-        "let_expression",
-    }:
-        replacement = f"({document.text(container)}) // {{ {assignment} }}"
-        return [(container.start_byte, container.end_byte, replacement.encode())]
+    """Set one package attribute, retaining unrelated fields and inherited names."""
     bindings = nix_syntax.binding_set(container)
     children = [] if bindings is None else bindings.named_children
     for binding in children:
         attrpath = binding.child_by_field_name("attrpath")
         expression = binding.child_by_field_name("expression")
-        if attrpath is not None and expression is not None:
-            names = nix_syntax.static_attrpath(document, attrpath)
-            if names == path:
-                if not overwrite or nix_syntax.compact(
-                    document.text(expression),
-                ) == nix_syntax.compact(
-                    value,
-                ):
-                    return []
-                return [(expression.start_byte, expression.end_byte, value.encode())]
-            if names and path[: len(names)] == names:
-                return _nix_binding_edits(
-                    document,
-                    expression,
-                    path[len(names) :],
-                    value,
-                    overwrite=overwrite,
-                )
+        if (
+            attrpath is not None
+            and expression is not None
+            and nix_syntax.static_attrpath(document, attrpath) == (name,)
+        ):
+            if not overwrite or nix_syntax.compact(
+                document.text(expression),
+            ) == nix_syntax.compact(value):
+                return []
+            return [(expression.start_byte, expression.end_byte, value.encode())]
     inherited = [
         (binding, attr)
         for binding in children
         if (attrs := binding.child_by_field_name("attrs")) is not None
         for attr in attrs.named_children
-        if document.text(attr) == path[0]
+        if document.text(attr) == name
     ]
     if (inherited and not overwrite) or (
-        len(path) == 1
-        and value == path[0]
-        and any(binding.type == "inherit" for binding, _ in inherited)
+        value == name and any(binding.type == "inherit" for binding, _ in inherited)
     ):
         return []
     edits = [(attr.start_byte, attr.end_byte, b"") for _, attr in inherited]
-    offset = (
-        container.start_byte + 3
-        if container.type == "let_expression"
-        else container.end_byte - 1
-    )
-    edits.append((offset, offset, f"\n  {assignment}\n".encode()))
+    offset = container.end_byte - 1
+    edits.append((offset, offset, f"\n  {name} = {value};\n".encode()))
     return edits
 
 
@@ -812,15 +775,15 @@ def _shared_package_required_edits(
         msg = f"{language} package must call the shared {builder} constructor"
         raise CommandError(msg)
     edits = [
-        *_nix_binding_edits(document, argument, ("pkgs",), "pkgs"),
-        *_nix_binding_edits(document, argument, ("src",), "./."),
+        *_package_binding_edits(document, argument, "pkgs", "pkgs"),
+        *_package_binding_edits(document, argument, "src", "./."),
     ]
     if package.kind in {"python", "lean4"}:
         edits.extend(
-            _nix_binding_edits(
+            _package_binding_edits(
                 document,
                 argument,
-                ("executable",),
+                "executable",
                 "true"
                 if package.kind == "lean4"
                 or source_python_has_main(read_regular(package.root / "main.py"))
@@ -3713,42 +3676,7 @@ def _home_ignore_rules(paths: list[Path]) -> set[str]:
     return rules
 
 
-def _home_ignore_previous_paths(root: Path) -> list[Path]:
-    """Recognize prior submodule exceptions from staged and committed gitlinks."""
-    records = git(root, ["ls-files", "--stage", "-z"]).stdout
-    committed = git(root, ["ls-tree", "-r", "-z", "HEAD"], check=False)
-    if committed.returncode == 0:
-        records += committed.stdout
-    paths = [
-        Path(record.partition("\t")[2])
-        for record in records.split("\0")
-        if record.startswith("160000 ")
-    ]
-    if HOME_IGNORE_START not in (read_regular(root / ".gitignore") or ""):
-        history = git(
-            root,
-            [
-                "log",
-                "--format=",
-                "--raw",
-                "--no-renames",
-                "--diff-filter=D",
-                "-z",
-                "HEAD",
-                "--",
-            ],
-            check=False,
-        )
-        deleted = history.stdout.split("\0")
-        paths.extend(
-            Path(deleted[index + 1])
-            for index, record in enumerate(deleted[:-1])
-            if record.lstrip("\n").startswith(":160000 ")
-        )
-    return paths
-
-
-def _home_ignore_parts(source: str) -> tuple[list[str], set[str] | None]:
+def _home_ignore_parts(source: str) -> tuple[list[str], set[str]]:
     """Separate personal rules from a persistent, explicitly owned rule block."""
     lines = source.splitlines(keepends=True)
     starts = [
@@ -3756,7 +3684,7 @@ def _home_ignore_parts(source: str) -> tuple[list[str], set[str] | None]:
     ]
     ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == HOME_IGNORE_END]
     if not starts and not ends:
-        return lines, None
+        return lines, set()
     if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
         msg = ".gitignore: malformed afairesi home allowlist block"
         raise CommandError(msg)
@@ -3766,16 +3694,12 @@ def _home_ignore_parts(source: str) -> tuple[list[str], set[str] | None]:
     }
 
 
-def _home_ignore_source(source: str, required: set[str], owned: set[str]) -> str:
+def _home_ignore_source(source: str, required: set[str]) -> str:
     """Refresh owned exceptions while preserving personal rules and parent access."""
     personal, managed = _home_ignore_parts(source)
-    if managed is None:
-        personal = [line for line in personal if line.rstrip("\r\n") not in owned]
-    else:
-        owned = owned | managed
     retained = {
         rule
-        for rule in owned - required
+        for rule in managed - required
         if rule.endswith("/") and any(line.startswith(rule) for line in personal)
     }
     updated = (
@@ -3809,14 +3733,12 @@ def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
 def _converge_home_ignore(
     root: Path,
     required: set[str],
-    previous: set[str],
     state: tuple[str | None, str, str | None],
 ) -> None:
     """Update working and staged allowlists independently to retain personal edits."""
     source, mode, indexed = state
-    owned = required | previous
-    updated = _home_ignore_source(source or "", required, owned)
-    staged = _home_ignore_source(indexed or "", required, owned)
+    updated = _home_ignore_source(source or "", required)
+    staged = _home_ignore_source(indexed or "", required)
     if source == updated and indexed == staged:
         return
     report_change("write '.gitignore'", dry_run=False)
@@ -3850,7 +3772,6 @@ def remove_home_submodule(
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
     ignore_state = _home_ignore_state(root)
-    previous_rules = _home_ignore_rules(paths + _home_ignore_previous_paths(root))
     arguments = ["rm", "-r"]
     if force:
         arguments.append("--force")
@@ -3862,7 +3783,6 @@ def remove_home_submodule(
     _converge_home_ignore(
         root,
         _home_ignore_rules(home_submodule_paths(root)),
-        previous_rules,
         ignore_state,
     )
 
@@ -3880,7 +3800,6 @@ def initialize_home() -> None:
     _converge_home_ignore(
         root,
         _home_ignore_rules(home_submodule_paths(root)),
-        _home_ignore_rules(_home_ignore_previous_paths(root)),
         ignore_state,
     )
 
@@ -3928,7 +3847,6 @@ def initialize_submodule(
         msg = f"retained Git history exists for {relative}; use --force to reuse it"
         raise CommandError(msg)
     ignore_state = _home_ignore_state(home)
-    previous_rules = _home_ignore_rules(_home_ignore_previous_paths(home))
     try:
         run(
             [*arguments, "--", remote, relative.as_posix()],
@@ -3938,7 +3856,6 @@ def initialize_submodule(
         _converge_home_ignore(
             home,
             _home_ignore_rules(home_submodule_paths(home)),
-            previous_rules,
             ignore_state,
         )
     except BaseException:
