@@ -46,19 +46,10 @@ summary:focus-visible {
   outline: 1px solid var(--accent);
   outline-offset: -1px;
 }
+h1,
 pre,
 code {
   font: inherit;
-}
-h1 {
-  font: inherit;
-}
-.guide p {
-  max-width: 80ch;
-  margin-block: 8px;
-}
-.guide {
-  margin-block: 12px;
 }
 .overview {
   display: grid;
@@ -68,9 +59,6 @@ h1 {
   border-radius: 6px;
   overflow: hidden;
 }
-.overview > figure {
-  min-width: 0;
-}
 .demo {
   display: flex;
   align-items: center;
@@ -79,14 +67,6 @@ h1 {
 }
 #demo-player {
   width: 100%;
-}
-.guide pre {
-  max-width: 80ch;
-  margin-block: 8px;
-  padding: 12px 16px;
-  overflow-x: auto;
-  background: var(--surface);
-  border-radius: 6px;
 }
 .top {
   display: flex;
@@ -118,12 +98,10 @@ main > p + p {
   line-height: 1.5;
   overflow-x: auto;
 }
-.package {
-  min-width: max-content;
-}
 .tree-scope {
   position: relative;
   min-width: max-content;
+  min-height: 16ch;
   padding-block: 8px;
   padding-inline-start: 4ch;
   border-inline-start: 1px solid var(--secondary);
@@ -139,7 +117,6 @@ main > p + p {
   white-space: nowrap;
 }
 .tree-system {
-  min-height: 16ch;
   padding-inline-start: 48px;
   border-inline-start: 0;
   background: color-mix(in srgb, var(--surface) 35%, var(--paper));
@@ -148,18 +125,14 @@ main > p + p {
   left: 24px;
 }
 .tree-home {
-  min-height: 16ch;
   background: color-mix(in srgb, var(--surface) 65%, var(--paper));
 }
 .tree-repo {
-  min-height: 16ch;
   background: var(--surface);
 }
 summary {
   cursor: pointer;
   list-style: none;
-}
-.package summary {
   white-space: pre;
 }
 summary::-webkit-details-marker {
@@ -167,9 +140,6 @@ summary::-webkit-details-marker {
 }
 summary:hover {
   background: color-mix(in srgb, var(--ink) 8%, transparent);
-}
-.guide > :not(summary) {
-  margin-inline-start: 2ch;
 }
 .disclosure::before {
   content: "▶";

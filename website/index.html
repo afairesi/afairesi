@@ -33,7 +33,6 @@
       </hgroup>
       <nav aria-label="afairesi links">
         <a href="https://github.com/afairesi/afairesi">Source</a>
-        <a href="https://github.com/pbizopoulos/afairesi-paper">Paper</a>
         <a href="https://github.com/afairesi/afairesi/blob/main/LICENSE">MIT License</a>
       </nav>
     </header>
@@ -44,10 +43,8 @@
         decisions.
       </p>
       <p>
-        NixOS defines the system, Preservation retains declared state, and Git records source and
-        repository revisions. Afairesi derives checkout locations from remotes, package names from
-        directories, and builds, checks, and development environments from tracked sources and
-        dependencies.
+        Repository conventions derive builds, checks, and development environments; the CLI adds
+        scaffolding, repair, inspection, and test tooling.
       </p>
       <div class="overview">
         <figure
@@ -134,109 +131,6 @@
           <figcaption>Earlier workflow recording.</figcaption>
         </figure>
       </div>
-      <p>
-        Git determines source membership. Select new files with <code>git add -- PATH</code>; use
-        <code>-f</code> when deliberately tracking an ignored file. Afairesi stages the files it
-        creates. Rename or remove resources from the project root with
-        <code>git mv -- OLD NEW</code> or <code>git rm -r -- NAME</code>. The
-        <code>default.nix</code> constructor selects the package type; supporting files can live
-        anywhere.
-      </p>
-      <p>
-        <code>afairesi repo fix</code> repairs and stages structure. <code>nix fmt</code> formats
-        tracked sources by file type, removes ordinary comments in languages supported by the
-        comment-removal tool, and sorts Nix bindings. <code>nix flake check</code> validates
-        structure, formatting, lint, types, tests, and builds without changing working files. Every
-        repository inherits the same formatting and lint policy; local formatter and linter
-        configuration files do not override it.
-      </p>
-      <details class="guide">
-        <summary><span class="disclosure" aria-hidden="true"></span> Tracking and cleanup</summary>
-        <p>
-          Builds and checks use tracked working files, including tests added by hand. Untracked
-          files stay outside those inputs whether or not Git ignores them. Search tracked source
-          with <code>git grep</code>.
-        </p>
-        <p>
-          A repository can keep disposable artifacts in <code>tmp/</code> directories and add
-          <code>tmp/</code> to its own <code>.gitignore</code>. This pattern covers that directory
-          name at any depth. Tools that write caches elsewhere may need additional patterns. Project
-          ignore rules remain under your control; tracking determines membership.
-        </p>
-        <p>
-          Home commands maintain <code>~/.gitignore</code> as an allowlist: <code>*</code> ignores
-          new files, with exceptions for <code>.gitignore</code>, <code>.gitmodules</code>, and
-          registered submodule directories and their parents. These exceptions follow
-          <code>.gitmodules</code> when repositories are added or removed. After manual Git changes,
-          run <code>afairesi home init</code> to refresh the allowlist using the declared paths,
-          including after committing a move or removal. The generated rules have explicit start and
-          end markers so their ownership survives commits and clones. Add personal exceptions
-          outside that block, including any parent directories. Afairesi preserves personal rules
-          and their staging while updating its structural rules.
-        </p>
-        <p>From a project root, preview untracked files to remove, including ignored files:</p>
-        <pre><code>git clean -ndx</code></pre>
-        <p>
-          Remove them with <code>git clean -fdx</code>. Tracked edits survive; cleanup neither
-          restores a revision nor cleans tracked submodules. Persistent application state follows
-          its Preservation declarations.
-        </p>
-      </details>
-      <details class="guide">
-        <summary><span class="disclosure" aria-hidden="true"></span> Design principle</summary>
-        <p>
-          Afairesi (<span lang="el">αφαίρεση</span>, subtraction or abstraction) favors declaring
-          each essential fact once and deriving the rest. Git owns source membership and history;
-          Preservation declares persistent state; Afairesi derives builds, checks, and environments.
-          The home allowlist follows submodule registrations; project ignore rules belong to each
-          repository's workflow.
-        </p>
-        <p>
-          Conventions should remove more decisions than their implementation and exceptions
-          introduce, while preserving required behavior. The
-          <a href="https://github.com/pbizopoulos/afairesi-paper">paper</a> explains the tradeoffs.
-        </p>
-      </details>
-      <details class="guide">
-        <summary><span class="disclosure" aria-hidden="true"></span> Install</summary>
-        <p>
-          The CLI requires Git and Nix with flakes on Linux or Apple Silicon macOS. The full
-          environment uses NixOS with Preservation.
-        </p>
-        <p>Use this <code>flake.nix</code> to derive packages, checks, and hosts:</p>
-        <pre><code>{
-  inputs.afairesi.url = "github:afairesi/afairesi";
-  outputs = inputs: inputs.afairesi.lib.mkFlake { inherit inputs; };
-}</code></pre>
-        <p>Install the CLI in a host's <code>configuration.nix</code>:</p>
-        <pre><code>{ inputs, pkgs, ... }:
-{
-  environment.systemPackages = [
-    inputs.afairesi.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
-  ];
-}</code></pre>
-        <p>Or start a shell with the CLI:</p>
-        <pre><code>nix shell github:afairesi/afairesi</code></pre>
-        <p>To manage hosted repositories as home submodules:</p>
-        <pre><code>afairesi home init
-afairesi home add https://github.com/&lt;user&gt;/&lt;repo&gt;.git</code></pre>
-        <p>In an empty Git worktree, create a project and package:</p>
-        <pre><code>afairesi repo init
-afairesi repo add example python</code></pre>
-        <p>
-          Python and HTML builds include supporting files from the package source, excluding
-          conventional tests and build metadata. A Python package's top-level
-          <code>__init__.py</code> is reserved for the installed <code>main.py</code>; put package
-          initialization in <code>main.py</code>. Nested Python packages can have their own
-          <code>__init__.py</code>. Lean modules live beside <code>main.lean</code>. Nix packages
-          may import <code>main.nix</code>; <code>test_main.nix</code> returns a check derivation.
-          Python and Lean4 packages receive development shells.
-        </p>
-        <p>
-          Campaign reports are kept in <code>$XDG_STATE_HOME/afairesi</code>, defaulting to
-          <code>~/.local/state/afairesi</code>.
-        </p>
-      </details>
     </main>
   </body>
 </html>
