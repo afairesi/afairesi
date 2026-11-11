@@ -3487,12 +3487,12 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     create.add_argument(
-        "resource",
+        "resource_name",
         metavar="RESOURCE",
         help="new directory name at the flake root",
     )
     create.add_argument(
-        "type",
+        "resource_type",
         metavar="TYPE",
         choices=(*PACKAGE_KINDS, "host"),
         help=f"resource type ({', '.join((*PACKAGE_KINDS, 'host'))})",
@@ -3840,7 +3840,7 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
         ),
     )
     remove.add_argument(
-        "resource",
+        "submodule_path",
         metavar="PATH",
         help="registered submodule path relative to $HOME",
     )
@@ -3862,7 +3862,7 @@ def _dispatch_home(options: argparse.Namespace) -> None:
         root = _require_home_repository()
         remove_home_submodule(
             root,
-            options.resource,
+            options.submodule_path,
             force=options.force,
         )
 
@@ -3909,7 +3909,7 @@ def _validate_add_arguments(
     if options.scope != "repo" or options.command != "add":
         return
     try:
-        validate_name(options.resource)
+        validate_name(options.resource_name)
     except CommandError as error:
         cli.error(str(error))
 
@@ -3965,10 +3965,10 @@ def _dispatch_workspace_command(
         return
     root = _require_flake_repository()
     if options.command == "add":
-        if options.type == "host":
-            add_host(root, options.resource)
+        if options.resource_type == "host":
+            add_host(root, options.resource_name)
         else:
-            add_package(root, options.type, options.resource)
+            add_package(root, options.resource_type, options.resource_name)
     elif options.command == "fix":
         converge_flake(root, dry_run=options.dry_run)
 

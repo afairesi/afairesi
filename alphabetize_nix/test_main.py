@@ -16,7 +16,7 @@ from hypothesis import strategies as st
 from alphabetize_nix import main as alphabetize
 
 
-def test_deeply_nested_bindings_do_not_repeat_rendering(
+def test_formatting_nested_bindings_requires_work_proportional_to_source_size(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Bound tree visits so small nested inputs cannot trigger exponential work."""
@@ -61,7 +61,9 @@ def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
         max_size=12,
     ),
 )
-def test_fuzz_preserves_values_and_converges(bindings: dict[str, int]) -> None:
+def test_fuzz_formatting_preserves_values_and_is_repeatable(
+    bindings: dict[str, int],
+) -> None:
     """Generated bindings retain their Nix value and stabilize after one pass."""
     source = (
         "{ " + " ".join(f'"{key}" = {value};' for key, value in bindings.items()) + " }"
@@ -118,7 +120,9 @@ def test_fuzz_preserves_values_and_converges(bindings: dict[str, int]) -> None:
         ),
     ],
 )
-def test_cli_formats_and_converges(tmp_path: Path, source: str, expected: str) -> None:
+def test_cli_canonicalizes_nix_expressions_and_is_repeatable(
+    tmp_path: Path, source: str, expected: str
+) -> None:
     """Canonicalize representative expressions without losing significant text."""
     path = tmp_path / "example with spaces.nix"
     path.write_text(source, encoding="utf-8")

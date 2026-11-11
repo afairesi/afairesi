@@ -23,7 +23,9 @@ if TYPE_CHECKING:
         st.sampled_from([b"{}", b"[ 1 2 ]", b"let a = 1; in a", b'"${toString 1}"']),
     ),
 )
-def test_fuzz_parse(source: bytes) -> None:
+def test_fuzz_parsing_preserves_valid_source_or_reports_a_syntax_error(
+    source: bytes,
+) -> None:
     """Arbitrary bytes produce a document or the documented syntax error."""
     try:
         document = nix_syntax.parse(source)
@@ -52,7 +54,7 @@ def _isolated_nix_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
         '"é"',
     ],
 )
-def test_string_value_matches_native_nix(source: str) -> None:
+def test_string_literals_follow_native_nix_decoding_rules(source: str) -> None:
     """Decode literals with Nix's own escape and line-ending rules."""
     native = subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
         ["nix-instantiate", "--eval", "--strict", "--json", "--expr", source],  # noqa: S607
@@ -66,14 +68,14 @@ def test_string_value_matches_native_nix(source: str) -> None:
 
 
 @pytest.mark.parametrize("source", ['"${undefined}"', "42", "''indented''"])
-def test_string_value_leaves_expressions_unevaluated(source: str) -> None:
+def test_literal_inspection_leaves_expressions_unevaluated(source: str) -> None:
     """Source inspection only evaluates quoted literals without interpolation."""
     document = nix_syntax.parse(source)
     if nix_syntax.string_value(document, document.root) is not None:
         raise AssertionError(source)
 
 
-def test_string_value_does_not_initialize_home_or_store(
+def test_literal_inspection_preserves_home_and_nix_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

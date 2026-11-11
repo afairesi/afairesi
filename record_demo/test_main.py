@@ -13,13 +13,13 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-from demo.main import Demo, Recorder, artificial_home
+from record_demo.main import Demo, Recorder, artificial_home
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 
-def test_terminal_recording_and_nonzero_exit(
+def test_recording_preserves_terminal_output_timing_and_failure_diagnostics(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
@@ -99,7 +99,9 @@ def test_timeout_stops_descendants(tmp_path: Path) -> None:
         raise AssertionError(message)
 
 
-def test_interactive_terminal_and_pipeline_failure(tmp_path: Path) -> None:
+def test_recording_accepts_terminal_input_and_reports_pipeline_failures(
+    tmp_path: Path,
+) -> None:
     """Deliver keys through a controlling terminal and propagate pipeline failures."""
     stream = io.StringIO()
     recorder = Recorder(stream, speed=1, idle_limit=1)
@@ -132,7 +134,9 @@ def test_interactive_terminal_and_pipeline_failure(tmp_path: Path) -> None:
         raise AssertionError(message)
 
 
-def test_private_home_and_local_remote(tmp_path: Path) -> None:
+def test_demo_keeps_repositories_and_remotes_in_an_isolated_home(
+    tmp_path: Path,
+) -> None:
     """Keep multiple hosted repositories inside the artificial home."""
     root = tmp_path / "workspace"
     root.mkdir()
@@ -159,7 +163,9 @@ def test_private_home_and_local_remote(tmp_path: Path) -> None:
             raise AssertionError(message)
 
 
-def test_artificial_home_ownership(tmp_path: Path) -> None:
+def test_demo_removes_its_temporary_home_and_preserves_existing_directories(
+    tmp_path: Path,
+) -> None:
     """Clean up the created home and refuse to overwrite existing contents."""
     directory = tmp_path / "home" / "user"
     with artificial_home(directory) as home:
@@ -177,7 +183,7 @@ def test_artificial_home_ownership(tmp_path: Path) -> None:
         raise AssertionError(message)
 
 
-def test_website_uses_tool_output(
+def test_demo_website_publishes_command_output_without_diagnostics(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
