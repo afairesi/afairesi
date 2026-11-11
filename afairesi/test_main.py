@@ -628,7 +628,11 @@ def test_missing_nix_definitions_require_unambiguous_source_markers() -> None:
     [
         (("nested/example", "host"), "root directory name"),
         (("example",), "required"),
-        (("workLaptop", "host"), "snake_case or dash-case"),
+        (("..", "host"), "root directory name"),
+        ((".", "host"), "root directory name"),
+        (("", "host"), "root directory name"),
+        (("/example", "host"), "root directory name"),
+        (("example/", "host"), "root directory name"),
         (("example", "unknown"), "invalid choice"),
         (("example", "python", "unexpected"), "unrecognized arguments"),
         (
@@ -1011,10 +1015,10 @@ def test_convergence_rejects_embedded_tests_without_changing_state(
         '(let build = pkgs.runCommand; in build "parallel" {} "touch $out")',
     ],
 )
-def test_flake_resource_ownership_rejects_parallel_definitions(
+def test_flake_preserves_resource_definitions(
     definition: str,
 ) -> None:
-    """Reject independently defined resources before repair or source validation."""
+    """Accept custom resources without evaluating or rewriting their definitions."""
     with _fresh_repository() as root:
         _repair_flake(root)
         _write_fixture_source(
@@ -1025,18 +1029,12 @@ def test_flake_resource_ownership_rejects_parallel_definitions(
         )
         (root / "prm").mkdir()
         (root / "prm/test_live.py").write_text("def test_live(): pass\n")
-        (root / "discarded").write_text("preserve until ownership is resolved")
+        (root / "discarded").write_text("preserve supporting files")
         before = _snapshot(root)
-        rejected = _repair_flake(root, code=1)
-        _expect(
-            "resource outside its owner" in rejected.stderr
-            and "flake.nix:" in rejected.stderr
-            and _snapshot(root) == before,
-            rejected,
-        )
-        (root / "discarded").unlink()
-        rejected_source = _check_flake_source(root, code=1)
-        _expect("resource outside its owner" in rejected_source.stderr, rejected_source)
+        _preview_flake_repair(root)
+        _repair_flake(root)
+        _check_flake_source(root)
+        _expect(_snapshot(root) == before, "custom resources changed during validation")
 
 
 @pytest.mark.parametrize(
@@ -1075,7 +1073,7 @@ def test_flake_resource_ownership_rejects_parallel_definitions(
         'base // { lib.command = pkgs.runCommand "partial"; }',
     ],
 )
-def test_flake_resource_ownership_preserves_composition(composition: str) -> None:
+def test_flake_preserves_composition(composition: str) -> None:
     """Preserve policies, output aliases, VM wrappers, imports, and lexical scopes."""
     with _fresh_repository() as root:
         source = (
@@ -1374,7 +1372,10 @@ def test_convergence_respects_excluded_trees() -> None:
         ("python", "dash-case", 'A "quoted" report.\n${literal}\\path', False),
         ("python", "snake_case", "é\x08\x0c\x01", True),
         ("python", "dash-library", "Nested library metadata", True),
+        ("python", "Mixed_Package--v2", "Mixed spelling", False),
+        ("python", "_Private", "Leading underscore", True),
         ("html", "web-site", "Δ report", False),
+        ("html", "Web.Site+v2", "Versioned site", False),
         ("latex", "my-document", "LaTeX\tresources", False),
         ("nix", "my-package", "é", False),
         ("python", "a", "x", False),
@@ -1713,14 +1714,15 @@ def test_equivalent_package_bindings_are_valid_and_preserved() -> None:
         _expect(evaluated["meta"]["mainProgram"] == "example", evaluated)
 
 
-def test_source_validation_still_rejects_malformed_nix() -> None:
+@pytest.mark.parametrize("relative", ["flake.nix", "example/default.nix"])
+def test_source_validation_still_rejects_malformed_nix(relative: str) -> None:
     """Separate expression flexibility from Nix syntax errors."""
     with _fresh_repository() as root:
         _fixture_add(root, "example", "python")
-        (root / "example/default.nix").write_text("{ inputs, pkgs, ... }: (\n")
+        (root / relative).write_text("{ inputs, pkgs, ... }: (\n")
         before = _snapshot(root)
-        result = _check_flake_source(root, code=1)
-        _expect("parse error" in result.stderr, result)
+        for result in (_repair_flake(root, code=1), _check_flake_source(root, code=1)):
+            _expect("parse error" in result.stderr, result)
         _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
@@ -1744,8 +1746,8 @@ def test_opaque_package_definitions_allow_supporting_language_markers() -> None:
 @pytest.mark.parametrize(
     ("arguments", "code"),
     [
-        (("add", "bad--name", "python"), 2),
-        (("add", "bad--name", "host"), 2),
+        (("add", "../outside", "python"), 2),
+        (("add", "..", "host"), 2),
         (("add", "laptop"), 2),
         (("add", "example", "python"), 1),
     ],
@@ -3461,7 +3463,76 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     _expect(not any(tmp_path.iterdir()), "invalid scope created state")
 
 
-@pytest.mark.parametrize("name", ["123", "1app", "class", "async"])
+@pytest.mark.parametrize(
+    ("kind", "name"),
+    [
+        ("python", "Mixed_Name-v2"),
+        ("python", "double--dash"),
+        ("python", "_Private"),
+        ("html", "Web.Site+v2"),
+        ("latex", "Report.v2"),
+        ("lean4", "Proof_Library-v2"),
+        ("nix", "Package Name"),
+        ("nix", "δοκιμή"),
+        ("host", "workLaptop"),
+    ],
+)
+def test_resource_names_have_no_spelling_convention(kind: str, name: str) -> None:
+    """Create, repair, validate, and inspect names without a shared style rule."""
+    with _fresh_repository() as root:
+        _run(root, "add", name, kind)
+        before = _snapshot(root)
+        _preview_flake_repair(root)
+        _repair_flake(root)
+        _check_flake_source(root)
+        report = json.loads(_run(root, "inspect").stdout)
+        _expect(report[name]["type"] == kind, report)
+        _expect(_snapshot(root) == before, "resource spelling changed during repair")
+
+
+@pytest.mark.parametrize("library", [False, True])
+@pytest.mark.parametrize("staged_mode", [0o644, 0o755])
+@pytest.mark.parametrize("working_mode", [0o644, 0o755])
+def test_python_source_permissions_remain_under_user_control(
+    staged_mode: int,
+    working_mode: int,
+    *,
+    library: bool,
+) -> None:
+    """Create ordinary source files and preserve existing working and staged modes."""
+    with _fresh_repository() as root:
+        _run(root, "add", "example", "python")
+        source = root / "example/main.py"
+        _expect(not source.stat().st_mode & 0o111, "creation made source executable")
+        if library:
+            _write_fixture_source(source, "VALUE = 42\n")
+        _repair_flake(root)
+        source.chmod(staged_mode)
+        _git(root, "add", "example/main.py")
+        source.chmod(working_mode)
+        before = _snapshot(root)
+        _preview_flake_repair(root)
+        _repair_flake(root)
+        _check_flake_source(root)
+        _expect(_snapshot(root) == before, "repair changed Python source permissions")
+
+
+def test_repair_creates_non_executable_python_source() -> None:
+    """Restore missing Python source as an ordinary file, including its index mode."""
+    with _fresh_repository() as root:
+        _run(root, "add", "example", "python")
+        source = root / "example/main.py"
+        source.unlink()
+        _repair_flake(root)
+        _expect(not source.stat().st_mode & 0o111, "repair made source executable")
+        _expect(
+            _git(root, "ls-files", "--stage", "example/main.py").startswith("100644 "),
+            "repair staged executable source",
+        )
+        _preview_flake_repair(root)
+
+
+@pytest.mark.parametrize("name", ["123", "1app", "class", "async", "foo.bar"])
 def test_python_names_are_rejected_before_creation(name: str) -> None:
     """Reject names that cannot be imported by the installed executable."""
     with _fresh_repository() as root:

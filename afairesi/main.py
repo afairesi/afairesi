@@ -340,9 +340,16 @@ def detect_packages(root: Path, paths: set[Path] | None = None) -> list[Package]
 
 
 def validate_name(name: str) -> None:
-    """Enforce shared package and host naming conventions."""
-    if not re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*|[a-z0-9]+(?:-[a-z0-9]+)*", name):
-        msg = f"resource name must use snake_case or dash-case: {name}"
+    """Require one directory name without imposing a spelling convention."""
+    path = Path(name)
+    if (
+        path.is_absolute()
+        or len(path.parts) != RESOURCE_PATH_COMPONENTS
+        or name != path.name
+        or name in {"..", ".git"}
+        or "\0" in name
+    ):
+        msg = f"resource path must be a root directory name: {name}"
         raise CommandError(msg)
 
 
@@ -882,7 +889,6 @@ def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) ->
                 relative,
                 source,
                 dry_run=dry_run,
-                executable=relative.name == "main.py",
             )
     return changed
 
@@ -890,7 +896,6 @@ def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) ->
 def _converge_file_modes(
     root: Path,
     managed: set[Path],
-    python_entrypoints: set[Path],
     *,
     dry_run: bool,
 ) -> bool:
@@ -900,12 +905,11 @@ def _converge_file_modes(
         path = root / relative
         if not path.is_file() or path.is_symlink():
             continue
-        executable = relative in python_entrypoints
-        if bool(path.stat().st_mode & 0o111) != executable:
+        if path.stat().st_mode & 0o111:
             report_change(f"set mode on '{relative}'", dry_run=dry_run)
             changed = True
             if not dry_run:
-                path.chmod(0o755 if executable else 0o644)
+                path.chmod(0o644)
                 git(root, ["add", "--", str(relative)])
     return changed
 
@@ -971,55 +975,11 @@ def _resource_variable_constructor(
     return name if name == "derivation" else None
 
 
-def _flake_resource_issues(root: Path) -> list[str]:
-    """Keep resource definitions in their owners and composition in the flake."""
+def _validate_flake_syntax(root: Path) -> None:
+    """Parse the flake without restricting its resource definitions."""
     source = read_regular(root / "flake.nix")
-    if source is None or not source.strip():
-        return []
-    document = nix_syntax.parse(source, "flake.nix")
-    outputs = _attrset_expression(document, document.root, ("outputs",))
-    constructors = {
-        "buildPythonPackage": (1, "NAME/default.nix"),
-        "buildPythonApplication": (1, "NAME/default.nix"),
-        "derivation": (1, "NAME/default.nix"),
-        "mkDerivation": (1, "NAME/default.nix"),
-        "mkHtmlPackage": (1, "NAME/default.nix"),
-        "mkLatexPackage": (1, "NAME/default.nix"),
-        "mkLean4Package": (1, "NAME/default.nix"),
-        "mkPythonPackage": (1, "NAME/default.nix"),
-        "nixosSystem": (1, "NAME/configuration.nix"),
-        "runNixOSTest": (1, "the host testing structure"),
-        "runCommand": (3, "the package or host structure"),
-        "runCommandLocal": (3, "the package or host structure"),
-    }
-    issues = []
-    reported = set()
-    for output in outputs:
-        for node in nix_syntax.walk(output):
-            if node.type != "apply_expression":
-                continue
-            function = node
-            arguments = 0
-            while function.type == "apply_expression":
-                child = function.child_by_field_name("function")
-                if child is None:
-                    break
-                arguments += 1
-                function = child
-            constructor = _resource_constructor(document, function)
-            if constructor not in constructors or function.start_byte in reported:
-                continue
-            arity, destination = constructors[constructor]
-            if arguments < arity:
-                continue
-            reported.add(function.start_byte)
-            issues.append(
-                f"flake.nix:{node.start_point.row + 1}: {constructor} defines a "
-                f"resource outside its owner; move the definition to {destination}. "
-                "flake.nix should compose existing resources and apply repository "
-                "policy; aliases and wrappers of generated outputs are supported",
-            )
-    return issues
+    if source is not None and source.strip():
+        nix_syntax.parse(source, "flake.nix")
 
 
 def converge_flake(
@@ -1035,7 +995,8 @@ def converge_flake(
         raise CommandError("missing required file: " + missing[0])
     paths = source_paths(root)
     packages = detect_packages(root, paths)
-    issues = _flake_resource_issues(root)
+    _validate_flake_syntax(root)
+    issues = []
     for package in packages:
         validate_name(package.name)
         issues.extend(_python_source_issues(package, paths))
@@ -1045,8 +1006,8 @@ def converge_flake(
     changed = _converge_packages(root, packages, dry_run=dry_run)
     changed |= _converge_file_modes(
         root,
-        managed_paths(root, packages, source_paths(root)),
-        {
+        managed_paths(root, packages, source_paths(root))
+        - {
             Path(package.name) / "main.py"
             for package in packages
             if package.kind == "python"
@@ -1061,7 +1022,7 @@ def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     paths = source_paths(root)
     packages, issues = inspect_structure(root, paths)
-    issues.extend(_flake_resource_issues(root))
+    _validate_flake_syntax(root)
     for required in ("flake.lock", "flake.nix"):
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
@@ -1139,7 +1100,6 @@ pkgs.writeTextFile {
     files: dict[Path, str] = {root / "default.nix": default}
     if kind == "python":
         files[root / "main.py"] = (
-            "#!/usr/bin/env python3\n"
             "# ruff: noqa: CPY001 - Set copyright ownership when publishing.\n"
             f"{description!r}\n\n\n"
             "def main() -> None:\n"
@@ -1227,7 +1187,7 @@ def add_package(
             path.parent.mkdir(parents=True, exist_ok=True)
             created.append(path)
             path.write_text(source, encoding="utf-8")
-            path.chmod(0o755 if path.name == "main.py" else 0o644)
+            path.chmod(0o644)
         generated = [str(path.relative_to(root)) for path in created]
         git(root, ["add", "--force", "--", *generated])
     except BaseException:
@@ -3948,16 +3908,8 @@ def _validate_add_arguments(
     """Reject invalid creation arguments before discovering the repository."""
     if options.scope != "repo" or options.command != "add":
         return
-    path = Path(options.resource)
-    if (
-        path.is_absolute()
-        or len(path.parts) != RESOURCE_PATH_COMPONENTS
-        or options.resource != path.name
-        or path.name == ".git"
-    ):
-        cli.error(f"resource path must be a root directory name: {options.resource}")
     try:
-        validate_name(path.name)
+        validate_name(options.resource)
     except CommandError as error:
         cli.error(str(error))
 
