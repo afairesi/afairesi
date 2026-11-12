@@ -7108,7 +7108,7 @@ def test_repo_inspect_diff_supports_help_and_repository_selection_outside_git(
     """Describe diffs outside Git and distinguish repository paths from commands."""
     help_output = _run(tmp_path, "inspect", "diff", "--help").stdout
     _expect("--cached" in help_output and "jd-compatible" in help_output, help_output)
-    _expect("--color" not in help_output, help_output)
+    _expect("--color | less -R" in help_output, help_output)
     _expect("| less" in help_output, help_output)
     _expect("| jd -t jd2patch | jless" in help_output, help_output)
     _expect(not list(tmp_path.iterdir()), "help wrote files")

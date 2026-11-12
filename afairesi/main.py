@@ -3367,7 +3367,7 @@ def _dispatch_inspect_diff(
         left.write_text(json.dumps(before), encoding="utf-8")
         right.write_text(json.dumps(after), encoding="utf-8")
         completed = run(
-            ["jd", left.name, right.name],
+            ["jd", *(["-color"] if options.color else []), left.name, right.name],
             cwd=Path(directory),
             check=False,
         )
@@ -3439,6 +3439,7 @@ def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
         epilog=(
             "Examples:\n"
             "  afairesi repo inspect diff --cached | less\n"
+            "  afairesi repo inspect diff --cached --color | less -R\n"
             "  afairesi repo inspect diff --cached | jd -t jd2patch | jless\n"
             "  afairesi repo inspect diff --cached > change.jd\n"
             "  jd -p change.jd before.json\n"
@@ -3452,6 +3453,11 @@ def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
         dest="cached",
         action="store_true",
         help="compare HEAD (or REV) with the index; before the first commit use {}",
+    )
+    difference.add_argument(
+        "--color",
+        action="store_true",
+        help="colorize the diff with ANSI escapes, including when piped",
     )
     difference.add_argument(
         "--exit-code",
