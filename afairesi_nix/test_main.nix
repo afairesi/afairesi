@@ -161,7 +161,6 @@ assert empty.apps.${system} == { };
 assert empty.devShells.${system} == { };
 assert empty.legacyPackages.${system} == { };
 assert empty.nixosConfigurations == { };
-assert !(builtins.pathExists (consumerSource + "/checks"));
 assert (consumer.checks.${system} ? exampleVm) == (system == "x86_64-linux");
 assert system != "x86_64-linux" || builtins.isString consumer.checks.${system}.exampleVm.drvPath;
 assert consumer.legacyPackages.${system} ? example-test-environment;

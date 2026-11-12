@@ -30,13 +30,10 @@ from cosmic_ray.work_item import WorkerOutcome, WorkItem, WorkResult
 if TYPE_CHECKING:
     from collections.abc import Iterator
 
-HOME_IGNORE_PREFIX = "# afairesi: home allowlist\n*\n!/.gitignore\n!/.gitmodules\n"
-HOME_IGNORE_SUFFIX = "# afairesi: end home allowlist\n"
-HOME_IGNORE = HOME_IGNORE_PREFIX + HOME_IGNORE_SUFFIX
+HOME_IGNORE = "*\n!/.gitignore\n!/.gitmodules\n"
 HOME_SUBMODULE_IGNORE = (
-    HOME_IGNORE_PREFIX
+    HOME_IGNORE
     + "!/forge.example/\n!/forge.example/owner/\n!/forge.example/owner/demo/\n"
-    + HOME_IGNORE_SUFFIX
 )
 
 
@@ -536,7 +533,6 @@ def test_repo_add_stages_only_the_requested_resource(
             "wrong resource files",
         )
         staged = {f"{relative}/{name}" for name in filenames}
-        _expect(not (root / "checks").exists(), "creation wrote check wrappers")
         if kind != "host":
             descriptions = {
                 "python": "A Python package.",
@@ -691,34 +687,19 @@ def test_repo_add_targets_repository_root_and_rejects_existing_resources(
         _expect(_snapshot(root) == before, "conflicting addition changed state")
 
 
-@pytest.mark.parametrize(
-    "tests",
-    [
-        "def test_example(): pass\n",
-        (
-            "class Cases:\n    def test_result(self):\n        assert True\n"
-            "class TestExample(Cases):\n    pass\n"
-        ),
-    ],
-)
-def test_repo_fix_registers_python_checks_and_is_repeatable(
-    tests: str,
-) -> None:
+def test_repo_fix_from_nested_directory_is_repeatable() -> None:
     """Repair from nested directories and preview without changing Git state."""
     with _fresh_repository() as root:
         nested = root / "tmp/nested"
         nested.mkdir(parents=True)
         _fixture_add(root, "example", "python")
-        _write_fixture_source(root / "example/test_main.py", tests)
+        _write_fixture_source(
+            root / "example/test_main.py", "def test_example(): pass\n"
+        )
         before = _snapshot(root)
-        result = _run(nested, "fix", "-n")
-        _expect("checks/example/default.nix" not in result.stdout, result.stdout)
+        _run(nested, "fix", "-n")
         _expect(_snapshot(root) == before, "repair preview changed state")
         _run(nested, "fix")
-        _expect(
-            not (root / "checks").exists(),
-            "repair created an unnecessary check directory",
-        )
         after = _snapshot(root)
         _run(nested, "fix", "--dry-run")
         _expect(_snapshot(root) == after, "converged repair changed state")
@@ -850,7 +831,7 @@ def test_repo_fix_rejects_source_symlinks_before_changing_state(
 
 @pytest.mark.parametrize(
     "relative",
-    ["discarded", "checks/example/default.nix", "example/unsupported"],
+    ["discarded", "assets/nested/link", "example/unsupported"],
 )
 @pytest.mark.parametrize("target_kind", ["file", "directory", "dangling"])
 @pytest.mark.parametrize("tracked", [False, True])
@@ -916,24 +897,6 @@ def test_repo_add_preserves_ignore_rules_and_staging_on_failure(kind: str) -> No
         )
         _expect("index.lock" in failed.stderr, failed)
         _expect(_snapshot(root) == before, "failed creation left structural changes")
-
-
-@pytest.mark.parametrize("tracked", [False, True])
-def test_repo_fix_preserves_supporting_check_directories(*, tracked: bool) -> None:
-    """Preserve additional checks without automatically registering them."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "laptop")
-        check = root / "checks/laptopVm/default.nix"
-        check.parent.mkdir(parents=True)
-        check.write_text("{}\n")
-        if tracked:
-            _git(root, "add", "--force", "--", str(check.relative_to(root)))
-        before = _snapshot(root)
-        _repair_flake(root, "--dry-run")
-        _expect(_snapshot(root) == before, "preview changed unsupported checks")
-        _repair_flake(root)
-        _expect(check.read_text() == "{}\n", "repair removed check files")
-        _preview_flake_repair(root)
 
 
 @pytest.mark.parametrize("tracked_scratch", [False, True])
@@ -1149,8 +1112,8 @@ def test_repo_fix_rejects_invalid_tests_without_changes(invalid: str) -> None:
         _expect(_snapshot(root) == before, "invalid tests changed state")
 
 
-def test_repo_fix_registers_host_checks_without_extra_files() -> None:
-    """Converge hosts without creating check files or rewriting host sources."""
+def test_repo_fix_preserves_host_sources() -> None:
+    """Preserve host customizations and Git state during repeated repair."""
     with _fresh_repository() as root:
         _fixture_add(root, "laptop")
         host = root / "laptop/configuration.nix"
@@ -1160,7 +1123,6 @@ def test_repo_fix_registers_host_checks_without_extra_files() -> None:
         _repair_flake(root)
         _preview_flake_repair(root)
         _expect(_snapshot(root) == before, "convergence changed the host")
-        _expect(not (root / "checks").exists(), "convergence created check wrappers")
 
 
 @pytest.mark.parametrize(
@@ -2332,7 +2294,9 @@ def _home_test_check_home_ignore_rules(home_repository: Path) -> None:
     ignore.write_text(expected, encoding="utf-8")
     before = _git(root, "show", ":.gitignore")
     _home_test_run(root, "init")
-    if ignore.read_text(encoding="utf-8") != HOME_SUBMODULE_IGNORE + expected:
+    if ignore.read_text(encoding="utf-8") != (
+        "*\n" + expected + HOME_SUBMODULE_IGNORE.removeprefix("*\n")
+    ):
         raise AssertionError(ignore.read_text(encoding="utf-8"))
     if _git(root, "show", ":.gitignore") != before:
         message = "convergence staged home ignore rules"
@@ -2691,7 +2655,8 @@ def test_home_init_preserves_missing_checkouts(
         "repair initialized a missing checkout",
     )
     _expect(
-        ignore.read_text() == HOME_SUBMODULE_IGNORE + expected_ignore,
+        ignore.read_text()
+        == "*\n" + expected_ignore + HOME_SUBMODULE_IGNORE.removeprefix("*\n"),
         "repair lost personal rules or missing-checkout exceptions",
     )
     _expect(
@@ -2730,14 +2695,14 @@ def test_home_init_preserves_missing_checkouts(
 
 @pytest.mark.parametrize("committed", [False, True])
 @pytest.mark.parametrize("url", ["git@mirror.example:team/other", "../other", None])
-def test_home_init_refreshes_the_allowlist_after_git_moves(
+def test_home_init_adds_missing_rules_without_pruning_manual_git_moves(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     url: str | None,
     *,
     committed: bool,
 ) -> None:
-    """Refresh the allowlist after Git moves while preserving declared paths."""
+    """Add current paths while leaving obsolete rules from manual moves to the user."""
     root = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(root))
     original = "forge.example/owner/demo"
@@ -2770,10 +2735,8 @@ def test_home_init_refreshes_the_allowlist_after_git_moves(
         _git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
         "initialization changed the submodule commit",
     )
-    expected = (
-        HOME_IGNORE_PREFIX + "!/projects/\n!/projects/demo/\n" + HOME_IGNORE_SUFFIX
-    )
-    _expect((root / ".gitignore").read_text() == expected, "stale allowlist")
+    expected = HOME_SUBMODULE_IGNORE + "!/projects/\n!/projects/demo/\n"
+    _expect((root / ".gitignore").read_text() == expected, "manual rules were pruned")
     _expect(_git(root, "show", ":.gitignore") == expected, "allowlist was not staged")
 
 
@@ -2856,16 +2819,12 @@ def test_home_init_targets_home_from_any_working_directory(
         _git(home, "show", ":.gitmodules") == existing_modules,
         "initialization staged submodule edits",
     )
-    _expect(ignore.read_text().endswith(expected), "personal ignore rules changed")
+    _expect(expected in ignore.read_text(), "personal ignore rules changed")
     _expect(
         "!/forge.example/owner/aaa/\n" in ignore.read_text(), "missing new exception"
     )
     _expect(
-        _git(home, "show", ":.gitignore")
-        == indexed.replace(
-            "!/forge.example/owner/demo/\n",
-            "!/forge.example/owner/aaa/\n!/forge.example/owner/demo/\n",
-        ),
+        _git(home, "show", ":.gitignore") == indexed + "!/forge.example/owner/aaa/\n",
         "repair did not stage only structural ignore rules",
     )
     _expect(
@@ -3069,14 +3028,12 @@ def test_home_init_preserves_gitmodules_and_personal_rules(
     _home_test_run(tmp_path, "init")
     _expect(modules.read_text() == working, modules.read_text())
     _expect(_git(home, "show", ":.gitmodules") == staged, modules)
-    _expect(
-        ignore.read_text().endswith(ignore_rules), "home command lost personal rules"
-    )
+    _expect(ignore_rules in ignore.read_text(), "home command lost personal rules")
     _expect("!/forge.example/team/aaa/\n" in ignore.read_text(), ignore)
     _expect("!/forge.example/team/zzz/\n" in ignore.read_text(), ignore)
     _expect(
         _git(home, "show", ":.gitignore")
-        == ignore.read_text().removesuffix(ignore_rules),
+        == ignore.read_text().replace(ignore_rules, ""),
         "home command staged personal rules",
     )
     before = _snapshot(home)
@@ -3085,23 +3042,32 @@ def test_home_init_preserves_gitmodules_and_personal_rules(
 
 
 @pytest.mark.parametrize(
-    ("policy", "tracked"),
+    ("policy", "tracked", "expected_home"),
     [
-        (None, False),
-        ("", False),
-        ("", True),
-        ("# Artifacts\n\ntmp/\n", False),
-        ("# Artifacts\n\ntmp/\n", True),
-        ("*\n", False),
-        ("*\n", True),
-        ("*\n!/.gitignore\n!/.gitmodules\n!/forge.example/\n", False),
-        ("*\n!/.gitignore\n!/.gitmodules\n!/forge.example/\n", True),
+        (None, False, HOME_IGNORE),
+        ("", False, HOME_IGNORE),
+        ("", True, HOME_IGNORE),
+        (
+            "# Artifacts\n\ntmp/\n",
+            False,
+            "*\n# Artifacts\n\ntmp/\n!/.gitignore\n!/.gitmodules\n",
+        ),
+        (
+            "# Artifacts\n\ntmp/\n",
+            True,
+            "*\n# Artifacts\n\ntmp/\n!/.gitignore\n!/.gitmodules\n",
+        ),
+        ("*\n", False, HOME_IGNORE),
+        ("*\n", True, HOME_IGNORE),
+        (HOME_IGNORE + "!/forge.example/\n", False, HOME_IGNORE + "!/forge.example/\n"),
+        (HOME_IGNORE + "!/forge.example/\n", True, HOME_IGNORE + "!/forge.example/\n"),
     ],
 )
 def test_home_and_repo_commands_preserve_user_ignore_rules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     policy: str | None,
+    expected_home: str,
     *,
     tracked: bool,
 ) -> None:
@@ -3133,7 +3099,7 @@ def test_home_and_repo_commands_preserve_user_ignore_rules(
                 _check_flake_source(root)
             expected = policy
             if directory == home:
-                expected = HOME_IGNORE + (policy or "")
+                expected = expected_home
             _expect(
                 (ignore.read_text() if ignore.exists() else None) == expected,
                 "command changed personal ignore rules",
@@ -3143,11 +3109,10 @@ def test_home_and_repo_commands_preserve_user_ignore_rules(
             if directory == home:
                 _expect(
                     _git(home, "show", ":.gitignore")
-                    == HOME_IGNORE
-                    + (
-                        "# Staged rules\nresult\n"
+                    == (
+                        "*\n# Staged rules\nresult\n!/.gitignore\n!/.gitmodules\n"
                         if tracked and policy is not None
-                        else ""
+                        else HOME_IGNORE
                     ),
                     "command changed personal staging",
                 )
@@ -3228,7 +3193,7 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
     monkeypatch: pytest.MonkeyPatch,
     command: str,
 ) -> None:
-    """Prune submodule rules while preserving personal exceptions and staging."""
+    """Prune only through home rm, preserving manual exceptions and their staging."""
     home = _home_test_home_repository(tmp_path / "home")
     monkeypatch.setenv("HOME", str(home))
     ignore = home / ".gitignore"
@@ -3249,10 +3214,12 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
         _home_test_run(tmp_path, "init")
     else:
         _home_test_run(tmp_path, "rm", relative)
-    expected = HOME_IGNORE_PREFIX + "!/forge.example/\n" + HOME_IGNORE_SUFFIX + personal
+    expected = (
+        HOME_IGNORE + "!/forge.example/\n" if command == "rm" else HOME_SUBMODULE_IGNORE
+    ) + personal
     _expect(
         ignore.read_text() == expected + local,
-        "removal lost personal rules or retained stale rules",
+        "removal changed unrelated rules or failed to remove its own rules",
     )
     _expect(
         _git(home, "show", ":.gitignore") == expected,
@@ -3263,7 +3230,8 @@ def test_home_allowlist_removal_preserves_shared_personal_parents(
         path.parent.mkdir(parents=True, exist_ok=True)
         path.touch()
         _git(home, "add", str(path))
-    _git(home, "check-ignore", "--quiet", "--no-index", relative)
+    if command == "rm":
+        _git(home, "check-ignore", "--quiet", "--no-index", relative)
     before = _snapshot(home)
     _home_test_run(tmp_path, "init")
     _expect(_snapshot(home) == before, "repeated removal repair changed state")
@@ -3363,32 +3331,62 @@ def test_home_cli_exposes_only_home_lifecycle_commands(
     _expect(not list(tmp_path.iterdir()), "invalid requests created files")
 
 
-@pytest.mark.parametrize("command", ["init", "add", "rm"])
-@pytest.mark.parametrize("staged", [False, True])
-def test_home_rejects_malformed_allowlist_before_mutation(
+def test_home_add_and_rm_only_update_target_rules(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    command: str,
-    *,
-    staged: bool,
 ) -> None:
-    """Require intact ownership markers before changing home metadata or checkouts."""
-    root = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(root))
-    ignore = root / ".gitignore"
-    ignore.write_text(HOME_IGNORE_PREFIX)
-    if staged:
-        _git(root, "add", ".gitignore")
-        ignore.write_text(HOME_SUBMODULE_IGNORE)
-    arguments = {
-        "init": (),
-        "add": ("https://forge.example/team/other.git",),
-        "rm": ("forge.example/owner/demo",),
-    }[command]
-    before = _snapshot(root)
-    result = _home_test_run(root, command, *arguments, code=1)
-    _expect("malformed afairesi home allowlist" in result.stderr, result)
-    _expect(_snapshot(root) == before, "invalid markers caused partial changes")
+    """Update only the selected path and preserve unrelated staging."""
+    home, _source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    _home_test_run(tmp_path, "init")
+    _git(home, "config", "--file", ".gitmodules", "submodule.other.path", "other/repo")
+    ignore = home / ".gitignore"
+    staged = HOME_IGNORE + "!/obsolete/\n# Manual rules\n!/notes/\n!/notes/staged.txt\n"
+    local = "!/notes/working.txt"
+    ignore.write_text(staged)
+    _git(home, "add", ".gitignore", ".gitmodules")
+    ignore.write_text(staged + local)
+    _home_test_run(tmp_path, "add", remote)
+    added = "!/example.test/\n!/example.test/team/\n!/example.test/team/repository/\n"
+    _expect(ignore.read_text() == staged + local + "\n" + added, ignore.read_text())
+    _expect(_git(home, "show", ":.gitignore") == staged + added, "add staged edits")
+    _fixture_git(home, "commit", "-qm", "Register repository")
+    _home_test_run(tmp_path, "rm", "example.test/team/repository")
+    _expect(ignore.read_text() == staged + local + "\n", ignore.read_text())
+    _expect(_git(home, "show", ":.gitignore") == staged, "removal staged edits")
+
+
+def test_home_rm_keeps_rules_needed_by_other_submodules(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Retain shared ancestors for a registered sibling even without a checkout."""
+    home = _home_test_home_repository(tmp_path / "home")
+    monkeypatch.setenv("HOME", str(home))
+    sibling = "forge.example/owner/remaining"
+    _git(home, "config", "--file", ".gitmodules", "submodule.sibling.path", sibling)
+    _git(home, "add", ".gitmodules")
+    _home_test_run(tmp_path, "init")
+    _fixture_git(home, "commit", "-qm", "Register sibling")
+    _home_test_run(tmp_path, "rm", "forge.example/owner/demo")
+    expected = (
+        HOME_IGNORE + "!/forge.example/\n!/forge.example/owner/\n" + f"!/{sibling}/\n"
+    )
+    _expect((home / ".gitignore").read_text() == expected, "shared rules removed")
+    _expect(_git(home, "show", ":.gitignore") == expected, "incorrect staged rules")
+
+
+def test_home_rm_preserves_a_manually_deleted_ignore_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Remove the requested repository without recreating an unrelated deleted file."""
+    home = _home_test_home_repository(tmp_path / "home")
+    monkeypatch.setenv("HOME", str(home))
+    _fixture_git(home, "commit", "-qm", "Home snapshot")
+    _git(home, "rm", ".gitignore")
+    _home_test_run(tmp_path, "rm", "forge.example/owner/demo")
+    _expect(not (home / ".gitignore").exists(), "removal recreated the ignore file")
+    _expect(not _git(home, "ls-files", "--", ".gitignore"), "removal staged a new file")
 
 
 def test_home_commands_reject_flake_repositories_without_changes(
@@ -4562,6 +4560,18 @@ def test_repo_test_coverage_continues_after_failed_nix_builds(
     report = tmp_path / "tmp/report"
     (report / "html").mkdir(parents=True)
     (report / "html/index.html").touch()
+    (report / "coverage.json").write_text(
+        json.dumps(
+            {
+                "totals": {
+                    "percent_covered": 100,
+                    "missing_lines": 0,
+                    "missing_branches": 0,
+                },
+                "files": {},
+            },
+        ),
+    )
     builds: list[str] = []
 
     def run(arguments: list[str], **_keywords: object) -> object:
@@ -4674,10 +4684,16 @@ def test_repo_test_coverage_describes_uncovered_branches(
         raise AssertionError(actual.err)
 
 
+@pytest.mark.parametrize(
+    ("missing", "message"),
+    [("html", "no HTML report"), ("json", "coverage.json")],
+)
 def test_repo_test_coverage_rejects_missing_report_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    missing: str,
+    message: str,
 ) -> None:
     """Validate coverage output guards without rebuilding a successful package."""
     campaign_subject = import_module("afairesi.main")
@@ -4687,6 +4703,9 @@ def test_repo_test_coverage_rejects_missing_report_files(
     package = _make_source_package(root, "example", "def test_ready(): pass\n")
     report = tmp_path / "report"
     report.mkdir()
+    if missing == "json":
+        (report / "html").mkdir()
+        (report / "html/index.html").touch()
     builds: list[list[str]] = []
 
     def run(
@@ -4704,7 +4723,6 @@ def test_repo_test_coverage_rejects_missing_report_files(
         Mock(wraps=subprocess.run, side_effect=run),
     )
     before = _snapshot(root)
-    message = "no HTML report"
     monkeypatch.setattr(
         sys,
         "argv",

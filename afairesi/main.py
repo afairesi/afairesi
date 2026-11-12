@@ -54,8 +54,6 @@ ROOT_FILES = {
 }
 RESOURCE_PATH_COMPONENTS = 1
 PYTEST_NO_TESTS_COLLECTED = 5
-HOME_IGNORE_START = "# afairesi: home allowlist"
-HOME_IGNORE_END = "# afairesi: end home allowlist"
 
 
 class CommandError(RuntimeError):
@@ -2051,21 +2049,20 @@ def _build_package_coverage(package: Path) -> None:
         raise CommandError(message)
     sys.stdout.write(f"{package.name}: {report}\n")
     data = report.parents[1] / "coverage.json"
-    if data.is_file():
-        coverage = json.loads(data.read_text(encoding="utf-8"))
-        totals = coverage["totals"]
-        sys.stdout.write(
-            f"  {totals['percent_covered']:.1f}% coverage; "
-            f"{totals['missing_lines']} missing lines, "
-            f"{totals['missing_branches']} missing branches\n",
-        )
-        for filename, measured in sorted(coverage["files"].items()):
-            if measured["missing_branches"]:
-                branches = ", ".join(
-                    f"{start} -> {end if end > 0 else 'exit'}"
-                    for start, end in measured["missing_branches"]
-                )
-                sys.stdout.write(f"  {filename}: missing branches {branches}\n")
+    coverage = json.loads(data.read_text(encoding="utf-8"))
+    totals = coverage["totals"]
+    sys.stdout.write(
+        f"  {totals['percent_covered']:.1f}% coverage; "
+        f"{totals['missing_lines']} missing lines, "
+        f"{totals['missing_branches']} missing branches\n",
+    )
+    for filename, measured in sorted(coverage["files"].items()):
+        if measured["missing_branches"]:
+            branches = ", ".join(
+                f"{start} -> {end if end > 0 else 'exit'}"
+                for start, end in measured["missing_branches"]
+            )
+            sys.stdout.write(f"  {filename}: missing branches {branches}\n")
 
 
 def _run_coverage(target: Path) -> bool:
@@ -3612,44 +3609,26 @@ def _home_ignore_rules(paths: list[Path]) -> set[str]:
     return rules
 
 
-def _home_ignore_parts(source: str) -> tuple[list[str], set[str]]:
-    """Separate personal rules from a persistent, explicitly owned rule block."""
+def _home_ignore_source(source: str, added: set[str], removed: set[str]) -> str:
+    """Apply one home operation's rules, retaining unrelated lines and parent access."""
     lines = source.splitlines(keepends=True)
-    starts = [
-        i for i, line in enumerate(lines) if line.rstrip("\r\n") == HOME_IGNORE_START
-    ]
-    ends = [i for i, line in enumerate(lines) if line.rstrip("\r\n") == HOME_IGNORE_END]
-    if not starts and not ends:
-        return lines, set()
-    if len(starts) != 1 or len(ends) != 1 or starts[0] >= ends[0]:
-        msg = ".gitignore: malformed afairesi home allowlist block"
-        raise CommandError(msg)
-    start, end = starts[0], ends[0]
-    return lines[:start] + lines[end + 1 :], {
-        line.rstrip("\r\n") for line in lines[start + 1 : end]
-    }
-
-
-def _home_ignore_source(source: str, required: set[str]) -> str:
-    """Refresh owned exceptions while preserving personal rules and parent access."""
-    personal, managed = _home_ignore_parts(source)
+    other = [line for line in lines if line.rstrip("\r\n") not in removed]
     retained = {
         rule
-        for rule in managed - required
-        if rule.endswith("/") and any(line.startswith(rule) for line in personal)
+        for rule in removed
+        if rule.endswith("/") and any(line.startswith(rule) for line in other)
     }
-    updated = (
-        HOME_IGNORE_START
-        + "\n*\n"
-        + "".join(rule + "\n" for rule in sorted((required | retained) - {"*"}))
-    )
-    return updated + HOME_IGNORE_END + "\n" + "".join(personal)
+    lines = [line for line in lines if line.rstrip("\r\n") not in removed - retained]
+    missing = added - {line.rstrip("\r\n") for line in lines}
+    updated = ("*\n" if "*" in missing else "") + "".join(lines)
+    additions = "".join(rule + "\n" for rule in sorted(missing - {"*"}))
+    separator = "\n" if additions and updated and not updated.endswith("\n") else ""
+    return updated + separator + additions
 
 
 def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
     """Read regular working and staged ignore files before changing home structure."""
     source = read_regular(root / ".gitignore")
-    _home_ignore_parts(source or "")
     if not (root / ".git").exists():
         return source, "100644", None
     entries = git(root, ["ls-files", "--stage", "-z", "--", ".gitignore"]).stdout
@@ -3662,25 +3641,25 @@ def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
             raise CommandError(msg)
         mode = fields[0]
         indexed = git(root, ["cat-file", "blob", fields[1]]).stdout
-        _home_ignore_parts(indexed)
     return source, mode, indexed
 
 
-def _converge_home_ignore(
+def _update_home_ignore(
     root: Path,
-    required: set[str],
+    added: set[str],
+    removed: set[str],
     state: tuple[str | None, str, str | None],
 ) -> None:
     """Update working and staged allowlists independently to retain personal edits."""
     source, mode, indexed = state
-    updated = _home_ignore_source(source or "", required)
-    staged = _home_ignore_source(indexed or "", required)
-    if source == updated and indexed == staged:
+    updated = _home_ignore_source(source or "", added, removed)
+    staged = _home_ignore_source(indexed or "", added, removed)
+    if (source or "") == updated and (indexed or "") == staged:
         return
     report_change("write '.gitignore'", dry_run=False)
-    if source != updated:
+    if (source or "") != updated:
         (root / ".gitignore").write_text(updated, encoding="utf-8")
-    if indexed != staged:
+    if (indexed or "") != staged:
         blob = run(
             ["git", "hash-object", "-w", "--stdin"], cwd=root, input_source=staged
         )
@@ -3707,6 +3686,9 @@ def remove_home_submodule(
     if relative.is_absolute() or ".." in relative.parts or relative not in paths:
         msg = f"not a registered home submodule: {value}"
         raise CommandError(msg)
+    removed = _home_ignore_rules([relative]) - _home_ignore_rules(
+        [path for path in paths if path != relative]
+    )
     ignore_state = _home_ignore_state(root)
     arguments = ["rm", "-r"]
     if force:
@@ -3716,15 +3698,16 @@ def remove_home_submodule(
         cwd=root,
         capture_output=False,
     )
-    _converge_home_ignore(
+    _update_home_ignore(
         root,
-        _home_ignore_rules(home_submodule_paths(root)),
+        set(),
+        removed,
         ignore_state,
     )
 
 
 def initialize_home() -> None:
-    """Initialize home metadata and refresh the staged home allowlist."""
+    """Initialize home metadata and add missing home allowlist rules."""
     root = Path.home()
     if repository_type(root, "home") != "home":
         msg = "cannot initialize a flake repository as a home repository"
@@ -3733,9 +3716,10 @@ def initialize_home() -> None:
     run(["git", "init", "--", str(root)], capture_output=False)
     if not (root / ".gitmodules").exists():
         write_managed(root, Path(".gitmodules"), "", dry_run=False)
-    _converge_home_ignore(
+    _update_home_ignore(
         root,
         _home_ignore_rules(home_submodule_paths(root)),
+        set(),
         ignore_state,
     )
 
@@ -3789,9 +3773,10 @@ def initialize_submodule(
             cwd=home,
             capture_output=False,
         )
-        _converge_home_ignore(
+        _update_home_ignore(
             home,
-            _home_ignore_rules(home_submodule_paths(home)),
+            _home_ignore_rules([relative]),
+            set(),
             ignore_state,
         )
     except BaseException:
@@ -3823,20 +3808,21 @@ def _configure_home_parser(result: argparse.ArgumentParser) -> None:
     )
     commands.add_parser(
         "init",
-        help="initialize the home repository and refresh its allowlist",
+        help="initialize the home repository and add missing allowlist rules",
         description=(
             "Initialize the home repository and create .gitmodules if missing. "
-            "Refresh and stage structural .gitignore rules from registered paths. "
-            "Run again to refresh the allowlist after native Git changes. "
-            "Preserve personal ignore rules and staging."
+            "Add and stage missing .gitignore rules for metadata and registered paths. "
+            "Preserve other rules and their staging. "
+            "After native Git moves or removals, edit ~/.gitignore manually."
         ),
     )
     remove = commands.add_parser(
         "rm",
         help="remove and stage a submodule",
         description=(
-            "Remove a submodule with git rm. Stage the updated submodule registration "
-            "and home allowlist exceptions."
+            "Remove a submodule with git rm and remove its ~/.gitignore exceptions. "
+            "Keep parent exceptions needed by remaining repositories or other rules. "
+            "Stage these changes while preserving unrelated rules and their staging."
         ),
     )
     remove.add_argument(
