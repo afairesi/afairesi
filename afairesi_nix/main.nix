@@ -140,7 +140,6 @@ let
       inherit pkgs self;
       treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
         programs = {
-          actionlint.enable = true;
           mypy = {
             directories = pkgs.lib.genAttrs pythonPackageNames (
               name:
@@ -171,10 +170,6 @@ let
         };
         projectRootFile = "flake.nix";
         settings.formatter = {
-          actionlint.options = [
-            "-config-file"
-            "${pkgs.writeText "actionlint.yaml" "{}"}"
-          ];
           deadnix = {
             command = pkgs.deadnix;
             includes = [ "*.nix" ];
