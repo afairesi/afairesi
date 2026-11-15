@@ -558,18 +558,36 @@ def test_explicit_repository_paths_use_git_root_or_cwd(
     _expect(subject.resolve_repository_path(nested) == nested, nested)
 
 
-def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
+@pytest.mark.parametrize("location", ["outside", "root", "nested"])
+def test_cli_help_lists_current_commands_and_rejects_invalid_requests(
+    location: str,
+) -> None:
     """Expose consistent commands and reject invalid requests before creating state."""
     with TemporaryDirectory(prefix="afairesi-cli-") as directory:
         root = Path(directory)
-        help_output = _run(root, "--help").stdout
+        if location != "outside":
+            _repository(root)
+        cwd = root
+        if location == "nested":
+            cwd = root / "prm/nested"
+            cwd.mkdir(parents=True)
+        before = _inspection_tree_snapshot(root)
+        help_output = _run(cwd, "--help").stdout
         _expect("usage:" in help_output, help_output)
-        commands = (("inspect",), ("test",))
-        for command_path in commands:
-            option = _run(root, *command_path, "--help").stdout
+        command_names = [
+            "inspect",
+            "inspect-diff",
+            "test-coverage",
+            "test-fuzz",
+            "test-mutation",
+            "test-performance",
+            "test-property",
+        ]
+        for command in command_names:
+            option = _run(cwd, command, "--help").stdout
             _expect(
-                "usage:" in option,
-                command_path,
+                f"usage: afairesi {command}" in option,
+                command,
             )
         environment = dict(os.environ)
         environment["PATH"] = (
@@ -578,20 +596,19 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             + environment["PATH"]
         )
         _expect(
-            _run(root, "--help", executable="afairesi", environment=environment).stdout
+            _run(cwd, "--help", executable="afairesi", environment=environment).stdout
             == help_output,
             "standalone command unavailable through PATH",
         )
-        rejected = _run(root, "unknown-command", code=2)
+        rejected = _run(cwd, "unknown-command", code=2)
         _expect("invalid choice" in rejected.stderr, rejected)
-        command_names = ["inspect", "test"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(
             positions == sorted(positions),
             "help commands must be alphabetical",
         )
-        _expect(_run(root).stdout == help_output, "bare afairesi must show help")
-        _expect(not any(root.iterdir()), "invalid CLI request created state")
+        _expect(_run(cwd).stdout == help_output, "bare afairesi must show help")
+        _expect(_inspection_tree_snapshot(root) == before, "CLI help changed state")
 
 
 @pytest.mark.parametrize("kind", ["html", "latex", "lean4", "python"])
@@ -1487,7 +1504,7 @@ def _campaign_run_runner_cli(
     executable_directory = str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603 - Test PATH selects afairesi; arguments come from fixtures.
-        ["afairesi", "test", command, str(root), *arguments],  # noqa: S607
+        ["afairesi", f"test-{command}", str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
@@ -1664,7 +1681,7 @@ def _run_campaign(
     """Run an omitted target and preserve original sources, settings, and refs."""
     before = _snapshot(root, exclude=("tmp",))
     result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], f"test-{command}", *arguments],
         cwd=cwd or root,
         env=environment,
         capture_output=True,
@@ -1732,7 +1749,7 @@ def test_campaign_routes_targets_and_forwards_test_selection(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "test", command, *arguments, *selectors],
+        ["afairesi", f"test-{command}", *arguments, *selectors],
     )
     with pytest.raises(SystemExit) as completed:
         subject.main()
@@ -1759,74 +1776,13 @@ def test_campaign_routes_targets_and_forwards_test_selection(
         )
 
 
-@pytest.mark.parametrize("location", ["outside", "root", "nested"])
-def test_campaign_without_a_campaign_shows_help_without_running_tests(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-    location: str,
-) -> None:
-    """Show the same help inside and outside Git without creating state."""
-    subject = import_module("afairesi.main")
-    root = tmp_path / "repository"
-    root.mkdir()
-    _repository(root)
-    nested = root / "example/prm/nested"
-    nested.mkdir(parents=True)
-    monkeypatch.chdir({"outside": tmp_path, "root": root, "nested": nested}[location])
-    coverage_run = Mock(side_effect=AssertionError("unexpected coverage run"))
-    other_campaigns = Mock(side_effect=AssertionError("unexpected campaign"))
-    monkeypatch.setattr(subject, "_run_coverage", coverage_run)
-    monkeypatch.setattr(subject, "_dispatch_test_runner", other_campaigns)
-    before = _snapshot(root)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "test", "--help"])
-    with pytest.raises(SystemExit) as completed:
-        subject.main()
-    if completed.value.code != 0:
-        raise AssertionError((completed.value.code, 0))
-    expected = capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["afairesi", "test"])
-    subject.main()
-    actual = capsys.readouterr()
-    if actual.out != expected.out:
-        raise AssertionError((actual.out, expected.out))
-    if actual.err != "":
-        raise AssertionError((actual.err, ""))
-    if coverage_run.call_count != 0:
-        raise AssertionError((coverage_run.call_count, 0))
-    if other_campaigns.call_count != 0:
-        raise AssertionError((other_campaigns.call_count, 0))
-    if _snapshot(root) != before:
-        raise AssertionError((_snapshot(root), before))
-
-    if list(tmp_path.iterdir()) != [root]:
-        raise AssertionError(list(tmp_path.iterdir()))
-
-
-@pytest.mark.parametrize(
-    "command",
-    [None, "coverage", "property", "fuzz", "mutation", "performance"],
-)
-def test_campaign_help_is_available_outside_git(
-    tmp_path: Path,
-    command: str | None,
-) -> None:
-    """Describe each campaign without requiring repository or build state."""
-    arguments = [] if command is None else [command]
-    result = _run(tmp_path, "test", *arguments, "--help")
-    if "usage: afairesi test" not in result.stdout:
-        raise AssertionError(result)
-    if list(tmp_path.iterdir()) != []:
-        raise AssertionError(list(tmp_path.iterdir()))
-
-
 @pytest.mark.parametrize(
     "command",
     ["coverage", "property", "fuzz", "mutation", "performance"],
 )
 def test_campaign_requires_repository(tmp_path: Path, command: str) -> None:
     """Keep explicit execution errors distinct from the bare help command."""
-    result = _run(tmp_path, "test", command, code=1)
+    result = _run(tmp_path, f"test-{command}", code=1)
     if "not inside a Git repository" not in result.stderr:
         raise AssertionError(result)
     if list(tmp_path.iterdir()) != []:
@@ -1854,8 +1810,7 @@ def test_campaign_rejects_invalid_timeout_without_changes(
     """Cover each invalid budget and ensure every campaign uses the validator."""
     result = _run(
         tmp_path,
-        "test",
-        command,
+        f"test-{command}",
         str(tmp_path),
         f"--timeout={timeout}",
         code=2,
@@ -1878,7 +1833,7 @@ def test_campaign_rejects_invalid_count_without_changes(
     limit: str,
 ) -> None:
     """Require a positive generation or mutation count."""
-    result = _run(tmp_path, "test", command, str(tmp_path), option, limit, code=2)
+    result = _run(tmp_path, f"test-{command}", str(tmp_path), option, limit, code=2)
     if f"{option} must be positive" not in result.stderr:
         raise AssertionError(result)
     if list(tmp_path.iterdir()) != []:
@@ -2050,8 +2005,7 @@ def test_campaign_handles_nonrunnable_targets_without_changes(layout: str) -> No
         for command in ("property", "mutation"):
             result = _run(
                 root,
-                "test",
-                command,
+                f"test-{command}",
                 str(target),
                 code=0 if layout == "untested" else 1,
             )
@@ -2066,7 +2020,7 @@ def test_campaign_handles_nonrunnable_targets_without_changes(layout: str) -> No
         if layout == "empty":
             _expect(
                 "no Python packages found"
-                in _run(root, "test", "coverage", code=1).stderr,
+                in _run(root, "test-coverage", code=1).stderr,
                 "coverage",
             )
         _expect(
@@ -2198,7 +2152,7 @@ def test_campaign_coverage_continues_after_failed_nix_builds(
         monkeypatch.setattr(
             sys,
             "argv",
-            ["afairesi", "test", "coverage", str(target)],
+            ["afairesi", "test-coverage", str(target)],
         )
         with pytest.raises(SystemExit) as completed:
             campaign_subject.main()
@@ -2210,7 +2164,7 @@ def test_campaign_coverage_continues_after_failed_nix_builds(
                 "1 passed, 1 failed, 1 skipped" in output.out
                 and "z-last:" in output.out
                 and str(report / "html/index.html") in output.out
-                and "afairesi test coverage: example:" in output.err,
+                and "afairesi test-coverage: example:" in output.err,
                 output,
             )
         _expect(_snapshot(tmp_path) == before, target)
@@ -2268,7 +2222,7 @@ def test_campaign_coverage_describes_uncovered_branches(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "test", "coverage", str(package)],
+        ["afairesi", "test-coverage", str(package)],
     )
     with pytest.raises(SystemExit) as completed:
         subject.main()
@@ -2328,7 +2282,7 @@ def test_campaign_coverage_rejects_missing_report_files(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "test", "coverage", str(package)],
+        ["afairesi", "test-coverage", str(package)],
     )
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
@@ -2384,8 +2338,7 @@ def test_campaign_preserves_native_nix_errors_for_package_targets(
     before = _snapshot(root, exclude=("tmp",))
     actual = _run(
         root,
-        "test",
-        command,
+        f"test-{command}",
         str(root / "example"),
         code=expected.returncode,
         environment=environment,
@@ -2446,8 +2399,7 @@ def test_campaign_property_preserves_native_pytest_status(
     before = _snapshot(root, exclude=("tmp",))
     actual = _run(
         root,
-        "test",
-        "property",
+        "test-property",
         str(package),
         *selectors,
         code=expected.returncode,
@@ -2488,7 +2440,7 @@ def test_campaign_coverage_skips_untested_packages_and_continues_after_invalid_s
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "test", "coverage", str(tmp_path)],
+        ["afairesi", "test-coverage", str(tmp_path)],
     )
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
@@ -2497,7 +2449,7 @@ def test_campaign_coverage_skips_untested_packages_and_continues_after_invalid_s
     _expect(built == [ready], built)
     _expect(
         "1 passed, 1 failed, 1 skipped" in output.out
-        and "afairesi test coverage: alpha:" in output.err,
+        and "afairesi test-coverage: alpha:" in output.err,
         output,
     )
     _expect(
@@ -2548,6 +2500,7 @@ def test_campaign_property_continues_after_failures(failure: str) -> None:
             result.returncode == 1 and "1 passed, 1 failed, 1 skipped" in result.stdout,
             result,
         )
+        _expect("afairesi test-property: alpha:" in result.stderr, result)
         (failed,) = _report_directory().glob("python-property-alpha-*")
         diagnostic = "Failing test case" if failure == "counterexample" else "timed out"
         _expect(
@@ -3023,7 +2976,7 @@ def test_inspect_reports_argument_free_executables(tmp_path: Path, source: str) 
     _expect(report == {"arguments": [], "commands": {}}, report)
     _inspection_repository(tmp_path)
     _write_fixture_source(tmp_path / "example/main.py", source)
-    completed = _run(tmp_path, "inspect", "--repository", str(tmp_path))
+    completed = _run(tmp_path, "inspect", str(tmp_path))
     resource = json.loads(completed.stdout)["example"]
     _expect(resource["cli"] == {}, resource)
     _expect(resource["tests"] == ["test_default_output"], resource)
@@ -3045,7 +2998,7 @@ def test_inspect_requires_supported_cli(tmp_path: Path, source: str) -> None:
     _inspection_repository(tmp_path)
     path = tmp_path / "example/main.py"
     path.write_text(source)
-    completed = _run(tmp_path, "inspect", "--repository", str(tmp_path), code=1)
+    completed = _run(tmp_path, "inspect", str(tmp_path), code=1)
     _expect(completed.stdout == "", completed)
     _expect(
         f"{path}: cannot inspect CLI: no supported parser found" in completed.stderr,
@@ -4023,7 +3976,7 @@ def test_inspect_cli_failure_has_context_and_no_partial_json(
     _inspection_repository(tmp_path)
     source = tmp_path / "example/main.py"
     _write_fixture_source(source, "import argparse\nother.add_argument('--missing')\n")
-    completed = _run(tmp_path, "inspect", "--repository", str(tmp_path), code=1)
+    completed = _run(tmp_path, "inspect", str(tmp_path), code=1)
     _expect(completed.stdout == "", completed)
     _expect(f"{source}:2:1: cannot inspect CLI:" in completed.stderr, completed)
     _expect("cannot resolve the argument parser" in completed.stderr, completed)
@@ -4126,7 +4079,7 @@ def test_inspect_reports_the_same_repository_through_equivalent_paths(
         _git(tmp_path, "init", "--quiet")
         _git(tmp_path, "add", ".")
     cwd = tmp_path / "example" if location == "nested" else tmp_path
-    paths = [["--repository", "."], ["--repository", str(tmp_path)]]
+    paths = [["."], [str(tmp_path)]]
     if location != "outside":
         paths.append([])
     for arguments in paths:
@@ -4199,7 +4152,6 @@ def _inspection_inspect_target(target: str) -> dict[str, Any]:
         [
             os.environ["PACKAGE_E2E_EXECUTABLE"],
             "inspect",
-            "--repository",
             target,
         ],
         capture_output=True,
@@ -4358,7 +4310,6 @@ def test_inspect_remote_preserves_native_clone_errors(
         [
             os.environ["PACKAGE_E2E_EXECUTABLE"],
             "inspect",
-            "--repository",
             remote,
         ],
         capture_output=True,
@@ -4430,11 +4381,16 @@ def _inspection_apply_diff(
         ((), "index", "working", 0),
         (("--cached",), "head", "index", 0),
         (("--staged",), "head", "index", 0),
-        (("HEAD",), "head", "working", 0),
-        (("--cached", "initial"), "initial", "index", 0),
-        (("initial", "HEAD"), "initial", "head", 0),
-        (("initial..HEAD",), "initial", "head", 0),
-        (("initial...HEAD",), "initial", "head", 0),
+        (("--from", "HEAD"), "head", "working", 0),
+        (("--to", "HEAD"), "index", "head", 0),
+        (("--cached", "--from", "initial"), "initial", "index", 0),
+        (("--from", "initial", "--to", "HEAD"), "initial", "head", 0),
+        (
+            ("--from", "initial", "--to", "HEAD", "--merge-base"),
+            "initial",
+            "head",
+            0,
+        ),
         (("--exit-code",), "index", "working", 1),
         (("-R",), "working", "index", 0),
     ],
@@ -4459,7 +4415,7 @@ def test_inspect_diff_uses_git_comparisons_and_emits_jd_patches(
     _inspection_diff_description(tmp_path, "Working")
     reports["working"] = inspection_subject.inspect_repository(tmp_path)
     before = _inspection_tree_snapshot(tmp_path)
-    completed = _run(tmp_path / "example", "inspect", "diff", *arguments, code=code)
+    completed = _run(tmp_path / "example", "inspect-diff", *arguments, code=code)
     _expect(
         _inspection_apply_diff(reports[left], completed.stdout) == reports[right],
         completed,
@@ -4486,7 +4442,7 @@ def test_inspect_diff_ignores_implementation_edits_and_untracked_resources(
     (tmp_path / "untracked").mkdir()
     (tmp_path / "untracked/configuration.nix").touch()
     before = _inspection_tree_snapshot(tmp_path)
-    completed = _run(tmp_path, "inspect", "diff", "--exit-code")
+    completed = _run(tmp_path, "inspect-diff", "--exit-code")
     _expect(not completed.stdout and not completed.stderr, completed)
     _expect(_inspection_tree_snapshot(tmp_path) == before, "empty diff changed state")
 
@@ -4513,7 +4469,7 @@ def test_inspect_diff_covers_structural_and_nested_cli_changes(
     (tmp_path / "new-host/configuration.nix").touch()
     _git(tmp_path, "add", ".")
     after = inspection_subject.inspect_repository(tmp_path)
-    completed = _run(tmp_path, "inspect", "diff", "--cached")
+    completed = _run(tmp_path, "inspect-diff", "--cached")
     _expect(_inspection_apply_diff(before, completed.stdout) == after, completed)
 
 
@@ -4521,7 +4477,7 @@ def test_inspect_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
     """Translate native diff stdin to JSON Patch for JSON viewers and patching."""
     before = _inspection_diff_repository(tmp_path)
     _inspection_diff_description(tmp_path, "Changed")
-    difference = _run(tmp_path, "inspect", "diff").stdout
+    difference = _run(tmp_path, "inspect-diff").stdout
     translated = subprocess.run(
         ["jd", "-t", "jd2patch"],  # noqa: S607
         input=difference,
@@ -4538,12 +4494,12 @@ def test_inspect_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
     )
     _expect("afairesi-inspect-diff-" not in difference, difference)
     _expect(
-        _run(tmp_path, "inspect", "diff").stdout == difference,
+        _run(tmp_path, "inspect-diff").stdout == difference,
         "temporary snapshot paths made identical diffs unstable",
     )
 
 
-def test_inspect_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None:
+def test_inspect_diff_uses_the_merge_base(tmp_path: Path) -> None:
     """Exclude the other branch's changes and ignore malformed working sources."""
     base = _inspection_diff_repository(tmp_path)
     _git(tmp_path, "tag", "base")
@@ -4560,8 +4516,10 @@ def test_inspect_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None:
     other = inspection_subject.inspect_repository(tmp_path)
     _write_fixture_source(tmp_path / "example/main.py", "def invalid(")
     before = _inspection_tree_snapshot(tmp_path)
-    for comparison, report in (("other...topic", base), ("other..topic", other)):
-        completed = _run(tmp_path, "inspect", "diff", comparison)
+    for arguments, report in ((("--merge-base",), base), ((), other)):
+        completed = _run(
+            tmp_path, "inspect-diff", "--from", "other", "--to", "topic", *arguments
+        )
         _expect(_inspection_apply_diff(report, completed.stdout) == topic, completed)
     _expect(_inspection_tree_snapshot(tmp_path) == before, "range diff changed state")
 
@@ -4571,13 +4529,13 @@ def test_inspect_diff_compares_initial_staging_against_an_empty_repository(
 ) -> None:
     """Compare the first staged interface against an empty inventory."""
     _git(tmp_path, "init", "--quiet")
-    _expect(not _run(tmp_path, "inspect", "diff", "--cached").stdout, "nonempty diff")
+    _expect(not _run(tmp_path, "inspect-diff", "--cached").stdout, "nonempty diff")
     _inspection_repository(tmp_path)
     _git(tmp_path, "add", ".")
     staged = inspection_subject.inspect_repository(tmp_path)
     _inspection_diff_description(tmp_path, "Unstaged")
     before = _inspection_tree_snapshot(tmp_path)
-    completed = _run(tmp_path, "inspect", "diff", "--cached", "--exit-code", code=1)
+    completed = _run(tmp_path, "inspect-diff", "--cached", "--exit-code", code=1)
     _expect(_inspection_apply_diff({}, completed.stdout) == staged, completed)
     _expect(_inspection_tree_snapshot(tmp_path) == before, "initial diff changed state")
 
@@ -4585,10 +4543,18 @@ def test_inspect_diff_compares_initial_staging_against_an_empty_repository(
 @pytest.mark.parametrize(
     ("arguments", "failure", "code"),
     [
-        (("missing-revision",), "Needed a single revision", 128),
-        (("HEAD", "HEAD", "HEAD"), "at most two revisions", 2),
-        (("--cached", "HEAD", "HEAD"), "at most one revision", 2),
-        (("--cached", "HEAD..HEAD"), "not a range", 2),
+        (("--from", "missing-revision"), "Needed a single revision", 128),
+        (("--to", "missing-revision"), "Needed a single revision", 128),
+        ((".", "HEAD", "HEAD"), "unrecognized arguments", 2),
+        (("--cached", "--to", "HEAD"), "cannot be combined with --to", 2),
+        (("--merge-base",), "requires --from and --to", 2),
+        (("--merge-base", "--from", "HEAD"), "requires --from and --to", 2),
+        (("--merge-base", "--to", "HEAD"), "requires --from and --to", 2),
+        (
+            ("--cached", "--from", "HEAD", "--to", "HEAD", "--merge-base"),
+            "cannot be combined with --to",
+            2,
+        ),
         ((), "could not parse Python source", 1),
     ],
 )
@@ -4609,35 +4575,42 @@ def test_inspect_diff_errors_leave_no_partial_output_or_temporary_sources(
     if not arguments:
         _write_fixture_source(root / "example/main.py", "def invalid(")
     before = _inspection_tree_snapshot(root)
-    completed = _run(root, "inspect", "diff", *arguments, code=code)
+    completed = _run(root, "inspect-diff", *arguments, code=code)
     _expect(not completed.stdout, completed)
     _expect(failure in completed.stderr, completed)
     _expect(not list(scratch.iterdir()), "failed diff left temporary sources")
     _expect(_inspection_tree_snapshot(root) == before, "failed diff changed state")
 
 
+@pytest.mark.parametrize("name", ["diff", "HEAD", "repository with spaces"])
 def test_inspect_diff_supports_help_and_repository_selection_outside_git(
     tmp_path: Path,
+    name: str,
 ) -> None:
     """Describe diffs outside Git and distinguish repository paths from commands."""
-    help_output = _run(tmp_path, "inspect", "diff", "--help").stdout
+    help_output = _run(tmp_path, "inspect-diff", "--help").stdout
     _expect("--cached" in help_output and "jd-compatible" in help_output, help_output)
     _expect("--color | less -R" in help_output, help_output)
     _expect("| less" in help_output, help_output)
     _expect("| jd -t jd2patch | jless" in help_output, help_output)
     _expect(not list(tmp_path.iterdir()), "help wrote files")
-    root = tmp_path / "diff"
+    root = tmp_path / name
     root.mkdir()
     report = _inspection_diff_repository(root)
-    completed = _run(tmp_path, "inspect", "--repository", "diff")
+    completed = _run(tmp_path, "inspect", name)
     _expect(json.loads(completed.stdout) == report, completed)
     _inspection_diff_description(root, "Changed")
-    completed = _run(tmp_path, "inspect", "--repository", str(root), "diff")
-    _expect(
-        _inspection_apply_diff(report, completed.stdout)
-        == inspection_subject.inspect_repository(root),
-        completed,
-    )
+    for target in (name, str(root)):
+        completed = _run(tmp_path, "inspect-diff", target)
+        _expect(
+            _inspection_apply_diff(report, completed.stdout)
+            == inspection_subject.inspect_repository(root),
+            completed,
+        )
+        completed = _run(
+            tmp_path, "inspect-diff", "--from", "HEAD", "--to", "HEAD", target
+        )
+        _expect(not completed.stdout, completed)
 
 
 def test_inspect_diff_rejects_unmerged_index_without_changes(
@@ -4662,7 +4635,7 @@ def test_inspect_diff_rejects_unmerged_index_without_changes(
         timeout=10,
     )
     before = _inspection_tree_snapshot(tmp_path)
-    completed = _run(tmp_path, "inspect", "diff", code=1)
+    completed = _run(tmp_path, "inspect-diff", code=1)
     _expect(not completed.stdout and "unmerged index" in completed.stderr, completed)
     _expect(
         _inspection_tree_snapshot(tmp_path) == before,
@@ -4678,7 +4651,7 @@ def test_inspect_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
     _git(root, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
     _inspection_diff_description(linked, "Linked")
     before = _inspection_tree_snapshot(tmp_path)
-    completed = _run(linked / "example", "inspect", "diff")
+    completed = _run(linked / "example", "inspect-diff")
     _expect(
         _inspection_apply_diff(report, completed.stdout)
         == inspection_subject.inspect_repository(linked),
@@ -4691,24 +4664,37 @@ def test_inspect_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
 
 
 def test_inspect_reports_public_commands_and_test_campaigns() -> None:
-    """Inventory the flat public CLI and its nested test campaigns."""
+    """Inventory every public command without nested command groups."""
     subject = import_module("afairesi.main")
     report = subject.ArgumentDiscovery(
         Path(__file__).with_name("main.py").read_bytes(),
     ).report()
     commands = report["commands"]
-    _expect(set(commands) == {"inspect", "test"}, commands)
-    _expect(set(commands["inspect"]["commands"]) == {"diff"}, commands["inspect"])
-    campaigns = commands["test"]["commands"]
     _expect(
-        list(campaigns) == ["coverage", "fuzz", "mutation", "performance", "property"],
-        campaigns,
+        set(commands)
+        == {
+            "inspect",
+            "inspect-diff",
+            "test-coverage",
+            "test-fuzz",
+            "test-mutation",
+            "test-performance",
+            "test-property",
+        },
+        commands,
     )
-    for name, campaign in campaigns.items():
-        arguments = [row["names"] for row in campaign["arguments"]]
-        _expect(arguments.count(["target"]) == 1, campaign)
-        for option in ("--timeout", "-k", "-m"):
-            _expect(arguments.count([option]) == (name != "coverage"), campaign)
+    for name, command in commands.items():
+        _expect(not command["commands"], command)
+        arguments = [row["names"] for row in command["arguments"]]
+        if name.startswith("test-"):
+            _expect(arguments.count(["target"]) == 1, command)
+            for option in ("--timeout", "-k", "-m"):
+                _expect(arguments.count([option]) == (name != "test-coverage"), command)
+        else:
+            _expect(arguments.count(["repository"]) == 1, command)
+            _expect(["--repository"] not in arguments, command)
+            for option in ("--from", "--to", "--merge-base"):
+                _expect(arguments.count([option]) == (name == "inspect-diff"), command)
     _expect(not report["arguments"], report["arguments"])
 
 
@@ -4728,7 +4714,6 @@ def test_source_validation_ignores_local_packages_and_optional_tests(
     local = root / "experiments"
     local.mkdir()
     (local / "main.py").write_bytes(b"def broken(:")
-    _check_flake_source(root)
     before = _snapshot(root)
     _check_flake_source(root)
     _expect(_snapshot(root) == before, "validation admitted or changed local sources")

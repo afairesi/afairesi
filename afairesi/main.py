@@ -1311,7 +1311,7 @@ def _run_test_repository(
         ) as error:
             outcomes[package.name] = "failed"
             sys.stderr.write(
-                f"afairesi test {command}: {package.name}: {error}\n",
+                f"afairesi test-{command}: {package.name}: {error}\n",
             )
             if isinstance(error, subprocess.CalledProcessError):
                 _report_process_failure(error)
@@ -1349,7 +1349,7 @@ def _dispatch_test_runner(
     return (
         runner(
             target,
-            options.test_command,
+            options.command.removeprefix("test-"),
             options.timeout,
             selection,
         )
@@ -1435,7 +1435,7 @@ def _run_coverage(target: Path) -> bool:
             if not repository and isinstance(error, subprocess.CalledProcessError):
                 raise
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"afairesi test coverage: {package.name}: {error}\n")
+            sys.stderr.write(f"afairesi test-coverage: {package.name}: {error}\n")
             if isinstance(error, subprocess.CalledProcessError):
                 _report_process_failure(error)
     if repository:
@@ -1486,16 +1486,12 @@ def _configure_test_timeout(result: argparse.ArgumentParser) -> None:
     )
 
 
-def _configure_test_parser(result: argparse.ArgumentParser) -> None:
-    """Construct the test campaign command-line parser."""
-    result.set_defaults(test_command=None, target=None, test_parser=result)
-    commands = result.add_subparsers(
-        dest="test_command",
-        title="commands",
-        metavar="COMMAND",
-    )
+def _configure_test_parsers(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    """Construct the top-level test campaign command-line parsers."""
     coverage = commands.add_parser(
-        "coverage",
+        "test-coverage",
         help="measure test coverage and print report paths",
         description=(
             "Build Nix coverage checks for Python package test suites. "
@@ -1505,7 +1501,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     )
     _configure_test_target(coverage)
     fuzz = commands.add_parser(
-        "fuzz",
+        "test-fuzz",
         help="run Hypothesis fuzz tests",
         description=(
             "Run Hypothesis tests named test_fuzz_* in isolated package copies. "
@@ -1530,7 +1526,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     )
 
     mutation = commands.add_parser(
-        "mutation",
+        "test-mutation",
         help="run mutation tests",
         description=(
             "Run mutation tests in isolated package copies. "
@@ -1574,7 +1570,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
         help="mutation limit per package (default: unlimited)",
     )
     performance = commands.add_parser(
-        "performance",
+        "test-performance",
         help="profile tests and package CLI calls",
         description=(
             "Profile tests and package CLI calls with cProfile in isolated package "
@@ -1589,7 +1585,7 @@ def _configure_test_parser(result: argparse.ArgumentParser) -> None:
     _configure_test_selection(performance)
     _configure_test_timeout(performance)
     property_tests = commands.add_parser(
-        "property",
+        "test-property",
         help="run complete test suites, including Hypothesis tests",
         description=(
             "Run test suites, including property-based tests, "
@@ -1608,10 +1604,7 @@ def _dispatch_test_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
 ) -> None:
-    """Show campaign help or run one explicitly selected campaign."""
-    if options.test_command is None:
-        options.test_parser.print_help()
-        return
+    """Run the selected top-level test campaign."""
     target = (
         resolve_repository_path(options.target)
         if options.target is not None
@@ -1620,12 +1613,12 @@ def _dispatch_test_command(
     try:
         success = (
             _run_coverage(target)
-            if options.test_command == "coverage"
+            if options.command == "test-coverage"
             else _dispatch_test_runner(options, cli, target)
         )
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
         sys.stderr.write(
-            f"afairesi test {options.test_command}: {target}: {error}\n",
+            f"afairesi {options.command}: {target}: {error}\n",
         )
         sys.exit(1)
     sys.exit(0 if success else 1)
@@ -2660,29 +2653,23 @@ def _inspection_diff_revisions(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
     root: Path,
-) -> list[str]:
-    """Resolve Git's two-dot and three-dot comparison shorthand."""
-    revisions: list[str] = options.revisions
-    if revisions[2:]:
-        cli.error("inspect diff accepts at most two revisions")
-    if len(revisions) == 1 and ".." in revisions[0]:
-        if options.cached:
-            cli.error("inspect diff --cached accepts one revision, not a range")
-        separator = "..." if "..." in revisions[0] else ".."
-        left, right = revisions[0].split(separator, 1)
-        revisions = [left or "HEAD", right or "HEAD"]
-        if separator == "...":
-            commits = [
-                git(
-                    root,
-                    ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
-                ).stdout.strip()
-                for ref in revisions
-            ]
-            revisions[0] = git(root, ["merge-base", *commits]).stdout.strip()
-    if options.cached and len(revisions) > 1:
-        cli.error("inspect diff --cached accepts at most one revision")
-    return revisions
+) -> tuple[str | None, str | None]:
+    """Resolve named comparison endpoints and an optional common ancestor."""
+    left, right = options.from_revision, options.to_revision
+    if options.cached and right is not None:
+        cli.error("inspect-diff --cached cannot be combined with --to")
+    if options.merge_base:
+        if left is None or right is None:
+            cli.error("inspect-diff --merge-base requires --from and --to")
+        commits = [
+            git(
+                root,
+                ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
+            ).stdout.strip()
+            for ref in (left, right)
+        ]
+        left = git(root, ["merge-base", *commits]).stdout.strip()
+    return left, right
 
 
 def _dispatch_inspect_diff(
@@ -2692,20 +2679,20 @@ def _dispatch_inspect_diff(
 ) -> None:
     """Render structural inspection changes with jd's native diff implementation."""
     root = repository_root(root)
-    revisions = _inspection_diff_revisions(options, cli, root)
+    left_revision, right_revision = _inspection_diff_revisions(options, cli, root)
     if options.cached:
         head = git(root, ["rev-parse", "--verify", "HEAD"], check=False)
         before = (
-            _inspection_git_report(root, revisions[0] if revisions else "HEAD")
-            if revisions or head.returncode == 0
+            _inspection_git_report(root, left_revision or "HEAD")
+            if left_revision is not None or head.returncode == 0
             else {}
         )
         after = _inspection_git_report(root)
     else:
-        before = _inspection_git_report(root, revisions[0] if revisions else None)
+        before = _inspection_git_report(root, left_revision)
         after = (
-            _inspection_git_report(root, revisions[1])
-            if revisions[1:]
+            _inspection_git_report(root, right_revision)
+            if right_revision is not None
             else _inspection_git_report(root, working_tree=True)
         )
     if options.reverse:
@@ -2748,7 +2735,7 @@ def _dispatch_inspect(
             )
         )
         with repository as root:
-            if options.inspect_command == "diff":
+            if options.command == "inspect-diff":
                 _dispatch_inspect_diff(options, cli, root)
                 return
             report = inspect_repository(root)
@@ -2757,50 +2744,45 @@ def _dispatch_inspect(
     sys.stdout.write(json.dumps(report, indent=2) + "\n")
 
 
-def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
-    """Configure repository selection and Git-style structural diffs."""
+def _configure_inspection_target(inspection: argparse.ArgumentParser) -> None:
+    """Declare an optional repository path or remote for inspection commands."""
     inspection.add_argument(
-        "--repository",
+        "repository",
+        nargs="?",
         metavar="PATH_OR_REMOTE",
         help=(
             "repository directory or Git URL (default: current repository); "
             "relative paths use the Git root, or the current directory outside Git"
         ),
     )
-    commands = inspection.add_subparsers(
-        dest="inspect_command",
-        title="commands",
-        metavar="COMMAND",
+
+
+def _configure_inspect_diff_parser(difference: argparse.ArgumentParser) -> None:
+    """Configure named revisions and structural diff output."""
+    _configure_inspection_target(difference)
+    difference.add_argument(
+        "--from",
+        dest="from_revision",
+        metavar="REV",
+        help="baseline revision (default: index, or HEAD with --cached)",
     )
-    difference = commands.add_parser(
-        "diff",
-        help="diff inspected interfaces in jd format",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "Print a jd-compatible structural diff of repository inspections. "
-            "Compare the index with tracked working-tree sources by default, "
-            "REV with the working tree, or REV1 with REV2. "
-            "Accept REV1..REV2 and REV1...REV2 (from their merge base). "
-            "Untracked files and implementation-only changes are omitted. "
-            "Inspect source without executing it or changing Git state."
-        ),
-        epilog=(
-            "Examples:\n"
-            "  afairesi inspect diff --cached | less\n"
-            "  afairesi inspect diff --cached --color | less -R\n"
-            "  afairesi inspect diff --cached | jd -t jd2patch | jless\n"
-            "  afairesi inspect diff --cached > change.jd\n"
-            "  jd -p change.jd before.json\n"
-            "\nFor patching, before.json must contain the baseline inspection."
-        ),
+    difference.add_argument(
+        "--to",
+        dest="to_revision",
+        metavar="REV",
+        help="target revision (default: working tree); incompatible with --cached",
     )
-    difference.add_argument("revisions", nargs="*", metavar="REV")
+    difference.add_argument(
+        "--merge-base",
+        action="store_true",
+        help="compare the common ancestor of --from and --to with --to; requires both",
+    )
     difference.add_argument(
         "--cached",
         "--staged",
         dest="cached",
         action="store_true",
-        help="compare HEAD (or REV) with the index; before the first commit use {}",
+        help="compare HEAD (or --from REV) with index; before first commit use {}",
     )
     difference.add_argument(
         "--color",
@@ -2844,13 +2826,32 @@ def parser() -> argparse.ArgumentParser:
             "Inspect source without executing it."
         ),
     )
-    _configure_inspect_parser(inspection)
-    testing = commands.add_parser(
-        "test",
-        help="run tests and measure coverage or performance",
-        description="Run tests and measure coverage or performance.",
+    _configure_inspection_target(inspection)
+    difference = commands.add_parser(
+        "inspect-diff",
+        help="diff inspected interfaces in jd format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Print a jd-compatible structural diff of repository inspections. "
+            "Compare the index with tracked working-tree sources by default. "
+            "Select revisions with --from and --to; use --merge-base to compare "
+            "their common ancestor with --to. "
+            "Untracked files and implementation-only changes are omitted. "
+            "Inspect source without executing it or changing Git state."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  afairesi inspect-diff ../project --from HEAD~1 --to HEAD\n"
+            "  afairesi inspect-diff --cached | less\n"
+            "  afairesi inspect-diff --cached --color | less -R\n"
+            "  afairesi inspect-diff --cached | jd -t jd2patch | jless\n"
+            "  afairesi inspect-diff --cached > change.jd\n"
+            "  jd -p change.jd before.json\n"
+            "\nFor patching, before.json must contain the baseline inspection."
+        ),
     )
-    _configure_test_parser(testing)
+    _configure_inspect_diff_parser(difference)
+    _configure_test_parsers(commands)
 
     return result
 
@@ -2878,9 +2879,9 @@ def _dispatch_command(
     """Run the selected inspection or test command."""
     if options.command is None:
         cli.print_help()
-    elif options.command == "inspect":
+    elif options.command in {"inspect", "inspect-diff"}:
         _dispatch_inspect(options, cli)
-    elif options.command == "test":
+    elif options.command.startswith("test-"):
         _dispatch_test_command(options, cli)
 
 

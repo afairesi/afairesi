@@ -140,41 +140,44 @@ nix run github:afairesi/afairesi -- --help</code></pre>
           <h3><code>afairesi inspect</code></h3>
           <p>
             Read package metadata, CLI arguments, and test identifiers as JSON. Inspection reads
-            source without executing it. Select a local repository or Git URL with
-            <code>--repository</code>.
+            source without executing it. Pass a local repository path or Git URL as the optional
+            argument; omitting it selects the current repository.
           </p>
           <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi inspect
-afairesi inspect --repository ../project</code></pre>
+afairesi inspect ../project</code></pre>
           <p>
-            Use <code>inspect diff</code> to compare interfaces in the working tree, index, or Git
-            revisions. Implementation changes that leave the interface unchanged are omitted.
+            Use <code>inspect-diff</code> to compare interfaces in the working tree, index, or Git
+            revisions. Pass an optional repository path and select revisions with
+            <code>--from</code> and <code>--to</code>. Add <code>--merge-base</code> with both
+            revisions to compare their common ancestor with <code>--to</code>. Implementation
+            changes that leave the interface unchanged are omitted.
           </p>
-          <pre tabindex="0" aria-label="Interface comparison commands"><code>afairesi inspect diff
-afairesi inspect diff --cached
-afairesi inspect diff HEAD~1 HEAD</code></pre>
-          <h3><code>afairesi test</code></h3>
+          <pre tabindex="0" aria-label="Interface comparison commands"><code>afairesi inspect-diff
+afairesi inspect-diff --cached
+afairesi inspect-diff --from HEAD~1 --to HEAD</code></pre>
+          <h3>Python test campaigns</h3>
           <p>
             Choose a Python test campaign. The optional path selects one package or a whole flake;
             omitting it selects the current repository. Repository campaigns skip packages without
             Python tests.
           </p>
           <dl class="campaigns">
-            <dt><code>coverage</code></dt>
+            <dt><code>test-coverage</code></dt>
             <dd>Build coverage checks and print HTML report paths in the Nix store.</dd>
-            <dt><code>fuzz</code></dt>
+            <dt><code>test-fuzz</code></dt>
             <dd>Run Hypothesis tests named <code>test_fuzz_*</code>.</dd>
-            <dt><code>mutation</code></dt>
+            <dt><code>test-mutation</code></dt>
             <dd>Change source expressions to check whether the tests catch them.</dd>
-            <dt><code>performance</code></dt>
+            <dt><code>test-performance</code></dt>
             <dd>Profile tests and package CLI calls with cProfile.</dd>
-            <dt><code>property</code></dt>
+            <dt><code>test-property</code></dt>
             <dd>Run complete test suites, including Hypothesis property tests.</dd>
           </dl>
-          <pre tabindex="0" aria-label="Python test campaign examples"><code>afairesi test property
-afairesi test coverage example
-afairesi test fuzz example --max-examples 100
-afairesi test mutation example --max-mutations 20
-afairesi test performance example</code></pre>
+          <pre tabindex="0" aria-label="Python test campaign examples"><code>afairesi test-property
+afairesi test-coverage example
+afairesi test-fuzz example --max-examples 100
+afairesi test-mutation example --max-mutations 20
+afairesi test-performance example</code></pre>
           <p>
             Use <code>-k</code> and <code>-m</code> to select tests in campaigns other than
             coverage. Add <code>--help</code> to any command for its options.
