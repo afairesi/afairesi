@@ -64,23 +64,15 @@ let
   };
   latexPackage = inputs.self.lib.mkLatexPackage {
     inherit pkgs;
-    src =
-      pkgs.runCommand "latex-scaffold"
-        {
-          nativeBuildInputs = [
-            inputs.self.packages.${system}.afairesi
-            pkgs.git
-          ];
-        }
-        ''
-          mkdir repository
-          cd repository
-          git init --quiet
-          touch flake.nix flake.lock
-          git add flake.nix flake.lock
-          afairesi repo add example latex
-          cp -R example "$out"
-        '';
+    src = pkgs.runCommand "latex-source" { } ''
+      mkdir "$out"
+      cat > "$out/ms.tex" <<'EOF'
+      \documentclass{article}
+      \begin{document}
+      Hello, world.
+      \end{document}
+      EOF
+    '';
   };
   leanExample = consumer.packages.${system}.lean-example;
   leanLibrary = consumer.packages.${system}.test_main;

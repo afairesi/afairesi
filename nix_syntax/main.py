@@ -137,36 +137,6 @@ def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | Non
     return tuple(parts) if parts else None
 
 
-def compact(text: str) -> str:
-    """Normalize layout whitespace while preserving literals and comments."""
-    document = parse(text)
-    edits = []
-
-    def normalize(node: Node) -> None:
-        if node.type in {"string_expression", "indented_string_expression", "comment"}:
-            return
-        position = node.start_byte
-        line_comment = False
-        for child in node.children:
-            normalize_gap(position, child.start_byte, line_comment=line_comment)
-            normalize(child)
-            position = child.end_byte
-            line_comment = child.type == "comment" and document.text(child).startswith(
-                "#",
-            )
-        if node.children:
-            normalize_gap(position, node.end_byte, line_comment=line_comment)
-
-    def normalize_gap(start: int, end: int, *, line_comment: bool) -> None:
-        gap = document.source[start:end]
-        if gap and gap.isspace():
-            replacement = b"\n" if line_comment else b" "
-            edits.append((start, end, replacement))
-
-    normalize(document.tree.root_node)
-    return apply_edits(document.source, edits).decode().strip()
-
-
 def apply_edits(source: bytes, edits: Iterable[tuple[int, int, bytes]]) -> bytes:
     """Apply non-overlapping edits in source-coordinate order."""
     result = source

@@ -45,7 +45,7 @@ in
 inputs.self.lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
-  meta.description = "afairesi CLI for creating and maintaining repositories, packages, and hosts in the afairesi computing environment.";
+  meta.description = "afairesi CLI for inspecting and testing repositories in the afairesi computing environment.";
   passthru = {
     checkEnv.AFAIRESI_NIX_SOURCE = ../afairesi_nix;
     checkInputs = [

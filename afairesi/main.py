@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Create and maintain the afairesi computing environment."""
+"""Inspect and test repositories in the afairesi computing environment."""
 
 from __future__ import annotations
 
@@ -34,7 +34,6 @@ if TYPE_CHECKING:
     from typing import Never
 
     from tree_sitter import Node
-PACKAGE_KINDS = ("html", "latex", "lean4", "nix", "python")
 KIND_MARKERS = {
     "html": "index.html",
     "latex": "ms.tex",
@@ -74,7 +73,6 @@ def run(
     cwd: Path | None = None,
     *,
     check: bool = True,
-    input_source: str | None = None,
     capture_output: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     """Run a process with captured output or inherited terminal streams."""
@@ -83,7 +81,6 @@ def run(
         cwd=cwd,
         capture_output=capture_output,
         check=False,
-        input=input_source,
         text=True,
     )
     if check and completed.returncode != 0:
@@ -132,39 +129,6 @@ def resolve_repository_path(path: Path) -> Path:
     return (root / path).resolve()
 
 
-def repository_type(root: Path, default: str | None = None) -> str:
-    """Detect home/submodule and flake repository layouts."""
-    flake, home = _repository_type_markers(root)
-    if home and not flake:
-        return "home"
-    if flake and not home:
-        return "flake"
-    if not home and not flake and default is not None:
-        return default
-    if home and flake:
-        msg = "repository contains markers for both home and flake layouts"
-        raise CommandError(msg)
-    msg = (
-        "cannot determine the repository type; run "
-        "'afairesi home init' or "
-        "'afairesi repo init'"
-    )
-    raise CommandError(msg)
-
-
-def _repository_type_markers(root: Path) -> tuple[bool, bool]:
-    """Recognize home and flake layouts for lifecycle commands."""
-    markers = ("flake.nix", "flake.lock", ".gitmodules")
-    paths = (
-        _tracked_paths(root)
-        if (root / ".git").exists()
-        else {Path(marker) for marker in markers if (root / marker).exists()}
-    )
-    flake = any(Path(marker) in paths for marker in ("flake.nix", "flake.lock"))
-    home = Path(".gitmodules") in paths
-    return flake, home
-
-
 def read_regular(path: Path) -> str | None:
     """Read an optional regular file, rejecting other filesystem entries."""
     try:
@@ -175,36 +139,6 @@ def read_regular(path: Path) -> str | None:
         msg = f"{path}: must be a regular file"
         raise CommandError(msg)
     return path.read_text(encoding="utf-8")
-
-
-def report_change(message: str, *, dry_run: bool) -> None:
-    """Report one deterministic convergence action."""
-    sys.stdout.write((("would " if dry_run else "") + message) + "\n")
-
-
-def write_managed(
-    root: Path,
-    relative: Path,
-    source: str,
-    *,
-    dry_run: bool,
-    executable: bool = False,
-) -> bool:
-    """Write and stage one managed file when its contents or mode differ."""
-    path = root / relative
-    current = read_regular(path)
-    current_mode = path.lstat().st_mode if path.exists() else 0
-    mode_matches = bool(current_mode & 0o111) == executable
-    if current == source and mode_matches and relative in _tracked_paths(root):
-        return False
-    report_change(f"write '{relative}'", dry_run=dry_run)
-    if dry_run:
-        return True
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(source, encoding="utf-8")
-    path.chmod(0o755 if executable else 0o644)
-    git(root, ["add", "--force", "--", str(relative)])
-    return True
 
 
 def _tracked_paths(root: Path) -> set[Path]:
@@ -224,45 +158,6 @@ def source_paths(root: Path) -> set[Path]:
             (directory / name).relative_to(root) for name in filenames if name != ".git"
         )
     return paths
-
-
-def hosted_remote(remote: str) -> tuple[str, str]:
-    """Read hosted remote components with Git's native URL parser."""
-    components = [
-        run(["git", "url-parse", "--component", component, "--", remote], check=False)
-        for component in ("scheme", "host", "path")
-    ]
-    scheme, host, path = [result.stdout.strip() for result in components]
-    if (
-        all(result.returncode == 0 for result in components)
-        and scheme in {"http", "https", "ssh", "git+ssh", "git"}
-        and host
-        and path.strip("/")
-    ):
-        return host.lower(), path.strip("/")
-    msg = f"remote URL has no canonical host and repository path: {remote}"
-    raise CommandError(
-        msg,
-    )
-
-
-def canonical_remote_path(remote: str) -> Path:
-    """Map a hosted remote to its canonical home-relative path."""
-    host, remote_path = hosted_remote(remote)
-    remote_path = remote_path.removesuffix(".git")
-    components = [host, *remote_path.split("/")]
-    if any(
-        not re.fullmatch(r"[A-Za-z0-9._-]+", component) or component in {".", ".."}
-        for component in components
-    ):
-        msg = (
-            "repository path components must contain only ASCII letters, "
-            "digits, '.', '-', or '_'"
-        )
-        raise CommandError(
-            msg,
-        )
-    return Path(*components)
 
 
 def _package_kind(name: str, markers: set[str], definition: str | None) -> str:
@@ -374,7 +269,7 @@ def validate_python_package_names(packages: list[Package]) -> None:
 
 
 def package_files(package: Package) -> set[Path]:
-    """Return conventional managed files for a package kind."""
+    """Return conventional source files for a package kind."""
     relative = Path() / package.name
     kind_files = {
         "python": {"main.py", "test_main.py"},
@@ -398,12 +293,14 @@ def required_package_files(package: Package) -> set[Path]:
     return {path for path in package_files(package) if path.name not in optional}
 
 
-def managed_paths(root: Path, packages: list[Package], paths: set[Path]) -> set[Path]:
-    """Select tracked conventional files whose structure Afairesi manages."""
-    managed = {Path(item) for item in ROOT_FILES} & paths
+def _conventional_paths(
+    root: Path, packages: list[Package], paths: set[Path]
+) -> set[Path]:
+    """Select tracked conventional files for source validation."""
+    conventional = {Path(item) for item in ROOT_FILES} & paths
     for host in detect_hosts(root, paths):
         validate_name(host.name)
-        managed.update(
+        conventional.update(
             {
                 Path(host.name) / "configuration.nix",
                 Path(host.name) / "hardware-configuration.nix",
@@ -411,41 +308,8 @@ def managed_paths(root: Path, packages: list[Package], paths: set[Path]) -> set[
             & paths,
         )
     for package in packages:
-        managed.update(package_files(package) & paths)
-    return managed
-
-
-def validate_flake_layout(root: Path) -> None:
-    """Validate tracked conventional files without examining local-only trees."""
-    paths = source_paths(root)
-    conventional = {
-        "default.nix",
-        "main.py",
-        "main.nix",
-        "main.lean",
-        "index.html",
-        "ms.tex",
-        "test_main.py",
-        "test_main.nix",
-        "test_main.lean",
-        "configuration.nix",
-        "hardware-configuration.nix",
-    }
-    for relative in paths:
-        if relative.as_posix() in ROOT_FILES or (
-            len(relative.parts) == RESOURCE_PATH_COMPONENTS + 1
-            and relative.name in conventional
-        ):
-            validate_managed_path(root, relative)
-    packages = detect_packages(root, paths)
-    for package in packages:
-        tests = package.root / "test_main.py"
-        if (
-            package.kind == "python"
-            and tests.relative_to(root) in paths
-            and tests.is_file()
-        ):
-            has_python_tests(tests)
+        conventional.update(package_files(package) & paths)
+    return conventional
 
 
 def inspect_structure(
@@ -463,7 +327,7 @@ def inspect_structure(
             for relative in sorted(required_package_files(package))
             if relative not in paths or not (root / relative).is_file()
         )
-    for relative in sorted(managed_paths(root, packages, paths)):
+    for relative in sorted(_conventional_paths(root, packages, paths)):
         path = root / relative
         if path.is_symlink():
             issues.append(
@@ -664,46 +528,6 @@ def _meta_description(source: str) -> str | None:
     return nix_syntax.string_value(document, matches[0]) if len(matches) == 1 else None
 
 
-def _package_binding_edits(
-    document: nix_syntax.Document,
-    container: Node,
-    name: str,
-    value: str,
-    *,
-    overwrite: bool,
-) -> list[tuple[int, int, bytes]]:
-    """Set one package attribute, retaining unrelated fields and inherited names."""
-    bindings = nix_syntax.binding_set(container)
-    children = [] if bindings is None else bindings.named_children
-    for binding in children:
-        attrpath = binding.child_by_field_name("attrpath")
-        expression = binding.child_by_field_name("expression")
-        if (
-            attrpath is not None
-            and expression is not None
-            and nix_syntax.static_attrpath(document, attrpath) == (name,)
-        ):
-            if not overwrite or document.text(expression) == value:
-                return []
-            return [(expression.start_byte, expression.end_byte, value.encode())]
-    if any(
-        document.text(attr) == name
-        for binding in children
-        if (attrs := binding.child_by_field_name("attrs")) is not None
-        for attr in attrs.named_children
-    ):
-        return []
-    offset = container.end_byte - 1
-    return [(offset, offset, f"\n  {name} = {value};\n".encode())]
-
-
-def source_python_has_main(source: str | None) -> bool:
-    """Recognize the module-level main binding used by canonical wrappers."""
-    if source is None:
-        return True
-    return _module_main_binding(ast.parse(source, filename="main.py")) is not None
-
-
 def _module_main_binding(module: ast.Module) -> ast.stmt | None:
     """Find the last explicit module-level binding used by the executable."""
     for node in reversed(module.body):
@@ -747,169 +571,6 @@ def _package_body(document: nix_syntax.Document) -> Node:
             raise CommandError(msg)
         body = child
     return body
-
-
-def _shared_package_required_edits(
-    package: Package,
-    document: nix_syntax.Document,
-) -> list[tuple[int, int, bytes]] | None:
-    """Repair recognizable builder calls with literal package attributes."""
-    body = _package_body(document)
-    argument = body.child_by_field_name("argument")
-    function = body.child_by_field_name("function")
-    builder = PACKAGE_BUILDERS[package.kind]
-    if (
-        body.type != "apply_expression"
-        or function is None
-        or _resource_constructor(document, function) != builder
-        or argument is None
-        or argument.type not in {"attrset_expression", "rec_attrset_expression"}
-    ):
-        return None
-    outer = document.root
-    while outer.type == "parenthesized_expression":
-        outer = cast("Node", outer.child_by_field_name("expression"))
-    formals = outer.child_by_field_name("formals")
-    if formals is None:
-        return None
-    edits = [
-        *_package_binding_edits(document, argument, "pkgs", "pkgs", overwrite=False),
-        *_package_binding_edits(document, argument, "src", "./.", overwrite=False),
-    ]
-    if package.kind in {"python", "lean4"}:
-        edits.extend(
-            _package_binding_edits(
-                document,
-                argument,
-                "executable",
-                "true"
-                if package.kind == "lean4"
-                or source_python_has_main(read_regular(package.root / "main.py"))
-                else "false",
-                overwrite=package.kind == "python"
-                and any(
-                    document.text(value) in {"true", "false"}
-                    for value in _attrset_expression(
-                        document, argument, ("executable",)
-                    )
-                ),
-            ),
-        )
-    if not edits:
-        return []
-    names = {
-        document.text(name)
-        for child in formals.named_children
-        if child.type == "formal"
-        and (name := child.child_by_field_name("name")) is not None
-    }
-    missing = [name for name in ("inputs", "pkgs") if name not in names]
-    if missing:
-        edits.append(
-            (
-                formals.start_byte + 1,
-                formals.start_byte + 1,
-                (" " + ", ".join(missing) + ",").encode(),
-            ),
-        )
-    return edits
-
-
-def canonical_package_default(package: Package) -> str | None:
-    """Create missing definitions or repair supported expressions conservatively."""
-    source = read_regular(package.root / "default.nix")
-    if source is None:
-        source = scaffold(package.kind, package.name, None)[
-            Path() / package.name / "default.nix"
-        ]
-        if package.kind == "nix":
-            return source
-    document = nix_syntax.parse(source, str(package.root / "default.nix"))
-    if package.kind == "nix":
-        return None
-    edits = _shared_package_required_edits(package, document)
-    if edits is None:
-        return None
-    return cast("bytes", nix_syntax.apply_edits(document.source, edits)).decode()
-
-
-def _write_managed_nix(
-    root: Path,
-    relative: Path,
-    source: str,
-    *,
-    dry_run: bool,
-) -> bool:
-    """Write a Nix template only when its formatted structure differs."""
-    current = read_regular(root / relative)
-    if current is not None and relative not in source_paths(root):
-        msg = f"{relative}: untracked file; select it with git add before repair"
-        raise CommandError(msg)
-    if current is not None and nix_syntax.compact(current) == nix_syntax.compact(
-        source,
-    ):
-        source = current
-    return write_managed(root, relative, source, dry_run=dry_run)
-
-
-def _converge_packages(root: Path, packages: list[Package], *, dry_run: bool) -> bool:
-    """Converge package templates and required source files."""
-    changed = False
-    for package in packages:
-        expected_default = canonical_package_default(package)
-        if expected_default is not None:
-            relative = Path() / package.name / "default.nix"
-            changed |= _write_managed_nix(
-                root,
-                relative,
-                expected_default,
-                dry_run=dry_run,
-            )
-        elif package.kind != "nix":
-            sys.stderr.write(
-                f"{package.name}/default.nix: automatic repair unavailable for this "
-                "expression; leaving it unchanged. Edit it manually if needed.\n"
-            )
-        expected_files = scaffold(
-            package.kind,
-            package.name,
-            package_description(package),
-        )
-        for relative, source in expected_files.items():
-            if (
-                relative.name == "default.nix"
-                or relative not in required_package_files(package)
-                or (root / relative).exists()
-            ):
-                continue
-            changed |= write_managed(
-                root,
-                relative,
-                source,
-                dry_run=dry_run,
-            )
-    return changed
-
-
-def _converge_file_modes(
-    root: Path,
-    managed: set[Path],
-    *,
-    dry_run: bool,
-) -> bool:
-    """Normalize modes of tracked conventional files without admitting new files."""
-    changed = False
-    for relative in sorted(managed):
-        path = root / relative
-        if not path.is_file() or path.is_symlink():
-            continue
-        if path.stat().st_mode & 0o111:
-            report_change(f"set mode on '{relative}'", dry_run=dry_run)
-            changed = True
-            if not dry_run:
-                path.chmod(0o644)
-                git(root, ["add", "--", str(relative)])
-    return changed
 
 
 def _resource_constructor(
@@ -980,42 +641,6 @@ def _validate_flake_syntax(root: Path) -> None:
         nix_syntax.parse(source, "flake.nix")
 
 
-def converge_flake(
-    root: Path,
-    *,
-    dry_run: bool,
-) -> None:
-    """Converge required files, structure, and templates."""
-    missing = [
-        name for name in ("flake.nix", "flake.lock") if not (root / name).is_file()
-    ]
-    if missing:
-        raise CommandError("missing required file: " + missing[0])
-    paths = source_paths(root)
-    packages = detect_packages(root, paths)
-    _validate_flake_syntax(root)
-    issues = []
-    for package in packages:
-        validate_name(package.name)
-        issues.extend(_python_source_issues(package, paths))
-        canonical_package_default(package)
-    if issues:
-        raise CommandError("\n".join(issues))
-    changed = _converge_packages(root, packages, dry_run=dry_run)
-    changed |= _converge_file_modes(
-        root,
-        managed_paths(root, packages, source_paths(root))
-        - {
-            Path(package.name) / "main.py"
-            for package in packages
-            if package.kind == "python"
-        },
-        dry_run=dry_run,
-    )
-    if not (dry_run and changed):
-        validate_flake_source(root)
-
-
 def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     paths = source_paths(root)
@@ -1034,273 +659,6 @@ def validate_flake_source(root: Path) -> None:
                 source = root / relative
                 if source.is_file():
                     nix_syntax.parse(source.read_bytes(), str(source))
-
-
-def scaffold(
-    kind: str,
-    name: str,
-    description: str | None,
-) -> dict[Path, str]:
-    """Render one supported package."""
-    description = (
-        description
-        or {
-            "python": "A Python package.",
-            "html": "An HTML package.",
-            "latex": "A LaTeX package.",
-            "lean4": "A Lean 4 package.",
-            "nix": "A Nix package.",
-        }[kind]
-    )
-    description_literal = nix_syntax.quote_string(description)
-    root = Path() / name
-    defaults = {
-        "lean4": """{ inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkLean4Package {
-  inherit pkgs;
-  executable = true;
-  meta.description = __DESCRIPTION__;
-  src = ./.;
-}
-""",
-        "python": """{ inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkPythonPackage {
-  inherit pkgs;
-  executable = true;
-  meta.description = __DESCRIPTION__;
-  propagatedBuildInputs = [ ];
-  src = ./.;
-}
-""",
-        "html": """{ inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkHtmlPackage {
-  inherit pkgs;
-  meta.description = __DESCRIPTION__;
-  src = ./.;
-}
-""",
-        "latex": """{ inputs, pkgs, ... }:
-(inputs.afairesi or inputs.self).lib.mkLatexPackage {
-  inherit pkgs;
-  meta.description = __DESCRIPTION__;
-  src = ./.;
-}
-""",
-        "nix": """{ pkgs, ... }:
-pkgs.writeTextFile {
-  name = baseNameOf ./.;
-  text = "";
-  meta.description = __DESCRIPTION__;
-}
-""",
-    }
-    default = defaults[kind].replace("__DESCRIPTION__", description_literal)
-    files: dict[Path, str] = {root / "default.nix": default}
-    if kind == "python":
-        files[root / "main.py"] = (
-            "# ruff: noqa: CPY001 - Set copyright ownership when publishing.\n"
-            f"{description!r}\n\n\n"
-            "def main() -> None:\n"
-            f'    """Run {name}."""\n'
-            "\n\n"
-            'if __name__ == "__main__":\n    main()\n'
-        )
-    elif kind == "lean4":
-        files[root / "main.lean"] = (
-            "/-- Run the application. -/\ndef main : IO Unit :=\n  pure ()\n"
-        )
-    elif kind == "html":
-        files[root / "index.html"] = "<!doctype html><html><body></body></html>\n"
-    elif kind == "latex":
-        files[root / "ms.tex"] = (
-            "\\documentclass{article}\n\\begin{document}\n"
-            "Hello, world.\n\\end{document}\n"
-        )
-    return files
-
-
-def validate_managed_path(root: Path, relative: Path) -> None:
-    """Reject symlinks and non-directory ancestors before modifying managed paths."""
-    for component in (*reversed(relative.parents), relative):
-        path = root / component
-        if path.is_symlink() or (
-            component != relative and path.exists() and not path.is_dir()
-        ):
-            msg = (
-                f"{component}: managed paths cannot contain symlinks or file ancestors"
-            )
-            raise CommandError(msg)
-
-
-def missing_directories(root: Path, paths: list[Path]) -> list[Path]:
-    """Remember missing directories for cleanup after a failed operation."""
-    directories = {parent for path in paths for parent in (path, *path.parents)}
-    return sorted(
-        (
-            root / path
-            for path in directories
-            if path != Path() and not (root / path).exists()
-        ),
-        key=lambda path: len(path.parts),
-        reverse=True,
-    )
-
-
-def remove_empty_directories(directories: list[Path]) -> None:
-    """Remove only directories created by an operation that remain empty."""
-    for directory in directories:
-        with contextlib.suppress(OSError):
-            directory.rmdir()
-
-
-def add_package(
-    root: Path,
-    kind: str,
-    name: str,
-    description: str | None = None,
-) -> None:
-    """Create a package transactionally and stage its managed files."""
-    if kind not in PACKAGE_KINDS:
-        msg = (
-            f"unsupported package type: {kind}\n"
-            f"hint: supported package types: {', '.join(PACKAGE_KINDS)}"
-        )
-        raise CommandError(
-            msg,
-        )
-    validate_name(name)
-    files = scaffold(kind, name, description)
-    relative = Path() / name
-    if (root / relative).exists():
-        msg = f"package already exists: {name}"
-        raise CommandError(msg)
-    validate_python_package_names(
-        [*detect_packages(root), Package(name, kind, root / relative)],
-    )
-    directories = missing_directories(root, [relative])
-    created: list[Path] = []
-    try:
-        for relative, source in files.items():
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            created.append(path)
-            path.write_text(source, encoding="utf-8")
-            path.chmod(0o644)
-        generated = [str(path.relative_to(root)) for path in created]
-        git(root, ["add", "--force", "--", *generated])
-    except BaseException:
-        for path in reversed(created):
-            path.unlink(missing_ok=True)
-        remove_empty_directories(directories)
-        raise
-
-
-def add_host(root: Path, name: str) -> None:
-    """Create a host and stage its canonical configuration."""
-    validate_name(name)
-    relative = Path() / name / "configuration.nix"
-    path = root / relative
-    if path.parent.exists():
-        msg = f"host already exists: {name}"
-        raise CommandError(msg)
-    directories = missing_directories(root, [relative.parent])
-    try:
-        path.parent.mkdir(parents=True)
-        path.write_text("{ ... }: { }\n", encoding="utf-8")
-        git(root, ["add", "--force", "--", str(relative)])
-    except BaseException:
-        path.unlink(missing_ok=True)
-        remove_empty_directories(directories)
-        raise
-
-
-def require_nix_flakes() -> None:
-    """Check the effective Nix features before initialization changes files."""
-    try:
-        completed = run(
-            ["nix", "config", "show", "experimental-features"],
-            check=False,
-        )
-    except FileNotFoundError as error:
-        msg = "Nix executable not found: nix; install Nix to use repo init"
-        raise CommandError(msg) from error
-    if completed.returncode != 0:
-        msg = f"could not check Nix features: {completed.stderr.strip()}"
-        raise CommandError(
-            msg + "\nrepo init requires Nix with "
-            "'experimental-features = nix-command flakes'",
-        )
-    missing = {"nix-command", "flakes"} - set(completed.stdout.split())
-    if missing:
-        msg = (
-            f"repo init requires Nix features: {', '.join(sorted(missing))}; "
-            "enable them with 'experimental-features = nix-command flakes' "
-            "in your Nix configuration"
-        )
-        raise CommandError(msg)
-
-
-def initialize_flake(root: Path) -> None:
-    """Scaffold and format a new flake in an existing repository directory."""
-    (root / "flake.nix").write_text(
-        "{\n"
-        '  inputs.afairesi.url = "github:afairesi/afairesi";\n'
-        "  outputs =\n"
-        "    inputs:\n"
-        "    inputs.afairesi.lib.mkFlake {\n"
-        "      inherit inputs;\n"
-        "    };\n"
-        "}\n",
-        encoding="utf-8",
-    )
-    git(root, ["add", "--force", "--", "flake.nix"])
-    run(["nix", "flake", "lock"], cwd=root, capture_output=False)
-    git(root, ["add", "--force", "--", "flake.lock"])
-    run(["nix", "fmt"], cwd=root, capture_output=False)
-    git(root, ["add", "--", "flake.lock", "flake.nix"])
-
-
-def initialize_repository() -> None:
-    """Initialize an empty Git worktree transactionally and stage its files."""
-    root = repository_root()
-    if (
-        any(path.name != ".git" for path in root.iterdir())
-        or git(
-            root,
-            ["ls-files", "--cached"],
-        ).stdout
-    ):
-        msg = "repo init requires an empty Git worktree; existing files are preserved"
-        raise CommandError(msg)
-    require_nix_flakes()
-    index = Path(
-        git(
-            root,
-            ["rev-parse", "--path-format=absolute", "--git-path", "index"],
-        ).stdout.strip(),
-    )
-    original_index = (
-        (index.read_bytes(), stat.S_IMODE(index.stat().st_mode))
-        if index.exists()
-        else None
-    )
-    try:
-        initialize_flake(root)
-    except BaseException:
-        for path in root.iterdir():
-            if path.name == ".git":
-                continue
-            if path.is_dir() and not path.is_symlink():
-                shutil.rmtree(path)
-            else:
-                path.unlink()
-        if original_index is None:
-            index.unlink(missing_ok=True)
-        else:
-            contents, mode = original_index
-            index.write_bytes(contents)
-            index.chmod(mode)
-        raise
 
 
 def _unittest_classes(module: ast.Module) -> set[str]:
@@ -1331,20 +689,6 @@ def _unittest_classes(module: ast.Module) -> set[str]:
     }:
         found.update(additions)
     return found
-
-
-def _command_target(target: Path | None) -> Path:
-    """Honor an explicit path or select the current Afairesi repository."""
-    if target is not None:
-        return resolve_repository_path(target)
-    root = repository_root()
-    if repository_type(root) != "flake":
-        msg = (
-            "test campaigns require a flake; use git submodule foreach "
-            "'afairesi repo test' for home"
-        )
-        raise CommandError(msg)
-    return root
 
 
 def _test_target_root(package: Path) -> Path:
@@ -1967,7 +1311,7 @@ def _run_test_repository(
         ) as error:
             outcomes[package.name] = "failed"
             sys.stderr.write(
-                f"afairesi repo test {command}: {package.name}: {error}\n",
+                f"afairesi test {command}: {package.name}: {error}\n",
             )
             if isinstance(error, subprocess.CalledProcessError):
                 _report_process_failure(error)
@@ -2091,7 +1435,7 @@ def _run_coverage(target: Path) -> bool:
             if not repository and isinstance(error, subprocess.CalledProcessError):
                 raise
             outcomes[package.name] = "failed"
-            sys.stderr.write(f"afairesi repo test coverage: {package.name}: {error}\n")
+            sys.stderr.write(f"afairesi test coverage: {package.name}: {error}\n")
             if isinstance(error, subprocess.CalledProcessError):
                 _report_process_failure(error)
     if repository:
@@ -2268,7 +1612,11 @@ def _dispatch_test_command(
     if options.test_command is None:
         options.test_parser.print_help()
         return
-    target = _command_target(options.target)
+    target = (
+        resolve_repository_path(options.target)
+        if options.target is not None
+        else repository_root()
+    )
     try:
         success = (
             _run_coverage(target)
@@ -2277,7 +1625,7 @@ def _dispatch_test_command(
         )
     except (CommandError, OSError, subprocess.TimeoutExpired) as error:
         sys.stderr.write(
-            f"afairesi repo test {options.test_command}: {target}: {error}\n",
+            f"afairesi test {options.test_command}: {target}: {error}\n",
         )
         sys.exit(1)
     sys.exit(0 if success else 1)
@@ -3438,10 +2786,10 @@ def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
         ),
         epilog=(
             "Examples:\n"
-            "  afairesi repo inspect diff --cached | less\n"
-            "  afairesi repo inspect diff --cached --color | less -R\n"
-            "  afairesi repo inspect diff --cached | jd -t jd2patch | jless\n"
-            "  afairesi repo inspect diff --cached > change.jd\n"
+            "  afairesi inspect diff --cached | less\n"
+            "  afairesi inspect diff --cached --color | less -R\n"
+            "  afairesi inspect diff --cached | jd -t jd2patch | jless\n"
+            "  afairesi inspect diff --cached > change.jd\n"
             "  jd -p change.jd before.json\n"
             "\nFor patching, before.json must contain the baseline inspection."
         ),
@@ -3472,58 +2820,16 @@ def _configure_inspect_parser(inspection: argparse.ArgumentParser) -> None:
     )
 
 
-def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
-    """Construct the flake resource command-line parser."""
+def parser() -> argparse.ArgumentParser:
+    """Construct the inspection and testing command-line parser."""
+    result = argparse.ArgumentParser(
+        prog="afairesi",
+        description=(
+            "Inspect and test repositories in the afairesi computing environment."
+        ),
+    )
     commands = result.add_subparsers(
-        dest="command",
-        title="commands",
-        metavar="COMMAND",
-    )
-    create = commands.add_parser(
-        "add",
-        help="create and stage a package or host",
-        description=(
-            "Create and stage a package or host. "
-            "Generate checks from test_main.py, test_main.lean, test_main.nix, "
-            "and host configurations. "
-            "Track supporting files explicitly with git add."
-        ),
-    )
-    create.add_argument(
-        "resource_name",
-        metavar="RESOURCE",
-        help="new directory name at the flake root",
-    )
-    create.add_argument(
-        "resource_type",
-        metavar="TYPE",
-        choices=(*PACKAGE_KINDS, "host"),
-        help=f"resource type ({', '.join((*PACKAGE_KINDS, 'host'))})",
-    )
-    fix = commands.add_parser(
-        "fix",
-        help="fix and stage tracked flake structure",
-        description=(
-            "Fix and stage tracked flake structure, preserving local files. "
-            "Track supporting files explicitly with git add. "
-            "Cleanup is separate: preview untracked project files with "
-            "git clean -ndx; remove them with git clean -fdx. "
-            "Format tracked sources with nix fmt; validate with nix flake check."
-        ),
-    )
-    fix.add_argument(
-        "-n",
-        "--dry-run",
-        action="store_true",
-        help="preview structural changes without modifying files or staging",
-    )
-    commands.add_parser(
-        "init",
-        help="initialize and stage a flake in an empty Git worktree",
-        description=(
-            "Initialize and stage a flake in an empty Git worktree. "
-            "Use Git to configure remotes, commit, and push."
-        ),
+        dest="command", title="commands", metavar="COMMAND"
     )
     inspection = commands.add_parser(
         "inspect",
@@ -3546,377 +2852,7 @@ def _configure_repo_parser(result: argparse.ArgumentParser) -> None:
     )
     _configure_test_parser(testing)
 
-
-def home_submodule_paths(root: Path) -> list[Path]:
-    """Read registered paths and validate fields with Git's configuration parser."""
-    modules = root / ".gitmodules"
-    if not modules.exists():
-        return []
-    read_regular(modules)
-    completed = git(
-        root,
-        [
-            "config",
-            "get",
-            "--file",
-            str(modules),
-            "--null",
-            "--show-names",
-            "--all",
-            "--regexp",
-            r"^submodule\..*\.(path|url)$",
-        ],
-        check=False,
-    )
-    if completed.returncode == 1 and not completed.stdout and not completed.stderr:
-        return []
-    if completed.returncode != 0:
-        msg = f"could not read {modules}: {completed.stderr.strip()}"
-        raise CommandError(msg)
-    grouped: dict[str, dict[str, str]] = {}
-    for record in completed.stdout.split("\0"):
-        if not record:
-            continue
-        key, separator, value = record.partition("\n")
-        match = re.fullmatch(r"submodule\.(.+)\.(path|url)", key)
-        if not separator or match is None:
-            msg = "malformed .gitmodules field"
-            raise CommandError(msg)
-        fields = grouped.setdefault(match.group(1), {})
-        if match.group(2) in fields:
-            msg = f'submodule "{match.group(1)}": duplicate {match.group(2)} field'
-            raise CommandError(msg)
-        fields[match.group(2)] = value
-    paths = []
-    for name, fields in grouped.items():
-        if "path" not in fields:
-            msg = f'submodule "{name}": must have exactly one path'
-            raise CommandError(
-                msg,
-            )
-        paths.append(Path(fields["path"]))
-    return paths
-
-
-def _home_ignore_rules(paths: list[Path]) -> set[str]:
-    """Allow home metadata and literal submodule directories at every depth."""
-    rules = {"*", "!/.gitignore", "!/.gitmodules"}
-    for path in paths:
-        if path.is_absolute() or ".." in path.parts or not path.parts:
-            msg = f"invalid home submodule path: {path}"
-            raise CommandError(msg)
-        for depth in range(1, len(path.parts) + 1):
-            relative = Path(*path.parts[:depth]).as_posix()
-            if "\n" in relative or "\r" in relative:
-                msg = f"invalid home submodule path: {path}"
-                raise CommandError(msg)
-            escaped = re.sub(r"([\\*?\[\] ])", r"\\\1", relative)
-            rules.add(f"!/{escaped}/")
-    return rules
-
-
-def _home_ignore_source(source: str, added: set[str], removed: set[str]) -> str:
-    """Apply one home operation's rules, retaining unrelated lines and parent access."""
-    lines = source.splitlines(keepends=True)
-    other = [line for line in lines if line.rstrip("\r\n") not in removed]
-    retained = {
-        rule
-        for rule in removed
-        if rule.endswith("/") and any(line.startswith(rule) for line in other)
-    }
-    lines = [line for line in lines if line.rstrip("\r\n") not in removed - retained]
-    missing = added - {line.rstrip("\r\n") for line in lines}
-    updated = ("*\n" if "*" in missing else "") + "".join(lines)
-    additions = "".join(rule + "\n" for rule in sorted(missing - {"*"}))
-    separator = "\n" if additions and updated and not updated.endswith("\n") else ""
-    return updated + separator + additions
-
-
-def _home_ignore_state(root: Path) -> tuple[str | None, str, str | None]:
-    """Read regular working and staged ignore files before changing home structure."""
-    source = read_regular(root / ".gitignore")
-    if not (root / ".git").exists():
-        return source, "100644", None
-    entries = git(root, ["ls-files", "--stage", "-z", "--", ".gitignore"]).stdout
-    mode = "100644"
-    indexed = None
-    if entries:
-        fields = entries.split("\t", 1)[0].split()
-        if fields[2] != "0" or fields[0] not in {"100644", "100755"}:
-            msg = ".gitignore: index must contain a regular file without conflicts"
-            raise CommandError(msg)
-        mode = fields[0]
-        indexed = git(root, ["cat-file", "blob", fields[1]]).stdout
-    return source, mode, indexed
-
-
-def _update_home_ignore(
-    root: Path,
-    added: set[str],
-    removed: set[str],
-    state: tuple[str | None, str, str | None],
-) -> None:
-    """Update working and staged allowlists independently to retain personal edits."""
-    source, mode, indexed = state
-    updated = _home_ignore_source(source or "", added, removed)
-    staged = _home_ignore_source(indexed or "", added, removed)
-    if (source or "") == updated and (indexed or "") == staged:
-        return
-    report_change("write '.gitignore'", dry_run=False)
-    if (source or "") != updated:
-        (root / ".gitignore").write_text(updated, encoding="utf-8")
-    if (indexed or "") != staged:
-        blob = run(
-            ["git", "hash-object", "-w", "--stdin"], cwd=root, input_source=staged
-        )
-        git(
-            root,
-            [
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                f"{mode},{blob.stdout.strip()},.gitignore",
-            ],
-        )
-
-
-def remove_home_submodule(
-    root: Path,
-    value: str,
-    *,
-    force: bool = False,
-) -> None:
-    """Remove a registered home submodule and stage its registration change."""
-    relative = Path(value)
-    paths = home_submodule_paths(root)
-    if relative.is_absolute() or ".." in relative.parts or relative not in paths:
-        msg = f"not a registered home submodule: {value}"
-        raise CommandError(msg)
-    removed = _home_ignore_rules([relative]) - _home_ignore_rules(
-        [path for path in paths if path != relative]
-    )
-    ignore_state = _home_ignore_state(root)
-    arguments = ["rm", "-r"]
-    if force:
-        arguments.append("--force")
-    run(
-        ["git", *arguments, "--", f":(literal){relative.as_posix()}"],
-        cwd=root,
-        capture_output=False,
-    )
-    _update_home_ignore(
-        root,
-        set(),
-        removed,
-        ignore_state,
-    )
-
-
-def initialize_home() -> None:
-    """Initialize home metadata and add missing home allowlist rules."""
-    root = Path.home()
-    if repository_type(root, "home") != "home":
-        msg = "cannot initialize a flake repository as a home repository"
-        raise CommandError(msg)
-    ignore_state = _home_ignore_state(root)
-    run(["git", "init", "--", str(root)], capture_output=False)
-    if not (root / ".gitmodules").exists():
-        write_managed(root, Path(".gitmodules"), "", dry_run=False)
-    _update_home_ignore(
-        root,
-        _home_ignore_rules(home_submodule_paths(root)),
-        set(),
-        ignore_state,
-    )
-
-
-def _require_home_repository() -> Path:
-    """Validate home setup and explain how to initialize it."""
-    home = Path.home()
-    completed = git(
-        home,
-        ["rev-parse", "--path-format=absolute", "--show-toplevel"],
-        check=False,
-    )
-    if completed.returncode != 0:
-        msg = "$HOME must be a Git repository; run 'afairesi home init' first"
-        raise CommandError(msg)
-    if Path(completed.stdout.strip()) != home or repository_type(home, "git") != "home":
-        msg = (
-            "$HOME must be an initialized canonical home repository; "
-            "run 'afairesi home init' first"
-        )
-        raise CommandError(msg)
-    return home
-
-
-def initialize_submodule(
-    remote: str,
-    *,
-    force: bool = False,
-) -> None:
-    """Add a hosted repository at its canonical home-relative path."""
-    relative = canonical_remote_path(remote)
-    home = _require_home_repository()
-    validate_managed_path(home, relative)
-    directories = missing_directories(home, [relative.parent])
-    if any(path.is_relative_to(relative) for path in _tracked_paths(home)):
-        msg = f"{relative}: already exists in the index"
-        raise CommandError(msg)
-    arguments = ["git", "submodule", "add", "--force"]
-    storage = Path(
-        git(home, ["rev-parse", "--git-path", f"modules/{relative}"]).stdout.strip(),
-    )
-    if not storage.is_absolute():
-        storage = home / storage
-    if storage.exists() and not force:
-        msg = f"retained Git history exists for {relative}; use --force to reuse it"
-        raise CommandError(msg)
-    ignore_state = _home_ignore_state(home)
-    try:
-        run(
-            [*arguments, "--", remote, relative.as_posix()],
-            cwd=home,
-            capture_output=False,
-        )
-        _update_home_ignore(
-            home,
-            _home_ignore_rules([relative]),
-            set(),
-            ignore_state,
-        )
-    except BaseException:
-        remove_empty_directories(directories)
-        raise
-
-
-def _configure_home_parser(result: argparse.ArgumentParser) -> None:
-    """Construct the home repository command-line parser."""
-    commands = result.add_subparsers(
-        dest="command",
-        title="commands",
-        metavar="COMMAND",
-    )
-    add = commands.add_parser(
-        "add",
-        help="add and stage a submodule",
-        description=(
-            "Add a submodule at $HOME/<remote-hostname>/<repository-path>. "
-            "Stage its registration and home allowlist exceptions."
-        ),
-    )
-    add.add_argument("remote", metavar="REMOTE", help="hosted Git repository URL")
-    add.add_argument(
-        "-f",
-        "--force",
-        action="store_true",
-        help="pass --force to git submodule add, including reuse of retained Git data",
-    )
-    commands.add_parser(
-        "init",
-        help="initialize the home repository and add missing allowlist rules",
-        description=(
-            "Initialize the home repository and create .gitmodules if missing. "
-            "Add and stage missing .gitignore rules for metadata and registered paths. "
-            "Preserve other rules and their staging. "
-            "After native Git moves or removals, edit ~/.gitignore manually."
-        ),
-    )
-    remove = commands.add_parser(
-        "rm",
-        help="remove and stage a submodule",
-        description=(
-            "Remove a submodule with git rm and remove its ~/.gitignore exceptions. "
-            "Keep parent exceptions needed by remaining repositories or other rules. "
-            "Stage these changes while preserving unrelated rules and their staging."
-        ),
-    )
-    remove.add_argument(
-        "submodule_path",
-        metavar="PATH",
-        help="registered submodule path relative to $HOME",
-    )
-    remove.add_argument(
-        "-f",
-        "--force",
-        action="store_true",
-        help="pass --force to git rm",
-    )
-
-
-def _dispatch_home(options: argparse.Namespace) -> None:
-    """Dispatch lifecycle commands against the home repository."""
-    if options.command == "init":
-        initialize_home()
-    elif options.command == "add":
-        initialize_submodule(options.remote, force=options.force)
-    elif options.command == "rm":
-        root = _require_home_repository()
-        remove_home_submodule(
-            root,
-            options.submodule_path,
-            force=options.force,
-        )
-
-
-def parser() -> argparse.ArgumentParser:
-    """Construct the workspace command-line parser."""
-    result = argparse.ArgumentParser(
-        prog="afairesi",
-        description=(
-            "Create and maintain repositories, packages, and hosts "
-            "in the afairesi computing environment."
-        ),
-    )
-    scopes = result.add_subparsers(dest="scope", title="scopes", metavar="SCOPE")
-    home = scopes.add_parser(
-        "home",
-        help="manage the home repository and its submodules",
-        description=(
-            "Manage the home repository and its submodules. "
-            "Changes are staged; use Git to commit and push."
-        ),
-    )
-    repo = scopes.add_parser(
-        "repo",
-        help="manage Nix flake packages, hosts, checks, and tests",
-        description=(
-            "Manage Nix flake packages, hosts, checks, and tests. "
-            "Structural changes are staged."
-        ),
-    )
-    _configure_repo_parser(repo)
-    _configure_home_parser(home)
-    result.set_defaults(command=None, scope_parser=result)
-    repo.set_defaults(scope_parser=repo)
-    home.set_defaults(scope_parser=home)
     return result
-
-
-def _validate_add_arguments(
-    cli: argparse.ArgumentParser,
-    options: argparse.Namespace,
-) -> None:
-    """Reject invalid creation arguments before discovering the repository."""
-    if options.scope != "repo" or options.command != "add":
-        return
-    try:
-        validate_name(options.resource_name)
-    except CommandError as error:
-        cli.error(str(error))
-
-
-def _require_flake_repository() -> Path:
-    """Select the current repository and require flake lifecycle commands."""
-    root = repository_root()
-    if repository_type(root) != "flake":
-        msg = (
-            "afairesi repo commands require a flake repository; "
-            "use afairesi home for home"
-        )
-        raise CommandError(msg)
-    validate_flake_layout(root)
-    return root
 
 
 def check_source_main() -> None:
@@ -3935,43 +2871,25 @@ def check_source_main() -> None:
         raise SystemExit(1) from error
 
 
-def _dispatch_workspace_command(
+def _dispatch_command(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
 ) -> None:
-    """Run the selected workspace operation with command-specific validation."""
+    """Run the selected inspection or test command."""
     if options.command is None:
-        options.scope_parser.print_help()
-        return
-    if options.scope == "home":
-        _dispatch_home(options)
-        return
-    if options.command == "init":
-        initialize_repository()
-        return
-    if options.command == "inspect":
+        cli.print_help()
+    elif options.command == "inspect":
         _dispatch_inspect(options, cli)
-        return
-    if options.command == "test":
+    elif options.command == "test":
         _dispatch_test_command(options, cli)
-        return
-    root = _require_flake_repository()
-    if options.command == "add":
-        if options.resource_type == "host":
-            add_host(root, options.resource_name)
-        else:
-            add_package(root, options.resource_type, options.resource_name)
-    elif options.command == "fix":
-        converge_flake(root, dry_run=options.dry_run)
 
 
 def main() -> None:
-    """Dispatch repository and home commands."""
+    """Dispatch inspection and testing commands."""
     cli = parser()
     options = cli.parse_args()
-    _validate_add_arguments(cli, options)
     try:
-        _dispatch_workspace_command(options, cli)
+        _dispatch_command(options, cli)
     except subprocess.CalledProcessError as error:
         _report_process_failure(error)
         raise SystemExit(

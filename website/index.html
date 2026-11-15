@@ -5,131 +5,181 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Afairesi is a computing environment designed to minimize independent decisions across the system, persistent state, home directory, repositories, packages, and tests."
+      content="Afairesi combines a Nix library for repository builds, checks, and development environments with a CLI for inspecting interfaces and running Python test campaigns."
     />
     <meta name="theme-color" content="#fdf6e3" />
-    <title>Afairesi — A computing environment designed to minimize independent decisions</title>
+    <title>Afairesi — Nix library and repository CLI</title>
     <link
       rel="icon"
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23fdf6e3'/%3E%3Cpath d='M8 16h16' stroke='%23586e75' stroke-width='2'/%3E%3C/svg%3E"
     />
-    <link
-      rel="stylesheet"
-      href="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.css"
-    />
     <link rel="stylesheet" href="style.css" />
-    <script
-      src="https://cdn.jsdelivr.net/npm/asciinema-player@3.17.0/dist/bundle/asciinema-player.min.js"
-      defer
-    ></script>
-    <script src="afairesi-demo.js" defer></script>
-    <script src="script.js" defer></script>
   </head>
   <body>
     <header class="top">
       <hgroup>
         <h1>afairesi</h1>
-        <p class="subtitle">A computing environment designed to minimize independent decisions.</p>
+        <p class="subtitle">A Nix library and CLI for consistent repositories.</p>
       </hgroup>
       <nav aria-label="afairesi links">
+        <a href="#library">Library</a>
+        <a href="#cli">CLI</a>
         <a href="https://github.com/afairesi/afairesi">Source</a>
         <a href="https://github.com/afairesi/afairesi/blob/main/LICENSE">MIT License</a>
       </nav>
     </header>
     <main>
-      <p>
-        Afairesi applies one principle across your system, persistent state, home directory,
-        repositories, packages, and tests: satisfy the requirements with the fewest independent
-        decisions.
-      </p>
-      <p>
-        Repository conventions derive builds, checks, and development environments; the CLI adds
-        scaffolding, repair, inspection, and test tooling.
+      <p class="intro">
+        Define packages once. Derive builds, checks, and development environments from the
+        repository layout, then inspect interfaces and run tests with two CLI commands.
       </p>
       <div class="overview">
-        <figure
-          class="tree"
-          tabindex="0"
-          role="region"
-          aria-label="Directory structure and Nix commands"
-        >
-          <div class="tree-scope tree-system">
-            <span class="tree-scope-label">NixOS with<br />Preservation</span>
-            <pre><code>/                           <span class="tree-comment"># Managed by Preservation</span></code></pre>
-            <details class="package home-branch" open>
-              <!-- prettier-ignore -->
-              <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>home/&lt;user&gt;/            <span class="tree-comment"># Persistent</span></code></summary>
-              <div class="tree-scope tree-home">
-                <span class="tree-scope-label">afairesi home</span>
-                <pre><code>│
-├── .gitignore              <span class="tree-comment"># Home allowlist.</span>
-├── .gitmodules             <span class="tree-comment"># Managed by afairesi.</span>
-│</code></pre>
-                <details class="package repo-branch" open>
-                  <!-- prettier-ignore -->
-                  <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>github.com/&lt;user&gt;/&lt;repo&gt;/</code></summary>
-                  <div class="tree-scope tree-repo">
-                    <span class="tree-scope-label">afairesi repo</span>
-                    <pre><code>│                       <span class="tree-comment"># <span class="tree-command">nix fmt</span></span>
-│                       <span class="tree-comment"># <span class="tree-command">nix flake check</span></span>
+        <section id="library" aria-labelledby="library-title">
+          <h2 id="library-title">Nix library</h2>
+          <p>
+            <code>mkFlake</code> discovers package directories containing
+            <code>default.nix</code> and connects them to Nix builds, formatting, checks, and test
+            environments.
+          </p>
+          <h3>Connect a repository</h3>
+          <p class="code-label">flake.nix</p>
+          <pre tabindex="0" aria-label="Flake definition"><code>{
+  inputs.afairesi.url = "github:afairesi/afairesi";
+  outputs = inputs:
+    inputs.afairesi.lib.mkFlake { inherit inputs; };
+}</code></pre>
+          <p>
+            Keep each package in a directory at the repository root. Track its source and supporting
+            files with Git so Nix includes them in builds.
+          </p>
+          <pre tabindex="0" aria-label="Example Python package layout"><code>project/
 ├── flake.nix
 ├── flake.lock
-│</code></pre>
-                    <details class="package">
-                      <!-- prettier-ignore -->
-                      <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>html_package/</code></summary>
-                      <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#html_package</span></span>
-│   ├── default.nix
-│   └── index.html</code></pre>
-                    </details>
-                    <details class="package">
-                      <!-- prettier-ignore -->
-                      <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>python_package/</code></summary>
-                      <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#python_package</span></span>
-│   ├── default.nix
-│   ├── main.py
-│   └── test_main.py    <span class="tree-comment"># Optional.</span></code></pre>
-                    </details>
-                    <details class="package">
-                      <!-- prettier-ignore -->
-                      <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>latex_package/</code></summary>
-                      <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix build .#latex_package</span></span>
-│   ├── default.nix
-│   └── ms.tex</code></pre>
-                    </details>
-                    <details class="package">
-                      <!-- prettier-ignore -->
-                      <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>lean4_package/</code></summary>
-                      <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix run .#lean4_package</span></span>
-│   ├── default.nix
-│   ├── main.lean
-│   └── test_main.lean  <span class="tree-comment"># Optional.</span></code></pre>
-                    </details>
-                    <details class="package">
-                      <!-- prettier-ignore -->
-                      <summary><code><span aria-hidden="true">├─<span class="disclosure"></span> </span>nix_package/</code></summary>
-                      <pre><code>│   │                   <span class="tree-comment"># <span class="tree-command">nix build .#nix_package</span></span>
-│   ├── default.nix
-│   ├── main.nix        <span class="tree-comment"># Optional; library or implementation.</span>
-│   └── test_main.nix   <span class="tree-comment"># Optional; returns a check derivation.</span></code></pre>
-                    </details>
-                    <details class="package">
-                      <!-- prettier-ignore -->
-                      <summary><code><span aria-hidden="true">└─<span class="disclosure"></span> </span>nixos-configuration/</code></summary>
-                      <pre><code>    │                   <span class="tree-comment"># <span class="tree-command">nix build .#nixosConfigurations.nixos-configuration.config.system.build.toplevel</span></span>
-    ├── configuration.nix
-    └── hardware-configuration.nix <span class="tree-comment"># Optional.</span></code></pre>
-                    </details>
-                  </div>
-                </details>
-              </div>
-            </details>
+└── example/
+    ├── default.nix
+    ├── main.py
+    └── test_main.py  <span class="muted"># Optional</span></code></pre>
+          <details>
+            <summary>example/default.nix</summary>
+            <pre tabindex="0" aria-label="Python package definition"><code>{ inputs, pkgs, ... }:
+inputs.afairesi.lib.mkPythonPackage {
+  inherit pkgs;
+  executable = true;
+  meta.description = "An example Python command.";
+  src = ./.;
+}</code></pre>
+            <p>
+              Define <code>main()</code> in <code>main.py</code> for an executable. Set
+              <code>executable = false;</code> for a Python or Lean library.
+            </p>
+          </details>
+          <h3>Package conventions</h3>
+          <div
+            class="table-scroll"
+            tabindex="0"
+            role="region"
+            aria-label="Package builders and sources"
+          >
+            <table>
+              <thead>
+                <tr>
+                  <th scope="col">Package</th>
+                  <th scope="col">Builder</th>
+                  <th scope="col">Source</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <th scope="row">Python</th>
+                  <td><code>mkPythonPackage</code></td>
+                  <td><code>main.py</code></td>
+                </tr>
+                <tr>
+                  <th scope="row">Lean 4</th>
+                  <td><code>mkLean4Package</code></td>
+                  <td><code>main.lean</code></td>
+                </tr>
+                <tr>
+                  <th scope="row">HTML</th>
+                  <td><code>mkHtmlPackage</code></td>
+                  <td><code>index.html</code></td>
+                </tr>
+                <tr>
+                  <th scope="row">LaTeX</th>
+                  <td><code>mkLatexPackage</code></td>
+                  <td><code>ms.tex</code></td>
+                </tr>
+                <tr>
+                  <th scope="row">Nix</th>
+                  <td>Any derivation</td>
+                  <td><code>default.nix</code></td>
+                </tr>
+              </tbody>
+            </table>
           </div>
-        </figure>
-        <figure class="demo">
-          <div id="demo-player" role="region" aria-label="afairesi terminal demonstration"></div>
-          <figcaption>Earlier workflow recording.</figcaption>
-        </figure>
+          <p>
+            Optional <code>test_main.py</code>, <code>test_main.lean</code>, and
+            <code>test_main.nix</code> files provide package checks. Python and Lean packages also
+            get a <code>&lt;name&gt;-test</code> development shell.
+          </p>
+          <pre tabindex="0" aria-label="Nix repository commands"><code>nix flake lock
+nix fmt
+nix flake check
+nix build .#example
+nix run .#example
+nix develop .#example-test</code></pre>
+        </section>
+        <section id="cli" aria-labelledby="cli-title">
+          <h2 id="cli-title">Repository CLI</h2>
+          <p>Install the CLI with Nix, or run it directly without installing.</p>
+          <pre
+            tabindex="0"
+            aria-label="Install or run the CLI"
+          ><code>nix profile add github:afairesi/afairesi
+nix run github:afairesi/afairesi -- --help</code></pre>
+          <h3><code>afairesi inspect</code></h3>
+          <p>
+            Read package metadata, CLI arguments, and test identifiers as JSON. Inspection reads
+            source without executing it. Select a local repository or Git URL with
+            <code>--repository</code>.
+          </p>
+          <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi inspect
+afairesi inspect --repository ../project</code></pre>
+          <p>
+            Use <code>inspect diff</code> to compare interfaces in the working tree, index, or Git
+            revisions. Implementation changes that leave the interface unchanged are omitted.
+          </p>
+          <pre tabindex="0" aria-label="Interface comparison commands"><code>afairesi inspect diff
+afairesi inspect diff --cached
+afairesi inspect diff HEAD~1 HEAD</code></pre>
+          <h3><code>afairesi test</code></h3>
+          <p>
+            Choose a Python test campaign. The optional path selects one package or a whole flake;
+            omitting it selects the current repository. Repository campaigns skip packages without
+            Python tests.
+          </p>
+          <dl class="campaigns">
+            <dt><code>coverage</code></dt>
+            <dd>Build coverage checks and print HTML report paths in the Nix store.</dd>
+            <dt><code>fuzz</code></dt>
+            <dd>Run Hypothesis tests named <code>test_fuzz_*</code>.</dd>
+            <dt><code>mutation</code></dt>
+            <dd>Change source expressions to check whether the tests catch them.</dd>
+            <dt><code>performance</code></dt>
+            <dd>Profile tests and package CLI calls with cProfile.</dd>
+            <dt><code>property</code></dt>
+            <dd>Run complete test suites, including Hypothesis property tests.</dd>
+          </dl>
+          <pre tabindex="0" aria-label="Python test campaign examples"><code>afairesi test property
+afairesi test coverage example
+afairesi test fuzz example --max-examples 100
+afairesi test mutation example --max-mutations 20
+afairesi test performance example</code></pre>
+          <p>
+            Use <code>-k</code> and <code>-m</code> to select tests in campaigns other than
+            coverage. Add <code>--help</code> to any command for its options.
+          </p>
+        </section>
       </div>
     </main>
   </body>

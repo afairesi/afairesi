@@ -14,7 +14,6 @@ import stat
 import subprocess
 import sys
 from contextlib import contextmanager
-from functools import partial
 from importlib import import_module
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -27,14 +26,10 @@ from cosmic_ray.work_db import WorkDB, use_db
 from cosmic_ray.work_item import TestOutcome as MutationTestOutcome
 from cosmic_ray.work_item import WorkerOutcome, WorkItem, WorkResult
 
+import nix_syntax
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
-
-HOME_IGNORE = "*\n!/.gitignore\n!/.gitmodules\n"
-HOME_SUBMODULE_IGNORE = (
-    HOME_IGNORE
-    + "!/forge.example/\n!/forge.example/owner/\n!/forge.example/owner/demo/\n"
-)
 
 
 def _nix_source() -> Path:
@@ -53,12 +48,10 @@ def _run(
     code: int = 0,
     executable: str | None = None,
     environment: dict[str, str] | None = None,
-    scope: tuple[str, ...] = ("repo",),
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [
             executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
-            *(scope if executable in (None, "afairesi") else ()),
             *arguments,
         ],
         cwd=root,
@@ -117,15 +110,6 @@ def _report_directory() -> Path:
     return Path(os.environ["XDG_STATE_HOME"]) / "afairesi"
 
 
-def _repair_flake(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    """Exercise the explicit structural repair command."""
-    return _run(root, "fix", *arguments, code=code)
-
-
 def _check_flake_source(
     root: Path, *, code: int = 0
 ) -> subprocess.CompletedProcess[str]:
@@ -138,13 +122,6 @@ def _check_flake_source(
         code=code,
         executable=sys.executable,
     )
-
-
-def _preview_flake_repair(root: Path, *, code: int = 0) -> None:
-    """Verify that flake repair previews preserve contents and Git state."""
-    before = _snapshot(root)
-    _repair_flake(root, "--dry-run", code=code)
-    _expect(_snapshot(root) == before, "flake repair preview changed state")
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -237,14 +214,53 @@ def _fixture_git(root: Path, *arguments: str) -> str:
     )
 
 
-def _fixture_add(root: Path, resource: str, kind: str | None = None) -> None:
-    """Prepare resources directly when the test exercises another operation."""
-    subject = import_module("afairesi.main")
-    name = Path(resource).name
-    if kind is None:
-        subject.add_host(root, name)
-    else:
-        subject.add_package(root, kind, name)
+def _fixture_add(
+    root: Path,
+    name: str,
+    kind: str,
+    description: str = "Fixture package.",
+) -> None:
+    """Write the minimal tracked source needed by a test."""
+    sources = {
+        "host": {"configuration.nix": "{ ... }: {}\n"},
+        "python": {"main.py": "def main():\n    pass\n"},
+        "html": {"index.html": "<!doctype html><html><body></body></html>\n"},
+        "latex": {
+            "ms.tex": (
+                "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n"
+            )
+        },
+        "lean4": {"main.lean": "def main : IO Unit := pure ()\n"},
+        "nix": {},
+    }[kind]
+    if kind != "host":
+        builder = {
+            "python": "inputs.self.lib.mkPythonPackage",
+            "html": "inputs.self.lib.mkHtmlPackage",
+            "latex": "inputs.self.lib.mkLatexPackage",
+            "lean4": "inputs.self.lib.mkLean4Package",
+            "nix": "pkgs.writeTextFile",
+        }[kind]
+        settings = (
+            '  name = baseNameOf ./.;\n  text = "";\n'
+            if kind == "nix"
+            else "  inherit pkgs;\n  src = ./.;\n"
+        )
+        if kind in {"python", "lean4"}:
+            settings += "  executable = true;\n"
+        sources["default.nix"] = (
+            "{ inputs, pkgs, ... }:\n"
+            + builder
+            + " {\n"
+            + settings
+            + f"  meta.description = {nix_syntax.quote_string(description)};\n"
+            + "}\n"
+        )
+    package = root / name
+    package.mkdir()
+    for filename, source in sources.items():
+        (package / filename).write_text(source)
+    _git(root, "add", "--force", "--", name)
 
 
 def _check_excluded_trees(repository: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -332,34 +348,6 @@ def _snapshot(root: Path, *, exclude: tuple[str, ...] = ()) -> tuple[object, ...
         _git(root, "ls-files", "--stage", "-z"),
         *_git_metadata_snapshot(root),
     )
-
-
-@pytest.mark.parametrize(
-    "arguments",
-    [
-        ("config", "fixture.changed", "true"),
-        ("update-ref", "refs/heads/other", "HEAD"),
-        ("pack-refs", "--all"),
-        ("symbolic-ref", "HEAD", "refs/heads/other"),
-    ],
-)
-def test_repository_preservation_checks_detect_git_metadata_changes(
-    tmp_path: Path,
-    arguments: tuple[str, ...],
-) -> None:
-    """Keep preservation assertions sensitive to refs, HEAD, and local settings."""
-    _repository(tmp_path)
-    _fixture_git(tmp_path, "commit", "--quiet", "-m", "initial")
-    before = _snapshot(tmp_path)
-    _git(tmp_path, *arguments)
-    _expect(_snapshot(tmp_path) != before, arguments)
-
-
-def _preview(root: Path, *arguments: str, code: int = 0) -> None:
-    """Preserve the whole repository during successful and rejected previews."""
-    before = _snapshot(root)
-    _run(root, *arguments, "--dry-run", code=code)
-    _expect(_snapshot(root) == before, arguments)
 
 
 def _nix_environment(root: Path) -> dict[str, str]:
@@ -505,78 +493,26 @@ def _check_launcher_environment(
     _expect("native-check-input" in python_inputs, python_inputs)
 
 
-@pytest.mark.parametrize(
-    ("kind", "filenames"),
-    [
-        ("python", {"default.nix", "main.py"}),
-        ("html", {"default.nix", "index.html"}),
-        ("latex", {"default.nix", "ms.tex"}),
-        ("lean4", {"default.nix", "main.lean"}),
-        ("nix", {"default.nix"}),
-        ("host", {"configuration.nix"}),
-    ],
-)
-def test_repo_add_stages_only_the_requested_resource(
-    kind: str,
-    filenames: set[str],
-) -> None:
-    """Create each supported resource with its declared files and related metadata."""
-    with _fresh_repository() as root:
-        _fixture_git(root, "commit", "-qm", "Initial repository")
-        head = _git(root, "rev-parse", "HEAD")
-        relative = "example"
-        arguments = (kind,)
-        _run(root, "add", relative, *arguments)
-        resource = root / relative
-        _expect(
-            {path.name for path in resource.iterdir()} == filenames,
-            "wrong resource files",
-        )
-        staged = {f"{relative}/{name}" for name in filenames}
-        if kind != "host":
-            descriptions = {
-                "python": "A Python package.",
-                "html": "An HTML package.",
-                "latex": "A LaTeX package.",
-                "lean4": "A Lean 4 package.",
-                "nix": "A Nix package.",
-            }
-            _expect(
-                f'meta.description = "{descriptions[kind]}";'
-                in (resource / "default.nix").read_text(),
-                "create lost the default description",
-            )
-        _expect(
-            set(_git(root, "diff", "--cached", "--name-only").splitlines()) == staged,
-            "create staged unexpected paths",
-        )
-        for path in staged:
-            _expect(_git(root, "show", f":{path}") == (root / path).read_text(), path)
-        _expect(_git(root, "rev-parse", "HEAD") == head, "create committed changes")
-
-
 @pytest.mark.parametrize("implementation", [False, True])
 @pytest.mark.parametrize("tests", [False, True])
-def test_nix_optional_sources_survive_repair_after_git_move(
+def test_inspect_finds_nix_optional_sources_after_git_move(
     *,
     implementation: bool,
     tests: bool,
 ) -> None:
     """Keep all four optional-file combinations without evaluating Nix source."""
     with _fresh_repository() as root:
-        _run(root, "add", "example", "nix")
+        _fixture_add(root, "example", "nix")
         files = {"default.nix": (root / "example/default.nix").read_text()}
         for name, enabled in (("main.nix", implementation), ("test_main.nix", tests)):
             if enabled:
                 files[name] = 'throw "source validation must not evaluate this"\n'
                 _write_fixture_source(root / "example" / name, files[name])
-        _repair_flake(root)
         _git(root, "mv", "--", "example", "renamed")
-        _repair_flake(root)
         _expect(
             {path.name: path.read_text() for path in (root / "renamed").iterdir()}
             == files,
-            "repair or rename changed the optional Nix sources",
+            "inspection or rename changed the optional Nix sources",
         )
         _expect(
             set(_git(root, "ls-files", "--", "renamed").splitlines())
@@ -592,117 +528,11 @@ def test_nix_optional_sources_survive_repair_after_git_move(
 def test_nix_optional_sources_are_syntax_checked(filename: str) -> None:
     """Reject malformed optional Nix files during source validation."""
     with _fresh_repository() as root:
-        _run(root, "add", "example", "nix")
+        _fixture_add(root, "example", "nix")
         _write_fixture_source(root / "example" / filename, "{ invalid = ; }\n")
-        result = _repair_flake(root, code=1)
+        result = _check_flake_source(root, code=1)
         _expect(f"example/{filename}:" in result.stderr, result)
         _expect("parse error" in result.stderr, result)
-
-
-def test_missing_nix_definitions_require_unambiguous_source_markers() -> None:
-    """Infer missing definitions only from unambiguous source markers."""
-    with _fresh_repository() as root:
-        package = root / "example"
-        package.mkdir()
-        _write_fixture_source(package / "main.nix", "{ answer = 42; }\n")
-        _repair_flake(root)
-        _expect((package / "default.nix").is_file(), "missing Nix package definition")
-        _expect(
-            not (package / "test_main.nix").exists(),
-            "repair created optional tests",
-        )
-        _write_fixture_source(package / "main.py", "")
-        (package / "default.nix").unlink()
-        before = _snapshot(root)
-        result = _repair_flake(root, code=1)
-        _expect("ambiguous project markers" in result.stderr, result)
-        _expect(_snapshot(root) == before, "ambiguous Nix sources changed state")
-
-
-@pytest.mark.parametrize(
-    ("arguments", "message"),
-    [
-        (("nested/example", "host"), "root directory name"),
-        (("example",), "required"),
-        (("..", "host"), "root directory name"),
-        ((".", "host"), "root directory name"),
-        (("", "host"), "root directory name"),
-        (("/example", "host"), "root directory name"),
-        (("example/", "host"), "root directory name"),
-        (("example", "unknown"), "invalid choice"),
-        (("example", "python", "unexpected"), "unrecognized arguments"),
-        (
-            ("example", "python", "--unknown-option"),
-            "unrecognized arguments",
-        ),
-        (
-            (".git", "python"),
-            "root directory name",
-        ),
-    ],
-)
-def test_repo_add_rejects_invalid_arguments_without_changes(
-    arguments: tuple[str, ...],
-    message: str,
-) -> None:
-    """Reject missing or incompatible resource arguments with an actionable error."""
-    with _fresh_repository() as root:
-        before = _snapshot(root)
-        result = _run(root, "add", *arguments, code=2)
-        _expect(message in result.stderr, result)
-        _expect(_snapshot(root) == before, "invalid create changed state")
-
-
-def test_repo_add_reports_invalid_arguments_before_requiring_git(
-    tmp_path: Path,
-) -> None:
-    """Reject malformed resource requests before requiring a Git repository."""
-    for arguments in (
-        ("add", "nested/example", "host"),
-        ("add", ".git", "python"),
-        ("add", "example", "unknown"),
-    ):
-        result = _run(tmp_path, *arguments, code=2)
-        _expect("not inside a Git repository" not in result.stderr, result.stderr)
-    _expect(not any(tmp_path.iterdir()), "invalid arguments created files")
-
-
-@pytest.mark.parametrize("kind", ["python", "html", "latex", "lean4", "nix", "host"])
-def test_repo_add_targets_repository_root_and_rejects_existing_resources(
-    kind: str,
-) -> None:
-    """Add from a nested cwd and reject existing resources without changes."""
-    with _fresh_repository() as root:
-        nested = root / "tmp/nested"
-        nested.mkdir(parents=True)
-        relative = "example"
-        arguments = (kind,)
-        _run(nested, "add", relative, *arguments)
-        _expect(
-            (root / relative).is_dir(),
-            "add used the working directory as its root",
-        )
-        before = _snapshot(root)
-        _run(nested, "add", relative, *arguments, code=1)
-        _expect(_snapshot(root) == before, "conflicting addition changed state")
-
-
-def test_repo_fix_from_nested_directory_is_repeatable() -> None:
-    """Repair from nested directories and preview without changing Git state."""
-    with _fresh_repository() as root:
-        nested = root / "tmp/nested"
-        nested.mkdir(parents=True)
-        _fixture_add(root, "example", "python")
-        _write_fixture_source(
-            root / "example/test_main.py", "def test_example(): pass\n"
-        )
-        before = _snapshot(root)
-        _run(nested, "fix", "-n")
-        _expect(_snapshot(root) == before, "repair preview changed state")
-        _run(nested, "fix")
-        after = _snapshot(root)
-        _run(nested, "fix", "--dry-run")
-        _expect(_snapshot(root) == after, "converged repair changed state")
 
 
 def test_explicit_repository_paths_use_git_root_or_cwd(
@@ -734,11 +564,7 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         root = Path(directory)
         help_output = _run(root, "--help").stdout
         _expect("usage:" in help_output, help_output)
-        commands = (
-            ("init",),
-            ("add",),
-            ("fix",),
-        )
+        commands = (("inspect",), ("test",))
         for command_path in commands:
             option = _run(root, *command_path, "--help").stdout
             _expect(
@@ -756,11 +582,9 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
             == help_output,
             "standalone command unavailable through PATH",
         )
-        _run(root, "unknown-command", code=2)
-        _run(root, "add", code=2)
-        initialization = _run(root, "init", code=1)
-        _expect("not inside a Git repository" in initialization.stderr, initialization)
-        command_names = ["add", "fix", "init", "inspect", "test"]
+        rejected = _run(root, "unknown-command", code=2)
+        _expect("invalid choice" in rejected.stderr, rejected)
+        command_names = ["inspect", "test"]
         positions = [help_output.index(f"    {name} ") for name in command_names]
         _expect(
             positions == sorted(positions),
@@ -770,466 +594,13 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests() -> None:
         _expect(not any(root.iterdir()), "invalid CLI request created state")
 
 
-@pytest.mark.parametrize("case", ["resource", "dangling-marker"])
-def test_repo_add_rejects_symlinks_without_writing_outside_the_repository(
-    tmp_path: Path,
-    case: str,
-) -> None:
-    """Reject existing resource trees and symlink ancestors before writing files."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    with _fresh_repository() as root:
-        package = root / "example"
-        if case == "resource":
-            package.symlink_to(outside, target_is_directory=True)
-        else:
-            package.mkdir(parents=True)
-            (package / "default.nix").symlink_to(outside / "external.nix")
-        before = _snapshot(root)
-        _run(root, "add", "example", "nix", code=1)
-        _expect(_snapshot(root) == before, "rejected creation changed repository state")
-        _expect(not any(outside.iterdir()), "creation wrote outside the repository")
-
-
-@pytest.mark.parametrize(
-    "relative",
-    ["example", "example/main.py", "example/default.nix"],
-)
-@pytest.mark.parametrize("dry_run", [False, True])
-def test_repo_fix_rejects_source_symlinks_before_changing_state(
-    tmp_path: Path,
-    relative: str,
-    *,
-    dry_run: bool,
-) -> None:
-    """Reject source symlinks before writing templates or changing the index."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    external = outside / "default.nix"
-    external.write_text("{}\n")
-    with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        _write_fixture_source(
-            root / "example/test_main.py",
-            "def test_example(): pass\n",
-        )
-        _run(root, "fix")
-        path = root / relative
-        if path.is_dir():
-            shutil.rmtree(path)
-        elif path.exists():
-            path.unlink()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.symlink_to(external if path.suffix else outside)
-        before = _snapshot(root)
-        repair = partial(_run, root, "fix")
-        rejected = repair(*(("--dry-run",) if dry_run else ()), code=1)
-        _expect("managed" in rejected.stderr, rejected)
-        _expect(_snapshot(root) == before, "rejected repair changed repository state")
-        _expect(external.read_text() == "{}\n", "repair wrote outside the repository")
-
-
-@pytest.mark.parametrize(
-    "relative",
-    ["discarded", "assets/nested/link", "example/unsupported"],
-)
-@pytest.mark.parametrize("target_kind", ["file", "directory", "dangling"])
-@pytest.mark.parametrize("tracked", [False, True])
-def test_repo_fix_preserves_supporting_symlinks_without_following_targets(
-    tmp_path: Path,
-    relative: str,
-    target_kind: str,
-    *,
-    tracked: bool,
-) -> None:
-    """Preserve tracked and local supporting links without following their targets."""
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    _write_fixture_source(outside / "configuration.nix", "{}\n")
-    external = outside / "asset"
-    external.write_bytes(bytes(range(256)))
-    target = {
-        "file": external,
-        "directory": outside,
-        "dangling": outside / "missing",
-    }[target_kind]
-    with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        _repair_flake(root)
-        path = root / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.symlink_to(target, target_is_directory=target_kind == "directory")
-        if tracked:
-            _git(root, "add", "--force", "--", relative)
-        repair = partial(_run, root, "fix")
-        before = _snapshot(root)
-        repair("--dry-run")
-        _expect(_snapshot(root) == before, "preview changed unsupported links")
-        repair()
-        _expect(path.is_symlink(), "repair removed supporting symlink")
-        _expect(
-            (relative in _git(root, "ls-files").splitlines()) == tracked,
-            "tracking changed",
-        )
-        _expect(external.read_bytes() == bytes(range(256)), "cleanup changed target")
-        _expect((outside / "configuration.nix").read_text() == "{}\n", "target changed")
-        _preview_flake_repair(root)
-
-
-@pytest.mark.parametrize("kind", ["python", "host"])
-def test_repo_add_preserves_ignore_rules_and_staging_on_failure(kind: str) -> None:
-    """Preserve distinct staged and working ignore rules after Git add fails."""
-    with _fresh_repository() as root:
-        ignore = root / ".gitignore"
-        ignore.write_text("# staged rules\ntmp/\n")
-        _git(root, "add", ".gitignore")
-        ignore.write_text("# working rules\n\ntmp/\nresult\n")
-        ignore.chmod(0o600)
-        (root / ".git/index.lock").touch()
-        before = _snapshot(root)
-        resource = "example"
-        failed = _run(
-            root,
-            "add",
-            resource,
-            kind,
-            code=128,
-        )
-        _expect("index.lock" in failed.stderr, failed)
-        _expect(_snapshot(root) == before, "failed creation left structural changes")
-
-
-@pytest.mark.parametrize("tracked_scratch", [False, True])
-@pytest.mark.parametrize(
-    "payload",
-    [b"", bytes(range(256))],
-    ids=["empty", "all-bytes"],
-)
-def test_repo_fix_preserves_sources_and_is_repeatable(
-    payload: bytes,
-    *,
-    tracked_scratch: bool,
-) -> None:
-    """Preserve arbitrary files and tracking regardless of directory names."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        _repair_flake(root)
-        paths = [
-            "tmp/root-state",
-            "example/tmp/package-state",
-            "prm/nested/asset.bin",
-            "example/prm/nested/asset.bin",
-            "assets/source.bin",
-            "notes.txt",
-        ]
-        for relative in paths:
-            path = root / relative
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(payload)
-            if tracked_scratch:
-                _git(root, "add", "--force", "--", relative)
-        before = _snapshot(root)
-        _preview_flake_repair(root)
-        _repair_flake(root)
-        _expect(
-            _snapshot(root) == before,
-            "repair changed supporting files or Git membership",
-        )
-
-
-@pytest.mark.parametrize(
-    "misplaced",
-    [
-        "def test_misplaced(): pass\n",
-        (
-            "from unittest import TestCase as Case\n"
-            "class Reports(Case):\n"
-            "    def test_result(self): pass\n"
-        ),
-    ],
-)
-def test_repo_fix_rejects_embedded_tests_without_changing_state(
-    misplaced: str,
-) -> None:
-    """Reject embedded function and unittest definitions independently of paths."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        source = root / "example/main.py"
-        _write_fixture_source(source, misplaced)
-        before = _snapshot(root)
-        rejected = _repair_flake(root, code=1)
-        _expect(
-            "move test definitions to test_main.py" in rejected.stderr
-            and _snapshot(root) == before,
-            rejected,
-        )
-
-
-@pytest.mark.parametrize(
-    "definition",
-    [
-        'pkgs.runCommand "integration" {} "python -m pytest ./prm/test_live.py"',
-        'pkgs.runCommand "site" {} "cp -r ./prm/site $out"',
-        'pkgs.runCommandLocal "data" {} "touch $out"',
-        'pkgs.stdenv.mkDerivation { name = "parallel"; src = ./prm; }',
-        'pkgs.python3.pkgs.buildPythonPackage { pname = "parallel"; src = ./prm; }',
-        "inputs.afairesi.lib.mkPythonPackage { inherit pkgs; src = ./prm; }",
-        "inputs.afairesi.lib.mkLean4Package { inherit pkgs; src = ./prm; }",
-        "inputs.nixpkgs.lib.nixosSystem { modules = [ ./prm/host.nix ]; }",
-        'builtins.derivation { name = "parallel"; builder = "/bin/sh"; }',
-        '(let build = pkgs.runCommand; in build "parallel" {} "touch $out")',
-    ],
-)
-def test_repo_validation_preserves_custom_resource_definitions(
-    definition: str,
-) -> None:
-    """Accept custom resources without evaluating or rewriting their definitions."""
-    with _fresh_repository() as root:
-        _repair_flake(root)
-        _write_fixture_source(
-            root / "flake.nix",
-            "{ outputs = inputs: let base = inputs.afairesi.lib.mkFlake "
-            "{ inherit inputs; }; pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux; "
-            f"in base // {{ checks.x86_64-linux.parallel = {definition}; }}; }}",
-        )
-        (root / "prm").mkdir()
-        (root / "prm/test_live.py").write_text("def test_live(): pass\n")
-        (root / "discarded").write_text("preserve supporting files")
-        before = _snapshot(root)
-        _preview_flake_repair(root)
-        _repair_flake(root)
-        _check_flake_source(root)
-        _expect(_snapshot(root) == before, "custom resources changed during validation")
-
-
-@pytest.mark.parametrize(
-    "composition",
-    [
-        "base // { formatter.x86_64-linux = pkgs.nixfmt; }",
-        (
-            "base // { packages = builtins.mapAttrs "
-            "(_: packages: packages // { default = packages.foo; }) base.packages; }"
-        ),
-        "base // { inherit (inputs.afairesi) lib; }",
-        (
-            "base // { checks = base.checks // { x86_64-linux = "
-            "base.checks.x86_64-linux // { foo = pkgs.vmTools.runInLinuxVM "
-            '(base.checks.x86_64-linux.foo.overrideAttrs { QEMU_OPTS = "-smp 2"; '
-            "memSize = 4096; }); }; }; }"
-        ),
-        (
-            "base // { packages.x86_64-linux.foo = import ./foo/default.nix "
-            "{ inherit inputs pkgs; }; }"
-        ),
-        'base // { note = "pkgs.runCommand \\"fake\\" {} \\"touch $out\\""; }',
-        (
-            "let build = pkgs.runCommand; in base // { lib.wrapper = build: "
-            'build "external" {} "touch $out"; }'
-        ),
-        (
-            "let build = pkgs.runCommand; in base // { lib.wrapper = { build }: "
-            'build "external" {} "touch $out"; }'
-        ),
-        (
-            "let build = pkgs.runCommand; in let build = x: x; in base // "
-            '{ lib.wrapper = build "external" {} "touch $out"; }'
-        ),
-        "base // { lib.command = pkgs.runCommand; }",
-        'base // { lib.command = pkgs.runCommand "partial"; }',
-    ],
-)
-def test_repo_fix_preserves_custom_flake_outputs(composition: str) -> None:
-    """Preserve policies, output aliases, VM wrappers, imports, and lexical scopes."""
-    with _fresh_repository() as root:
-        source = (
-            "{ outputs = inputs: let base = inputs.afairesi.lib.mkFlake "
-            "{ inherit inputs; nixpkgs.config.allowUnfree = true; }; "
-            f"pkgs = inputs.nixpkgs.legacyPackages.x86_64-linux; in {composition}; }}"
-        )
-        _write_fixture_source(root / "flake.nix", source)
-        _repair_flake(root)
-        stable = _snapshot(root)
-        _repair_flake(root)
-        _expect(
-            _snapshot(root) == stable and (root / "flake.nix").read_text() == source,
-            "composition was rewritten",
-        )
-
-
-@pytest.mark.parametrize(
-    ("source", "message"),
-    [
-        ("async def main(): pass\n", "main must be synchronous"),
-        ("def main(value): pass\n", "main must accept a call without arguments"),
-        ("def main(value, /): pass\n", "main must accept a call without arguments"),
-        ("def main(*, value): pass\n", "main must accept a call without arguments"),
-        ("main = 42\n", "main must be callable"),
-        ("main = lambda value: None\n", "main must accept a call without arguments"),
-        ("main: object = None\n", "main must be callable"),
-        ("def main(): pass\nmain = []\n", "main must be callable"),
-    ],
-)
-def test_repo_fix_rejects_invalid_entrypoints_without_changes(
-    source: str,
-    message: str,
-) -> None:
-    """Preserve files and Git state when an executable cannot call its entrypoint."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "a", "python")
-        _fixture_add(root, "z", "python")
-        _write_fixture_source(
-            root / "a/default.nix",
-            "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
-        )
-        _write_fixture_source(root / "z/main.py", source)
-        (root / "unsupported").write_text("preserve until source errors are fixed")
-        before = _snapshot(root)
-        for operation in (
-            partial(_repair_flake, root),
-            partial(_repair_flake, root, "--dry-run"),
-            partial(_check_flake_source, root),
-        ):
-            result = operation(code=1)
-            _expect(message in result.stderr, result)
-            _expect(_snapshot(root) == before, "invalid entrypoint changed state")
-
-
-@pytest.mark.parametrize("invalid", ["def broken(:", "\xff"])
-def test_repo_fix_rejects_invalid_tests_without_changes(invalid: str) -> None:
-    """Parse tests before repairing earlier packages or changing Git state."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "a", "python")
-        _fixture_add(root, "z", "python")
-        _write_fixture_source(
-            root / "a/default.nix",
-            "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {}\n",
-        )
-        (root / "z/test_main.py").write_bytes(invalid.encode("latin-1"))
-        _git(root, "add", "--force", "z/test_main.py")
-        before = _snapshot(root)
-        result = _repair_flake(root, code=1)
-        _expect("Python source could not be parsed" in result.stderr, result)
-        _expect(_snapshot(root) == before, "invalid tests changed state")
-
-
-def test_repo_fix_preserves_host_sources() -> None:
-    """Preserve host customizations and Git state during repeated repair."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "laptop")
-        host = root / "laptop/configuration.nix"
-        host.write_text(host.read_text() + "# Keep host customizations.\n")
-        _git(root, "add", "--", str(host.relative_to(root)))
-        before = _snapshot(root)
-        _repair_flake(root)
-        _preview_flake_repair(root)
-        _expect(_snapshot(root) == before, "convergence changed the host")
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "def main(value=None, /, *, other=None): pass\n",
-        "def main(*args, **kwargs): pass\n",
-        "main = lambda: None\n",
-        "main = lambda value=None: None\n",
-        "def main(): pass\nmain: object\n",
-        "main = 42\ndef main(): pass\n",
-        "from example import main\n",
-        "VALUE = 42\n",
-        "",
-    ],
-)
-def test_repo_fix_restores_python_build_options_and_preserves_entrypoints(
-    source: str,
-) -> None:
-    """Repair missing constructor arguments while retaining library and CLI sources."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        package = root / "example"
-        _write_fixture_source(package / "main.py", source)
-        definition = package / "default.nix"
-        definition.write_text(
-            "{ ... }: (inputs.afairesi or inputs.self).lib.mkPythonPackage {\n"
-            '  meta.description = "Preserved";\n'
-            '  passthru.custom = "Preserved too";\n'
-            "}\n",
-        )
-        _preview_flake_repair(root)
-        _repair_flake(root)
-        evaluated = _evaluated_template(root, "example", _nix_environment(root))
-        _expect(evaluated["meta"]["description"] == "Preserved", evaluated)
-        _expect(evaluated["name"] == "example", evaluated)
-        _expect(
-            ("mainProgram" in evaluated["meta"])
-            == (source not in {"", "VALUE = 42\n"}),
-            evaluated,
-        )
-        _expect((package / "main.py").read_text() == source, source)
-        _expect(
-            'passthru.custom = "Preserved too"' in definition.read_text(),
-            definition,
-        )
-        _preview_flake_repair(root)
-
-
-@pytest.mark.parametrize("executable", [True, False])
-def test_repo_fix_preserves_lean_sources_and_explicit_build_options(
-    *,
-    executable: bool,
-) -> None:
-    """Repair Lean bindings and test registration while preserving library choices."""
-    with _fresh_repository() as root:
-        _run(root, "add", "lean-example", "lean4")
-        package = root / "lean-example"
-        definition = package / "default.nix"
-        definition.write_text(
-            "{ ... }: (inputs.afairesi or inputs.self).lib.mkLean4Package {\n"
-            f"executable = {str(executable).lower()};\n"
-            'meta.description = "Lean proofs"; passthru.custom = "preserved";\n}\n',
-        )
-        source = "def answer : Nat := 42\n"
-        tests = "example : 1 + 1 = 2 := rfl\n"
-        _write_fixture_source(package / "main.lean", source)
-        _write_fixture_source(package / "test_main.lean", tests)
-        _repair_flake(root)
-        _preview_flake_repair(root)
-        repaired = definition.read_text()
-        _expect("src = ./.;" in repaired, repaired)
-        _expect(f"executable = {str(executable).lower()};" in repaired, repaired)
-        _expect('passthru.custom = "preserved";' in repaired, repaired)
-        _expect((package / "main.lean").read_text() == source, source)
-        _expect((package / "test_main.lean").read_text() == tests, tests)
-        _expect("lean-example/test_main.lean" in _git(root, "ls-files"), repaired)
-        report = import_module("afairesi.main").inspect_repository(root)
-        _expect(report["lean-example"]["type"] == "lean4", report)
-        _expect(report["lean-example"]["description"] == "Lean proofs", report)
-        _expect(report["lean-example"]["tests"] == ["test_main.lean"], report)
-
-
-def test_repo_fix_restores_unambiguous_lean_package_definitions() -> None:
-    """Restore an inferred definition, rejecting ambiguity when none is declared."""
-    with _fresh_repository() as root:
-        _run(root, "add", "example", "lean4")
-        package = root / "example"
-        definition = package / "default.nix"
-        definition.unlink()
-        _repair_flake(root)
-        _expect("mkLean4Package" in definition.read_text(), definition)
-        definition.unlink()
-        _write_fixture_source(package / "main.py", "")
-        before = _snapshot(root)
-        rejected = _repair_flake(root, code=1)
-        _expect("ambiguous project markers" in rejected.stderr, rejected)
-        _expect(_snapshot(root) == before, "ambiguous package repair changed state")
-
-
 @pytest.mark.parametrize("kind", ["html", "latex", "lean4", "python"])
 @pytest.mark.parametrize(
     "constructor",
     [
         "inputs.self.lib.BUILDER",
         "inputs.afairesi.lib.BUILDER",
-        "(inputs.afairesi or inputs.self).lib.BUILDER",
+        "(inputs.self).lib.BUILDER",
         "let lib = inputs.self.lib; in lib.BUILDER",
         "let build = inputs.self.lib.BUILDER; in build",
     ],
@@ -1247,7 +618,7 @@ def test_declared_package_kind_allows_supporting_entrypoint_names(
         builder = subject.PACKAGE_BUILDERS[kind]
         definition.write_text(
             definition.read_text().replace(
-                f"(inputs.afairesi or inputs.self).lib.{builder}",
+                f"inputs.self.lib.{builder}",
                 "let dependency = inputs.self.lib.mkHtmlPackage {}; in "
                 + constructor.replace("BUILDER", builder),
                 1,
@@ -1257,7 +628,6 @@ def test_declared_package_kind_allows_supporting_entrypoint_names(
             if not (package / marker).exists():
                 _write_fixture_source(package / marker, "")
         _git(root, "add", "--force", "example")
-        _preview_flake_repair(root)
         report = subject.inspect_repository(root)
         _expect(report["example"]["type"] == kind, report)
         _check_flake_source(root)
@@ -1275,13 +645,13 @@ def test_untracked_definition_does_not_resolve_ambiguous_sources() -> None:
         _git(root, "add", "--force", "example/ms.tex")
         _git(root, "rm", "--cached", "example/default.nix")
         before = _snapshot(root)
-        rejected = _repair_flake(root, code=1)
+        rejected = _check_flake_source(root, code=1)
         _expect("ambiguous project markers" in rejected.stderr, rejected)
         _expect(_snapshot(root) == before, "untracked definition changed state")
 
 
 @pytest.mark.parametrize("kind", ["html", "latex", "lean4", "nix"])
-def test_repo_inspect_selects_tests_by_package_kind(kind: str) -> None:
+def test_inspect_selects_tests_by_package_kind(kind: str) -> None:
     """Supporting Python files never replace another package kind's test report."""
     with _fresh_repository() as root:
         _fixture_add(root, "example", kind)
@@ -1300,11 +670,10 @@ def test_python_initializer_collision_is_rejected_before_build() -> None:
         _fixture_add(root, "example", "python")
         initializer = root / "example/__init__.py"
         initializer.write_text('"""Personal initialization."""\n')
-        _preview_flake_repair(root)
         _git(root, "add", "example/__init__.py")
         before = _snapshot(root)
-        for result in (_repair_flake(root, code=1), _check_flake_source(root, code=1)):
-            _expect("__init__.py: reserved" in result.stderr, result)
+        result = _check_flake_source(root, code=1)
+        _expect("__init__.py: reserved" in result.stderr, result)
         result = _run(
             root,
             "eval",
@@ -1322,7 +691,7 @@ def test_python_initializer_collision_is_rejected_before_build() -> None:
         )
 
 
-def test_repo_fix_respects_excluded_trees() -> None:
+def test_source_validation_respects_excluded_trees() -> None:
     """Validate excluded trees once, independently of generated resource payloads."""
     with _fresh_repository() as root, pytest.MonkeyPatch.context() as patch:
         _check_excluded_trees(root, patch)
@@ -1343,7 +712,7 @@ def test_repo_fix_respects_excluded_trees() -> None:
         ("python", "a", "x", False),
     ],
 )
-def test_generated_packages_preserve_metadata_and_install_runnable_programs_and_assets(
+def test_package_builders_preserve_metadata_and_install_runnable_programs_and_assets(
     kind: str,
     name: str,
     description: str,
@@ -1352,8 +721,7 @@ def test_generated_packages_preserve_metadata_and_install_runnable_programs_and_
 ) -> None:
     """Evaluate generated Nix and run installed Python and HTML launchers."""
     with _fresh_repository() as root:
-        subject = import_module("afairesi.main")
-        subject.add_package(root, kind, name, description)
+        _fixture_add(root, name, kind, description)
         package = root / name
         asset = package / "assets/asset.bin"
         asset.parent.mkdir()
@@ -1371,6 +739,7 @@ def test_generated_packages_preserve_metadata_and_install_runnable_programs_and_
                 "  meta.description =",
             )
             if library:
+                source = source.replace("executable = true;", "executable = false;")
                 _write_fixture_source(package / "main.py", "VALUE = 1\n")
             else:
                 _write_fixture_source(
@@ -1405,20 +774,17 @@ def test_generated_packages_preserve_metadata_and_install_runnable_programs_and_
                     f"{binding} = {expression} ++ [ {dependency} ];",
                     f"inherit {binding};",
                 ).replace(
-                    "(inputs.afairesi or inputs.self)",
-                    f"let {binding} = {expression} ++ [ {dependency} ]; "
-                    "in (inputs.afairesi or inputs.self)",
+                    "inputs.self",
+                    f"let {binding} = {expression} ++ [ {dependency} ]; in inputs.self",
                     1,
                 )
         definition.write_text(source)
-        _repair_flake(root)
-        _preview_flake_repair(root)
         environment = _nix_environment(root)
         actual = _evaluated_template(root, name, environment)
         _expect(
             kind not in {"html", "latex"}
             or 'passthru.custom = "preserved";' in definition.read_text(),
-            "convergence lost custom package attributes",
+            "evaluation changed custom package attributes",
         )
         expected_name = name.replace("-", "_") if kind == "python" else name
         _expect(actual["name"] == expected_name, actual)
@@ -1500,7 +866,10 @@ def _check_installed_python_template(
                 "    argparse.ArgumentParser().parse_args()\n"
             ),
         )
-        _repair_flake(root)
+        definition = package / "default.nix"
+        definition.write_text(
+            definition.read_text().replace("executable = false;", "executable = true;")
+        )
         restored = _evaluated_template(root, name, environment)
         _expect(restored["meta"]["mainProgram"] == name, restored)
     else:
@@ -1632,7 +1001,7 @@ def test_application_runtime_paths_are_unrestricted(
         "import ./builder.nix { inherit inputs pkgs; }",
     ],
 )
-def test_source_validation_accepts_expressions_requiring_manual_repair(
+def test_source_validation_accepts_custom_package_expressions(
     expression: str,
 ) -> None:
     """Accept Nix expressions without rewriting builders or evaluating source."""
@@ -1643,10 +1012,7 @@ def test_source_validation_accepts_expressions_requiring_manual_repair(
         _git(root, "add", ".")
         before = _snapshot(root)
         _check_flake_source(root)
-        for arguments in ((), ("--dry-run",)):
-            result = _repair_flake(root, *arguments)
-            _expect("automatic repair unavailable" in result.stderr, result)
-            _expect(_snapshot(root) == before, "manual definition changed repository")
+        _expect(_snapshot(root) == before, "validation changed repository")
 
 
 def test_equivalent_package_bindings_are_valid_and_preserved() -> None:
@@ -1668,8 +1034,6 @@ def test_equivalent_package_bindings_are_valid_and_preserved() -> None:
         _git(root, "add", ".")
         before = _snapshot(root)
         _check_flake_source(root)
-        _repair_flake(root)
-        _preview_flake_repair(root)
         _expect(_snapshot(root) == before, "equivalent bindings were rewritten")
         evaluated = _evaluated_template(root, "example", _nix_environment(root))
         _expect(evaluated["meta"]["description"] == "Equivalent definition", evaluated)
@@ -1677,14 +1041,14 @@ def test_equivalent_package_bindings_are_valid_and_preserved() -> None:
 
 
 @pytest.mark.parametrize("relative", ["flake.nix", "example/default.nix"])
-def test_repo_validation_rejects_malformed_nix(relative: str) -> None:
+def test_source_validation_rejects_malformed_nix(relative: str) -> None:
     """Separate expression flexibility from Nix syntax errors."""
     with _fresh_repository() as root:
         _fixture_add(root, "example", "python")
         (root / relative).write_text("{ inputs, pkgs, ... }: (\n")
         before = _snapshot(root)
-        for result in (_repair_flake(root, code=1), _check_flake_source(root, code=1)):
-            _expect("parse error" in result.stderr, result)
+        result = _check_flake_source(root, code=1)
+        _expect("parse error" in result.stderr, result)
         _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
@@ -1699,32 +1063,9 @@ def test_opaque_package_definitions_allow_supporting_language_markers() -> None:
         _git(root, "add", ".")
         before = _snapshot(root)
         _check_flake_source(root)
-        _repair_flake(root)
         _expect(_snapshot(root) == before, "opaque definition was rewritten")
         subject = import_module("afairesi.main")
         _expect(subject.detect_packages(root)[0].kind == "nix", "guessed a language")
-
-
-@pytest.mark.parametrize(
-    ("arguments", "code"),
-    [
-        (("add", "../outside", "python"), 2),
-        (("add", "..", "host"), 2),
-        (("add", "laptop"), 2),
-        (("add", "example", "python"), 1),
-    ],
-)
-def test_rejected_operations_preserve_contents_modes_index_and_refs(
-    arguments: tuple[str, ...],
-    code: int,
-) -> None:
-    """Reject invalid paths and collisions before modifying work."""
-    with _fresh_repository() as root:
-        _run(root, "add", "example", "python")
-        (root / "work-in-progress").write_text("preserve unrelated work")
-        before = _snapshot(root)
-        rejected = _run(root, *arguments, code=code)
-        _expect(bool(rejected.stderr) and _snapshot(root) == before, rejected)
 
 
 def test_source_inspection_handles_deep_unrelated_calls(tmp_path: Path) -> None:
@@ -1840,1627 +1181,6 @@ def test_static_test_names_match_native_collection(tmp_path: Path, source: str) 
     _expect(declared == collected, (declared, collected))
 
 
-_home_test_run = partial(_run, scope=("home",))
-
-
-def _home_test_home_repository(root: Path) -> Path:
-    """Create a home repository with a locally initialized submodule."""
-    relative = "forge.example/owner/demo"
-    checkout = root / relative
-    checkout.mkdir(parents=True)
-    _git(root, "init", "--quiet")
-    _git(checkout, "init", "--quiet")
-    with (root / ".git/config").open("a", encoding="utf-8") as config:
-        config.write("[maintenance]\n\tauto = false\n")
-    with (checkout / ".git/config").open("a", encoding="utf-8") as config:
-        config.write(
-            "[maintenance]\n\tauto = false\n"
-            "[user]\n\tname = Test\n\temail = test@example.org\n"
-            "[commit]\n\tgpgSign = false\n"
-            '[remote "origin"]\n\turl = git@forge.example:owner/demo\n'
-            "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
-        )
-    source = checkout / "LICENSE"
-    _write_fixture_source(source, "first", encoding="utf-8")
-    _git(checkout, "add", "LICENSE")
-    _git(checkout, "commit", "--quiet", "-m", "first")
-    _git(checkout, "update-ref", "refs/remotes/origin/main", "HEAD")
-    (root / ".gitmodules").write_text(
-        f'[submodule "{relative}"]\npath = {relative}\n'
-        "url = git@forge.example:owner/demo\n",
-        encoding="utf-8",
-    )
-    (root / ".gitignore").write_text(
-        HOME_SUBMODULE_IGNORE,
-        encoding="utf-8",
-    )
-    _git(root, "add", "--force", ".gitignore", ".gitmodules", relative)
-    return root
-
-
-@pytest.mark.parametrize(
-    ("remote", "relative"),
-    [
-        ("https://example.test/team/project.git", "example.test/team/project"),
-        ("ssh://git@example.test/team/project.git", "example.test/team/project"),
-        ("git@example.test:team/project.git", "example.test/team/project"),
-        ("https://example.test/project.git", "example.test/project"),
-        ("git@example.test:project.git", "example.test/project"),
-        (
-            "https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git",
-            "git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux",
-        ),
-    ],
-)
-def test_home_add_registers_existing_content_without_creating_commits(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    remote: str,
-    relative: str,
-) -> None:
-    """Preserve the full remote path at any depth without creating commits."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    origin = tmp_path / "remote"
-    origin.mkdir()
-    _git(origin, "init", "--quiet")
-    (origin / "LICENSE").write_text("existing repository")
-    _git(origin, "add", "LICENSE")
-    _git(
-        origin,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.test",
-        "commit",
-        "--quiet",
-        "-m",
-        "Existing content",
-    )
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{origin.as_uri()}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
-    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    _home_test_run(tmp_path, "init")
-    _git(
-        home,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.test",
-        "commit",
-        "--quiet",
-        "-m",
-        "Home policy",
-    )
-    head = _git(home, "rev-parse", "HEAD")
-    result = _home_test_run(tmp_path, "add", remote)
-    checkout = home / relative
-    ignore = (home / ".gitignore").read_text()
-    _expect(f"!/{relative}/\n" in ignore, "add REMOTE omitted its allowlist exception")
-    _expect(_git(home, "show", ":.gitignore") == ignore, "allowlist was not staged")
-    if (checkout / "LICENSE").read_text() != "existing repository":
-        raise AssertionError(result.stdout + result.stderr)
-    if _git(home, "rev-parse", "HEAD") != head:
-        message = "add REMOTE created a home commit"
-        raise AssertionError(message)
-    if (
-        _git(
-            home,
-            "config",
-            "--file",
-            ".gitmodules",
-            f"submodule.{relative}.url",
-        ).strip()
-        != remote
-    ):
-        message = "add REMOTE changed the registered remote"
-        raise AssertionError(message)
-    if not _git(home, "ls-files", "--stage", "--", relative).startswith(
-        "160000 ",
-    ):
-        message = "add REMOTE did not stage the submodule"
-        raise AssertionError(message)
-    repeated = _home_test_run(tmp_path, "add", remote, code=1)
-    _expect("already exists in the index" in repeated.stderr, repeated)
-    _expect((home / ".gitignore").read_text() == ignore, "rejected add changed rules")
-
-
-def _local_init(root: Path, *, code: int = 0) -> subprocess.CompletedProcess[str]:
-    """Run source initialization with the caller's Nix tool configuration."""
-    return _run(
-        root,
-        "-c",
-        "from afairesi.main import main; main()",
-        "repo",
-        "init",
-        code=code,
-        executable=sys.executable,
-    )
-
-
-@pytest.mark.parametrize("force_flag", ["-f", "--force"])
-def test_home_add_reuses_retained_history_only_with_force(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    force_flag: str,
-) -> None:
-    """Re-add removed submodules using Git's explicit force option."""
-    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    _home_test_run(tmp_path, "init")
-    _home_test_run(tmp_path, "add", remote)
-    relative = "example.test/team/repository"
-    _fixture_git(home, "commit", "-qm", "Register submodule")
-    _home_test_run(tmp_path, "rm", relative)
-    storage = home / ".git/modules" / relative
-    history = _home_test_history_snapshot(storage)
-    before = _snapshot(home)
-    failed = _home_test_run(tmp_path, "add", remote, code=1)
-    _expect("--force" in failed.stderr, failed)
-    _expect(_snapshot(home) == before, "failed re-add changed home state")
-    _home_test_run(tmp_path, "add", force_flag, remote)
-    _expect(
-        _git(home / relative, "rev-parse", "HEAD") == _git(source, "rev-parse", "HEAD"),
-        "reused checkout has the wrong commit",
-    )
-    _expect(
-        _git(
-            home,
-            "config",
-            "-f",
-            ".gitmodules",
-            f"submodule.{relative}.path",
-        ).strip()
-        == relative,
-        "registration changed the canonical path",
-    )
-    _expect(
-        all((storage / path).read_bytes() == value for path, value in history.items()),
-        "reuse discarded retained history",
-    )
-
-
-def test_home_add_force_allows_path_ignored_by_nested_policy(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Explicit home addition registers the requested path despite ignore rules."""
-    home, _, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    _home_test_run(tmp_path, "init")
-    parent = home / "example.test/team"
-    parent.mkdir(parents=True)
-    (parent / ".gitignore").write_text("repository\n")
-    _home_test_run(tmp_path, "add", remote)
-    _expect((parent / "repository/.git").is_file(), "forced add did not register")
-
-
-@pytest.mark.parametrize("branch", ["main", "trunk"])
-def test_repo_init_stages_files_without_committing_or_requiring_home(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    branch: str,
-) -> None:
-    """Initialize a local worktree, preserving Git configuration and formatted files."""
-    nix_executable = shutil.which("nix")
-    _expect(nix_executable is not None, "initialization fixtures require Nix")
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    fake_nix = tools / "nix"
-    fake_nix.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = config ]; then\n'
-        "    printf 'nix-command flakes\\n'\n"
-        'elif [ "$1" = flake ]; then\n'
-        "    git ls-files --error-unmatch flake.nix >/dev/null || exit 7\n"
-        "    printf '{}\\n' > flake.lock\n"
-        "else\n"
-        "    git ls-files --error-unmatch flake.lock >/dev/null || exit 8\n"
-        "    printf '\\n' >> flake.nix\n"
-        "fi\n",
-    )
-    fake_nix.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
-    monkeypatch.setenv("HOME", str(tmp_path / "uninitialized-home"))
-    root = tmp_path / "project"
-    root.mkdir()
-    _git(root, "init", "--quiet", f"--initial-branch={branch}")
-    config = _git(root, "config", "--local", "--list")
-    _local_init(root)
-    outputs = _run(
-        root,
-        "eval",
-        "--impure",
-        "--json",
-        "--expr",
-        f"(import {json.dumps(str(root / 'flake.nix'))}).outputs {{ "
-        'self = "consumer"; afairesi = { '
-        'lib.mkFlake = _: { packages = "preserved"; formatter = "automatic"; }; }; }',
-        executable=nix_executable,
-        environment=_nix_environment(root)
-        | {"HOME": str(root / "tmp/evaluation-home")},
-    )
-    _expect(
-        json.loads(outputs.stdout)
-        == {"packages": "preserved", "formatter": "automatic"},
-        outputs,
-    )
-    files = {"flake.lock", "flake.nix"}
-    _expect(not (root / ".gitignore").exists(), "initialization created ignore rules")
-    _expect(set(_git(root, "ls-files").splitlines()) == files, "wrong staged files")
-    for name in files:
-        _expect(_git(root, "show", f":{name}") == (root / name).read_text(), name)
-    _expect(_git(root, "symbolic-ref", "--short", "HEAD").strip() == branch, branch)
-    _expect(not _git(root, "for-each-ref"), "initialization created a commit")
-    _expect(_git(root, "config", "--local", "--list") == config, "Git config changed")
-    _expect(not Path.home().exists(), "initialization required home setup")
-    before = _snapshot(root)
-    _local_init(root, code=1)
-    _expect(_snapshot(root) == before, "repeated initialization changed files")
-
-
-@pytest.mark.parametrize("failure", ["lock", "format", "interrupt"])
-@pytest.mark.parametrize("index_exists", [False, True])
-def test_repo_init_rolls_back_failed_nix_commands_and_can_retry(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    failure: str,
-    *,
-    index_exists: bool,
-) -> None:
-    """Restore the empty worktree and original index after errors or interruption."""
-    root = tmp_path / "project"
-    root.mkdir()
-    _git(root, "init", "--quiet")
-    index = root / ".git/index"
-    if index_exists:
-        _git(root, "read-tree", "--empty")
-        index.chmod(0o640)
-    original_index = (
-        (index.read_bytes(), index.stat().st_mode) if index_exists else None
-    )
-    before = _snapshot(root)
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    fake_nix = tools / "nix"
-    fake_nix.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = config ]; then\n'
-        "    printf 'nix-command flakes\\n'\n"
-        "    exit 0\n"
-        "fi\n"
-        "printf '{}\\n' > flake.lock\n"
-        'if [ "$1" = flake ] && [ "$FAILURE" != lock ]; then exit 0; fi\n'
-        "mkdir -p tmp/cache\n"
-        "printf 'partial output' > tmp/cache/result\n"
-        "ln -s tmp/cache partial-link\n"
-        "git add --force flake.lock tmp/cache/result partial-link\n"
-        'if [ "$FAILURE" = interrupt ]; then kill -INT "$PPID"; exit 0; fi\n'
-        "echo 'test Nix failure' >&2\n"
-        "exit 23\n",
-    )
-    fake_nix.chmod(0o755)
-    monkeypatch.setenv("PATH", str(tools) + os.pathsep + os.environ["PATH"])
-    monkeypatch.setenv("FAILURE", failure)
-    result = _local_init(root, code=130 if failure == "interrupt" else 23)
-    if failure != "interrupt":
-        _expect("test Nix failure" in result.stderr, result)
-    _expect(_snapshot(root) == before, "failed initialization changed repository state")
-    restored_index = (
-        (index.read_bytes(), index.stat().st_mode) if index.exists() else None
-    )
-    _expect(restored_index == original_index, "original Git index was not restored")
-    fake_nix.write_text(
-        "#!/bin/sh\n"
-        'if [ "$1" = config ]; then\n'
-        "    printf 'nix-command flakes\\n'\n"
-        'elif [ "$1" = flake ]; then\n'
-        "    printf '{}\\n' > flake.lock\n"
-        "fi\n",
-    )
-    _local_init(root)
-    _expect(
-        set(_git(root, "ls-files").splitlines()) == {"flake.lock", "flake.nix"},
-        "initialization could not be retried",
-    )
-
-
-@pytest.mark.parametrize("existing", ["untracked", "staged", "deleted", "symlink"])
-def test_repo_init_rejects_existing_content_without_changes(
-    tmp_path: Path,
-    existing: str,
-) -> None:
-    """Reject populated worktrees and retained index entries before mutation."""
-    _git(tmp_path, "init", "--quiet")
-    path = tmp_path / "personal-data"
-    if existing == "symlink":
-        path.symlink_to(tmp_path / "missing")
-    else:
-        path.write_text("preserve this")
-        if existing in {"staged", "deleted"}:
-            _git(tmp_path, "add", "personal-data")
-        if existing == "deleted":
-            path.unlink()
-    before = _snapshot(tmp_path)
-    result = _run(tmp_path, "init", code=1)
-    _expect("empty Git worktree" in result.stderr, result)
-    _expect(_snapshot(tmp_path) == before, "initialization changed existing content")
-
-
-@pytest.mark.parametrize("features", ["", "nix-command", "flakes"])
-def test_repo_init_checks_nix_features_before_creating_state(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    features: str,
-) -> None:
-    """Explain disabled Nix features before writing files or staging."""
-    _git(tmp_path, "init", "--quiet")
-    monkeypatch.setenv(
-        "NIX_CONFIG",
-        f"experimental-features = {features}\nextra-experimental-features =\n",
-    )
-    before = _snapshot(tmp_path)
-    result = _run(tmp_path, "init", code=1)
-    _expect("experimental-features = nix-command flakes" in result.stderr, result)
-    _expect(_snapshot(tmp_path) == before, "Nix prerequisite failure changed state")
-
-
-def test_repo_init_reports_missing_nix_without_changes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Explain missing Nix before writing files or staging."""
-    root = tmp_path / "project"
-    root.mkdir()
-    _git(root, "init", "--quiet")
-    tools = tmp_path / "tools"
-    tools.mkdir()
-    git_executable = shutil.which("git")
-    if git_executable is None:
-        pytest.fail("Missing Git executable")
-    (tools / "git").symlink_to(git_executable)
-    monkeypatch.setenv("PATH", str(tools))
-    before = _snapshot(root)
-    result = _local_init(root, code=1)
-    _expect("Nix executable not found" in result.stderr, result)
-    _expect(_snapshot(root) == before, "missing Nix changed state")
-
-
-@pytest.mark.parametrize("initialized_git", [False, True])
-def test_home_prerequisites_explain_initialization_without_changes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    *,
-    initialized_git: bool,
-) -> None:
-    """Direct missing home setup to home initialization without modifying the home."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    if initialized_git:
-        _git(home, "init", "--quiet")
-    before = _snapshot(home) if initialized_git else None
-    result = _home_test_run(
-        tmp_path,
-        "add",
-        "https://example.test/team/new.git",
-        code=1,
-    )
-    _expect("afairesi home init" in result.stderr, result)
-    if initialized_git:
-        _expect(
-            _snapshot(home) == before,
-            "home prerequisite check changed Git state",
-        )
-    else:
-        _expect(
-            not list(home.iterdir()),
-            "home prerequisite check created files",
-        )
-
-
-def _home_test_check_home_commits(
-    home_repository: Path,
-) -> None:
-    """Leave dirty files and gitlink advancement to native Git."""
-    root = home_repository
-    relative = "forge.example/owner/demo"
-    checkout = root / relative
-    source = checkout / "LICENSE"
-    first = _git(checkout, "rev-parse", "HEAD").strip()
-    _write_fixture_source(source, "second", encoding="utf-8")
-    _home_test_run(root, "init")
-    if source.read_text() != "second":
-        message = "convergence changed dirty submodule content"
-        raise AssertionError(message)
-    _git(checkout, "add", "LICENSE")
-    _git(checkout, "commit", "--quiet", "-m", "second")
-    second = _git(checkout, "rev-parse", "HEAD").strip()
-    for published in (False, True):
-        if published:
-            _git(checkout, "update-ref", "refs/remotes/origin/main", second)
-        _home_test_run(root, "init")
-        if first not in _git(root, "ls-files", "--stage", relative):
-            message = "convergence advanced the recorded submodule commit"
-            raise AssertionError(message)
-    _git(root, "add", relative)
-
-
-def _home_test_check_home_ignore_rules(home_repository: Path) -> None:
-    """Preserve local and staged ignore rules when repairing home submodules."""
-    root = home_repository
-    ignore = root / ".gitignore"
-    expected = "# Local policy\n\ntmp/\n"
-    ignore.write_text(expected, encoding="utf-8")
-    before = _git(root, "show", ":.gitignore")
-    _home_test_run(root, "init")
-    if ignore.read_text(encoding="utf-8") != (
-        "*\n" + expected + HOME_SUBMODULE_IGNORE.removeprefix("*\n")
-    ):
-        raise AssertionError(ignore.read_text(encoding="utf-8"))
-    if _git(root, "show", ":.gitignore") != before:
-        message = "convergence staged home ignore rules"
-        raise AssertionError(message)
-
-
-def _home_test_check_home_settings(
-    home_repository: Path,
-) -> None:
-    """Preserve optional submodule settings when refreshing home metadata."""
-    root = home_repository
-    modules = root / ".gitmodules"
-    source = modules.read_text() + (
-        "branch = main\nignore = dirty\nshallow = true\nupdate = checkout\n"
-    )
-    modules.write_text(source)
-    _git(root, "add", ".gitmodules")
-    index = _git(root, "ls-files", "--stage")
-    _home_test_run(root, "init")
-    if modules.read_text() != source or _git(root, "ls-files", "--stage") != index:
-        message = "convergence changed optional submodule settings"
-        raise AssertionError(message)
-
-
-def _home_test_history_snapshot(root: Path) -> dict[Path, bytes]:
-    """Observe stored Git files without requiring a surviving worktree."""
-    return {
-        path.relative_to(root): path.read_bytes()
-        for path in root.rglob("*")
-        if path.is_file()
-        and path.relative_to(root).parts[0] in {"objects", "refs", "logs", "HEAD"}
-    }
-
-
-def _git_rule_snapshot(root: Path) -> dict[str, object]:
-    """Compare native Git state, including repository-owned ignore rules."""
-    files, index, refs, config = _snapshot(root)
-    contents = cast("dict[str, tuple[int, int, bytes]]", files)
-    root_bytes = os.fsencode(root)
-    modules = {}
-    storage = root / ".git/modules"
-    module_configs = [
-        *storage.rglob("config"),
-        *(
-            marker / "config"
-            for marker in root.rglob(".git")
-            if marker != root / ".git" and marker.is_dir()
-        ),
-    ]
-    for module_config in sorted(module_configs):
-        directory = module_config.parent
-        modules[directory.relative_to(root).as_posix()] = (
-            module_config.read_bytes().replace(root_bytes, b"<ROOT>"),
-            {
-                path: value.replace(root_bytes, b"<ROOT>")
-                for path, value in _home_test_history_snapshot(directory).items()
-            },
-            _git(
-                root,
-                "--git-dir",
-                str(directory),
-                "--work-tree",
-                str(root),
-                "ls-files",
-                "--stage",
-                "-z",
-            ),
-        )
-    return {
-        "files": {
-            path: (kind, mode, value.replace(root_bytes, b"<ROOT>"))
-            for path, (kind, mode, value) in contents.items()
-            if ".git" not in Path(path).parts[:-1]
-        },
-        "index": [record for record in cast("str", index).split("\0") if record],
-        "refs": refs,
-        "config": cast("str", config).replace(str(root), "<ROOT>"),
-        "modules": modules,
-        "locks": {
-            path.relative_to(root / ".git"): path.read_bytes()
-            for path in (root / ".git").rglob("*.lock")
-            if path.is_file()
-        },
-    }
-
-
-def _expect_git_rule_state(
-    native: Path,
-    wrapped: Path,
-) -> None:
-    """Report the state fields that diverge from the native Git oracle."""
-    expected = _git_rule_snapshot(native)
-    actual = _git_rule_snapshot(wrapped)
-    differences = {
-        key: {"git": expected[key], "afairesi": actual[key]}
-        for key in expected
-        if expected[key] != actual[key]
-    }
-    _expect(not differences, differences)
-
-
-def _git_rule_home_fixture(root: Path, state: str) -> Path:
-    """Prepare equivalent submodule states before copying the oracle fixture."""
-    native = _home_test_home_repository(root)
-    relative = "forge.example/owner/demo"
-    checkout = native / relative
-    if state != "legacy":
-        _git(native, "submodule", "absorbgitdirs")
-    _git(native, "config", f"submodule.{relative}.active", "true")
-    _git(
-        native,
-        "config",
-        f"submodule.{relative}.url",
-        "git@mirror.test:repo",
-    )
-    _fixture_git(native, "commit", "-qm", "Home snapshot")
-    if state in {"dirty", "staged", "advanced"}:
-        (checkout / "LICENSE").write_text("local edits")
-        if state in {"staged", "advanced"}:
-            _git(checkout, "add", "LICENSE")
-        if state == "advanced":
-            _fixture_git(checkout, "commit", "-qm", "Local commit")
-    elif state in {"untracked", "ignored"}:
-        if state == "ignored":
-            exclude = _git(
-                checkout,
-                "rev-parse",
-                "--path-format=absolute",
-                "--git-path",
-                "info/exclude",
-            ).strip()
-            Path(exclude).write_text("asset\n")
-        (checkout / "asset").write_bytes(b"local data\x00\xff")
-    elif state == "deinitialized":
-        _git(native, "submodule", "deinit", "--", relative)
-    elif state == "dirty-modules":
-        modules = native / ".gitmodules"
-        modules.write_text(modules.read_text() + "# unstaged change\n")
-    elif state == "index-lock":
-        (native / ".git/index.lock").touch()
-    return native
-
-
-@pytest.mark.parametrize("force", [False, True])
-@pytest.mark.parametrize(
-    "state",
-    [
-        "clean",
-        "dirty",
-        "staged",
-        "advanced",
-        "untracked",
-        "ignored",
-        "legacy",
-        "deinitialized",
-        "dirty-modules",
-        "index-lock",
-    ],
-)
-def test_home_rm_matches_native_git(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    state: str,
-    *,
-    force: bool,
-) -> None:
-    """Use real Git as the oracle for removal errors, force rules, and side effects."""
-    native = _git_rule_home_fixture(tmp_path / "native", state)
-    wrapped = tmp_path / "wrapped"
-    relative = "forge.example/owner/demo"
-    shutil.copytree(native, wrapped)
-    monkeypatch.setenv("HOME", str(wrapped))
-    arguments = []
-    if force:
-        arguments.append("--force")
-    expected = subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
-        ["git", "rm", "-r", *arguments, "--", relative],  # noqa: S607
-        cwd=native,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    actual = _home_test_run(
-        wrapped,
-        "rm",
-        relative,
-        *arguments,
-        code=expected.returncode,
-    )
-    if expected.returncode == 0:
-        (native / ".gitignore").write_text(HOME_IGNORE)
-        _git(native, "add", ".gitignore")
-    _expect(
-        actual.stderr.replace(str(wrapped), "<ROOT>")
-        == expected.stderr.replace(str(native), "<ROOT>"),
-        (expected.stderr, actual.stderr),
-    )
-    _expect_git_rule_state(
-        native,
-        wrapped,
-    )
-
-
-@pytest.mark.parametrize("branch", ["main", "trunk"])
-def test_home_init_stages_metadata_without_cleaning_or_committing(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    branch: str,
-) -> None:
-    """Initialize HOME from another directory and preserve existing home data."""
-    home = tmp_path / "home"
-    home.mkdir()
-    local = home / "personal-data"
-    local.write_bytes(b"\x00keep home data\xff")
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", "init.defaultBranch")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", branch)
-    _home_test_run(tmp_path, "init")
-    _expect(
-        _git(home, "branch", "--show-current").strip() == branch,
-        "home initialization changed Git's initial branch",
-    )
-    _expect((home / ".gitignore").read_text() == HOME_IGNORE, "missing home allowlist")
-    _expect(
-        _git(home, "ls-files").splitlines() == [".gitignore", ".gitmodules"],
-        "home data was staged",
-    )
-    _expect(
-        not _git(home, "for-each-ref"),
-        "home initialization created a commit",
-    )
-    _expect(
-        local.read_bytes() == b"\x00keep home data\xff",
-        "home initialization cleaned HOME",
-    )
-    before = _snapshot(home)
-    template = tmp_path / "template"
-    (template / "hooks").mkdir(parents=True)
-    (template / "hooks/custom-hook").write_text("custom Git template")
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "2")
-    monkeypatch.setenv("GIT_CONFIG_KEY_1", "init.templateDir")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_1", str(template))
-    _home_test_run(tmp_path, "init")
-    _expect(
-        (home / ".git/hooks/custom-hook").read_text() == "custom Git template",
-        "home initialization skipped native Git reinitialization",
-    )
-    _expect(
-        _snapshot(home) == before,
-        "repeated home initialization changed state",
-    )
-    _expect(
-        not (tmp_path / ".git").exists(),
-        "home initialization initialized the working directory",
-    )
-
-
-@pytest.mark.parametrize("case", ["flake", "gitfile"])
-def test_home_init_rejects_invalid_state_without_creating_files(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case: str,
-) -> None:
-    """Reject invalid home policy and preserve Git initialization errors."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    name, source = {
-        "flake": ("flake.nix", "{}\n"),
-        "gitfile": (".git", "invalid gitfile\n"),
-    }[case]
-    (home / name).write_text(source)
-    before = {path.name: path.read_bytes() for path in home.iterdir()}
-    result = _home_test_run(tmp_path, "init", code=128 if case == "gitfile" else 1)
-    _expect(not (home / ".git").is_dir(), "failed init created Git metadata")
-    _expect(
-        {path.name: path.read_bytes() for path in home.iterdir()} == before,
-        "failed initialization changed home files",
-    )
-    if case == "gitfile":
-        _expect("fatal:" in result.stderr, result)
-
-
-def test_home_add_preserves_ignore_rules_and_staging_on_failure(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Preserve ignore rules, staging, and directories after submodule add failure."""
-    home = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(home))
-    remote = "https://example.test/team/missing.git"
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv(
-        "GIT_CONFIG_KEY_0",
-        f"url.{(tmp_path / 'missing').as_uri()}.insteadOf",
-    )
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
-    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    ignore = home / ".gitignore"
-    ignore.write_text(ignore.read_text() + "!/working-only\n")
-    before = _snapshot(home)
-    _home_test_run(tmp_path, "add", remote, code=128)
-    _expect(
-        _snapshot(home) == before,
-        "failed add changed the home repository",
-    )
-
-
-@pytest.mark.parametrize("state", ["deinitialized", "missing", "placeholder"])
-def test_home_init_preserves_missing_checkouts(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    state: str,
-) -> None:
-    """Preserve missing checkouts, their registrations, and local ignore rules."""
-    root = _home_test_home_repository(tmp_path)
-    monkeypatch.setenv("HOME", str(root))
-    relative = "forge.example/owner/demo"
-    checkout = root / relative
-    _git(root, "submodule", "absorbgitdirs", "--", relative)
-    _git(
-        root,
-        "config",
-        f"submodule.{relative}.url",
-        "git@mirror.example:owner/demo",
-    )
-    _fixture_git(root, "commit", "-qm", "Home snapshot")
-    if state == "deinitialized":
-        _git(root, "submodule", "deinit", "--", relative)
-    else:
-        shutil.rmtree(checkout)
-        if state == "placeholder":
-            checkout.mkdir()
-            (checkout / "LICENSE").write_text("unrelated local data")
-    _git(
-        root,
-        "config",
-        "--file",
-        ".gitmodules",
-        f"submodule.{relative}.url",
-        "git@forge.example:owner/renamed",
-    )
-    modules_before = (root / ".gitmodules").read_bytes()
-    gitlink_before = _git(root, "ls-files", "--stage", "--", relative)
-    config_before = _git(root, "config", "--local", "--list")
-    history = root / ".git/modules" / relative
-    history_before = _home_test_history_snapshot(history)
-    ignore = root / ".gitignore"
-    expected_ignore = "# Local policy\n\ntmp/\n"
-    ignore.write_text(expected_ignore)
-    _home_test_run(root, "init")
-    _expect(
-        not (checkout / ".git").exists(),
-        "repair initialized a missing checkout",
-    )
-    _expect(
-        ignore.read_text()
-        == "*\n" + expected_ignore + HOME_SUBMODULE_IGNORE.removeprefix("*\n"),
-        "repair lost personal rules or missing-checkout exceptions",
-    )
-    _expect(
-        (root / ".gitmodules").read_bytes() == modules_before,
-        "repair moved missing checkout registration",
-    )
-    _expect(
-        _git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
-        "repair changed missing checkout gitlink",
-    )
-    _expect(
-        _git(root, "config", "--local", "--list") == config_before,
-        "repair changed local registration",
-    )
-    _expect(
-        _home_test_history_snapshot(history) == history_before,
-        "repair changed stored history",
-    )
-    if state == "placeholder":
-        _expect(
-            (checkout / "LICENSE").read_text() == "unrelated local data",
-            "repair changed placeholder data",
-        )
-    elif state == "missing":
-        _expect(
-            not checkout.exists(),
-            "repair recreated missing checkout directory",
-        )
-    after = _snapshot(root)
-    _home_test_run(root, "init")
-    _expect(
-        _snapshot(root) == after,
-        "repeated repair changed missing checkout state",
-    )
-
-
-@pytest.mark.parametrize("committed", [False, True])
-@pytest.mark.parametrize("url", ["git@mirror.example:team/other", "../other", None])
-def test_home_init_adds_missing_rules_without_pruning_manual_git_moves(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    url: str | None,
-    *,
-    committed: bool,
-) -> None:
-    """Add current paths while leaving obsolete rules from manual moves to the user."""
-    root = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(root))
-    original = "forge.example/owner/demo"
-    relative = "projects/demo"
-    _git(root, "submodule", "absorbgitdirs", "--", original)
-    _fixture_git(root, "commit", "-qm", "Home snapshot")
-    (root / "projects").mkdir()
-    _git(root, "mv", "--", original, relative)
-    key = f"submodule.{original}.url"
-    if url is None:
-        _git(root, "config", "--file", ".gitmodules", "--unset", key)
-    else:
-        _git(root, "config", "--file", ".gitmodules", key, url)
-    _git(root, "add", ".gitmodules")
-    if committed:
-        _fixture_git(root, "commit", "-qm", "Move repository")
-    checkout = root / relative
-    (checkout / "LICENSE").write_text("local edits")
-    (checkout / "untracked").write_text("local data")
-    checkout_before = _snapshot(checkout)
-    modules_before = (root / ".gitmodules").read_bytes()
-    gitlink_before = _git(root, "ls-files", "--stage", "--", relative)
-    _home_test_run(tmp_path, "init")
-    _expect(_snapshot(checkout) == checkout_before, "initialization changed checkout")
-    _expect(
-        (root / ".gitmodules").read_bytes() == modules_before,
-        "initialization changed submodule registration",
-    )
-    _expect(
-        _git(root, "ls-files", "--stage", "--", relative) == gitlink_before,
-        "initialization changed the submodule commit",
-    )
-    expected = HOME_SUBMODULE_IGNORE + "!/projects/\n!/projects/demo/\n"
-    _expect((root / ".gitignore").read_text() == expected, "manual rules were pruned")
-    _expect(_git(root, "show", ":.gitignore") == expected, "allowlist was not staged")
-
-
-def test_home_init_preserves_dirty_submodules() -> None:
-    """Preserve checkout/index state when refreshing home metadata."""
-    with (
-        TemporaryDirectory(prefix="afairesi-home-") as directory,
-        pytest.MonkeyPatch.context() as patch,
-    ):
-        root = _home_test_home_repository(Path(directory))
-        patch.setenv("HOME", str(root))
-        before = _snapshot(root)
-        rejected = _repair_flake(root, code=1)
-        _expect("use afairesi home" in rejected.stderr, rejected)
-        _expect(
-            _snapshot(root) == before,
-            "flake repair changed home state",
-        )
-        _home_test_check_home_commits(root)
-        _home_test_check_home_ignore_rules(root)
-        _home_test_check_home_settings(root)
-        modules = root / ".gitmodules"
-        modules.write_text(
-            modules.read_text() + "url = git@forge.example:owner/other\n",
-        )
-        before = _snapshot(root)
-        result = _home_test_run(root, "init", code=1)
-        _expect(
-            "duplicate url field" in result.stderr and _snapshot(root) == before,
-            result,
-        )
-
-
-@pytest.mark.parametrize(
-    "location",
-    ["home", "nested", "submodule", "flake", "outside"],
-)
-def test_home_init_targets_home_from_any_working_directory(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    location: str,
-) -> None:
-    """Refresh only HOME when invoked from repositories or plain paths."""
-    home = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(home))
-    checkout = home / "forge.example/owner/demo"
-    (checkout / "flake.nix").touch()
-    flake = tmp_path / "flake"
-    flake.mkdir()
-    _git(flake, "init", "--quiet")
-    (flake / "flake.nix").touch()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    cwd = {
-        "home": home,
-        "nested": checkout.parent,
-        "submodule": checkout,
-        "flake": flake,
-        "outside": outside,
-    }[location]
-    ignore = home / ".gitignore"
-    expected = "# Home policy\n\ntmp/\n"
-    ignore.write_text(expected)
-    indexed = _git(home, "show", ":.gitignore")
-    modules = home / ".gitmodules"
-    existing_modules = modules.read_text()
-    new_module = (
-        '[submodule "aaa"]\npath = forge.example/owner/aaa\n'
-        "url = git@forge.example:owner/aaa\n"
-    )
-    modules.write_text(existing_modules + new_module)
-    checkout_before = _snapshot(checkout)
-    flake_before = _snapshot(flake)
-    _home_test_run(cwd, "init")
-    _expect(
-        modules.read_text() == existing_modules + new_module,
-        "initialization changed submodule registration",
-    )
-    _expect(
-        _git(home, "show", ":.gitmodules") == existing_modules,
-        "initialization staged submodule edits",
-    )
-    _expect(expected in ignore.read_text(), "personal ignore rules changed")
-    _expect(
-        "!/forge.example/owner/aaa/\n" in ignore.read_text(), "missing new exception"
-    )
-    _expect(
-        _git(home, "show", ":.gitignore") == indexed + "!/forge.example/owner/aaa/\n",
-        "repair did not stage only structural ignore rules",
-    )
-    _expect(
-        _snapshot(checkout) == checkout_before,
-        "home repair changed submodule",
-    )
-    _expect(
-        _snapshot(flake) == flake_before,
-        "home repair changed unrelated flake",
-    )
-    _expect(not list(outside.iterdir()), "home repair changed outside path")
-
-
-@pytest.mark.parametrize("case", ["unknown", "parent"])
-def test_home_rm_rejects_unknown_submodules_and_parent_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    case: str,
-) -> None:
-    """Reject paths that do not identify one registered submodule."""
-    root = _home_test_home_repository(tmp_path)
-    monkeypatch.setenv("HOME", str(root))
-    relative = "forge.example/owner/demo"
-    _git(root, "submodule", "absorbgitdirs")
-    _fixture_git(root, "commit", "-qm", "Home snapshot")
-    target = {"unknown": "missing", "parent": "forge.example/owner"}.get(
-        case,
-        relative,
-    )
-    before = _snapshot(root)
-    _home_test_run(root, "rm", target, code=1)
-    _expect(
-        _snapshot(root) == before,
-        "rejected removal changed home state",
-    )
-
-
-@pytest.mark.parametrize(
-    "location",
-    ["home", "nested", "submodule", "flake", "outside"],
-)
-@pytest.mark.parametrize("name", ["forge.example/owner/demo", "legacy-name"])
-def test_home_rm_stages_metadata_and_preserves_shared_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    name: str,
-    location: str,
-) -> None:
-    """Remove and stage a submodule while preserving ignore rules and shared paths."""
-    root = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(root))
-    relative = "forge.example/owner/demo"
-    flake = tmp_path / "flake"
-    flake.mkdir()
-    _git(flake, "init", "--quiet")
-    (flake / "flake.nix").touch()
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    cwd = {
-        "home": root,
-        "nested": (root / relative).parent,
-        "submodule": root / relative,
-        "flake": flake,
-        "outside": outside,
-    }[location]
-    flake_before = _snapshot(flake)
-    _git(root, "submodule", "absorbgitdirs")
-    if name != relative:
-        _git(
-            root,
-            "config",
-            "--file",
-            ".gitmodules",
-            "--rename-section",
-            f"submodule.{relative}",
-            f"submodule.{name}",
-        )
-        _git(root, "add", ".gitmodules")
-    _git(
-        root,
-        "config",
-        f"submodule.{name}.url",
-        "git@forge.example:owner/demo",
-    )
-    _git(root, "config", f"submodule.{name}.active", "true")
-    _git(root, "config", "submodule.unrelated.active", "false")
-    local_config_before = _git(root, "config", "--local", "--list")
-    history = root / ".git/modules" / relative
-    history_before = _home_test_history_snapshot(history)
-    ignore = root / ".gitignore"
-    _git(root, "add", ".gitignore")
-    _fixture_git(root, "commit", "-qm", "Home snapshot")
-    _home_test_run(cwd, "rm", relative)
-    _expect(
-        _snapshot(flake) == flake_before,
-        "removal changed unrelated flake",
-    )
-    _expect(not list(outside.iterdir()), "removal changed outside path")
-    _expect(
-        not (root / relative).exists(),
-        "submodule checkout was not removed",
-    )
-    _expect(
-        ignore.read_text() == HOME_IGNORE, "removal left stale submodule exceptions"
-    )
-    subject = import_module("afairesi.main")
-    _expect(
-        subject.home_submodule_paths(root) == [],
-        "submodule remains registered",
-    )
-    _expect(
-        _git(root, "config", "--local", "--list") == local_config_before,
-        "removal changed local submodule settings",
-    )
-    _expect(
-        _home_test_history_snapshot(history) == history_before,
-        "removal changed stored history",
-    )
-    staged = _git(root, "diff", "--cached", "--name-only").splitlines()
-    _expect(set(staged) == {".gitignore", ".gitmodules", relative}, staged)
-    _expect(
-        not _git(root, "diff", "--name-only"),
-        "metadata was not staged",
-    )
-
-
-@pytest.mark.parametrize("storage", ["directory", "absorbed", "deinitialized"])
-def test_home_rm_preserves_history_for_submodules_without_urls(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    storage: str,
-) -> None:
-    """Preserve history for registrations without URLs, including absent checkouts."""
-    root = _home_test_home_repository(tmp_path)
-    monkeypatch.setenv("HOME", str(root))
-    relative = "forge.example/owner/demo"
-    checkout = root / relative
-    history = root / ".git/modules" / relative
-    if storage != "directory":
-        _git(root, "submodule", "absorbgitdirs")
-    history_before = _home_test_history_snapshot(
-        checkout / ".git" if storage == "directory" else history,
-    )
-    _fixture_git(root, "commit", "-qm", "Home snapshot")
-    if storage == "deinitialized":
-        _git(root, "submodule", "deinit", "--", relative)
-    _git(
-        root,
-        "config",
-        "--file",
-        ".gitmodules",
-        "--unset",
-        f"submodule.{relative}.url",
-    )
-    _git(root, "add", ".gitmodules")
-    config_before = _git(root, "config", "--local", "--list")
-    _home_test_run(root, "rm", relative)
-    _expect(not checkout.exists(), "removal left checkout")
-    _expect(
-        _home_test_history_snapshot(history) == history_before,
-        "removal changed stored history",
-    )
-    _expect(
-        _git(root, "config", "--local", "--list") == config_before,
-        "removal changed local configuration",
-    )
-
-
-def test_home_init_preserves_gitmodules_and_personal_rules(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Preserve submodule metadata, personal rules, and their staging."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    _home_test_run(tmp_path, "init")
-    ignore = home / ".gitignore"
-    ignore_rules = "# Local policy\n\ntmp/\ntmp/\n"
-    ignore.write_text(ignore_rules)
-    prefix = "# Home repositories\n"
-    last = (
-        '[submodule "zzz"] # retained comment\n'
-        "\tpath = forge.example/team/zzz\n"
-        "\turl = https://forge.example/team/zzz.git\n"
-        "\tbranch = stable\n\n"
-    )
-    other = "[custom]\n\tsetting = retained\n"
-    first = (
-        '[submodule "aaa]quoted\\"name"]\n'
-        "\tpath = forge.example/team/aaa\n"
-        "\turl = https://forge.example/team/aaa.git\n"
-        "\tupdate = none\n"
-    )
-    modules = home / ".gitmodules"
-    staged = prefix + last + other + first
-    modules.write_text(staged)
-    _git(home, "add", ".gitmodules")
-    working = staged + "\tignore = dirty\n"
-    modules.write_text(working)
-    _home_test_run(tmp_path, "init")
-    _expect(modules.read_text() == working, modules.read_text())
-    _expect(_git(home, "show", ":.gitmodules") == staged, modules)
-    _expect(ignore_rules in ignore.read_text(), "home command lost personal rules")
-    _expect("!/forge.example/team/aaa/\n" in ignore.read_text(), ignore)
-    _expect("!/forge.example/team/zzz/\n" in ignore.read_text(), ignore)
-    _expect(
-        _git(home, "show", ":.gitignore")
-        == ignore.read_text().replace(ignore_rules, ""),
-        "home command staged personal rules",
-    )
-    before = _snapshot(home)
-    _home_test_run(tmp_path, "init")
-    _expect(_snapshot(home) == before, "repeated command changed home state")
-
-
-@pytest.mark.parametrize(
-    ("policy", "tracked", "expected_home"),
-    [
-        (None, False, HOME_IGNORE),
-        ("", False, HOME_IGNORE),
-        ("", True, HOME_IGNORE),
-        (
-            "# Artifacts\n\ntmp/\n",
-            False,
-            "*\n# Artifacts\n\ntmp/\n!/.gitignore\n!/.gitmodules\n",
-        ),
-        (
-            "# Artifacts\n\ntmp/\n",
-            True,
-            "*\n# Artifacts\n\ntmp/\n!/.gitignore\n!/.gitmodules\n",
-        ),
-        ("*\n", False, HOME_IGNORE),
-        ("*\n", True, HOME_IGNORE),
-        (HOME_IGNORE + "!/forge.example/\n", False, HOME_IGNORE + "!/forge.example/\n"),
-        (HOME_IGNORE + "!/forge.example/\n", True, HOME_IGNORE + "!/forge.example/\n"),
-    ],
-)
-def test_home_and_repo_commands_preserve_user_ignore_rules(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    policy: str | None,
-    expected_home: str,
-    *,
-    tracked: bool,
-) -> None:
-    """Leave ignore rules, their modes, and their index entries under user control."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    with _fresh_repository() as root:
-        _git(root, "rm", "--force", ".gitignore")
-        _git(home, "init", "--quiet")
-        for directory in (home, root):
-            ignore = directory / ".gitignore"
-            mode = 0o755
-            if policy is not None:
-                if tracked:
-                    ignore.write_text("# Staged rules\nresult\n")
-                    _git(directory, "add", "--force", ".gitignore")
-                ignore.write_text(policy)
-                ignore.chmod(mode)
-            indexed = _git(directory, "ls-files", "--stage", "--", ".gitignore")
-            if directory == home:
-                _home_test_run(tmp_path, "init")
-            else:
-                _run(root, "add", "prm", "python")
-                _run(root, "add", "tmp", "nix")
-                _run(root, "add", "host", "host")
-                _preview_flake_repair(root)
-                _run(root, "fix")
-                _check_flake_source(root)
-            expected = policy
-            if directory == home:
-                expected = expected_home
-            _expect(
-                (ignore.read_text() if ignore.exists() else None) == expected,
-                "command changed personal ignore rules",
-            )
-            if policy is not None:
-                _expect(stat.S_IMODE(ignore.stat().st_mode) == mode, ignore)
-            if directory == home:
-                _expect(
-                    _git(home, "show", ":.gitignore")
-                    == (
-                        "*\n# Staged rules\nresult\n!/.gitignore\n!/.gitmodules\n"
-                        if tracked and policy is not None
-                        else HOME_IGNORE
-                    ),
-                    "command changed personal staging",
-                )
-            else:
-                _expect(
-                    _git(directory, "ls-files", "--stage", "--", ".gitignore")
-                    == indexed,
-                    "command staged ignore rules",
-                )
-        _expect(
-            (home / ".gitmodules").read_text() == "",
-            "empty home lacks registration metadata",
-        )
-        _expect(
-            {p.name for p in import_module("afairesi.main").detect_packages(root)}
-            == {"prm", "tmp"},
-            "packages named prm or tmp were omitted",
-        )
-
-
-def test_home_allowlist_admits_only_selected_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Allow selected home paths without exposing their siblings."""
-    home, _source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    _home_test_run(tmp_path, "init")
-    ignore = home / ".gitignore"
-    ignore.write_text(ignore.read_text() + "!/notes/\n!/notes/keep.txt\n")
-    _home_test_run(tmp_path, "add", remote)
-    for relative in (
-        "private.txt",
-        ".ssh/private-key",
-        "example.test/unregistered/README",
-        "example.test/team/other/README",
-        "example.test/team/private.txt",
-        "notes/cache.txt",
-        "notes/keep.txt",
-    ):
-        path = home / relative
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("local data")
-        _run(
-            home,
-            "check-ignore",
-            "--quiet",
-            "--no-index",
-            relative,
-            executable="git",
-            code=1 if relative == "notes/keep.txt" else 0,
-        )
-    for relative in (".gitignore", ".gitmodules", "example.test/team/repository"):
-        _run(
-            home,
-            "check-ignore",
-            "--quiet",
-            "--no-index",
-            relative,
-            executable="git",
-            code=1,
-        )
-    _git(home, "add", "notes/keep.txt")
-    _expect(
-        "notes/keep.txt" in _git(home, "ls-files").splitlines(),
-        "personal file stayed ignored",
-    )
-    _expect(
-        "notes" not in _git(home, "show", ":.gitignore"), "add staged personal rules"
-    )
-    before = _snapshot(home)
-    _home_test_run(tmp_path, "init")
-    _expect(_snapshot(home) == before, "repeated repair changed allowlist state")
-
-
-@pytest.mark.parametrize("command", ["rm", "native", "committed"])
-def test_home_allowlist_removal_preserves_shared_personal_parents(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-) -> None:
-    """Prune only through home rm, preserving manual exceptions and their staging."""
-    home = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(home))
-    ignore = home / ".gitignore"
-    personal = (
-        "# Personal files\n!/forge.example/personal/\n"
-        "!/forge.example/personal/staged.txt\n"
-    )
-    ignore.write_text(ignore.read_text() + personal)
-    _git(home, "add", ".gitignore")
-    _fixture_git(home, "commit", "-qm", "Home snapshot")
-    local = "!/forge.example/personal/working.txt\n"
-    ignore.write_text(ignore.read_text() + local)
-    relative = "forge.example/owner/demo"
-    if command in {"native", "committed"}:
-        _git(home, "rm", "-r", "--", relative)
-        if command == "committed":
-            _fixture_git(home, "commit", "-qm", "Remove repository")
-        _home_test_run(tmp_path, "init")
-    else:
-        _home_test_run(tmp_path, "rm", relative)
-    expected = (
-        HOME_IGNORE + "!/forge.example/\n" if command == "rm" else HOME_SUBMODULE_IGNORE
-    ) + personal
-    _expect(
-        ignore.read_text() == expected + local,
-        "removal changed unrelated rules or failed to remove its own rules",
-    )
-    _expect(
-        _git(home, "show", ":.gitignore") == expected,
-        "removal changed personal staging",
-    )
-    for name in ("staged", "working"):
-        path = home / f"forge.example/personal/{name}.txt"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.touch()
-        _git(home, "add", str(path))
-    if command == "rm":
-        _git(home, "check-ignore", "--quiet", "--no-index", relative)
-    before = _snapshot(home)
-    _home_test_run(tmp_path, "init")
-    _expect(_snapshot(home) == before, "repeated removal repair changed state")
-
-
-def test_home_allowlist_escapes_uninitialized_submodule_paths(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Escape submodule paths without admitting matching sibling names."""
-    home = tmp_path / "home"
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    _home_test_run(tmp_path, "init")
-    relative = "legacy [x] /repo?*\\name"
-    _git(home, "config", "--file", ".gitmodules", "submodule.legacy.path", relative)
-    _git(
-        home,
-        "config",
-        "--file",
-        ".gitmodules",
-        "submodule.legacy.url",
-        "https://forge.example/team/repo.git",
-    )
-    (home / relative).mkdir(parents=True)
-    (home / "legacy x /repo1othername").mkdir(parents=True)
-    _home_test_run(tmp_path, "init")
-    _run(
-        home,
-        "check-ignore",
-        "--quiet",
-        "--no-index",
-        relative,
-        executable="git",
-        code=1,
-    )
-    _git(home, "check-ignore", "--quiet", "--no-index", "legacy x /repo1othername")
-    _expect(
-        not (home / "forge.example").exists(), "repair moved an uninitialized checkout"
-    )
-
-
-@pytest.mark.parametrize("command", ["init", "add", "rm"])
-@pytest.mark.parametrize("state", ["working-symlink", "staged-symlink"])
-def test_home_commands_reject_nonregular_ignore_before_mutation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    command: str,
-    state: str,
-) -> None:
-    """Reject a symlinked ignore file before changing registrations or checkouts."""
-    home = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(home))
-    target = tmp_path / "personal-ignore"
-    target.write_text("personal policy\n")
-    ignore = home / ".gitignore"
-    if state == "working-symlink":
-        ignore.unlink()
-        ignore.symlink_to(target)
-    else:
-        blob = _git(home, "hash-object", "-w", str(target)).strip()
-        _git(home, "update-index", "--cacheinfo", f"120000,{blob},.gitignore")
-    arguments = {
-        "init": (),
-        "add": ("https://forge.example/team/other.git",),
-        "rm": ("forge.example/owner/demo",),
-    }[command]
-    before = _snapshot(home)
-    result = _home_test_run(tmp_path, command, *arguments, code=1)
-    _expect("regular file" in result.stderr, result)
-    _expect(_snapshot(home) == before, "rejected command changed home state")
-    _expect(target.read_text() == "personal policy\n", "command changed symlink target")
-
-
-def test_home_cli_exposes_only_home_lifecycle_commands(
-    tmp_path: Path,
-) -> None:
-    """Keep home lifecycle commands separate from flake resource management."""
-    commands = ("add", "init", "rm")
-    help_output = _home_test_run(tmp_path, "--help").stdout
-    _expect(_home_test_run(tmp_path).stdout == help_output, help_output)
-    positions = [help_output.index(f"    {name} ") for name in commands]
-    _expect(positions == sorted(positions), help_output)
-    for command in commands:
-        _expect(
-            "usage:" in _home_test_run(tmp_path, command, "--help").stdout,
-            command,
-        )
-    for arguments in (
-        ("unknown-command",),
-        ("clone", "https://example.test/team/repository.git"),
-        ("add",),
-        ("init", "unexpected"),
-        ("rm",),
-    ):
-        _home_test_run(tmp_path, *arguments, code=2)
-    _expect(not list(tmp_path.iterdir()), "invalid requests created files")
-
-
-def test_home_add_and_rm_only_update_target_rules(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Update only the selected path and preserve unrelated staging."""
-    home, _source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    _home_test_run(tmp_path, "init")
-    _git(home, "config", "--file", ".gitmodules", "submodule.other.path", "other/repo")
-    ignore = home / ".gitignore"
-    staged = HOME_IGNORE + "!/obsolete/\n# Manual rules\n!/notes/\n!/notes/staged.txt\n"
-    local = "!/notes/working.txt"
-    ignore.write_text(staged)
-    _git(home, "add", ".gitignore", ".gitmodules")
-    ignore.write_text(staged + local)
-    _home_test_run(tmp_path, "add", remote)
-    added = "!/example.test/\n!/example.test/team/\n!/example.test/team/repository/\n"
-    _expect(ignore.read_text() == staged + local + "\n" + added, ignore.read_text())
-    _expect(_git(home, "show", ":.gitignore") == staged + added, "add staged edits")
-    _fixture_git(home, "commit", "-qm", "Register repository")
-    _home_test_run(tmp_path, "rm", "example.test/team/repository")
-    _expect(ignore.read_text() == staged + local + "\n", ignore.read_text())
-    _expect(_git(home, "show", ":.gitignore") == staged, "removal staged edits")
-
-
-def test_home_rm_keeps_rules_needed_by_other_submodules(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Retain shared ancestors for a registered sibling even without a checkout."""
-    home = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(home))
-    sibling = "forge.example/owner/remaining"
-    _git(home, "config", "--file", ".gitmodules", "submodule.sibling.path", sibling)
-    _git(home, "add", ".gitmodules")
-    _home_test_run(tmp_path, "init")
-    _fixture_git(home, "commit", "-qm", "Register sibling")
-    _home_test_run(tmp_path, "rm", "forge.example/owner/demo")
-    expected = (
-        HOME_IGNORE + "!/forge.example/\n!/forge.example/owner/\n" + f"!/{sibling}/\n"
-    )
-    _expect((home / ".gitignore").read_text() == expected, "shared rules removed")
-    _expect(_git(home, "show", ":.gitignore") == expected, "incorrect staged rules")
-
-
-def test_home_rm_preserves_a_manually_deleted_ignore_file(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Remove the requested repository without recreating an unrelated deleted file."""
-    home = _home_test_home_repository(tmp_path / "home")
-    monkeypatch.setenv("HOME", str(home))
-    _fixture_git(home, "commit", "-qm", "Home snapshot")
-    _git(home, "rm", ".gitignore")
-    _home_test_run(tmp_path, "rm", "forge.example/owner/demo")
-    _expect(not (home / ".gitignore").exists(), "removal recreated the ignore file")
-    _expect(not _git(home, "ls-files", "--", ".gitignore"), "removal staged a new file")
-
-
-def test_home_commands_reject_flake_repositories_without_changes(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Prevent home lifecycle commands from modifying a flake repository."""
-    _git(tmp_path, "init", "--quiet")
-    (tmp_path / "flake.nix").touch()
-    _git(tmp_path, "add", "--force", "flake.nix")
-    monkeypatch.setenv("HOME", str(tmp_path))
-    before = _snapshot(tmp_path)
-    for arguments in (("init",), ("rm", "example")):
-        _home_test_run(tmp_path, *arguments, code=1)
-        _expect(
-            _snapshot(tmp_path) == before,
-            "home command changed flake state",
-        )
-
-
-def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
-    tmp_path: Path,
-) -> None:
-    """Expose both scopes and reject unscoped or cross-scope commands."""
-    executable = os.environ["PACKAGE_E2E_EXECUTABLE"]
-    help_output = _run(tmp_path, "--help", executable=executable).stdout
-    _expect(
-        "Create and maintain repositories, packages, and hosts "
-        "in the afairesi computing environment." in " ".join(help_output.split()),
-        help_output,
-    )
-    _expect("    repo " in help_output and "    home " in help_output, help_output)
-    _expect(
-        help_output.index("    home ") < help_output.index("    repo "),
-        help_output,
-    )
-    _expect(_run(tmp_path, executable=executable).stdout == help_output, help_output)
-    arguments: tuple[str, ...]
-    for arguments in (
-        ("add", "example", "python"),
-        ("init",),
-        ("repo", "init", "unexpected"),
-        ("home", "add", "example", "python"),
-        ("unknown-scope",),
-    ):
-        _run(tmp_path, *arguments, executable=executable, code=2)
-    for arguments in (
-        ("repo", "init"),
-        ("repo", "add", "example", "python"),
-        ("home", "init"),
-        ("home", "add", "https://example.test/team/repository.git"),
-        ("home", "rm", "forge.example/owner/demo"),
-    ):
-        command_help = _run(
-            tmp_path,
-            *arguments[:2],
-            "--help",
-            executable=executable,
-        ).stdout
-        _expect("--dry-run" not in command_help, command_help)
-        for flag in ("-n", "--dry-run"):
-            rejected = _run(
-                tmp_path,
-                *arguments,
-                flag,
-                executable=executable,
-                code=2,
-            )
-            _expect("unrecognized arguments" in rejected.stderr, rejected)
-    fix_help = _run(tmp_path, "repo", "fix", "--help", executable=executable).stdout
-    _expect("--dry-run" in fix_help, fix_help)
-    _expect(not any(tmp_path.iterdir()), "invalid scope created state")
-
-
 @pytest.mark.parametrize(
     ("kind", "name"),
     [
@@ -3476,92 +1196,14 @@ def test_workspace_cli_requires_explicit_scope_and_shows_scoped_help(
     ],
 )
 def test_resource_names_have_no_spelling_convention(kind: str, name: str) -> None:
-    """Create, repair, validate, and inspect names without a shared style rule."""
+    """Validate and inspect names without a shared style rule."""
     with _fresh_repository() as root:
-        _run(root, "add", name, kind)
+        _fixture_add(root, name, kind)
         before = _snapshot(root)
-        _preview_flake_repair(root)
-        _repair_flake(root)
         _check_flake_source(root)
         report = json.loads(_run(root, "inspect").stdout)
         _expect(report[name]["type"] == kind, report)
-        _expect(_snapshot(root) == before, "resource spelling changed during repair")
-
-
-@pytest.mark.parametrize("library", [False, True])
-@pytest.mark.parametrize("staged_mode", [0o644, 0o755])
-@pytest.mark.parametrize("working_mode", [0o644, 0o755])
-def test_python_source_permissions_remain_under_user_control(
-    staged_mode: int,
-    working_mode: int,
-    *,
-    library: bool,
-) -> None:
-    """Create ordinary source files and preserve existing working and staged modes."""
-    with _fresh_repository() as root:
-        _run(root, "add", "example", "python")
-        source = root / "example/main.py"
-        _expect(not source.stat().st_mode & 0o111, "creation made source executable")
-        if library:
-            _write_fixture_source(source, "VALUE = 42\n")
-        _repair_flake(root)
-        source.chmod(staged_mode)
-        _git(root, "add", "example/main.py")
-        source.chmod(working_mode)
-        before = _snapshot(root)
-        _preview_flake_repair(root)
-        _repair_flake(root)
-        _check_flake_source(root)
-        _expect(_snapshot(root) == before, "repair changed Python source permissions")
-
-
-def test_repo_fix_creates_non_executable_python_source() -> None:
-    """Restore missing Python source as an ordinary file, including its index mode."""
-    with _fresh_repository() as root:
-        _run(root, "add", "example", "python")
-        source = root / "example/main.py"
-        source.unlink()
-        _repair_flake(root)
-        _expect(not source.stat().st_mode & 0o111, "repair made source executable")
-        _expect(
-            _git(root, "ls-files", "--stage", "example/main.py").startswith("100644 "),
-            "repair staged executable source",
-        )
-        _preview_flake_repair(root)
-
-
-@pytest.mark.parametrize("name", ["123", "1app", "class", "async", "foo.bar"])
-def test_repo_add_rejects_invalid_python_package_names(name: str) -> None:
-    """Reject names that cannot be imported by the installed executable."""
-    with _fresh_repository() as root:
-        _run(root, "add", "example", "python")
-        before = _snapshot(root)
-        _run(root, "add", name, "python", code=1)
-        _expect(_snapshot(root) == before, name)
-        _run(root, "add", name, "nix")
-
-
-def test_python_module_collisions_are_rejected_before_changes() -> None:
-    """Keep distinct resources from sharing one installed Python module."""
-    with _fresh_repository() as root:
-        _run(root, "add", "foo-bar", "python")
-        before = _snapshot(root)
-        rejected = _run(root, "add", "foo_bar", "python", code=1)
-        _expect("collide" in rejected.stderr, rejected)
-        _expect(_snapshot(root) == before, "rejected creation changed state")
-
-
-@pytest.mark.parametrize("remote_kind", ["path", "file"])
-def test_repo_fix_accepts_local_git_origins(remote_kind: str) -> None:
-    """Local Git origins do not require a hosted home-repository identity."""
-    with _fresh_repository() as root:
-        upstream = root / "upstream.git"
-        remote = str(upstream) if remote_kind == "path" else upstream.as_uri()
-        _fixture_add(root, "example", "python")
-        _git(root, "remote", "add", "origin", remote)
-        _run(root, "fix")
-        _expect((root / "example/main.py").is_file(), "repair removed package source")
-        _preview(root, "fix")
+        _expect(_snapshot(root) == before, "validation changed resource spelling")
 
 
 @pytest.mark.parametrize("filename", ["main.nix", "test_main.nix"])
@@ -3606,21 +1248,6 @@ def test_nix_optional_sources_are_formatted(filename: str) -> None:
         _expect(json.loads(result.stdout) == {"a": 1, "z": 2}, result)
 
 
-def test_fresh_python_scaffold_passes_formatting() -> None:
-    """Accept generated Python under the bundled lint and formatting rules."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        source = root / "example/main.py"
-        _run(root, "--no-cache", "example/main.py", executable="treefmt")
-        formatted = source.read_text()
-        _run(root, "--no-cache", "example/main.py", executable="treefmt")
-        _expect(source.read_text() == formatted, "scaffold formatting did not converge")
-        _expect("argparse" not in formatted, "empty parser in generated package")
-        _run(root, str(source), executable=sys.executable)
-        report = inspection_subject.inspect_repository(root)["example"]["cli"]
-        _expect(report == {}, report)
-
-
 def test_web_formatting_preserves_literal_line_breaks() -> None:
     """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
     with _fresh_repository() as root:
@@ -3642,7 +1269,7 @@ def test_web_formatting_preserves_literal_line_breaks() -> None:
         _expect("first\n\nsecond" in html.read_text(), html.read_text())
 
 
-def test_formatting_transforms_tracked_sources_without_repair_or_staging() -> None:
+def test_formatting_transforms_tracked_sources_without_staging() -> None:
     """Remove ordinary comments while preserving lint findings and Git selection."""
     with _fresh_repository() as root:
         _fixture_add(root, "site", "html")
@@ -3692,30 +1319,6 @@ def test_formatting_transforms_tracked_sources_without_repair_or_staging() -> No
             _git(root, "diff", "--cached", "--binary") == staged,
             "formatter staged changes",
         )
-
-
-@pytest.mark.parametrize(
-    ("kind", "filenames"),
-    [("html", ("script.js", "style.css", "app.js")), ("latex", ("ms.bib", "refs.bib"))],
-)
-def test_repo_fix_preserves_supporting_assets(
-    kind: str, filenames: tuple[str, ...]
-) -> None:
-    """Repair treats conventional asset names like any other supporting file."""
-    with _fresh_repository() as root:
-        _fixture_add(root, "site", kind)
-        for name in filenames:
-            path = root / "site" / name
-            path.write_text("supporting file\n")
-            path.chmod(0o755)
-            _git(root, "add", "--force", "--", str(path))
-        _run(root, "fix")
-        for name in filenames:
-            path = root / "site" / name
-            _expect(
-                bool(path.stat().st_mode & 0o111), "repair changed supporting file mode"
-            )
-            _expect(path.read_text() == "supporting file\n", "repair changed asset")
 
 
 @pytest.mark.parametrize("tracked", [False, True])
@@ -3810,9 +1413,6 @@ def test_formatting_normalizes_metadata_and_supporting_sources() -> None:
             )
 
 
-_campaign_run = partial(_run, scope=("repo", "test"))
-
-
 def _campaign_make_runner_target(
     root: Path,
     source: str,
@@ -3887,7 +1487,7 @@ def _campaign_run_runner_cli(
     executable_directory = str(Path(os.environ["PACKAGE_E2E_EXECUTABLE"]).parent)
     environment["PATH"] = executable_directory + os.pathsep + environment["PATH"]
     return subprocess.run(  # noqa: S603 - Test PATH selects afairesi; arguments come from fixtures.
-        ["afairesi", "repo", "test", command, str(root), *arguments],  # noqa: S607
+        ["afairesi", "test", command, str(root), *arguments],  # noqa: S607
         env=environment,
         capture_output=True,
         text=True,
@@ -3942,7 +1542,7 @@ def _campaign_prepare_coverage_flake(
     (root / "prm/afairesi").mkdir()
     shutil.copyfile(Path(__file__).with_name("main.py"), root / "prm/afairesi/main.py")
     name = "z-last"
-    _run(root, "add", f"{name}", "python")
+    _fixture_add(root, name, "python")
     package = root / name
     source = (
         "import os\n"
@@ -4015,7 +1615,7 @@ def _campaign_prepare_coverage_flake(
         f"packageDrv = packages.{json.dumps(name)}; "
         f"check = checks.{json.dumps(name)}; }};"
     )
-    _repair_flake(root)
+    _check_flake_source(root)
     _write_fixture_source(
         root / "flake.nix",
         "{ outputs = _: let nixLibrary = import ./prm/builders/main.nix "
@@ -4064,7 +1664,7 @@ def _run_campaign(
     """Run an omitted target and preserve original sources, settings, and refs."""
     before = _snapshot(root, exclude=("tmp",))
     result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "test", command, *arguments],
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], "test", command, *arguments],
         cwd=cwd or root,
         env=environment,
         capture_output=True,
@@ -4100,7 +1700,7 @@ def _run_campaign(
         ("performance", "absolute", True),
     ],
 )
-def test_repo_test_routes_targets_and_forwards_test_selection(
+def test_campaign_routes_targets_and_forwards_test_selection(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     command: str,
@@ -4111,6 +1711,8 @@ def test_repo_test_routes_targets_and_forwards_test_selection(
     """Cover all path forms with property tests and both target kinds per campaign."""
     subject = import_module("afairesi.main")
     root = _repository(tmp_path)
+    (root / ".gitmodules").touch()
+    _git(root, "add", ".gitmodules")
     package = _make_source_package(root, "alpha", "def test_alpha(): pass\n")
     directory = package / "prm/nested" if nested else package
     directory.mkdir(parents=True, exist_ok=True)
@@ -4130,7 +1732,7 @@ def test_repo_test_routes_targets_and_forwards_test_selection(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "repo", "test", command, *arguments, *selectors],
+        ["afairesi", "test", command, *arguments, *selectors],
     )
     with pytest.raises(SystemExit) as completed:
         subject.main()
@@ -4158,7 +1760,7 @@ def test_repo_test_routes_targets_and_forwards_test_selection(
 
 
 @pytest.mark.parametrize("location", ["outside", "root", "nested"])
-def test_repo_test_without_a_campaign_shows_help_without_running_tests(
+def test_campaign_without_a_campaign_shows_help_without_running_tests(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -4177,13 +1779,13 @@ def test_repo_test_without_a_campaign_shows_help_without_running_tests(
     monkeypatch.setattr(subject, "_run_coverage", coverage_run)
     monkeypatch.setattr(subject, "_dispatch_test_runner", other_campaigns)
     before = _snapshot(root)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "--help"])
+    monkeypatch.setattr(sys, "argv", ["afairesi", "test", "--help"])
     with pytest.raises(SystemExit) as completed:
         subject.main()
     if completed.value.code != 0:
         raise AssertionError((completed.value.code, 0))
     expected = capsys.readouterr()
-    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test"])
+    monkeypatch.setattr(sys, "argv", ["afairesi", "test"])
     subject.main()
     actual = capsys.readouterr()
     if actual.out != expected.out:
@@ -4205,14 +1807,14 @@ def test_repo_test_without_a_campaign_shows_help_without_running_tests(
     "command",
     [None, "coverage", "property", "fuzz", "mutation", "performance"],
 )
-def test_repo_test_help_is_available_outside_git(
+def test_campaign_help_is_available_outside_git(
     tmp_path: Path,
     command: str | None,
 ) -> None:
     """Describe each campaign without requiring repository or build state."""
     arguments = [] if command is None else [command]
-    result = _campaign_run(tmp_path, *arguments, "--help")
-    if "usage: afairesi repo test" not in result.stdout:
+    result = _run(tmp_path, "test", *arguments, "--help")
+    if "usage: afairesi test" not in result.stdout:
         raise AssertionError(result)
     if list(tmp_path.iterdir()) != []:
         raise AssertionError(list(tmp_path.iterdir()))
@@ -4222,9 +1824,9 @@ def test_repo_test_help_is_available_outside_git(
     "command",
     ["coverage", "property", "fuzz", "mutation", "performance"],
 )
-def test_repo_test_requires_repository(tmp_path: Path, command: str) -> None:
+def test_campaign_requires_repository(tmp_path: Path, command: str) -> None:
     """Keep explicit execution errors distinct from the bare help command."""
-    result = _campaign_run(tmp_path, command, code=1)
+    result = _run(tmp_path, "test", command, code=1)
     if "not inside a Git repository" not in result.stderr:
         raise AssertionError(result)
     if list(tmp_path.iterdir()) != []:
@@ -4244,14 +1846,15 @@ def test_repo_test_requires_repository(tmp_path: Path, command: str) -> None:
         ("performance", "nan"),
     ],
 )
-def test_repo_test_rejects_invalid_timeout_without_changes(
+def test_campaign_rejects_invalid_timeout_without_changes(
     tmp_path: Path,
     command: str,
     timeout: str,
 ) -> None:
     """Cover each invalid budget and ensure every campaign uses the validator."""
-    result = _campaign_run(
+    result = _run(
         tmp_path,
+        "test",
         command,
         str(tmp_path),
         f"--timeout={timeout}",
@@ -4268,14 +1871,14 @@ def test_repo_test_rejects_invalid_timeout_without_changes(
     [("mutation", "--max-mutations"), ("fuzz", "--max-examples")],
 )
 @pytest.mark.parametrize("limit", ["0", "-1"])
-def test_repo_test_rejects_invalid_count_without_changes(
+def test_campaign_rejects_invalid_count_without_changes(
     tmp_path: Path,
     command: str,
     option: str,
     limit: str,
 ) -> None:
     """Require a positive generation or mutation count."""
-    result = _campaign_run(tmp_path, command, str(tmp_path), option, limit, code=2)
+    result = _run(tmp_path, "test", command, str(tmp_path), option, limit, code=2)
     if f"{option} must be positive" not in result.stderr:
         raise AssertionError(result)
     if list(tmp_path.iterdir()) != []:
@@ -4283,7 +1886,7 @@ def test_repo_test_rejects_invalid_count_without_changes(
 
 
 @pytest.mark.parametrize("limit", [None, 3])
-def test_repo_test_fuzz_selects_targets_and_applies_example_budgets(
+def test_campaign_fuzz_selects_targets_and_applies_example_budgets(
     tmp_path: Path,
     limit: int | None,
 ) -> None:
@@ -4320,7 +1923,7 @@ def test_repo_test_fuzz_selects_targets_and_applies_example_budgets(
     _expect(not list(workspace.glob("test-runtime-*")), workspace)
 
 
-def test_repo_test_fuzz_skips_missing_tests_and_reports_failures(
+def test_campaign_fuzz_skips_missing_tests_and_reports_failures(
     tmp_path: Path,
 ) -> None:
     """Continue across packages without hiding failures or invalid fuzz definitions."""
@@ -4354,9 +1957,7 @@ def test_repo_test_fuzz_skips_missing_tests_and_reports_failures(
     _expect((workspace / "tests.log").is_file(), workspace)
 
 
-def test_repo_test_performance_profiles_tests_and_cli_without_changing_sources() -> (
-    None
-):
+def test_campaign_performance_profiles_tests_and_cli_without_changing_sources() -> None:
     """Retain native parent and CLI profiles, even when selected tests fail."""
     with TemporaryDirectory(prefix="afairesi-profile-") as directory:
         root = Path(directory) / "source with spaces"
@@ -4434,12 +2035,12 @@ def test_repo_test_performance_profiles_tests_and_cli_without_changing_sources()
     "layout",
     ["empty", "nonpython", "untested", "single_untested"],
 )
-def test_repo_test_handles_nonrunnable_targets_without_changes(layout: str) -> None:
+def test_campaign_handles_nonrunnable_targets_without_changes(layout: str) -> None:
     """Skip untested repository packages and reject nonrunnable targets safely."""
     with _fresh_repository() as root:
         target = root
         if layout == "nonpython":
-            _run(root, "add", "web", "html")
+            _fixture_add(root, "web", "html")
         elif layout in {"untested", "single_untested"}:
             target = _campaign_make_runner_target(root, "", "")
             (target / "test_main.py").unlink()
@@ -4447,8 +2048,9 @@ def test_repo_test_handles_nonrunnable_targets_without_changes(layout: str) -> N
                 target = root
         before = _snapshot(root)
         for command in ("property", "mutation"):
-            result = _campaign_run(
+            result = _run(
                 root,
+                "test",
                 command,
                 str(target),
                 code=0 if layout == "untested" else 1,
@@ -4464,7 +2066,7 @@ def test_repo_test_handles_nonrunnable_targets_without_changes(layout: str) -> N
         if layout == "empty":
             _expect(
                 "no Python packages found"
-                in _campaign_run(root, "coverage", code=1).stderr,
+                in _run(root, "test", "coverage", code=1).stderr,
                 "coverage",
             )
         _expect(
@@ -4473,7 +2075,7 @@ def test_repo_test_handles_nonrunnable_targets_without_changes(layout: str) -> N
         )
 
 
-def test_repo_test_coverage_measures_subprocesses_without_changing_sources() -> None:
+def test_campaign_coverage_measures_subprocesses_without_changing_sources() -> None:
     """Build real checks, measure CLI lines, and keep reports outside the checkout."""
     with TemporaryDirectory(prefix="afairesi-coverage-") as directory:
         root = Path(directory) / "source with spaces"
@@ -4483,7 +2085,7 @@ def test_repo_test_coverage_measures_subprocesses_without_changing_sources() -> 
             f"let f = builtins.getFlake {json.dumps('git+' + root.as_uri())}; "
             'in f.checks.${builtins.currentSystem}."z-last"'
         )
-        plain = _campaign_run(
+        plain = _run(
             root,
             "build",
             "--no-link",
@@ -4541,7 +2143,7 @@ def test_repo_test_coverage_measures_subprocesses_without_changing_sources() -> 
         )
 
 
-def test_repo_test_coverage_continues_after_failed_nix_builds(
+def test_campaign_coverage_continues_after_failed_nix_builds(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -4596,7 +2198,7 @@ def test_repo_test_coverage_continues_after_failed_nix_builds(
         monkeypatch.setattr(
             sys,
             "argv",
-            ["afairesi", "repo", "test", "coverage", str(target)],
+            ["afairesi", "test", "coverage", str(target)],
         )
         with pytest.raises(SystemExit) as completed:
             campaign_subject.main()
@@ -4608,7 +2210,7 @@ def test_repo_test_coverage_continues_after_failed_nix_builds(
                 "1 passed, 1 failed, 1 skipped" in output.out
                 and "z-last:" in output.out
                 and str(report / "html/index.html") in output.out
-                and "afairesi repo test coverage: example:" in output.err,
+                and "afairesi test coverage: example:" in output.err,
                 output,
             )
         _expect(_snapshot(tmp_path) == before, target)
@@ -4631,7 +2233,7 @@ def test_repo_test_coverage_continues_after_failed_nix_builds(
         ([[3, -1]], "  main.py: missing branches 3 -> exit\n"),
     ],
 )
-def test_repo_test_coverage_describes_uncovered_branches(
+def test_campaign_coverage_describes_uncovered_branches(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -4666,7 +2268,7 @@ def test_repo_test_coverage_describes_uncovered_branches(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "repo", "test", "coverage", str(package)],
+        ["afairesi", "test", "coverage", str(package)],
     )
     with pytest.raises(SystemExit) as completed:
         subject.main()
@@ -4688,7 +2290,7 @@ def test_repo_test_coverage_describes_uncovered_branches(
     ("missing", "message"),
     [("html", "no HTML report"), ("json", "coverage.json")],
 )
-def test_repo_test_coverage_rejects_missing_report_files(
+def test_campaign_coverage_rejects_missing_report_files(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -4726,7 +2328,7 @@ def test_repo_test_coverage_rejects_missing_report_files(
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "repo", "test", "coverage", str(package)],
+        ["afairesi", "test", "coverage", str(package)],
     )
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
@@ -4746,7 +2348,7 @@ def test_repo_test_coverage_rejects_missing_report_files(
     ["coverage", "property", "fuzz", "mutation", "performance"],
 )
 @pytest.mark.parametrize("failure", ["missing-output", "invalid-flake"])
-def test_repo_test_preserves_native_nix_errors_for_package_targets(
+def test_campaign_preserves_native_nix_errors_for_package_targets(
     tmp_path: Path,
     command: str,
     failure: str,
@@ -4780,8 +2382,9 @@ def test_repo_test_preserves_native_nix_errors_for_package_targets(
     )
     _expect(expected.returncode != 0, expected)
     before = _snapshot(root, exclude=("tmp",))
-    actual = _campaign_run(
+    actual = _run(
         root,
+        "test",
         command,
         str(root / "example"),
         code=expected.returncode,
@@ -4798,7 +2401,7 @@ def test_repo_test_preserves_native_nix_errors_for_package_targets(
 
 
 @pytest.mark.parametrize("failure", ["assertion", "collection", "selection", "usage"])
-def test_repo_test_property_preserves_native_pytest_status(
+def test_campaign_property_preserves_native_pytest_status(
     tmp_path: Path,
     failure: str,
 ) -> None:
@@ -4841,8 +2444,9 @@ def test_repo_test_property_preserves_native_pytest_status(
     )
     _expect(expected.returncode != 0, expected)
     before = _snapshot(root, exclude=("tmp",))
-    actual = _campaign_run(
+    actual = _run(
         root,
+        "test",
         "property",
         str(package),
         *selectors,
@@ -4862,7 +2466,7 @@ def test_repo_test_property_preserves_native_pytest_status(
     )
 
 
-def test_repo_test_coverage_skips_untested_packages_and_continues_after_invalid_sources(
+def test_campaign_coverage_skips_untested_packages_and_continues_after_invalid_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -4884,7 +2488,7 @@ def test_repo_test_coverage_skips_untested_packages_and_continues_after_invalid_
     monkeypatch.setattr(
         sys,
         "argv",
-        ["afairesi", "repo", "test", "coverage", str(tmp_path)],
+        ["afairesi", "test", "coverage", str(tmp_path)],
     )
     with pytest.raises(SystemExit) as completed:
         campaign_subject.main()
@@ -4893,7 +2497,7 @@ def test_repo_test_coverage_skips_untested_packages_and_continues_after_invalid_
     _expect(built == [ready], built)
     _expect(
         "1 passed, 1 failed, 1 skipped" in output.out
-        and "afairesi repo test coverage: alpha:" in output.err,
+        and "afairesi test coverage: alpha:" in output.err,
         output,
     )
     _expect(
@@ -4903,7 +2507,7 @@ def test_repo_test_coverage_skips_untested_packages_and_continues_after_invalid_
 
 
 @pytest.mark.parametrize("failure", ["counterexample", "timeout"])
-def test_repo_test_property_continues_after_failures(failure: str) -> None:
+def test_campaign_property_continues_after_failures(failure: str) -> None:
     """Retain counterexamples and terminate stalled descendants before continuing."""
     with TemporaryDirectory(prefix="afairesi-failed-campaign-") as directory:
         root = Path(directory) / "source with spaces"
@@ -4960,7 +2564,7 @@ def test_repo_test_property_continues_after_failures(failure: str) -> None:
             )
 
 
-def test_repo_test_property_generates_cases_in_isolated_sources() -> None:
+def test_campaign_property_generates_cases_in_isolated_sources() -> None:
     """Count generated cases and isolate copied Git commands and runtime state."""
     with TemporaryDirectory(prefix="afairesi-campaign-") as directory:
         root = Path(directory) / "source with spaces"
@@ -5074,7 +2678,7 @@ def test_repo_test_property_generates_cases_in_isolated_sources() -> None:
 
 
 @pytest.mark.parametrize("command", ["property", "fuzz", "performance"])
-def test_repo_test_preserves_native_plugins_options_and_hypothesis_profiles(
+def test_campaign_preserves_native_plugins_options_and_hypothesis_profiles(
     command: str,
 ) -> None:
     """Respect package plugins, pytest options, and the active example budget."""
@@ -5116,7 +2720,7 @@ def test_repo_test_preserves_native_plugins_options_and_hypothesis_profiles(
         )
 
 
-def test_repo_test_mutation_rejects_invalid_baselines_and_continues() -> None:
+def test_campaign_mutation_rejects_invalid_baselines_and_continues() -> None:
     """Reject invalid baselines and accept a passing suite with no mutations."""
     with TemporaryDirectory(prefix="afairesi-baselines-") as directory:
         root = Path(directory) / "source with spaces"
@@ -5176,7 +2780,7 @@ def test_repo_test_mutation_rejects_invalid_baselines_and_continues() -> None:
     "problem",
     [None, "timeout", "error", "pending", "skipped", "incompetent"],
 )
-def test_repo_test_mutation_preserves_engine_failure_status(
+def test_campaign_mutation_preserves_engine_failure_status(
     tmp_path: Path,
     problem: str | None,
 ) -> None:
@@ -5211,7 +2815,7 @@ def test_repo_test_mutation_preserves_engine_failure_status(
     )
 
 
-def test_repo_test_mutation_reports_outcomes_and_filters_mutations() -> None:
+def test_campaign_mutation_reports_outcomes_and_filters_mutations() -> None:
     """Check killed/surviving mutations and native filters once with a fixed value."""
     with TemporaryDirectory(prefix="afairesi-mutations-") as directory:
         root = Path(directory) / "source with spaces"
@@ -5315,29 +2919,11 @@ def test_repo_test_mutation_reports_outcomes_and_filters_mutations() -> None:
         )
 
 
-def test_repo_test_rejects_home_repository_targets(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    capsys: pytest.CaptureFixture[str],
-) -> None:
-    """Reject home scope instead of silently traversing registered submodules."""
-    campaign_subject = import_module("afairesi.main")
-    _git(tmp_path, "init", "--quiet")
-    (tmp_path / ".gitmodules").touch()
-    _git(tmp_path, "add", "--force", ".gitmodules")
-    monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "repo", "test", "property"])
-    with pytest.raises(SystemExit) as completed:
-        campaign_subject.main()
-    _expect(completed.value.code == 1, completed)
-    _expect("git submodule foreach" in capsys.readouterr().err, completed)
-
-
 inspection_subject = import_module("afairesi.main")
 
 
 @pytest.mark.parametrize("description", [None, "package"])
-def test_repo_inspect_reports_package_descriptions_without_dependency_metadata(
+def test_inspect_reports_package_descriptions_without_dependency_metadata(
     description: str | None,
 ) -> None:
     """Read only the returned package's description, including curried builders."""
@@ -5431,9 +3017,7 @@ def main():
 """,
     ],
 )
-def test_repo_inspect_reports_argument_free_executables(
-    tmp_path: Path, source: str
-) -> None:
+def test_inspect_reports_argument_free_executables(tmp_path: Path, source: str) -> None:
     """Argument-free scripts need no parser and remain statically inspectable."""
     report = _inspection_discovery(source)
     _expect(report == {"arguments": [], "commands": {}}, report)
@@ -5456,7 +3040,7 @@ def test_repo_inspect_reports_argument_free_executables(
         "from sys import argv as args\ndef main(): return args[1:]",
     ],
 )
-def test_repo_inspect_requires_supported_cli(tmp_path: Path, source: str) -> None:
+def test_inspect_requires_supported_cli(tmp_path: Path, source: str) -> None:
     """Fail inspection when a Python package's interface cannot be discovered."""
     _inspection_repository(tmp_path)
     path = tmp_path / "example/main.py"
@@ -5469,7 +3053,7 @@ def test_repo_inspect_requires_supported_cli(tmp_path: Path, source: str) -> Non
     )
 
 
-def test_repo_inspect_reports_arguments_in_their_public_commands() -> None:
+def test_inspect_reports_arguments_in_their_public_commands() -> None:
     """Resolve aliases, returned parsers, groups, and helper contexts."""
     report = _inspection_discovery("""
 import argparse as ap
@@ -5506,7 +3090,7 @@ def main():
     )
 
 
-def test_repo_inspect_preserves_nested_and_argument_free_commands() -> None:
+def test_inspect_preserves_nested_and_argument_free_commands() -> None:
     """Keep empty commands and arguments with the same name in distinct scopes."""
     report = _inspection_discovery("""
 import argparse
@@ -5547,7 +3131,7 @@ add.add_argument("url")
     )
 
 
-def test_repo_inspect_marks_unresolved_argument_metadata_as_unknown() -> None:
+def test_inspect_marks_unresolved_argument_metadata_as_unknown() -> None:
     """Keep unresolved metadata when argument names and scope are known."""
     report = _inspection_discovery("""
 from argparse import ArgumentParser as Parser
@@ -5579,7 +3163,7 @@ cli.add_argument("--output", default=compute_default(), **options)
         'if enabled:\n    target = cli\ntarget.add_argument("--token")',
     ],
 )
-def test_repo_inspect_rejects_runtime_dependent_structure(declaration: str) -> None:
+def test_inspect_rejects_runtime_dependent_structure(declaration: str) -> None:
     """Reject uncertain argument membership, including helper and alias dependencies."""
     source = "import argparse\ncli = argparse.ArgumentParser()\n" + declaration
     with pytest.raises(
@@ -5601,7 +3185,7 @@ def test_repo_inspect_rejects_runtime_dependent_structure(declaration: str) -> N
         "cli.customize()",
     ],
 )
-def test_repo_inspect_rejects_argument_configuration_outside_the_inspected_source(
+def test_inspect_rejects_argument_configuration_outside_the_inspected_source(
     configure: str,
 ) -> None:
     """Fail when parser flow escapes the supported helper and method patterns."""
@@ -5611,7 +3195,7 @@ def test_repo_inspect_rejects_argument_configuration_outside_the_inspected_sourc
 
 
 @pytest.mark.parametrize("consumed", [False, True])
-def test_repo_inspect_rejects_ambiguous_public_interfaces(*, consumed: bool) -> None:
+def test_inspect_rejects_ambiguous_public_interfaces(*, consumed: bool) -> None:
     """Require an unambiguous root instead of merging distinct command interfaces."""
     source = """
 import argparse
@@ -5629,7 +3213,7 @@ two.add_argument('--two')
         _inspection_discovery(source)
 
 
-def test_repo_inspect_reports_statically_declared_arguments_in_order() -> None:
+def test_inspect_reports_statically_declared_arguments_in_order() -> None:
     """Resolve literal branches and preserve the order of finite literal loops."""
     report = _inspection_discovery("""
 import argparse
@@ -5657,7 +3241,7 @@ for name in []:
     )
 
 
-def test_repo_inspect_includes_interfaces_declared_in_the_main_guard() -> None:
+def test_inspect_includes_interfaces_declared_in_the_main_guard() -> None:
     """Treat the standard main guard as active when describing an executable CLI."""
     report = _inspection_discovery("""
 import argparse
@@ -5685,7 +3269,7 @@ if __name__ == '__main__':
         "{path: process(path) for path in cli.parse_args().files}",
     ],
 )
-def test_repo_inspect_recognizes_arguments_used_to_generate_collections(
+def test_inspect_recognizes_arguments_used_to_generate_collections(
     expression: str,
 ) -> None:
     """Recognize a parser consumed while evaluating the first comprehension iterable."""
@@ -5716,7 +3300,7 @@ def main():
         "(item for item in items for path in cli.parse_args().files)",
     ],
 )
-def test_repo_inspect_rejects_conditionally_used_command_interfaces(
+def test_inspect_rejects_conditionally_used_command_interfaces(
     expression: str,
 ) -> None:
     """Reject parser consumption that depends on comprehension iterations or filters."""
@@ -5741,7 +3325,7 @@ def main():
         "while cli.parse_args().files:\n        break",
     ],
 )
-def test_repo_inspect_recognizes_arguments_used_to_control_loops(loop: str) -> None:
+def test_inspect_recognizes_arguments_used_to_control_loops(loop: str) -> None:
     """Loop iterables and initial while conditions execute before their bodies."""
     report = _inspection_discovery(
         """
@@ -5762,7 +3346,7 @@ def main():
     )
 
 
-def test_repo_inspect_reports_argument_groups_exclusivity_and_defaults() -> None:
+def test_inspect_reports_argument_groups_exclusivity_and_defaults() -> None:
     """Expose group membership, exclusivity, and defaults in the correct command."""
     report = _inspection_discovery("""
 import argparse
@@ -5802,7 +3386,7 @@ run.set_defaults(token='anonymous', password=compute_default())
     )
 
 
-def test_repo_inspect_ignores_unreachable_configuration() -> None:
+def test_inspect_ignores_unreachable_configuration() -> None:
     """Discover the consumed interface without executing uncalled configuration."""
     report = _inspection_discovery("""
 import argparse
@@ -5835,13 +3419,13 @@ def main():
         "argparse.ArgumentParser().add_subparsers().add_parser('run', **options)",
     ],
 )
-def test_repo_inspect_rejects_unresolved_interface_settings(constructor: str) -> None:
+def test_inspect_rejects_unresolved_interface_settings(constructor: str) -> None:
     """Unresolved parser settings may hide inherited arguments or command aliases."""
     with pytest.raises(inspection_subject.CommandError, match="literal mapping"):
         _inspection_discovery("import argparse\ncli = " + constructor)
 
 
-def test_repo_inspect_preserves_aliases_declared_in_static_settings() -> None:
+def test_inspect_preserves_aliases_declared_in_static_settings() -> None:
     """Expand literal parser settings while retaining subcommand aliases."""
     report = _inspection_discovery("""
 import argparse
@@ -5859,7 +3443,7 @@ run.add_argument('--token')
     )
 
 
-def test_repo_inspect_rejects_custom_subcommand_parsers() -> None:
+def test_inspect_rejects_custom_subcommand_parsers() -> None:
     """Custom parser classes can introduce declarations outside the inspected tree."""
     with pytest.raises(
         inspection_subject.CommandError,
@@ -5911,7 +3495,7 @@ cli.add_subparsers(parser_class=CustomParser).add_parser('run')
         ),
     ],
 )
-def test_repo_inspect_rejects_unresolved_interfaces_with_source_context(
+def test_inspect_rejects_unresolved_interfaces_with_source_context(
     source: str, reason: str
 ) -> None:
     """Fail discovery with source context instead of a partial successful report."""
@@ -5931,7 +3515,7 @@ def test_repo_inspect_rejects_unresolved_interfaces_with_source_context(
 
 
 @pytest.mark.parametrize("constructor", ["argparse.ArgumentParser()", "Parser()"])
-def test_repo_inspect_rejects_unsupported_class_based_interfaces(
+def test_inspect_rejects_unsupported_class_based_interfaces(
     constructor: str,
 ) -> None:
     """Do not report a class-based CLI as an empty successful interface."""
@@ -5950,7 +3534,7 @@ def main():
         _inspection_discovery(source)
 
 
-def test_repo_inspect_keeps_command_arguments_in_their_declared_scope() -> None:
+def test_inspect_keeps_command_arguments_in_their_declared_scope() -> None:
     """Keep same-named helpers attached to their own subcommands."""
     source = """
 import argparse
@@ -5985,7 +3569,7 @@ def main():
     )
 
 
-def test_repo_inspect_rejects_ambiguous_argument_definitions() -> None:
+def test_inspect_rejects_ambiguous_argument_definitions() -> None:
     """Retain an explicit failure when helper definitions remain ambiguous."""
     with pytest.raises(inspection_subject.CommandError, match="ambiguous helper"):
         _inspection_discovery("""
@@ -6001,7 +3585,7 @@ def main():
 """)
 
 
-def test_repo_inspect_includes_arguments_declared_by_nested_helpers() -> None:
+def test_inspect_includes_arguments_declared_by_nested_helpers() -> None:
     """Follow parser parameters read by a nested helper without global fallback."""
     report = _inspection_discovery("""
 import argparse
@@ -6020,7 +3604,7 @@ def main():
     )
 
 
-def test_repo_inspect_ignores_unrelated_imports_when_resolving_the_interface() -> None:
+def test_inspect_ignores_unrelated_imports_when_resolving_the_interface() -> None:
     """Keep an unrelated factory alias from replacing the CLI constructor."""
     report = _inspection_discovery("""
 def parser():
@@ -6066,13 +3650,13 @@ cli.parse_args()
 """,
     ],
 )
-def test_repo_inspect_rejects_shadowed_constructor_aliases(source: str) -> None:
+def test_inspect_rejects_shadowed_constructor_aliases(source: str) -> None:
     """Do not treat reassigned names or parameters as their shadowed imports."""
     with pytest.raises(inspection_subject.CommandError, match="cannot resolve"):
         _inspection_discovery(source)
 
 
-def test_repo_inspect_rejects_arguments_from_replaced_definitions() -> None:
+def test_inspect_rejects_arguments_from_replaced_definitions() -> None:
     """An opaque callable must not inherit the interface of a replaced helper."""
     with pytest.raises(inspection_subject.CommandError, match="external helper"):
         _inspection_discovery("""
@@ -6088,14 +3672,14 @@ def main():
 
 
 @pytest.mark.parametrize("module", ["argparse", "click"])
-def test_repo_inspect_rejects_unresolved_cli_star_imports(module: str) -> None:
+def test_inspect_rejects_unresolved_cli_star_imports(module: str) -> None:
     """Keep unresolved wildcard interfaces from becoming an empty successful CLI."""
     with pytest.raises(inspection_subject.CommandError, match="no supported parser"):
         _inspection_discovery(f"from {module} import *\ndef main(): pass\n")
 
 
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
-def test_repo_inspect_preserves_unicode_arguments_across_line_endings(
+def test_inspect_preserves_unicode_arguments_across_line_endings(
     newline: str,
 ) -> None:
     """Match AST byte columns to LibCST names across Unicode and line endings."""
@@ -6118,7 +3702,7 @@ def main():
     )
 
 
-def test_repo_inspect_preserves_declared_source_encoding() -> None:
+def test_inspect_preserves_declared_source_encoding() -> None:
     """Decode a source encoding cookie before matching metadata byte offsets."""
     source = """# coding: latin-1
 import argparse
@@ -6136,7 +3720,7 @@ cli.add_argument('--résumé', default='é')
     )
 
 
-def test_repo_inspect_reports_the_same_interface_for_command_aliases() -> None:
+def test_inspect_reports_the_same_interface_for_command_aliases() -> None:
     """Expose aliases with the same interface as their canonical command."""
     report = _inspection_discovery("""
 import argparse
@@ -6166,7 +3750,7 @@ listing.add_subparsers().add_parser('files', aliases=['f'])
     "method",
     ["parse_intermixed_args", "parse_known_intermixed_args"],
 )
-def test_repo_inspect_excludes_internal_interfaces_when_arguments_are_intermixed(
+def test_inspect_excludes_internal_interfaces_when_arguments_are_intermixed(
     method: str,
 ) -> None:
     """Identify public roots for both intermixed argparse entry points."""
@@ -6189,7 +3773,7 @@ def main():
     )
 
 
-def test_repo_inspect_preserves_required_arguments_declared_by_helpers() -> None:
+def test_inspect_preserves_required_arguments_declared_by_helpers() -> None:
     """Follow returned constructors and keyword helper arguments."""
     report = _inspection_discovery("""
 from argparse import ArgumentParser
@@ -6208,7 +3792,7 @@ def main():
 
 
 @pytest.mark.parametrize("entrypoint", ["parser().parse_args()", "parse(parser())"])
-def test_repo_inspect_excludes_internal_commands_and_arguments(
+def test_inspect_excludes_internal_commands_and_arguments(
     entrypoint: str,
 ) -> None:
     """Select the parser consumed by main while retaining its configured helpers."""
@@ -6246,7 +3830,7 @@ def parse(cli):
     _expect(list(report["commands"]) == ["repo"], "internal command leaked")
 
 
-def test_repo_inspect_reports_sorted_test_names_with_class_context(
+def test_inspect_reports_sorted_test_names_with_class_context(
     tmp_path: Path,
 ) -> None:
     """Retain sorted test identifiers and class context."""
@@ -6334,7 +3918,7 @@ def test_resource_discovery_requires_tracking(tmp_path: Path, directory: str) ->
     )
 
 
-def test_repo_inspect_is_read_only(tmp_path: Path) -> None:
+def test_inspect_is_read_only(tmp_path: Path) -> None:
     """Inspect source containing failing statements without executing or writing."""
     _inspection_repository(tmp_path)
     before = {
@@ -6369,7 +3953,7 @@ def test_repo_inspect_is_read_only(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("has_parser", [False, True])
-def test_repo_inspect_reports_library_metadata_and_tests_without_a_cli(
+def test_inspect_reports_library_metadata_and_tests_without_a_cli(
     tmp_path: Path, *, has_parser: bool
 ) -> None:
     """Retain metadata and tests for a declared non-executable Python library."""
@@ -6380,7 +3964,7 @@ def test_repo_inspect_reports_library_metadata_and_tests_without_a_cli(
         """
 { inputs, pkgs, ... }:
 let python = pkgs.python3;
-in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
+in inputs.self.lib.mkPythonPackage {
     inherit pkgs;
     executable = false;
     meta.description = "Python library";
@@ -6405,7 +3989,7 @@ in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
     )
 
 
-def test_repo_inspect_uses_package_executable_settings_without_dependency_metadata(
+def test_inspect_uses_package_executable_settings_without_dependency_metadata(
     tmp_path: Path,
 ) -> None:
     """Read executable metadata from the outer package rather than dependencies."""
@@ -6415,7 +3999,7 @@ def test_repo_inspect_uses_package_executable_settings_without_dependency_metada
         """
 { inputs, pkgs, ... }:
 let dependency = { executable = false; };
-in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
+in inputs.self.lib.mkPythonPackage {
     inherit pkgs;
     executable = true;
     src = ./.;
@@ -6432,7 +4016,7 @@ in (inputs.afairesi or inputs.self).lib.mkPythonPackage {
     )
 
 
-def test_repo_inspect_cli_failure_has_context_and_no_partial_json(
+def test_inspect_cli_failure_has_context_and_no_partial_json(
     tmp_path: Path,
 ) -> None:
     """Surface discovery errors on stderr with a failing status and no JSON output."""
@@ -6447,7 +4031,7 @@ def test_repo_inspect_cli_failure_has_context_and_no_partial_json(
     _expect("Traceback" not in completed.stderr, completed)
 
 
-def test_repo_inspect_preserves_package_and_host_in_one_directory(
+def test_inspect_preserves_package_and_host_in_one_directory(
     tmp_path: Path,
 ) -> None:
     """Retain both resource roles when their marker files share a directory."""
@@ -6457,7 +4041,7 @@ def test_repo_inspect_preserves_package_and_host_in_one_directory(
     _expect(resource["type"] == ["python", "host"], resource)
 
 
-def test_repo_inspect_compacts_commands_without_losing_declared_values(
+def test_inspect_compacts_commands_without_losing_declared_values(
     tmp_path: Path,
 ) -> None:
     """Keep empty commands, aliases, and literal defaults when pruning containers."""
@@ -6503,7 +4087,7 @@ run.set_defaults(internal=None)
     )
 
 
-def test_repo_inspect_omits_docstrings_and_test_implementation(tmp_path: Path) -> None:
+def test_inspect_omits_docstrings_and_test_implementation(tmp_path: Path) -> None:
     """Return stable identifiers without test bodies or source docstrings."""
     _inspection_repository(tmp_path)
     source = tmp_path / "example/main.py"
@@ -6527,7 +4111,7 @@ def test_repo_inspect_omits_docstrings_and_test_implementation(tmp_path: Path) -
 
 
 @pytest.mark.parametrize("location", ["outside", "root", "nested"])
-def test_repo_inspect_reports_the_same_repository_through_equivalent_paths(
+def test_inspect_reports_the_same_repository_through_equivalent_paths(
     tmp_path: Path,
     location: str,
 ) -> None:
@@ -6547,7 +4131,7 @@ def test_repo_inspect_reports_the_same_repository_through_equivalent_paths(
         paths.append([])
     for arguments in paths:
         completed = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-            [os.environ["PACKAGE_E2E_EXECUTABLE"], "repo", "inspect", *arguments],
+            [os.environ["PACKAGE_E2E_EXECUTABLE"], "inspect", *arguments],
             cwd=cwd,
             capture_output=True,
             text=True,
@@ -6560,7 +4144,7 @@ def test_repo_inspect_reports_the_same_repository_through_equivalent_paths(
         )
 
 
-def test_repo_inspect_rejects_invalid_repositories_and_source_with_context(
+def test_inspect_rejects_invalid_repositories_and_source_with_context(
     tmp_path: Path,
 ) -> None:
     """Report invalid repositories and malformed source with useful errors."""
@@ -6575,7 +4159,7 @@ def test_repo_inspect_rejects_invalid_repositories_and_source_with_context(
         inspection_subject.inspect_repository(tmp_path)
 
 
-def test_repo_inspect_reports_no_resources_for_an_empty_repository(
+def test_inspect_reports_no_resources_for_an_empty_repository(
     tmp_path: Path,
 ) -> None:
     """Return an empty resource map for an empty repository."""
@@ -6614,7 +4198,6 @@ def _inspection_inspect_target(target: str) -> dict[str, Any]:
     completed = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [
             os.environ["PACKAGE_E2E_EXECUTABLE"],
-            "repo",
             "inspect",
             "--repository",
             target,
@@ -6650,17 +4233,12 @@ def _inspection_advance_remote(source: Path) -> None:
     inspection_subject.git(source, ["commit", "--quiet", "-m", "add host"])
 
 
-@pytest.mark.parametrize("initialized", [False, True])
-def test_repo_inspect_remote_preserves_home_and_does_not_block_submodule_add(
+def test_inspect_remote_is_fresh_and_read_only(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    *,
-    initialized: bool,
 ) -> None:
     """Inspect fresh remote contents without creating persistent home state."""
     home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    if initialized:
-        inspection_subject.initialize_home()
     before = _inspection_tree_snapshot(home)
     _expect(
         _inspection_inspect_target(remote)
@@ -6677,18 +4255,10 @@ def test_repo_inspect_remote_preserves_home_and_does_not_block_submodule_add(
         _inspection_tree_snapshot(home) == before,
         "remote inspection changed HOME",
     )
-    if initialized:
-        inspection_subject.initialize_submodule(remote)
-        checkout = home / "example.test/team/repository"
-        _expect(
-            inspection_subject.git(checkout, ["rev-parse", "HEAD"]).stdout
-            == inspection_subject.git(source, ["rev-parse", "HEAD"]).stdout,
-            "inspection interfered with native submodule add",
-        )
 
 
 @pytest.mark.parametrize("malformed", [False, True])
-def test_repo_inspect_remote_cleans_temporary_checkout(
+def test_inspect_remote_cleans_temporary_checkout(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -6719,89 +4289,34 @@ def test_repo_inspect_remote_cleans_temporary_checkout(
     _expect(not list(home.iterdir()), "temporary inspection changed HOME")
 
 
-def test_repo_inspect_includes_uncommitted_changes_only_for_local_paths(
+def test_inspect_includes_uncommitted_changes_only_for_local_paths(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Keep local dirty content visible only when explicitly inspecting its path."""
-    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    inspection_subject.initialize_home()
-    inspection_subject.initialize_submodule(remote)
-    checkout = home / "example.test/team/repository"
-    (checkout / "local").mkdir(parents=True)
-    (checkout / "local/configuration.nix").touch()
-    inspection_subject.git(
-        checkout,
-        ["remote", "set-url", "origin", "https://fork.test/team/repository"],
-    )
-    before = _inspection_tree_snapshot(home)
+    _home, _source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "clone", "--", remote, str(checkout))
+    module = checkout / "example/main.py"
+    module.write_text(module.read_text().replace('default="result"', 'default="local"'))
+    before = _inspection_tree_snapshot(tmp_path)
+    local_report = _inspection_inspect_target(str(checkout))
     _expect(
-        _inspection_inspect_target(str(checkout))
-        == inspection_subject.inspect_repository(checkout),
-        "explicit local inspection ignored local content",
+        local_report["example"]["cli"]["arguments"][0]["default"] == "local",
+        local_report,
     )
+    remote_report = _inspection_inspect_target(remote)
     _expect(
-        _inspection_inspect_target(remote)
-        == inspection_subject.inspect_repository(source),
-        "remote URL inspected a local fork or untracked files",
+        remote_report["example"]["cli"]["arguments"][0]["default"] == "result",
+        remote_report,
     )
     _expect(
-        _inspection_tree_snapshot(home) == before,
-        "inspection changed local Git state",
+        _inspection_tree_snapshot(tmp_path) == before,
+        "inspection changed source or Git state",
     )
 
 
-@pytest.mark.parametrize("state", ["checkout", "deinitialized", "cache", "placeholder"])
-def test_repo_inspect_remote_ignores_existing_home_storage(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    state: str,
-) -> None:
-    """Leave existing worktrees, retained Git data, and unrelated paths untouched."""
-    home, source, remote = _inspection_remote_fixture(tmp_path, monkeypatch)
-    inspection_subject.initialize_home()
-    relative = Path("example.test/team/repository")
-    checkout = home / relative
-    if state == "cache":
-        modules = Path(
-            inspection_subject.git(
-                home,
-                ["rev-parse", "--path-format=absolute", "--git-path", "modules"],
-            ).stdout.strip(),
-        )
-        storage = modules / relative
-        storage.parent.mkdir(parents=True)
-        inspection_subject.git(
-            home,
-            ["clone", "--bare", "--", str(source), str(storage)],
-        )
-    elif state == "placeholder":
-        checkout.mkdir(parents=True)
-        (checkout / "personal-data").write_bytes(b"preserve data\\x00\\xff")
-    else:
-        inspection_subject.initialize_submodule(remote)
-        if state == "deinitialized":
-            inspection_subject.git(
-                home,
-                ["submodule", "deinit", "--force", "--", str(relative)],
-            )
-        else:
-            inspection_subject.git(checkout, ["remote", "remove", "origin"])
-            (checkout / "LICENSE").write_text("local changes")
-    _inspection_advance_remote(source)
-    before = _inspection_tree_snapshot(home)
-    _expect(
-        _inspection_inspect_target(remote)
-        == inspection_subject.inspect_repository(source),
-        "local state affected remote inspection",
-    )
-    _expect(
-        _inspection_tree_snapshot(home) == before,
-        "inspection changed existing Git storage",
-    )
-
-
-def test_repo_inspect_remote_accepts_native_file_urls(
+def test_inspect_remote_accepts_native_file_urls(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6816,7 +4331,7 @@ def test_repo_inspect_remote_accepts_native_file_urls(
 
 
 @pytest.mark.parametrize("remote_kind", ["missing", "unsupported", "invalid"])
-def test_repo_inspect_remote_preserves_native_clone_errors(
+def test_inspect_remote_preserves_native_clone_errors(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     remote_kind: str,
@@ -6842,7 +4357,6 @@ def test_repo_inspect_remote_preserves_native_clone_errors(
     actual = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [
             os.environ["PACKAGE_E2E_EXECUTABLE"],
-            "repo",
             "inspect",
             "--repository",
             remote,
@@ -6925,7 +4439,7 @@ def _inspection_apply_diff(
         (("-R",), "working", "index", 0),
     ],
 )
-def test_repo_inspect_diff_uses_git_comparisons_and_emits_jd_patches(
+def test_inspect_diff_uses_git_comparisons_and_emits_jd_patches(
     tmp_path: Path,
     arguments: tuple[str, ...],
     left: str,
@@ -6957,7 +4471,7 @@ def test_repo_inspect_diff_uses_git_comparisons_and_emits_jd_patches(
     )
 
 
-def test_repo_inspect_diff_ignores_implementation_edits_and_untracked_resources(
+def test_inspect_diff_ignores_implementation_edits_and_untracked_resources(
     tmp_path: Path,
 ) -> None:
     """Emit nothing for changes outside the tracked interface contract."""
@@ -6977,7 +4491,7 @@ def test_repo_inspect_diff_ignores_implementation_edits_and_untracked_resources(
     _expect(_inspection_tree_snapshot(tmp_path) == before, "empty diff changed state")
 
 
-def test_repo_inspect_diff_covers_structural_and_nested_cli_changes(
+def test_inspect_diff_covers_structural_and_nested_cli_changes(
     tmp_path: Path,
 ) -> None:
     """Round-trip resource changes, nested arguments, and lists with jd context."""
@@ -7003,7 +4517,7 @@ def test_repo_inspect_diff_covers_structural_and_nested_cli_changes(
     _expect(_inspection_apply_diff(before, completed.stdout) == after, completed)
 
 
-def test_repo_inspect_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
+def test_inspect_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
     """Translate native diff stdin to JSON Patch for JSON viewers and patching."""
     before = _inspection_diff_repository(tmp_path)
     _inspection_diff_description(tmp_path, "Changed")
@@ -7029,7 +4543,7 @@ def test_repo_inspect_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
     )
 
 
-def test_repo_inspect_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None:
+def test_inspect_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None:
     """Exclude the other branch's changes and ignore malformed working sources."""
     base = _inspection_diff_repository(tmp_path)
     _git(tmp_path, "tag", "base")
@@ -7052,7 +4566,7 @@ def test_repo_inspect_diff_three_dot_uses_the_merge_base(tmp_path: Path) -> None
     _expect(_inspection_tree_snapshot(tmp_path) == before, "range diff changed state")
 
 
-def test_repo_inspect_diff_compares_initial_staging_against_an_empty_repository(
+def test_inspect_diff_compares_initial_staging_against_an_empty_repository(
     tmp_path: Path,
 ) -> None:
     """Compare the first staged interface against an empty inventory."""
@@ -7078,7 +4592,7 @@ def test_repo_inspect_diff_compares_initial_staging_against_an_empty_repository(
         ((), "could not parse Python source", 1),
     ],
 )
-def test_repo_inspect_diff_errors_leave_no_partial_output_or_temporary_sources(
+def test_inspect_diff_errors_leave_no_partial_output_or_temporary_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     arguments: tuple[str, ...],
@@ -7102,7 +4616,7 @@ def test_repo_inspect_diff_errors_leave_no_partial_output_or_temporary_sources(
     _expect(_inspection_tree_snapshot(root) == before, "failed diff changed state")
 
 
-def test_repo_inspect_diff_supports_help_and_repository_selection_outside_git(
+def test_inspect_diff_supports_help_and_repository_selection_outside_git(
     tmp_path: Path,
 ) -> None:
     """Describe diffs outside Git and distinguish repository paths from commands."""
@@ -7126,7 +4640,7 @@ def test_repo_inspect_diff_supports_help_and_repository_selection_outside_git(
     )
 
 
-def test_repo_inspect_diff_rejects_unmerged_index_without_changes(
+def test_inspect_diff_rejects_unmerged_index_without_changes(
     tmp_path: Path,
 ) -> None:
     """Reject conflict stages instead of emitting an incomplete interface diff."""
@@ -7156,7 +4670,7 @@ def test_repo_inspect_diff_rejects_unmerged_index_without_changes(
     )
 
 
-def test_repo_inspect_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
+def test_inspect_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
     """Read the selected worktree's index while preserving shared Git metadata."""
     root, linked = tmp_path / "repository", tmp_path / "linked"
     root.mkdir()
@@ -7176,17 +4690,14 @@ def test_repo_inspect_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
     )
 
 
-def test_repo_inspect_reports_public_repo_commands_and_test_campaigns() -> None:
-    """Inventory the public nested campaign CLI while excluding formatter internals."""
+def test_inspect_reports_public_commands_and_test_campaigns() -> None:
+    """Inventory the flat public CLI and its nested test campaigns."""
     subject = import_module("afairesi.main")
     report = subject.ArgumentDiscovery(
         Path(__file__).with_name("main.py").read_bytes(),
     ).report()
-    _expect(set(report["commands"]) == {"repo", "home"}, report)
-    home = report["commands"]["home"]["commands"]
-    _expect(set(home) == {"add", "init", "rm"}, home)
-    commands = report["commands"]["repo"]["commands"]
-    _expect(set(commands) == {"add", "fix", "init", "inspect", "test"}, commands)
+    commands = report["commands"]
+    _expect(set(commands) == {"inspect", "test"}, commands)
     _expect(set(commands["inspect"]["commands"]) == {"diff"}, commands["inspect"])
     campaigns = commands["test"]["commands"]
     _expect(
@@ -7202,11 +4713,11 @@ def test_repo_inspect_reports_public_repo_commands_and_test_campaigns() -> None:
 
 
 @pytest.mark.parametrize("kind", ["python", "nix", "lean4"])
-def test_repo_fix_ignores_local_packages_and_optional_tests(
+def test_source_validation_ignores_local_packages_and_optional_tests(
     tmp_path: Path,
     kind: str,
 ) -> None:
-    """Keep unselected sources out of inspection, repair, and test workspaces."""
+    """Keep unselected sources out of validation, inspection, and test workspaces."""
     root = tmp_path / "project"
     root.mkdir()
     _repository(root)
@@ -7217,10 +4728,10 @@ def test_repo_fix_ignores_local_packages_and_optional_tests(
     local = root / "experiments"
     local.mkdir()
     (local / "main.py").write_bytes(b"def broken(:")
-    _repair_flake(root)
+    _check_flake_source(root)
     before = _snapshot(root)
-    _repair_flake(root)
-    _expect(_snapshot(root) == before, "repair admitted or changed local sources")
+    _check_flake_source(root)
+    _expect(_snapshot(root) == before, "validation admitted or changed local sources")
     subject = import_module("afairesi.main")
     report = subject.inspect_repository(root)
     _expect(set(report) == {"example"} and "tests" not in report["example"], report)
@@ -7231,7 +4742,7 @@ def test_repo_fix_ignores_local_packages_and_optional_tests(
     _expect(not (workspace / tests).exists(), "copied local tests")
 
 
-def test_repo_test_includes_tracked_assets_and_unstaged_edits(
+def test_campaign_includes_tracked_assets_and_unstaged_edits(
     tmp_path: Path,
 ) -> None:
     """Use Git membership and working contents without assigning meaning to names."""
@@ -7259,7 +4770,7 @@ def test_repo_test_includes_tracked_assets_and_unstaged_edits(
 
 
 @pytest.mark.parametrize("command", ["property", "fuzz"])
-def test_repo_test_artifacts_do_not_replace_selected_sources(
+def test_campaign_artifacts_do_not_replace_selected_sources(
     tmp_path: Path,
     command: str,
 ) -> None:
