@@ -14,6 +14,7 @@ import os
 import shlex
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -1026,22 +1027,120 @@ def handler(application: Application) -> type[BaseHTTPRequestHandler]:  # noqa: 
     return Handler
 
 
+def ssh_arguments(options: argparse.Namespace) -> tuple[list[str], str]:
+    """Quote one remote launcher command and forward its loopback port unchanged."""
+    port = options.port
+    if port == 0:
+        with socket.socket() as listener:
+            listener.bind(("127.0.0.1", 0))
+            port = listener.getsockname()[1]
+    remote = [
+        "env",
+        "AFAIRESI_GUI_SSH_SESSION=1",
+        "afairesi_gui",
+        "--no-open",
+        "--port",
+        str(port),
+        "--codex",
+        options.codex,
+    ]
+    if options.home is not None:
+        remote.extend(["--home", str(options.home)])
+    return [
+        "ssh",
+        "-T",
+        "-S",
+        "none",
+        "-o",
+        "ExitOnForwardFailure=yes",
+        "-o",
+        "StdinNull=no",
+        "-o",
+        "RemoteCommand=none",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=3",
+        "-L",
+        f"127.0.0.1:{port}:127.0.0.1:{port}",
+        "--",
+        options.ssh,
+        shlex.join(remote),
+    ], f"http://127.0.0.1:{port}"
+
+
+def remote_workspace(options: argparse.Namespace) -> None:
+    """Keep one SSH transport alive for the remote server and local browser."""
+    arguments, url = ssh_arguments(options)
+    with subprocess.Popen(  # noqa: S603 - SSH uses a fixed option vector and a shell-quoted remote command.
+        arguments,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    ) as process:
+        ready = False
+        try:
+            if process.stdout is None:
+                message = "SSH did not provide a startup stream."
+                raise RuntimeError(message)
+            for line in process.stdout:
+                if line.strip() == f"Afairesi workspace: {url}":
+                    ready = True
+                    sys.stdout.write(f"Afairesi workspace ({options.ssh}): {url}\n")
+                    sys.stdout.flush()
+                    if not options.no_open:
+                        webbrowser.open(url)
+                else:
+                    sys.stderr.write(line)
+            code = process.wait()
+            if not ready or code:
+                message = (
+                    f"Remote workspace exited (SSH status {code}). "
+                    "Ensure afairesi_gui is on the remote PATH and the selected "
+                    "port is free on both machines."
+                )
+                raise ValueError(message)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            if process.stdin is not None:
+                process.stdin.close()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                with contextlib.suppress(ProcessLookupError):
+                    process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+
+
+def stop_on_ssh_disconnect(server: ThreadingHTTPServer) -> None:
+    """Close the remote server when its owning SSH session closes stdin."""
+    sys.stdin.buffer.read()
+    server.shutdown()
+
+
 def main() -> None:
     """Launch the browser workspace on the loopback interface."""
     parser = argparse.ArgumentParser(
-        description="Open the local Afairesi workspace for home's direct submodules."
+        description="Open home's direct submodules locally or over SSH."
+    )
+    parser.add_argument(
+        "--ssh", metavar="DESTINATION", help="remote SSH host alias or user@host"
     )
     parser.add_argument(
         "--home",
         type=Path,
-        default=Path.home(),
-        help="home Git repository (default: your home directory)",
+        help="home Git repository (default: home on the machine running the workspace)",
     )
     parser.add_argument(
         "--port",
         type=int,
         default=8765,
-        help="local HTTP port (default: 8765; 0 chooses a free port)",
+        help="HTTP port on each machine (default: 8765; 0 chooses a local free port)",
     )
     parser.add_argument(
         "--no-open", action="store_true", help="print the URL without opening a browser"
@@ -1050,7 +1149,17 @@ def main() -> None:
         "--codex", default="codex", help="Codex executable (default: codex on PATH)"
     )
     options = parser.parse_args()
-    application = Application(options.home, options.codex)
+    if not 0 <= options.port <= 65535:  # noqa: PLR2004 - TCP port range.
+        parser.error("--port must be between 0 and 65535")
+    if options.ssh is not None:
+        if not options.ssh or options.ssh.startswith("-"):
+            parser.error("--ssh requires an SSH host alias or user@host")
+        try:
+            remote_workspace(options)
+        except (OSError, ValueError) as error:
+            parser.error(str(error))
+        return
+    application = Application((options.home or Path.home()).expanduser(), options.codex)
     try:
         application.workspace.repositories()
         with ThreadingHTTPServer(
@@ -1061,6 +1170,10 @@ def main() -> None:
             sys.stdout.flush()
             if not options.no_open:
                 webbrowser.open(url)
+            if os.environ.get("AFAIRESI_GUI_SSH_SESSION") == "1":
+                threading.Thread(
+                    target=stop_on_ssh_disconnect, args=(server,), daemon=True
+                ).start()
             server.serve_forever()
     except KeyboardInterrupt:
         pass

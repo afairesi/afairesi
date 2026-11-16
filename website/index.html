@@ -168,6 +168,22 @@ afairesi ../project</code></pre>
           <pre tabindex="0" aria-label="Open the local workspace"><code>nix run .#afairesi_gui
 nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
           <p>
+            Pass <code>--ssh user@host</code> or an SSH host alias to open a remote workspace in
+            your local browser. The remote machine must have this version of
+            <code>afairesi_gui</code> on its PATH. Repository discovery, builds, tests, diffs, and
+            Codex run there; SSH forwards the loopback server using your existing SSH configuration
+            and authentication. The default home is the remote user's home, and
+            <code>--home</code> selects a remote path.
+          </p>
+          <pre tabindex="0" aria-label="Open a remote workspace"><code>afairesi_gui --ssh user@host
+nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></pre>
+          <p>
+            The selected port must be free on both machines; <code>--port 0</code> chooses a local
+            free port and uses it on both ends. Keep the launcher running. Closing it stops the
+            tunnel and its remote workspace session. Remote chat uses Codex installed and signed in
+            on the remote machine.
+          </p>
+          <p>
             The server listens on <code>127.0.0.1</code>. Install Codex separately and make
             <code>codex</code> available on your PATH, then select Connect to use your existing
             account or sign in. Each repository has its own conversation. The GUI keeps activity and

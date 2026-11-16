@@ -852,3 +852,184 @@ def test_all_resource_actions_share_one_nix_evaluation(
     expect(
         not any(argv[:2] in (["nix", "build"], ["nix", "run"]) for argv in calls), calls
     )
+
+
+def test_ssh_arguments_preserve_remote_paths_and_loopback_origin() -> None:
+    """Pass remote paths literally and retain the HTTP server's origin checks."""
+    import argparse  # noqa: PLC0415 - Only used to supply launcher options.
+    import shlex  # noqa: PLC0415 - Decode the command passed to the remote shell.
+    from pathlib import Path  # noqa: PLC0415 - Runtime paths in launcher options.
+
+    options = argparse.Namespace(
+        ssh="user@host-alias",
+        home=Path("/remote/home with 'quotes' $(touch unwanted)"),
+        port=8766,
+        codex="/remote/codex with spaces",
+    )
+    arguments, url = subject.ssh_arguments(options)
+    expect(arguments[:4] == ["ssh", "-T", "-S", "none"], arguments)
+    expect("ExitOnForwardFailure=yes" in arguments, arguments)
+    expect(
+        arguments[arguments.index("-L") + 1] == "127.0.0.1:8766:127.0.0.1:8766",
+        arguments,
+    )
+    expect(arguments[-3:-1] == ["--", options.ssh], arguments)
+    expect(url == "http://127.0.0.1:8766", url)
+    expect(
+        shlex.split(arguments[-1])
+        == [
+            "env",
+            "AFAIRESI_GUI_SSH_SESSION=1",
+            "afairesi_gui",
+            "--no-open",
+            "--port",
+            "8766",
+            "--codex",
+            options.codex,
+            "--home",
+            str(options.home),
+        ],
+        arguments,
+    )
+    options.home = None
+    options.port = 0
+    arguments, url = subject.ssh_arguments(options)
+    remote = shlex.split(arguments[-1])
+    expect("--home" not in remote, remote)
+    port = remote[remote.index("--port") + 1]
+    expect(int(port) > 0 and url == f"http://127.0.0.1:{port}", arguments)
+
+
+@pytest.mark.parametrize("exit_code", [0, 255])
+def test_ssh_startup_failure_never_opens_browser(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, exit_code: int
+) -> None:
+    """Do not open a dashboard when SSH fails or no server announces readiness."""
+    import argparse  # noqa: PLC0415 - Launcher options for this contract test.
+
+    executable = tmp_path / "ssh"
+    executable.write_text(f"#!{sys.executable}\nraise SystemExit({exit_code})\n")
+    executable.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{os.pathsep}{os.environ['PATH']}")
+    opened: list[str] = []
+    monkeypatch.setattr(subject.webbrowser, "open", opened.append)
+    with pytest.raises(ValueError, match="Remote workspace exited"):
+        subject.remote_workspace(
+            argparse.Namespace(
+                ssh="test-host", home=None, port=0, codex="codex", no_open=False
+            )
+        )
+    expect(opened == [], opened)
+
+
+@pytest.mark.parametrize("explicit_home", [False, True])
+def test_ssh_launcher_uses_remote_home_and_stops_its_server(
+    workspace: subject.Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    explicit_home: bool,
+) -> None:
+    """Exercise the real server through a simulated SSH command and stdin lifetime."""
+    import signal  # noqa: PLC0415 - Interrupt only the test-owned launcher.
+    from pathlib import Path  # noqa: PLC0415 - Locate the shipped entry point.
+
+    scratch = workspace.home / "ssh-test"
+    scratch.mkdir()
+    executable = scratch / "ssh"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        "import json, os, shlex, sys\nfrom pathlib import Path\n"
+        "Path(os.environ['SSH_TEST_LOG']).write_text(json.dumps(sys.argv[1:]))\n"
+        "Path(os.environ['SSH_TEST_PID']).write_text(str(os.getpid()))\n"
+        "command = shlex.split(sys.argv[-1])\n"
+        "assert command[:2] == ['env', 'AFAIRESI_GUI_SSH_SESSION=1']\n"
+        "os.environ['AFAIRESI_GUI_SSH_SESSION'] = '1'\n"
+        "os.environ['HOME'] = os.environ['SSH_TEST_HOME']\n"
+        "os.execvp(command[2], command[2:])\n"
+    )
+    executable.chmod(0o755)
+    entry = scratch / "afairesi_gui"
+    entry.write_text(
+        f"#!{sys.executable}\nimport afairesi_gui.main as app\napp.main()\n"
+    )
+    entry.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{scratch}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("HOME", str(scratch / "not-a-local-repository"))
+    monkeypatch.setenv(
+        "SSH_TEST_HOME", str(workspace.home if not explicit_home else scratch)
+    )
+    monkeypatch.setenv("SSH_TEST_LOG", str(scratch / "arguments.json"))
+    monkeypatch.setenv("SSH_TEST_PID", str(scratch / "server.pid"))
+    launcher = [
+        sys.executable,
+        str(Path(subject.__file__)),
+        "--ssh",
+        "test-host",
+        "--no-open",
+        "--port",
+        "0",
+        "--codex",
+        "/unavailable-codex",
+    ]
+    if explicit_home:
+        launcher.extend(["--home", str(workspace.home)])
+    with (
+        (scratch / "stdout").open("w") as output,
+        subprocess.Popen(  # noqa: S603 - Test-owned launcher and fake SSH executable.
+            launcher,
+            stdout=output,
+            stderr=subprocess.PIPE,
+            text=True,
+        ) as process,
+    ):
+        try:
+            wait_for(
+                lambda: (
+                    "Afairesi workspace (test-host):"
+                    in (scratch / "stdout").read_text()
+                    or process.poll() is not None
+                )
+            )
+            expect(process.poll() is None, (scratch / "stdout").read_text())
+            url = (scratch / "stdout").read_text().strip().split()[-1]
+            port = int(url.rsplit(":", 1)[-1])
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            try:
+                connection.request("GET", "/api/workspace")
+                response = connection.getresponse()
+                result = json.loads(response.read())
+                expect(response.status == HTTPStatus.OK, result)
+                expect(result["home"] == str(workspace.home), result)
+                expect(
+                    [repo["id"] for repo in result["repositories"]]
+                    == ["projects/example"],
+                    result,
+                )
+                connection.request(
+                    "POST",
+                    "/api/agent/connect",
+                    body="{}",
+                    headers={"Content-Type": "application/json", "Origin": url},
+                )
+                response = connection.getresponse()
+                expect(response.status != HTTPStatus.FORBIDDEN, response.read())
+                connection.request(
+                    "POST",
+                    "/api/agent/connect",
+                    body="{}",
+                    headers={
+                        "Content-Type": "application/json",
+                        "Origin": "https://foreign.invalid",
+                    },
+                )
+                response = connection.getresponse()
+                expect(response.status == HTTPStatus.FORBIDDEN, response.read())
+            finally:
+                connection.close()
+        finally:
+            process.send_signal(signal.SIGINT)
+            _stdout, errors = process.communicate(timeout=10)
+        expect(process.returncode == 0, errors)
+    pid = int((scratch / "server.pid").read_text())
+    with pytest.raises(ProcessLookupError):
+        os.kill(pid, 0)
