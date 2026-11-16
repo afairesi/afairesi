@@ -1,0 +1,73 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#fdf6e3" />
+    <meta
+      name="description"
+      content="Your repositories, resources, and coding conversations in one local workspace."
+    />
+    <title>afairesi — workspace</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23073642'/%3E%3Cpath d='M9 16h14' stroke='%23fdf6e3' stroke-width='2'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/style.css" />
+    <script type="module" src="/app.js"></script>
+  </head>
+  <body>
+    <header class="toolbar" aria-label="Workspace controls">
+      <button id="home" class="button brand" title="Home workspace">afairesi</button>
+      <input id="search" type="search" placeholder="Find a box…" aria-label="Find a box" />
+      <button id="refresh" class="button" title="Refresh workspace">↻</button>
+      <button id="fit" class="button">Fit</button>
+      <button id="zoom-out" class="button" aria-label="Zoom out">−</button>
+      <button id="zoom-in" class="button" aria-label="Zoom in">+</button>
+    </header>
+    <main
+      id="viewport"
+      aria-label="Repository dependency graph"
+      title="Scroll to zoom · drag to pan"
+      tabindex="0"
+    >
+      <div id="canvas">
+        <svg id="edges" aria-label="Dependency relationships"></svg>
+        <div id="boxes"></div>
+      </div>
+    </main>
+    <span id="graph-status" class="sr-only" role="status">Reading home submodules…</span>
+    <div id="repository-notice" class="notice" role="status" hidden></div>
+    <aside id="chat-pane" class="chat-pane" aria-label="Codex chat">
+      <div id="messages" class="messages" aria-live="polite" aria-relevant="additions text"></div>
+      <div id="chat-requests" class="chat-requests"></div>
+      <form id="chat-form" class="chat-controls">
+        <div id="mentions" class="mentions" role="listbox" aria-label="Repositories" hidden></div>
+        <label class="sr-only" for="message">Message Codex</label>
+        <textarea
+          id="message"
+          rows="1"
+          placeholder="Message Codex · @repository"
+          aria-autocomplete="list"
+          aria-controls="mentions"
+          aria-expanded="false"
+          disabled
+        ></textarea>
+        <div class="composer-footer">
+          <span id="chat-context" class="chat-context"></span>
+          <button id="connect" type="button" class="button small">Connect Codex</button>
+          <button
+            id="send"
+            type="submit"
+            class="button icon-button"
+            aria-label="Send message"
+            disabled
+          ></button>
+          <button id="stop-chat" type="button" class="button small" hidden>Stop</button>
+        </div>
+        <p id="agent-status" class="agent-status" role="status" hidden></p>
+      </form>
+    </aside>
+    <div id="toast" class="toast" role="status" hidden></div>
+  </body>
+</html>

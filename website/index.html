@@ -145,6 +145,35 @@ nix run github:afairesi/afairesi -- --help</code></pre>
           </p>
           <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi
 afairesi ../project</code></pre>
+          <h3>Local workspace</h3>
+          <p>
+            The <code>afairesi_gui</code> package opens a local browser workspace for the direct
+            submodules registered in your home Git repository. All registered repositories load on
+            one canvas inside nested directory boxes, such as github.com / owner / repository,
+            arranged horizontally on desktop. Scroll to zoom around the pointer and drag to pan.
+            Resource boxes show build, run, and test controls, with collapsible sections for
+            declared CLI arguments and readable test names. Dependency arrows connect resources
+            within each repository. Compact workspace controls and a Codex chat input float over the
+            full-screen canvas. Type <code>@</code> in chat to choose a registered repository;
+            subsequent messages continue that conversation. Responses and approval requests appear
+            above the input, and job output can be sent directly with Ask Codex. Staged and unstaged
+            interface differences from <code>afairesi diff</code> appear directly on resource
+            blocks, descriptions, argument controls, tests, and dependency edges, with green
+            additions and red removals. Removed resources remain visible with disabled controls.
+            Diffs refresh every ten seconds and reuse cached results while HEAD, the index, and
+            tracked files remain unchanged. Dragging boxes and their text pans the canvas; argument
+            inputs remain editable. Edges point from dependencies to consumers and describe source
+            declarations, not the full evaluated Nix closure.
+          </p>
+          <pre tabindex="0" aria-label="Open the local workspace"><code>nix run .#afairesi_gui
+nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
+          <p>
+            The server listens on <code>127.0.0.1</code>. Install Codex separately and make
+            <code>codex</code> available on your PATH, then select Connect to use your existing
+            account or sign in. Each repository has its own conversation. The GUI keeps activity and
+            conversations for the server session; stopping the server stops its running jobs.
+          </p>
+          <h3>Interface changes</h3>
           <p>
             Use <code>diff</code> to compare interfaces in the working tree, index, or Git
             revisions. Pass an optional repository path and select revisions with

@@ -1,0 +1,854 @@
+# Copyright (c) 2026- Paschalis Bizopoulos
+"""Exercise workspace boundaries, HTTP requests, processes, and Codex events."""
+
+from __future__ import annotations
+
+import http.client
+import json
+import os
+import subprocess
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from http import HTTPStatus
+from http.server import ThreadingHTTPServer
+from typing import TYPE_CHECKING, Any
+
+import pytest
+
+import afairesi_gui.main as subject
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterator
+    from pathlib import Path
+
+
+def expect(condition: bool, detail: object) -> None:  # noqa: FBT001
+    """Report a violated behavior without relying on optimized-away assertions."""
+    if not condition:
+        raise AssertionError(detail)
+
+
+def wait_for(predicate: Callable[[], bool]) -> None:
+    """Wait briefly for an asynchronous process or protocol event."""
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.02)
+    message = "Timed out waiting for the expected event"
+    raise AssertionError(message)
+
+
+def git(root: Path, *arguments: str) -> str:
+    """Run Git against isolated test repositories."""
+    return subprocess.run(  # noqa: S603 - Fixed Git executable with test-owned argument vectors.
+        ["git", "-C", str(root), *arguments],  # noqa: S607
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    ).stdout.strip()
+
+
+def initialize(root: Path) -> None:
+    """Create a repository without depending on user commit configuration."""
+    root.mkdir(parents=True, exist_ok=True)
+    git(root, "init", "--quiet")
+    git(
+        root,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--allow-empty",
+        "--quiet",
+        "-m",
+        "initial",
+    )
+
+
+def register(home: Path, child: Path) -> None:
+    """Register a checkout by its actual Git index entry and .gitmodules path."""
+    relative = str(child.relative_to(home))
+    git(home, "config", "--file", ".gitmodules", f"submodule.{relative}.path", relative)
+    git(
+        home,
+        "config",
+        "--file",
+        ".gitmodules",
+        f"submodule.{relative}.url",
+        "https://example.invalid/repo.git",
+    )
+    git(home, "add", "--force", ".gitmodules")
+    git(
+        home,
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        f"160000,{git(child, 'rev-parse', 'HEAD')},{relative}",
+    )
+
+
+@pytest.fixture
+def workspace(tmp_path: Path) -> subject.Workspace:
+    """Provide one registered package repository and an unrelated checkout."""
+    initialize(tmp_path)
+    child = tmp_path / "projects" / "example"
+    initialize(child)
+    (child / "flake.nix").write_text("{}")
+    package = child / "hello"
+    package.mkdir()
+    (package / "default.nix").write_text(
+        "{ inputs, pkgs, ... }: inputs.self.lib.mkPythonPackage { "
+        "inherit pkgs; executable = true; src = ./.; "
+        'meta.description = "Hello"; }'
+    )
+    (package / "main.py").write_text(
+        "import argparse\ndef main():\n    parser = argparse.ArgumentParser()\n"
+        '    parser.add_argument("--name", default="world")\n'
+        "    parser.parse_args()\n"
+    )
+    (package / "test_main.py").write_text("def test_hello():\n    pass\n")
+    git(child, "add", "--force", ".")
+    register(tmp_path, child)
+    initialize(tmp_path / "unregistered")
+    return subject.Workspace(tmp_path)
+
+
+def test_discovery_is_exactly_one_level_of_registered_gitlinks(
+    workspace: subject.Workspace,
+) -> None:
+    """Exclude unregistered checkouts, nested submodules, and declaration-only paths."""
+    home = workspace.home
+    child = home / "projects/example"
+    nested = child / "nested"
+    initialize(nested)
+    register(child, nested)
+    git(
+        home,
+        "config",
+        "--file",
+        ".gitmodules",
+        "submodule.unregistered.path",
+        "unregistered",
+    )
+    entries = workspace.repositories()
+    expect([entry["id"] for entry in entries] == ["projects/example"], entries)
+    expect(entries[0]["initialized"], entries)
+    for path in ("unregistered", "projects/example/nested", "../outside", "/outside"):
+        with pytest.raises(ValueError, match="direct registered"):
+            workspace.repository(path)
+
+
+def test_deinitialized_submodule_remains_visible(workspace: subject.Workspace) -> None:
+    """Keep registered repositories in the catalog when their checkout is absent."""
+    home = workspace.home
+    child = home / "projects/example"
+    child.rename(home / "parked")
+    entries = workspace.repositories()
+    expect(len(entries) == 1 and not entries[0]["initialized"], entries)
+    with pytest.raises(ValueError, match="not initialized"):
+        workspace.repository("projects/example")
+
+
+def test_inspection_uses_afairesi_report_and_never_executes_source(
+    workspace: subject.Workspace,
+) -> None:
+    """Return actual CLI/test data without importing the inspected package."""
+    source = workspace.home / "projects/example/hello/main.py"
+    source.write_text(source.read_text() + '\nraise RuntimeError("must not execute")\n')
+    report = workspace.inspect("projects/example")
+    expect(report["resources"]["hello"]["tests"] == ["test_hello"], report)
+    expect(
+        report["resources"]["hello"]["cli"]["arguments"][0]["names"] == ["--name"],
+        report,
+    )
+    expect(report["dirty"] and not report["pin_changed"], report)
+    source.write_text("invalid python !")
+    report = workspace.inspect("projects/example")
+    expect(bool(report["inspection_error"]) and not report["resources"], report)
+
+
+def test_changes_separates_staged_and_unstaged_interface_diffs(
+    workspace: subject.Workspace,
+) -> None:
+    """Use the actual CLI for both comparisons without changing the checkout."""
+    root = workspace.home / "projects/example"
+    git(
+        root,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "baseline",
+    )
+    source = root / "hello/main.py"
+    source.write_text(source.read_text().replace('default="world"', 'default="staged"'))
+    git(root, "add", "--force", "hello/main.py")
+    source.write_text(
+        source.read_text().replace('default="staged"', 'default="working"')
+    )
+    index = (root / ".git/index").read_bytes()
+    content = source.read_bytes()
+    changes = workspace.changes("projects/example")
+    for name, before, after in (
+        ("working", "staged", "working"),
+        ("staged", "world", "staged"),
+    ):
+        difference = changes["interfaces"][name]["diff"]
+        expect(f'- "{before}"' in difference, difference)
+        expect(f'+ "{after}"' in difference, difference)
+        expect("\x1b" not in difference and '@ ["hello",' in difference, difference)
+        expect("diff --git" in changes[name], changes)
+    expect((root / ".git/index").read_bytes() == index, "diff changed the index")
+    expect(source.read_bytes() == content, "diff changed working sources")
+
+
+@pytest.mark.parametrize("malformed", [False, True])
+def test_changes_keeps_file_diffs_when_interfaces_are_unchanged_or_invalid(
+    workspace: subject.Workspace, *, malformed: bool
+) -> None:
+    """Keep raw changes visible when an interface diff is empty or fails."""
+    source = workspace.home / "projects/example/hello/main.py"
+    source.write_text(
+        source.read_text()
+        + ("\ninvalid python !\n" if malformed else "\ndef internal(): return 42\n")
+    )
+    changes = workspace.changes("projects/example")
+    working = changes["interfaces"]["working"]
+    expect(
+        bool(working.get("error"))
+        if malformed
+        else working["diff"] == "" and working["patch"] == [],
+        changes,
+    )
+    expect(bool(changes["interfaces"]["staged"]["diff"]), changes)
+    expect("diff --git" in changes["working"], changes)
+
+
+def test_interface_diff_cache_tracks_working_index_and_head_changes(
+    workspace: subject.Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Share concurrent inspections and invalidate each actual comparison input."""
+    calls = []
+    comparisons = 2
+    original: Callable[..., str] = subject.command
+
+    def tracked(
+        arguments: list[str], root: Path, *, input_text: str | None = None
+    ) -> str:
+        if arguments[:2] == ["afairesi", "diff"]:
+            calls.append(arguments)
+        return original(arguments, root, input_text=input_text)
+
+    monkeypatch.setattr(subject, "command", tracked)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(workspace.interface_changes, ["projects/example"] * 2))
+    expect(len(calls) == comparisons and results[0] == results[1], calls)
+    results[0]["working"]["diff"] = "modified by caller"
+    expect(
+        workspace.interface_changes("projects/example")["working"]["diff"] == "",
+        results,
+    )
+    expect(len(calls) == comparisons, calls)
+    calls.clear()
+    root = workspace.home / "projects/example"
+    source = root / "hello/main.py"
+    before = source.stat()
+    source.write_text(source.read_text().replace('default="world"', 'default="earth"'))
+    os.utime(source, ns=(before.st_atime_ns, before.st_mtime_ns))
+    result = workspace.interface_changes("projects/example")
+    expect(
+        '+ "earth"' in result["working"]["diff"] and len(calls) == comparisons, result
+    )
+    calls.clear()
+    git(root, "add", "--force", "hello/main.py")
+    result = workspace.interface_changes("projects/example")
+    expect(result["working"]["diff"] == "" and len(calls) == comparisons, result)
+    calls.clear()
+    git(
+        root,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "interfaces",
+    )
+    result = workspace.interface_changes("projects/example")
+    expect(
+        all(item["diff"] == "" and item["patch"] == [] for item in result.values()),
+        result,
+    )
+    expect(len(calls) == comparisons, calls)
+
+
+def test_diff_versions_preserve_native_array_edits_and_deleted_resources(
+    tmp_path: Path,
+) -> None:
+    """Reconstruct both baselines from native jd patches, including shifted arrays."""
+    from pathlib import Path  # noqa: PLC0415 - Runtime path for the browser module.
+
+    before = {
+        "runner": {
+            "type": "python",
+            "description": "Before",
+            "tests": ["test_removed", "test_kept"],
+            "cli": {
+                "arguments": [{"names": ["--old"]}, {"names": ["--port"], "default": 1}]
+            },
+            "dependencies": [{"resource": "removed", "kind": "runtime"}],
+        },
+        "removed": {"type": "python"},
+        "special/~": {"type": "python", "description": "before"},
+    }
+    staged = json.loads(json.dumps(before))
+    staged["runner"]["description"] = "Staged"
+    staged["runner"]["cli"]["arguments"][1]["default"] = 2
+    staged["runner"]["tests"] = ["test_kept", "test_staged"]
+    staged["new"] = {"type": "nix"}
+    working = json.loads(json.dumps(staged))
+    working["runner"]["description"] = "Working"
+    working["runner"]["cli"]["arguments"] = [
+        {"names": ["--port"], "default": 3},
+        {"names": ["--new"]},
+    ]
+    working["runner"]["tests"] = ["test_working", "test_kept"]
+    working["runner"]["dependencies"] = [{"resource": "new", "kind": "build"}]
+    working["special/~"]["description"] = "after"
+    del working["removed"]
+    paths = [tmp_path / name for name in ("before.json", "index.json", "working.json")]
+    for path, value in zip(paths, (before, staged, working), strict=True):
+        path.write_text(json.dumps(value))
+    interfaces = {}
+    for name, left, right in (
+        ("staged", paths[0], paths[1]),
+        ("working", paths[1], paths[2]),
+    ):
+        result = subprocess.run(  # noqa: S603 - Native diff over test-owned snapshots.
+            ["jd", str(left), str(right)],  # noqa: S607
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+        expect(result.returncode == 1, result.stderr)
+        interfaces[name] = {
+            "diff": result.stdout,
+            "patch": json.loads(
+                subject.command(
+                    ["jd", "-t", "jd2patch"], tmp_path, input_text=result.stdout
+                )
+            ),
+        }
+    interfaces["working"]["resources"] = working
+    module = Path(subject.__file__).with_name("differences.js").as_uri()
+    script = f"""
+        import {{
+            repositoryVersions, differences, versionEntries, equal, reversePatch,
+            changeKind
+        }} from {json.dumps(module)};
+        import {{ readFileSync }} from 'node:fs';
+        const payload = JSON.parse(readFileSync(0, 'utf8'));
+        const view = repositoryVersions(payload);
+        const tests = versionEntries(view, root => root.runner.tests, name => name);
+        const argumentsList = versionEntries(view,
+            root => root.runner.cli.arguments, argument => argument.names[0]);
+        let staleRejected = false;
+        try {{ reversePatch({{a: 2}}, [{{op: 'add', path: '/a', value: 1}}]); }}
+        catch {{ staleRejected = true; }}
+        const special = reversePatch({{}}, [{{
+            op:'remove',path:'/__proto__',value:{{polluted:true}}
+        }}]);
+        process.stdout.write(JSON.stringify({{
+            view, tests, argumentsList,
+            changes: differences(view, root => root.runner.description),
+            unchanged: differences(view, root => root.runner.type),
+            transient: changeKind(tests.find(t => t.key === 'test_staged').changes),
+            orderIndependent: equal({{a:1,b:2}},{{b:2,a:1}}),
+            staleRejected,
+            safe: Object.hasOwn(special, '__proto__') && !({{}}).polluted,
+        }}));
+    """
+    completed = subprocess.run(  # noqa: S603 - Exercise the shipped browser module with native patches.
+        ["node", "--input-type=module", "-e", script],  # noqa: S607
+        input=json.dumps(interfaces),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    result = json.loads(completed.stdout)
+    expect(
+        result["view"] == {"head": before, "index": staged, "working": working}, result
+    )
+    expect(
+        result["changes"]
+        == [
+            {"before": "Before", "after": "Staged", "stage": "staged"},
+            {"before": "Staged", "after": "Working", "stage": "unstaged"},
+        ],
+        result,
+    )
+    expect(result["unchanged"] == [], result)
+    expect(result["transient"] == "remove", result)
+    expect(
+        {entry["key"]: entry["current"] for entry in result["tests"]}
+        == {
+            "test_working": True,
+            "test_kept": True,
+            "test_staged": False,
+            "test_removed": False,
+        },
+        result,
+    )
+    expect(
+        {entry["key"]: entry["current"] for entry in result["argumentsList"]}
+        == {"--port": True, "--new": True, "--old": False},
+        result,
+    )
+    expect(
+        result["orderIndependent"] and result["staleRejected"] and result["safe"],
+        result,
+    )
+
+
+def test_action_arguments_are_vectors_and_do_not_use_a_shell(
+    workspace: subject.Workspace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep quoted run arguments literal and reject actions before spawning."""
+    application = subject.Application(workspace.home)
+    captured = []
+
+    def actions(_repository: str, _resource: str) -> dict[str, list[str]]:
+        return {"run": ["nix", "run", '.#"hello"']}
+
+    def start(*arguments: object) -> dict[str, Any]:
+        captured.append(arguments)
+        return {"id": "job"}
+
+    monkeypatch.setattr(application.workspace, "actions", actions)
+    monkeypatch.setattr(application.jobs, "start", start)
+    application.post(
+        "/api/jobs",
+        {
+            "repository": "projects/example",
+            "resource": "hello",
+            "action": "run",
+            "arguments": "--name 'two words' '$(touch unwanted)'",
+        },
+    )
+    expect(
+        captured[0][-1]
+        == [
+            "nix",
+            "run",
+            '.#"hello"',
+            "--",
+            "--name",
+            "two words",
+            "$(touch unwanted)",
+        ],
+        captured,
+    )
+    application.post(
+        "/api/jobs",
+        {
+            "repository": "projects/example",
+            "resource": "hello",
+            "action": "run",
+            "arguments": ["--name", "", "two words", "0", "$(touch unwanted)"],
+        },
+    )
+    argv = captured[-1][-1]
+    expect(
+        isinstance(argv, list)
+        and argv[-5:] == ["--name", "", "two words", "0", "$(touch unwanted)"],
+        captured,
+    )
+    with pytest.raises(TypeError, match="array of strings"):
+        application.post(
+            "/api/jobs",
+            {
+                "repository": "projects/example",
+                "resource": "hello",
+                "action": "run",
+                "arguments": [0],
+            },
+        )
+    with pytest.raises(ValueError, match="unavailable"):
+        application.post(
+            "/api/jobs",
+            {"repository": "projects/example", "resource": "hello", "action": "clean"},
+        )
+    with pytest.raises(ValueError, match="direct registered"):
+        application.post(
+            "/api/jobs",
+            {"repository": "unregistered", "resource": "hello", "action": "run"},
+        )
+    expect([item[3] for item in captured] == ["run", "run"], captured)
+
+
+def test_job_streams_before_exit_and_can_be_cancelled(tmp_path: Path) -> None:
+    """Observe live stdout and terminate a running process without a shell."""
+    jobs = subject.Jobs()
+    try:
+        job = jobs.start(
+            tmp_path,
+            "repo",
+            "resource",
+            "run",
+            [sys.executable, "-u", "-c", "import time; print('ready'); time.sleep(30)"],
+        )
+        wait_for(lambda: "ready" in jobs.snapshot("repo")[0]["output"])
+        expect(jobs.snapshot("repo")[0]["status"] == "running", jobs.snapshot("repo"))
+        jobs.cancel(job["id"])
+        wait_for(lambda: jobs.snapshot("repo")[0]["exit_code"] is not None)
+        expect(jobs.snapshot("repo")[0]["status"] == "cancelled", jobs.snapshot("repo"))
+        jobs.start(
+            tmp_path,
+            "other",
+            "resource",
+            "test",
+            [sys.executable, "-c", "raise SystemExit(7)"],
+        )
+        wait_for(lambda: jobs.snapshot("other")[0]["status"] == "failed")
+        expected_failure = 7
+        expect(
+            jobs.snapshot("other")[0]["exit_code"] == expected_failure,
+            jobs.snapshot("other"),
+        )
+        expect(len(jobs.snapshot("repo")) == 1, jobs.snapshot("repo"))
+    finally:
+        jobs.close()
+
+
+@pytest.fixture
+def server(workspace: subject.Workspace) -> Iterator[ThreadingHTTPServer]:
+    """Run the actual HTTP router against the temporary home."""
+    application = subject.Application(workspace.home)
+    with ThreadingHTTPServer(("127.0.0.1", 0), subject.handler(application)) as httpd:
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        try:
+            yield httpd
+        finally:
+            httpd.shutdown()
+            thread.join(timeout=5)
+            application.close()
+
+
+def request(
+    server: ThreadingHTTPServer,
+    method: str,
+    path: str,
+    headers: dict[str, str] | None = None,
+) -> tuple[int, bytes]:
+    """Send an HTTP request to the test server."""
+    connection = http.client.HTTPConnection("127.0.0.1", server.server_port, timeout=10)
+    try:
+        connection.request(
+            method, path, body="{}" if method == "POST" else None, headers=headers or {}
+        )
+        response = connection.getresponse()
+        return response.status, response.read()
+    finally:
+        connection.close()
+
+
+def test_http_serves_only_assets_and_rejects_foreign_origins(
+    server: ThreadingHTTPServer,
+) -> None:
+    """Keep home files and mutation APIs outside arbitrary browser origins."""
+    status, body = request(server, "GET", "/api/workspace")
+    expect(status == HTTPStatus.OK and len(json.loads(body)["repositories"]) == 1, body)
+    status, body = request(server, "GET", "/")
+    expect(status == HTTPStatus.OK and b"afairesi" in body, status)
+    expect(
+        request(server, "GET", "/.git/config")[0] == HTTPStatus.NOT_FOUND,
+        "served Git files",
+    )
+    expect(
+        request(server, "GET", "/api/workspace", {"Host": "attacker.invalid"})[0]
+        == HTTPStatus.FORBIDDEN,
+        "accepted foreign host",
+    )
+    expect(
+        request(
+            server,
+            "POST",
+            "/api/agent/connect",
+            {"Content-Type": "application/json", "Origin": "https://attacker.invalid"},
+        )[0]
+        == HTTPStatus.FORBIDDEN,
+        "accepted foreign origin",
+    )
+    expect(
+        request(server, "POST", "/api/agent/connect", {"Content-Type": "text/plain"})[0]
+        == HTTPStatus.BAD_REQUEST,
+        "accepted form-compatible body",
+    )
+
+
+def test_codex_streams_and_routes_approvals_to_the_correct_repository(
+    tmp_path: Path,
+) -> None:
+    """Exercise the actual line protocol using a local fake, without model calls."""
+    executable = tmp_path / "fake-codex"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        """
+import json
+import sys
+loaded = False
+def emit(value):
+    print(json.dumps(value), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    result = {}
+    if method == "account/read":
+        result = {"account": {"type": "chatgpt", "planType": "plus"}}
+    elif method == "thread/start":
+        loaded = True
+        result = {"thread": {"id": "thread-one"}}
+    elif method == "thread/resume":
+        loaded = True
+    elif method == "turn/start":
+        if not loaded:
+            emit({"id": message["id"], "error": {"message": "Thread not loaded"}})
+            continue
+        emit({"method": "turn/started", "params": {
+            "threadId": "thread-one", "turn": {"id": "turn-one"}}})
+        emit({"method": "item/agentMessage/delta", "params": {
+            "threadId": "thread-one", "itemId": "message-one",
+            "delta": "Hello from Codex"}})
+        emit({"id": 500, "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-one", "turnId": "turn-one",
+                "command": "nix build"}})
+    elif method is None and message.get("id") == 500:
+        emit({"method": "turn/completed", "params": {
+            "threadId": "thread-one", "turn": {
+                "id": "turn-one", "status": "completed"}}})
+    if method and "id" in message:
+        emit({"id": message["id"], "result": result})
+"""
+    )
+    executable.chmod(0o755)
+    codex = subject.Codex(str(executable))
+    try:
+        expect(codex.connect()["connected"], codex.status())
+        codex.send(tmp_path, "repository", "hello", "selected resource")
+        wait_for(lambda: bool(codex.snapshot("repository")["requests"]))
+        chat = codex.snapshot("repository")
+        expect(
+            chat["busy"] and chat["messages"][-1]["text"] == "Hello from Codex", chat
+        )
+        expect(not codex.snapshot("other")["messages"], codex.snapshot("other"))
+        with pytest.raises(ValueError, match="no longer pending"):
+            codex.reply("other", "500", {"decision": "accept"})
+        codex.reply("repository", "500", {"decision": "decline"})
+        wait_for(lambda: not codex.snapshot("repository")["busy"])
+        codex.close()
+        codex.connect()
+        codex.send(tmp_path, "repository", "continue", "same resource")
+        wait_for(lambda: bool(codex.snapshot("repository")["requests"]))
+        codex.reply("repository", "500", {"decision": "decline"})
+        wait_for(lambda: not codex.snapshot("repository")["busy"])
+    finally:
+        codex.close()
+
+
+def test_source_does_not_modify_home_registration(workspace: subject.Workspace) -> None:
+    """Reading the workspace preserves the registry, index, and working sources."""
+    root = workspace.home
+    before = {
+        path: path.read_bytes()
+        for path in (
+            root / ".gitmodules",
+            root / ".git/index",
+            root / "projects/example/hello/main.py",
+        )
+    }
+    workspace.repositories()
+    workspace.inspect("projects/example")
+    expect(
+        all(path.read_bytes() == content for path, content in before.items()),
+        "workspace read changed tracked state",
+    )
+
+
+def test_argument_controls_round_trip_through_argparse() -> None:
+    """Preserve omission, empty strings, zero, repeated flags, and choices."""
+    import argparse  # noqa: PLC0415 - Only used by the CLI control contract test.
+    from pathlib import Path  # noqa: PLC0415 - Runtime path needed for the browser module.
+
+    arguments = [
+        {"names": ["--name"], "default": "fallback"},
+        {"names": ["--port"], "type": "int"},
+        {"names": ["--dry-run"], "action": "store_true"},
+        {"names": ["--quiet"], "action": "store_false"},
+        {"names": ["-v"], "action": "count"},
+        {"names": ["--color"], "choices": ["red", "blue"]},
+        {"names": ["--tag"], "action": "append"},
+        {"names": ["--cache"], "action": {"unknown": "argparse.BooleanOptionalAction"}},
+        {"names": ["--limit"], "type": "int", "nargs": "?", "const": 5},
+        {"names": ["path"]},
+    ]
+    values = {
+        str(index): {"enabled": True, "text": text}
+        for index, text in enumerate(
+            [
+                "",
+                "0",
+                "",
+                "",
+                "2",
+                "blue",
+                "two words\n$(touch unwanted)",
+                "false",
+                "",
+                "a directory",
+            ]
+        )
+    }
+    values["8"]["constant"] = True
+    command = {"arguments": arguments}
+    cases = [
+        {"command": command, "values": values},
+        {"command": {"arguments": arguments[:1]}, "values": {}},
+        {
+            "command": {"arguments": [arguments[1]]},
+            "values": {"0": {"enabled": True, "text": "1.5"}},
+        },
+        {
+            "command": {"arguments": [arguments[5]]},
+            "values": {"0": {"enabled": True, "text": "green"}},
+        },
+        {
+            "command": {
+                "arguments": arguments[:2],
+                "groups": [{"exclusive": True, "arguments": [["--name"], ["--port"]]}],
+            },
+            "values": values,
+        },
+    ]
+    module = Path(subject.__file__).with_name("arguments.js").as_uri()
+    script = f"""
+        import {{ commandArguments }} from {json.dumps(module)};
+        import {{ readFileSync }} from 'node:fs';
+        const cases = JSON.parse(readFileSync(0, 'utf8'));
+        process.stdout.write(JSON.stringify(cases.map(item => {{
+            try {{ return {{ argv: commandArguments(item.command, item.values) }}; }}
+            catch (error) {{ return {{ error: error.message }}; }}
+        }})));
+    """
+    result = subprocess.run(  # noqa: S603 - Test-authored JavaScript and metadata, no shell.
+        ["node", "--input-type=module", "-e", script],  # noqa: S607
+        input=json.dumps(cases),
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=10,
+    )
+    results = json.loads(result.stdout)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--name", default="fallback")
+    parser.add_argument("--port", type=int)
+    parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument("--quiet", action="store_false")
+    parser.add_argument("-v", action="count")
+    parser.add_argument("--color", choices=["red", "blue"])
+    parser.add_argument("--tag", action="append")
+    parser.add_argument("--cache", action=argparse.BooleanOptionalAction)
+    parser.add_argument("--limit", type=int, nargs="?", const=5)
+    parser.add_argument("path")
+    parsed = vars(parser.parse_args(results[0]["argv"]))
+    expect(
+        parsed
+        == {
+            "name": "",
+            "port": 0,
+            "dry_run": True,
+            "quiet": False,
+            "v": 2,
+            "color": "blue",
+            "tag": ["two words", "$(touch unwanted)"],
+            "cache": False,
+            "limit": 5,
+            "path": "a directory",
+        },
+        parsed,
+    )
+    expect(results[1]["argv"] == [], results)
+    expect(all("error" in result for result in results[2:]), results)
+
+
+def test_all_resource_actions_share_one_nix_evaluation(
+    workspace: subject.Workspace,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resolve every initial resource box against real offline flake outputs."""
+    root = workspace.home / "projects/example"
+    library = root / "library"
+    library.mkdir()
+    (library / "default.nix").write_text('{ pkgs }: pkgs.runCommand "library" {} ""')
+    (library / "main.nix").write_text("{}")
+    (root / "flake.nix").write_text("""{
+      outputs = { self }: {
+        packages.${builtins.currentSystem} = {
+          hello.meta.mainProgram = "hello";
+          library = {};
+        };
+        checks.${builtins.currentSystem}.hello = {};
+      };
+    }""")
+    git(root, "add", "--force", ".")
+    scratch = workspace.home / "nix-test"
+    monkeypatch.setenv(
+        "NIX_REMOTE",
+        f"local?store={scratch / 'store'}"
+        f"&state={scratch / 'state'}&log={scratch / 'log'}",
+    )
+    monkeypatch.setenv(
+        "NIX_CONFIG",
+        "experimental-features = nix-command flakes\n"
+        "build-users-group =\nsandbox = false\n"
+        "eval-cache = false\nsubstituters =\n",
+    )
+    calls: list[list[str]] = []
+    original: Callable[[list[str], Path], str] = subject.command
+
+    def record(argv: list[str], cwd: Path) -> str:
+        calls.append(argv)
+        return original(argv, cwd)
+
+    monkeypatch.setattr(subject, "command", record)
+    application = subject.Application(workspace.home)
+    result = application.get("/api/actions", {"repository": ["projects/example"]})
+    if not isinstance(result, dict):
+        raise TypeError(result)
+    expect(set(result) == {"hello", "library"}, result)
+    expect(set(result["hello"]) == {"build", "run", "test"}, result)
+    expect(set(result["library"]) == {"build"}, result)
+    evaluations = [
+        argv for argv in calls if argv[:2] == ["nix", "eval"] and "--json" in argv
+    ]
+    expect(len(evaluations) == 1, calls)
+    expect(
+        not any(argv[:2] in (["nix", "build"], ["nix", "run"]) for argv in calls), calls
+    )

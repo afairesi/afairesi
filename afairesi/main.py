@@ -1165,7 +1165,12 @@ class ArgumentDiscovery:
             return set().union(
                 *(self._resolve(value, seen) for value in self.returns.get(key, [])),
             )
-        if isinstance(node.func, ast.Attribute):
+        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+            "add_subparsers",
+            "add_argument_group",
+            "add_mutually_exclusive_group",
+            "add_parser",
+        }:
             parents = self._resolve(node.func.value, seen)
             if node.func.attr in {
                 "add_subparsers",
@@ -1343,13 +1348,15 @@ class ArgumentDiscovery:
         self,
         node: ast.expr,
         roots: set[str],
-        seen: frozenset[int] = frozenset(),
+        seen: set[int] | None = None,
     ) -> bool:
         """Find parser inputs wrapped in literal containers or aliases."""
+        if seen is None:
+            seen = set()
         key = id(node)
         if key in seen:
             return False
-        seen = seen | {key}
+        seen.add(key)
         if any(path[0] in roots for path in self._resolve(node)):
             return True
         if isinstance(node, ast.Name):
@@ -1561,6 +1568,201 @@ def _compact_cli(command: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+_DEPENDENCY_FIELDS = {
+    "propagatedBuildInputs": "runtime",
+    "propagatedNativeBuildInputs": "build",
+    "buildInputs": "build",
+    "nativeBuildInputs": "build",
+    "runtimeInputs": "runtime",
+    "dependencies": "runtime",
+    "build-system": "build",
+    "checkInputs": "test",
+    "nativeCheckInputs": "test",
+    "systemPackages": "runtime",
+}
+
+
+def _dependency_alias(
+    document: nix_syntax.Document,
+    node: Node,
+    name: str,
+) -> Node | None:
+    """Find an alias in its lexical let/recursive-set scope, respecting formals."""
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "function_expression":
+            formals = parent.child_by_field_name("formals")
+            if formals is not None and any(
+                child.type == "formal"
+                and (formal := child.child_by_field_name("name")) is not None
+                and document.text(formal) == name
+                for child in formals.named_children
+            ):
+                return None
+        if parent.type in {"let_expression", "rec_attrset_expression"}:
+            bindings = next(
+                (
+                    child
+                    for child in parent.named_children
+                    if child.type == "binding_set"
+                ),
+                None,
+            )
+            for binding in [] if bindings is None else bindings.named_children:
+                attrpath = binding.child_by_field_name("attrpath")
+                if attrpath is not None and nix_syntax.static_attrpath(
+                    document,
+                    attrpath,
+                ) == (name,):
+                    return binding.child_by_field_name("expression")
+        parent = parent.parent
+    return None
+
+
+def _dependency_parts(
+    document: nix_syntax.Document,
+    node: Node,
+    seen: frozenset[int] = frozenset(),
+) -> list[str | None] | None:
+    """Expand static attribute prefixes and aliases, retaining dynamic components."""
+    if node.id in seen:
+        return None
+    seen = seen | {node.id}
+    if node.type in {"variable_expression", "identifier"}:
+        name = document.text(node)
+        alias = _dependency_alias(document, node, name)
+        if alias is not None:
+            return _dependency_parts(document, alias, seen)
+        return [name]
+    if node.type == "select_expression":
+        base = node.child_by_field_name("expression")
+        attrs = node.child_by_field_name("attrpath")
+        parts = None if base is None else _dependency_parts(document, base, seen)
+        if parts is None or attrs is None:
+            return None
+        for child in attrs.named_children:
+            if child.type == "identifier":
+                parts.append(document.text(child))
+            else:
+                parts.append(nix_syntax.string_value(document, child))
+        return parts
+    return None
+
+
+def _dependency_target(parts: list[str | None] | None) -> str | None:
+    """Return a statically named package from this flake only."""
+    if parts is not None:
+        for prefix in (["inputs", "self", "packages"], ["self", "packages"]):
+            if parts[: len(prefix)] == prefix and len(parts) >= len(prefix) + 2:
+                return parts[len(prefix) + 1]
+    return None
+
+
+def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax form
+    document: nix_syntax.Document,
+    node: Node,
+    seen: frozenset[int] = frozenset(),
+) -> list[tuple[Node, list[str | None] | None]]:
+    """Expand lists and aliases while retaining unresolved expressions."""
+    if node.id in seen:
+        return [(node, None)]
+    seen = seen | {node.id}
+    if node.type == "comment":
+        return []
+    if node.type == "list_expression":
+        return [
+            value
+            for child in node.named_children
+            for value in _dependency_values(document, child, seen)
+        ]
+    if node.type in {"variable_expression", "identifier"}:
+        alias = _dependency_alias(document, node, document.text(node))
+        if alias is not None:
+            if alias.type in {
+                "apply_expression",
+                "attrset_expression",
+                "rec_attrset_expression",
+            }:
+                return [(node, [document.text(node)])]
+            return _dependency_values(document, alias, seen)
+    if node.type == "with_expression":
+        body = node.child_by_field_name("body")
+        environment = node.child_by_field_name("environment")
+        prefix = (
+            None if environment is None else _dependency_parts(document, environment)
+        )
+        values = [] if body is None else _dependency_values(document, body, seen)
+        return [
+            (item, prefix + parts if prefix and parts and len(parts) == 1 else parts)
+            for item, parts in values
+        ]
+    if node.type == "parenthesized_expression":
+        return _dependency_values(document, node.named_children[0], seen)
+    if node.type == "binary_expression":
+        left, right = (
+            node.child_by_field_name("left"),
+            node.child_by_field_name("right"),
+        )
+        if (
+            left is not None
+            and right is not None
+            and document.source[left.end_byte : right.start_byte].strip() == b"++"
+        ):
+            return _dependency_values(document, left, seen) + _dependency_values(
+                document,
+                right,
+                seen,
+            )
+    return [(node, _dependency_parts(document, node))]
+
+
+def resource_dependencies(  # noqa: C901 - Traverse declarations and source references separately.
+    root: Path,
+    name: str,
+    paths: set[Path],
+    resources: set[str],
+) -> list[dict[str, str]]:
+    """Read declared local dependencies; do not evaluate the Nix dependency closure."""
+    records: set[tuple[str, str]] = set()
+    for filename in ("default.nix", "configuration.nix"):
+        relative = Path(name) / filename
+        if relative not in paths or not (root / relative).is_file():
+            continue
+        document = nix_syntax.parse((root / relative).read_bytes(), str(relative))
+        for binding in nix_syntax.walk(document.root):
+            if binding.type != "binding":
+                continue
+            attrs = binding.child_by_field_name("attrpath")
+            parts = (
+                None if attrs is None else nix_syntax.static_attrpath(document, attrs)
+            )
+            expression = binding.child_by_field_name("expression")
+            if not parts or parts[-1] not in _DEPENDENCY_FIELDS or expression is None:
+                continue
+            for _node, reference in _dependency_values(document, expression):
+                target = _dependency_target(reference)
+                if target in resources and target != name:
+                    records.add((target, _DEPENDENCY_FIELDS[parts[-1]]))
+        known = {target for target, _kind in records}
+        for node in nix_syntax.walk(document.root):
+            target = (
+                _dependency_target(_dependency_parts(document, node))
+                if node.type == "select_expression"
+                else None
+            )
+            if target in resources and target != name and target not in known:
+                records.add((target, "reference"))
+            if node.type == "path_expression":
+                text = document.text(node)
+                if text.startswith(("./", "../")) and "${" not in text:
+                    normalized = os.path.normpath(str(relative.parent / text))
+                    components = Path(normalized).parts
+                    target = components[0] if components else None
+                    if target in resources and target != name:
+                        records.add((target, "source"))
+    return [{"resource": target, "kind": kind} for target, kind in sorted(records)]
+
+
 def inspect_repository(root: Path) -> dict[str, Any]:
     """Describe root resources by name, with their interfaces and test identifiers."""
     if not (root / "flake.nix").is_file():
@@ -1616,6 +1818,10 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         if identifiers:
             resource["tests"] = identifiers
         resources[package.name] = resource
+    for name, resource in resources.items():
+        dependencies = resource_dependencies(root, name, paths, set(resources))
+        if dependencies:
+            resource["dependencies"] = dependencies
     return dict(sorted(resources.items()))
 
 

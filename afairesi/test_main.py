@@ -3434,3 +3434,57 @@ def test_source_validation_ignores_local_packages_and_optional_tests(
     subject = import_module("afairesi.main")
     report = subject.inspect_repository(root)
     _expect(set(report) == {"example"} and "tests" not in report["example"], report)
+
+
+def test_inspection_reports_declared_local_dependency_edges(tmp_path: Path) -> None:
+    """Read local relationships without evaluating Nix or resolving external inputs."""
+    root = _repository(tmp_path)
+    for name in ("consumer", "library", "other"):
+        directory = root / name
+        directory.mkdir()
+        _write_fixture_source(directory / "default.nix", "{}: {}")
+        _write_fixture_source(directory / "main.nix", "{}")
+    source = """{ inputs, pkgs, ... }:
+      let local = inputs.self.packages.${pkgs.stdenv.system};
+          deps = [ local.library ];
+      in pkgs.runCommand "consumer" {
+        propagatedBuildInputs = deps ++
+          (with inputs.self.packages.${pkgs.stdenv.system}; [ other ]);
+        nativeCheckInputs = [ inputs.self.packages.${pkgs.stdenv.system}.library ];
+        buildInputs = [ inputs.external.packages.${pkgs.stdenv.system}.other ];
+        text = "inputs.self.packages.fake.consumer";
+        src = ../other/main.nix;
+        root = ../.;
+      } "throw must-not-evaluate"
+    """
+    _write_fixture_source(root / "consumer/default.nix", source)
+    report = inspection_subject.inspect_repository(root)
+    _expect(
+        report["consumer"]["dependencies"]
+        == [
+            {"resource": "library", "kind": "runtime"},
+            {"resource": "library", "kind": "test"},
+            {"resource": "other", "kind": "runtime"},
+            {"resource": "other", "kind": "source"},
+        ],
+        report,
+    )
+    _expect("dependencies" not in report["library"], report)
+    _write_fixture_source(
+        root / "consumer/default.nix", "\n# moved declaration\n" + source
+    )
+    _expect(
+        inspection_subject.inspect_repository(root) == report,
+        "line numbers leaked into the interface",
+    )
+
+
+def test_inspection_handles_shared_non_parser_aliases() -> None:
+    """Traverse shared containers once while finding actual parser arguments."""
+    source = "import argparse\nvalue0 = []\n"
+    for index in range(1, 24):
+        source += f"value{index} = [value{index - 1}, value{index - 1}]\n"
+    source += "consume(value23)\nparser = argparse.ArgumentParser()\n"
+    source += "parser.add_argument('--name')\nparser.parse_args()\n"
+    report = _inspection_discovery(source)
+    _expect(report["arguments"] == [{"names": ["--name"]}], report)
