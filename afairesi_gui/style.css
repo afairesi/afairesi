@@ -191,207 +191,56 @@ pre {
   color: #a84c45;
   background: #f5e5d6;
 }
-.chat-pane {
+.codex-pane {
   position: fixed;
   bottom: 12px;
   left: 50%;
   transform: translateX(-50%);
-  width: min(720px, calc(100vw - 24px));
+  width: min(1040px, calc(100vw - 24px));
+  height: 300px;
+  min-height: 160px;
   max-height: calc(100dvh - 80px);
   z-index: 6;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  min-width: 0;
-  min-height: 0;
-  pointer-events: none;
-}
-.chat-pane > * {
-  pointer-events: auto;
-}
-.messages {
-  flex: 0 1 auto;
-  overflow: auto;
-  min-height: 0;
-  max-height: min(36dvh, 320px);
-}
-.message {
-  margin-bottom: 6px;
-  padding: 10px 12px;
   border: 1px solid var(--line);
-  border-radius: 5px;
+  border-radius: 6px;
   background: var(--paper);
-  overflow-wrap: anywhere;
-  font-size: 11px;
-}
-.message:last-child,
-.request:last-child {
-  margin-bottom: 0;
-}
-.message-role {
-  font-size: 9px;
-  color: var(--muted);
-  margin-bottom: 7px;
-  display: block;
-}
-.message.user {
-  background: var(--inset);
-  padding: 12px;
-  border-radius: 5px;
-}
-.message.error {
-  color: var(--red);
-}
-.message-text {
-  white-space: pre-wrap;
-  line-height: 1.85;
-}
-.message-text code {
-  background: var(--inset);
-  border-radius: 3px;
-  padding: 1px 3px;
-}
-.message.tool {
-  color: var(--muted);
-  font-size: 10px;
-  padding-left: 10px;
-  border-left: 2px solid var(--line);
-}
-.message.tool summary {
-  cursor: pointer;
-  white-space: pre-wrap;
-}
-.message.tool pre {
-  max-height: 200px;
-  overflow: auto;
-  font-size: 9px;
-  padding-top: 8px;
-}
-.thinking {
-  font-size: 10px;
-  color: var(--accent);
-  padding: 8px 12px;
-  background: var(--paper);
-  border: 1px solid var(--line);
-}
-.chat-controls {
-  flex-shrink: 0;
-  border: 1px solid #cdd0bd;
-  border-radius: 7px;
-  margin: 0;
-  background: var(--paper);
-  overflow: hidden;
   box-shadow: 0 3px 14px #07364212;
+  overflow: hidden;
 }
-.chat-controls textarea {
-  display: block;
-  width: 100%;
-  min-height: 40px;
-  max-height: 120px;
-  field-sizing: content;
-  resize: none;
-  border: 0;
-  outline: none;
-  padding: 10px 12px;
-  background: none;
-  font-size: 11px;
+#terminal-resize {
+  flex: 0 0 8px;
+  cursor: ns-resize;
+  touch-action: none;
+  background: linear-gradient(var(--line), var(--line)) center / 40px 2px no-repeat;
 }
-.mentions {
-  max-height: min(220px, 30dvh);
-  overflow: auto;
-  border-bottom: 1px solid var(--line);
-}
-.mentions button {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  width: 100%;
-  padding: 7px 12px;
-  text-align: left;
-  overflow-wrap: anywhere;
-  border: 0;
-  background: var(--paper);
-  font-size: 11px;
-}
-.mentions button[aria-selected="true"],
-.mentions button:hover {
-  background: var(--accent-wash);
-}
-.chat-controls:focus-within {
-  border-color: #82afbc;
-  box-shadow: 0 0 0 2px #268bd20b;
-}
-.composer-footer {
+.terminal-toolbar {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 6px 8px;
-  gap: 6px;
-}
-.agent-status {
-  color: var(--muted);
+  gap: 8px;
+  min-height: 20px;
+  padding: 0 10px 4px;
   font-size: 10px;
-  padding: 0 12px 8px;
-  overflow-wrap: anywhere;
+  color: var(--muted);
 }
-.login-code {
-  user-select: all;
-  font-weight: 600;
-  padding: 2px 5px;
-  background: var(--inset);
-}
-.chat-context {
+#terminal {
   flex: 1;
-  min-width: 0;
-  color: var(--muted);
-  font-size: 10px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-#connect {
-  white-space: nowrap;
-}
-.chat-requests {
-  flex: 0 1 auto;
   min-height: 0;
-  max-height: min(30dvh, 240px);
-  overflow: auto;
+  padding: 0 8px 6px;
 }
-.messages:empty,
-.chat-requests:empty {
+#terminal .xterm {
+  height: 100%;
+}
+#terminal .xterm-viewport {
+  background: var(--paper);
+}
+#terminal .scrollbar {
   display: none;
 }
-.request {
-  padding: 12px;
-  border: 1px solid #d8c697;
-  border-radius: 5px;
-  background: #f5ecd2;
-  margin-bottom: 10px;
-  font-size: 10px;
-}
-.request p,
-.request pre {
-  margin-bottom: 10px;
-  overflow-wrap: anywhere;
-  max-height: 180px;
-  overflow: auto;
-}
-.request .request-actions {
-  display: flex;
-  gap: 7px;
-}
-.request label {
-  display: block;
-  margin: 9px 0;
-}
-.request input {
-  width: 100%;
-  background: var(--paper);
-  border: 1px solid var(--line);
-  border-radius: 3px;
-  padding: 6px;
-  margin-top: 5px;
+#terminal .xterm-screen {
+  user-select: none;
 }
 .toast {
   position: fixed;

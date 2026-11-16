@@ -153,17 +153,18 @@ afairesi ../project</code></pre>
             arranged horizontally on desktop. Scroll to zoom around the pointer and drag to pan.
             Resource boxes show build, run, and test controls, with collapsible sections for
             declared CLI arguments and readable test names. Dependency arrows connect resources
-            within each repository. Compact workspace controls and a Codex chat input float over the
-            full-screen canvas. Type <code>@</code> in chat to choose a registered repository;
-            subsequent messages continue that conversation. Responses and approval requests appear
-            above the input, and job output can be sent directly with Ask Codex. Staged and unstaged
-            interface differences from <code>afairesi diff</code> appear directly on resource
-            blocks, descriptions, argument controls, tests, and dependency edges, with green
-            additions and red removals. Removed resources remain visible with disabled controls.
-            Diffs refresh every ten seconds and reuse cached results while HEAD, the index, and
-            tracked files remain unchanged. Dragging boxes and their text pans the canvas; argument
-            inputs remain editable. Edges point from dependencies to consumers and describe source
-            declarations, not the full evaluated Nix closure.
+            within each repository. Compact workspace controls and a resizable native Codex terminal
+            float over the full-screen canvas. Codex handles slash commands, file mentions,
+            approvals, and conversation history directly. The terminal starts in the configured home
+            directory; use <code>/cd</code> to switch directories and <code>@</code> to mention
+            files. Ask Codex pastes job output into its composer for you to review and send. Staged
+            and unstaged interface differences from <code>afairesi diff</code> appear directly on
+            resource blocks, descriptions, argument controls, tests, and dependency edges, with
+            green additions and red removals. Removed resources remain visible with disabled
+            controls. Diffs refresh every ten seconds and reuse cached results while HEAD, the
+            index, and tracked files remain unchanged. Dragging boxes and their text pans the
+            canvas; argument inputs remain editable. Edges point from dependencies to consumers and
+            describe source declarations, not the full evaluated Nix closure.
           </p>
           <pre tabindex="0" aria-label="Open the local workspace"><code>nix run .#afairesi_gui
 nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
@@ -193,13 +194,15 @@ nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></
           </p>
           <p>
             The server listens on <code>127.0.0.1</code>. The GUI bundles Codex from the locked
-            Nixpkgs input, so it needs no separate installation. Select Connect Codex to use your
-            existing account or sign in. Over SSH, the chat displays a sign-in link and device code
-            that you complete in your local browser; credentials stay managed by Codex on the remote
-            machine. Local sessions use browser sign-in. Pass <code>--codex /path/to/codex</code>
-            to override the executable on the machine running the workspace. Each repository has its
-            own conversation. The GUI keeps activity and conversations for the server session;
-            stopping the server stops its running jobs.
+            Nixpkgs input, so it needs no separate installation. Codex starts automatically in the
+            bottom terminal and uses its existing account or native sign-in. Over SSH, an
+            unsigned-in session first runs <code>codex login --device-auth</code>; open its link
+            locally and enter the displayed code. Credentials stay managed by Codex on the workspace
+            machine. Pass <code>--codex /path/to/codex</code> to override the executable on that
+            machine. Refreshing or reconnecting the browser reattaches to the same running terminal
+            and replays its recent output. Native <code>/resume</code> restores saved Codex
+            conversations after a workspace restart. Closing the launcher stops its terminal and
+            running jobs.
           </p>
           <h3>Interface changes</h3>
           <p>

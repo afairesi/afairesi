@@ -5,19 +5,24 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import codecs
 import contextlib
+import fcntl
 import hashlib
 import json
 import mimetypes
 import os
+import pty
 import re
+import select
 import shlex
 import shutil
 import signal
 import socket
 import subprocess
 import sys
+import termios
 import threading
 import time
 import uuid
@@ -40,13 +45,18 @@ MAX_BODY = 65_536
 MAX_JOBS = 4
 BUNDLED_CODEX = "codex"
 SOURCE_REVISION = ""
+TERMINAL_ASSETS = ""
+MAX_TERMINAL_OUTPUT = 2_000_000
 ASSETS = {
     "/": "index.html",
     "/app.js": "app.js",
+    "/terminal.js": "terminal.js",
     "/arguments.js": "arguments.js",
     "/differences.js": "differences.js",
     "/style.css": "style.css",
 }
+
+TERMINAL_FILES = {"xterm.js", "xterm.css", "addon-fit.js", "addon-web-links.js"}
 
 
 def command(arguments: list[str], root: Path, *, input_text: str | None = None) -> str:
@@ -439,7 +449,7 @@ class Jobs:
         threading.Thread(target=self.reap, args=(process,), daemon=True).start()
 
     @staticmethod
-    def reap(process: subprocess.Popen[str]) -> None:
+    def reap(process: subprocess.Popen[Any]) -> None:
         """Escalate cancellation when a program ignores termination."""
         try:
             process.wait(timeout=3)
@@ -455,373 +465,206 @@ class Jobs:
             self.cancel(identifier)
 
 
-class Codex:
-    """Bridge Codex's app-server protocol to repository-scoped chat panes."""
+class Terminal:
+    """Own one native Codex session behind a browser terminal."""
 
-    def __init__(self, executable: str = BUNDLED_CODEX) -> None:
-        """Defer Codex startup until the user connects."""
+    def __init__(
+        self, root: Path, executable: str = BUNDLED_CODEX, *, remote: bool = False
+    ) -> None:
+        """Retain terminal output and process ownership across browser reconnects."""
+        self.root = root
         self.executable = executable
-        self.process: subprocess.Popen[str] | None = None
+        self.remote = remote
+        self.condition = threading.Condition(threading.RLock())
+        self.process: subprocess.Popen[bytes] | None = None
         self.reader: threading.Thread | None = None
-        self.lock = threading.RLock()
-        self.write_lock = threading.Lock()
-        self.connect_lock = threading.RLock()
-        self.counter = 0
-        self.pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
-        self.chats: dict[str, dict[str, Any]] = {}
-        self.requests: dict[str, dict[str, Any]] = {}
-        self.account: dict[str, Any] | None = None
-        self.login: dict[str, Any] | None = None
-        self.login_generation = 0
-        self.error: str | None = None
+        self.master: int | None = None
+        self.output = bytearray()
+        self.offset = 0
+        self.session = ""
+        self.finished = True
+        self.closed = False
 
-    def connect(self) -> dict[str, Any]:
-        """Start the official runtime and use its existing managed account."""
-        with self.connect_lock:
-            fresh = self.process is None or self.process.poll() is not None
-            if fresh:
-                if self.reader is not None:
-                    self.reader.join(timeout=3)
-                self.process = subprocess.Popen(  # noqa: S603 - User-selected executable; fixed app-server arguments.
-                    [self.executable, "app-server", "--listen", "stdio://"],
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
-                    text=True,
-                    bufsize=1,
+    def start(self, columns: int, rows: int) -> dict[str, Any]:
+        """Start once; attaching another browser preserves the existing process."""
+        with self.condition:
+            if self.closed:
+                message = "The workspace is shutting down."
+                raise ValueError(message)
+            if not self.finished:
+                return self.snapshot()
+            self.dimensions(columns, rows)
+            if shutil.which(self.executable) is None:
+                message = "Codex executable is unavailable."
+                raise ValueError(message)
+            master, slave = pty.openpty()
+            try:
+                termios.tcsetwinsize(slave, (rows, columns))
+                self.process = subprocess.Popen(  # noqa: S603 - Fixed child launcher; executable remains an argv value.
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--home",
+                        str(self.root),
+                        "--codex",
+                        self.executable,
+                    ],
+                    stdin=slave,
+                    stdout=slave,
+                    stderr=slave,
+                    cwd=self.root,
+                    env={
+                        **os.environ,
+                        "PYTHONPATH": os.pathsep.join(sys.path),
+                        "TERM": "xterm-256color",
+                        "COLORTERM": "truecolor",
+                        "AFAIRESI_GUI_TERMINAL_CHILD": "1",
+                        "AFAIRESI_GUI_DEVICE_AUTH": "1" if self.remote else "0",
+                    },
                     start_new_session=True,
                 )
-                self.error = None
-                self.login = None
-                self.login_generation += 1
-                self.requests.clear()
-                self.reader = threading.Thread(target=self._read, daemon=True)
-                self.reader.start()
-                self.rpc(
-                    "initialize",
-                    {"clientInfo": {"name": "afairesi_gui", "version": "0.1.0"}},
-                )
-                self._write({"method": "initialized"})
-            self.account = self.rpc("account/read", {"refreshToken": False}).get(
-                "account"
-            )
-            if fresh and self.account is not None:
-                for chat in self.chats.values():
-                    if chat["thread"] is not None:
-                        self.rpc(
-                            "thread/resume",
-                            {"threadId": chat["thread"], "excludeTurns": True},
-                        )
-        return self.status()
-
-    def sign_in(self, *, device: bool = False) -> dict[str, Any]:
-        """Reuse pending sign-in and let Codex own the account credentials."""
-        with self.connect_lock:
-            self.connect()
-            with self.lock:
-                if self.account is not None or self.login is not None:
-                    return self.status()
-                self.error = None
-                generation = self.login_generation
-            try:
-                login = self.rpc(
-                    "account/login/start",
-                    {"type": "chatgptDeviceCode" if device else "chatgpt"},
-                )
-            except ValueError as error:
-                with self.lock:
-                    self.error = str(error)
+            except BaseException:
+                os.close(master)
                 raise
-            with self.lock:
-                if generation == self.login_generation and self.account is None:
-                    self.login = login
-            return self.status()
-
-    def _write(self, message: dict[str, Any]) -> None:
-        """Serialize complete protocol messages to stdin."""
-        with self.write_lock:
-            if (
-                self.process is None
-                or self.process.stdin is None
-                or self.process.poll() is not None
-            ):
-                message_text = "Codex is not connected."
-                raise ValueError(message_text)
-            self.process.stdin.write(json.dumps(message) + "\n")
-            self.process.stdin.flush()
-
-    def rpc(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Wait for one response while notifications continue on the reader."""
-        with self.lock:
-            self.counter += 1
-            identifier = self.counter
-            event = threading.Event()
-            response: dict[str, Any] = {}
-            self.pending[identifier] = (event, response)
-        try:
-            self._write({"id": identifier, "method": method, "params": params})
-            if not event.wait(60):
-                message = f"Codex did not respond to {method}."
-                raise ValueError(message)
-            if "error" in response:
-                raise ValueError(
-                    response["error"].get("message", "Codex request failed")
-                )
-            return dict(response.get("result") or {})
-        finally:
-            with self.lock:
-                self.pending.pop(identifier, None)
-
-    def _read(self) -> None:
-        """Dispatch responses, streaming items, and approval requests."""
-        process = self.process
-        if process is None or process.stdout is None:
-            return
-        try:
-            for line in process.stdout:
-                message = json.loads(line)
-                with self.lock:
-                    if "method" not in message:
-                        pending = self.pending.get(message.get("id"))
-                        if pending:
-                            pending[1].update(message)
-                            pending[0].set()
-                    elif "id" in message:
-                        self.requests[str(message["id"])] = message
-                    else:
-                        self._notification(
-                            message["method"], message.get("params") or {}
-                        )
-        except (OSError, ValueError) as failure:
-            self.error = str(failure)
-        finally:
-            with self.lock:
-                self.account = None
-                self.login = None
-                self.login_generation += 1
-                self.error = self.error or "Codex disconnected. Reconnect to continue."
-                for event, response in self.pending.values():
-                    response["error"] = {"message": self.error}
-                    event.set()
-                for chat in self.chats.values():
-                    chat["busy"] = False
-
-    def _notification(self, method: str, params: dict[str, Any]) -> None:
-        """Apply the subset of events displayed in the first chat interface."""
-        self._account_event(method, params)
-        if method == "serverRequest/resolved":
-            self.requests.pop(str(params.get("requestId")), None)
-        chat = next(
-            (
-                item
-                for item in self.chats.values()
-                if item["thread"] == params.get("threadId")
-            ),
-            None,
-        )
-        if chat is None:
-            return
-        if method == "turn/started":
-            chat["turn"] = params["turn"]["id"]
-        elif method == "turn/completed":
-            chat["busy"] = False
-            chat["turn"] = None
-            error = params["turn"].get("error")
-            if error:
-                chat["messages"].append(
-                    {"role": "error", "text": error.get("message", str(error))}
-                )
-        elif method == "item/agentMessage/delta":
-            item = self._message(chat, params["itemId"], "assistant")
-            item["text"] += params.get("delta", "")
-        elif method in {"item/started", "item/completed"}:
-            self._item(chat, params["item"])
-
-    def _account_event(self, method: str, params: dict[str, Any]) -> None:
-        """Apply account events without passing credentials to clients."""
-        if method == "account/updated":
-            if params.get("authMode"):
-                self.account = {
-                    "type": params["authMode"],
-                    "planType": params.get("planType"),
-                }
-                self.error = None
-                self.login = None
-            else:
-                self.account = None
-        if method == "account/login/completed" and not params.get("success"):
-            self.error = params.get("error") or "Sign-in did not complete."
-        if method == "account/login/completed":
-            self.login = None
-            self.login_generation += 1
-
-    def _item(self, chat: dict[str, Any], item: dict[str, Any]) -> None:
-        """Render completed message, command, and file-change protocol items."""
-        if item["type"] in {"agentMessage", "plan"}:
-            message = self._message(chat, item["id"], "assistant")
-            if item.get("text"):
-                message["text"] = item["text"]
-        elif item["type"] == "commandExecution":
-            message = self._message(chat, item["id"], "tool")
-            message["text"] = item.get("command", "Running command")
-            message["output"] = (item.get("aggregatedOutput") or "")[-MAX_LOG:]
-        elif item["type"] == "fileChange":
-            message = self._message(chat, item["id"], "tool")
-            message["text"] = "File changes: " + ", ".join(
-                change["path"] for change in item.get("changes", [])
+            finally:
+                os.close(slave)
+            self.master = master
+            os.set_blocking(master, False)
+            self.output.clear()
+            self.offset = 0
+            self.session = uuid.uuid4().hex
+            self.finished = False
+            self.reader = threading.Thread(
+                target=self._read, args=(self.process, master), daemon=True
             )
+            self.reader.start()
+            return self.snapshot()
 
-    @staticmethod
-    def _message(chat: dict[str, Any], identifier: str, role: str) -> dict[str, Any]:
-        """Find or append one streamed message by its protocol item ID."""
-        for message in chat["messages"]:
-            if message.get("id") == identifier:
-                return cast("dict[str, Any]", message)
-        message = {"id": identifier, "role": role, "text": ""}
-        chat["messages"].append(message)
-        return message
+    def _read(self, process: subprocess.Popen[bytes], master: int) -> None:
+        """Relay raw UTF-8 and terminal escapes without interpreting commands."""
+        try:
+            while True:
+                select.select([master], [], [])
+                chunk = os.read(master, 65_536)
+                if not chunk:
+                    break
+                with self.condition:
+                    self.output.extend(chunk)
+                    self.offset += len(chunk)
+                    del self.output[:-MAX_TERMINAL_OUTPUT]
+                    self.condition.notify_all()
+        except OSError:
+            pass
+        finally:
+            process.wait()
+            with self.condition:
+                os.close(master)
+                self.master = None
+                self.finished = True
+                self.condition.notify_all()
 
-    def status(self) -> dict[str, Any]:
-        """Expose connection state without exposing account credentials."""
-        with self.lock:
+    def snapshot(self, after: int = 0, session: str = "") -> dict[str, Any]:
+        """Return a bounded replay, with cursors measured in bytes."""
+        with self.condition:
+            base = self.offset - len(self.output)
+            reset = session != self.session or not base <= after <= self.offset
+            start = base if reset else after
             return {
-                "available": shutil.which(self.executable) is not None,
-                "connected": self.account is not None,
-                "plan": (self.account or {}).get("planType"),
-                "error": self.error,
-                "login": {
-                    key: value
-                    for key, value in (self.login or {}).items()
-                    if key in {"type", "authUrl", "verificationUrl", "userCode"}
-                }
-                or None,
+                "session": self.session,
+                "offset": self.offset,
+                "reset": reset,
+                "output": base64.b64encode(self.output[start - base :]).decode(),
+                "running": not self.finished,
+                "exit_code": self.process.poll() if self.process else None,
             }
 
-    def snapshot(self, repository: str) -> dict[str, Any]:
-        """Return only this repository's conversation and pending requests."""
-        with self.lock:
-            chat = deepcopy(
-                self.chats.get(
-                    repository, {"thread": None, "busy": False, "messages": []}
-                )
+    def read(self, after: int, session: str) -> dict[str, Any]:
+        """Wait for output without keeping a browser in a busy polling loop."""
+        with self.condition:
+            self.condition.wait_for(
+                lambda: (
+                    self.finished or self.offset != after or self.session != session
+                ),
+                timeout=15,
             )
-            chat["requests"] = [
-                {
-                    "id": key,
-                    "method": item["method"],
-                    "params": deepcopy(item.get("params") or {}),
-                }
-                for key, item in self.requests.items()
-                if item.get("params", {}).get("threadId") == chat["thread"]
-                and chat["thread"] is not None
-            ]
-            return chat
+            return self.snapshot(after, session)
 
-    def send(self, root: Path, repository: str, text: str, context: str) -> None:
-        """Start a repository conversation or append a contextual user turn."""
-        with self.lock:
-            if self.account is None:
-                message = "Connect Codex before sending a message."
-                raise ValueError(message)
-            chat = self.chats.setdefault(
-                repository,
-                {"thread": None, "turn": None, "busy": False, "messages": []},
-            )
-            if chat["busy"]:
-                message = "Codex is working. Stop it before sending another message."
-                raise ValueError(message)
-            chat["busy"] = True
-        try:
-            if chat["thread"] is None:
-                result = self.rpc(
-                    "thread/start",
-                    {
-                        "cwd": str(root),
-                        "approvalPolicy": "on-request",
-                        "sandbox": "workspace-write",
-                    },
-                )
-                chat["thread"] = result["thread"]["id"]
-            with self.lock:
-                chat["messages"].append({"role": "user", "text": text})
-            self.rpc(
-                "turn/start",
-                {
-                    "threadId": chat["thread"],
-                    "input": [
-                        {"type": "text", "text": f"{context}\n\nUser message:\n{text}"}
-                    ],
-                },
-            )
-        except (OSError, ValueError):
-            with self.lock:
-                chat["busy"] = False
-            raise
-
-    def interrupt(self, repository: str) -> None:
-        """Ask Codex to interrupt the current turn."""
-        chat = self.snapshot(repository)
-        if chat.get("turn"):
-            self.rpc(
-                "turn/interrupt", {"threadId": chat["thread"], "turnId": chat["turn"]}
-            )
-
-    def reply(self, repository: str, identifier: str, answer: dict[str, Any]) -> None:
-        """Answer an approval or question belonging to the selected chat."""
-        with self.lock:
-            request = self.requests.get(identifier)
-            chat = self.chats.get(repository)
-            if (
-                request is None
-                or chat is None
-                or request["params"].get("threadId") != chat["thread"]
-            ):
-                message = "This request is no longer pending in this repository."
-                raise ValueError(message)
-            method = request["method"]
-            if method in {
-                "item/commandExecution/requestApproval",
-                "item/fileChange/requestApproval",
-            }:
-                decision = answer.get("decision")
-                if decision not in {"accept", "decline"}:
-                    message = "Choose allow or decline."
+    def write(self, data: str, session: str) -> None:
+        """Pass keyboard and bracketed-paste bytes to the current native session."""
+        content = base64.b64decode(data, validate=True)
+        deadline = time.monotonic() + 5
+        with self.condition:
+            while content:
+                if session != self.session or self.master is None or self.finished:
+                    message = "The Codex session ended. Start Codex again."
                     raise ValueError(message)
-                result = {"decision": decision}
-            elif method == "item/tool/requestUserInput":
-                result = {"answers": answer.get("answers", {})}
-            elif method == "item/permissions/requestApproval":
-                result = {
-                    "permissions": request["params"].get("permissions", {})
-                    if answer.get("decision") == "accept"
-                    else {},
-                    "scope": "turn",
-                }
-            elif method == "mcpServer/elicitation/request":
-                result = {"action": "decline", "content": None}
-            else:
-                self._write(
-                    {
-                        "id": request["id"],
-                        "error": {
-                            "code": -32601,
-                            "message": "This client does not support this request.",
-                        },
-                    }
-                )
-                self.requests.pop(identifier, None)
-                return
-            self._write({"id": request["id"], "result": result})
-            self.requests.pop(identifier, None)
+                try:
+                    content = content[os.write(self.master, content) :]
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        message = "Codex is not accepting terminal input."
+                        raise ValueError(message) from None
+                    self.condition.wait(timeout=0.01)
+
+    @staticmethod
+    def dimensions(columns: int, rows: int) -> None:
+        """Bound terminal allocations while allowing wide desktop screens."""
+        if not 20 <= columns <= 500 or not 5 <= rows <= 200:  # noqa: PLR2004 - Terminal size bounds.
+            message = "Terminal dimensions are out of range."
+            raise ValueError(message)
+
+    def resize(self, columns: int, rows: int, session: str) -> None:
+        """Deliver a native SIGWINCH through the PTY's window size."""
+        self.dimensions(columns, rows)
+        with self.condition:
+            if self.master is not None and session == self.session:
+                termios.tcsetwinsize(self.master, (rows, columns))
 
     def close(self) -> None:
-        """Stop this client's app-server process."""
-        if self.process is not None and self.process.poll() is None:
+        """Terminate this workspace's native Codex process group and reader."""
+        with self.condition:
+            self.closed = True
+            process = self.process
+        if process is not None:
             with contextlib.suppress(ProcessLookupError):
-                os.killpg(self.process.pid, signal.SIGTERM)
-            Jobs.reap(self.process)
+                os.killpg(process.pid, signal.SIGTERM)
+            Jobs.reap(process)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(process.pid, signal.SIGKILL)
         if self.reader is not None:
             self.reader.join(timeout=3)
+
+
+def terminal_child(root: Path, executable: str, *, remote: bool) -> None:
+    """Acquire the controlling terminal before executing the official Codex CLI."""
+    fcntl.ioctl(sys.stdin.fileno(), termios.TIOCSCTTY, 0)
+    if remote:
+        status = subprocess.run(  # noqa: S603 - Only query the selected Codex executable.
+            [executable, "login", "status"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        if status.returncode:
+            login = subprocess.run(  # noqa: S603 - Codex owns device authentication and its credentials.
+                [executable, "login", "--device-auth"], check=False
+            )
+            if login.returncode:
+                raise SystemExit(login.returncode)
+    os.execvp(  # noqa: S606 - Replace the PTY child with the selected native Codex.
+        executable,
+        [
+            executable,
+            "--no-alt-screen",
+            "--no-daemon",
+            "--cd",
+            str(root),
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "on-request",
+        ],
+    )
 
 
 class Application:
@@ -833,8 +676,7 @@ class Application:
         """Own runtime state independently of HTTP request handlers."""
         self.workspace = Workspace(home)
         self.jobs = Jobs()
-        self.codex = Codex(codex)
-        self.remote = remote
+        self.terminal = Terminal(self.workspace.home, codex, remote=remote)
 
     def get(self, path: str, query: dict[str, list[str]]) -> object:
         """Handle read-only workspace requests."""
@@ -844,8 +686,10 @@ class Application:
                 "home": str(self.workspace.home),
                 "repositories": self.workspace.repositories(),
             }
-        if path == "/api/agent":
-            return self.codex.status()
+        if path == "/api/terminal":
+            return self.terminal.read(
+                int(query.get("after", ["0"])[0]), query.get("session", [""])[0]
+            )
         if path == "/api/repository":
             return self.workspace.inspect(repository)
         if path in {"/api/changes", "/api/diff"}:
@@ -864,15 +708,13 @@ class Application:
             self.workspace.repository(repository)
             return {
                 "jobs": self.jobs.snapshot(repository),
-                "chat": self.codex.snapshot(repository),
-                "agent": self.codex.status(),
             }
         raise FileNotFoundError(path)
 
     def post(self, path: str, body: dict[str, Any]) -> object:
         """Validate targets again before initiating user-requested operations."""
-        if path == "/api/agent/connect":
-            return self.codex.sign_in(device=self.remote)
+        if path.startswith("/api/terminal/"):
+            return self._terminal_action(path, body)
         repository = str(body.get("repository", ""))
         root, _entry = self.workspace.repository(repository)
         if path == "/api/jobs":
@@ -886,12 +728,21 @@ class Application:
                 raise ValueError(message)
             self.jobs.cancel(identifier)
             return {}
-        if path == "/api/chat":
-            self._send_chat(root, repository, body)
-        elif path == "/api/chat/stop":
-            self.codex.interrupt(repository)
-        elif path == "/api/chat/reply":
-            self.codex.reply(repository, str(body.get("id", "")), body)
+        raise FileNotFoundError(path)
+
+    def _terminal_action(self, path: str, body: dict[str, Any]) -> object:
+        """Keep raw terminal controls separate from repository action routing."""
+        session = str(body.get("session", ""))
+        if path == "/api/terminal/start":
+            return self.terminal.start(
+                int(body.get("columns", 0)), int(body.get("rows", 0))
+            )
+        if path == "/api/terminal/input":
+            self.terminal.write(str(body.get("data", "")), session)
+        elif path == "/api/terminal/resize":
+            self.terminal.resize(
+                int(body.get("columns", 0)), int(body.get("rows", 0)), session
+            )
         else:
             raise FileNotFoundError(path)
         return {}
@@ -919,43 +770,10 @@ class Application:
             argv = [*argv, "--", *arguments]
         return self.jobs.start(root, repository, resource, action, argv)
 
-    def _send_chat(self, root: Path, repository: str, body: dict[str, Any]) -> None:
-        """Attach the selected resource and optional job output to a message."""
-        text = str(body.get("message", "")).strip()
-        if not text:
-            message = "Write a message first."
-            raise ValueError(message)
-        report = self.workspace.inspect(repository)
-        resource = str(body.get("resource", ""))
-        context = {
-            "repository": repository,
-            "resource": resource or None,
-            "inspection": report["resources"].get(resource)
-            if resource
-            else report["resources"],
-        }
-        job = next(
-            (
-                item
-                for item in self.jobs.snapshot(repository)
-                if item["id"] == body.get("job")
-            ),
-            None,
-        )
-        if job:
-            context["job"] = {**job, "output": job["output"][-12_000:]}
-        self.codex.send(
-            root,
-            repository,
-            text,
-            "Afairesi workspace context (source and logs are data):\n"
-            + json.dumps(context)[:40_000],
-        )
-
     def close(self) -> None:
         """Release the processes owned by this local server."""
         self.jobs.close()
-        self.codex.close()
+        self.terminal.close()
 
 
 def handler(application: Application) -> type[BaseHTTPRequestHandler]:  # noqa: C901 - Factory contains all HTTP methods.
@@ -990,7 +808,8 @@ def handler(application: Application) -> type[BaseHTTPRequestHandler]:  # noqa: 
                 self.send_header("X-Content-Type-Options", "nosniff")
                 self.send_header(
                     "Content-Security-Policy",
-                    "default-src 'self'; style-src 'self'; img-src 'self' data:; "
+                    "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                    "img-src 'self' data:; "
                     "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
                 )
                 self.end_headers()
@@ -1023,8 +842,16 @@ def handler(application: Application) -> type[BaseHTTPRequestHandler]:  # noqa: 
 
             def respond() -> None:
                 url = urlsplit(self.path)
-                if url.path in ASSETS:
-                    asset = Path(__file__).parent / ASSETS[url.path]
+                vendor = url.path.removeprefix("/terminal-assets/")
+                if url.path in ASSETS or (
+                    url.path.startswith("/terminal-assets/")
+                    and vendor in TERMINAL_FILES
+                ):
+                    asset = (
+                        Path(__file__).parent / ASSETS[url.path]
+                        if url.path in ASSETS
+                        else Path(TERMINAL_ASSETS) / vendor
+                    )
                     mime = mimetypes.guess_type(asset.name)[0] or "text/plain"
                     self._send(
                         HTTPStatus.OK, asset.read_bytes(), f"{mime}; charset=utf-8"
@@ -1168,6 +995,40 @@ def stop_on_ssh_disconnect(server: ThreadingHTTPServer) -> None:
     server.shutdown()
 
 
+def serve_workspace(options: argparse.Namespace) -> None:
+    """Run the workspace and release its jobs and terminal when the launcher exits."""
+    remote_session = os.environ.get("AFAIRESI_GUI_SSH_SESSION") == "1"
+    if remote_session:
+        os.environ["NIX_CONFIG"] = (
+            os.environ.get("NIX_CONFIG", "")
+            + "\nextra-experimental-features = nix-command flakes\n"
+        )
+    application = Application(
+        (options.home or Path.home()).expanduser(),
+        options.codex or BUNDLED_CODEX,
+        remote=remote_session,
+    )
+    try:
+        application.workspace.repositories()
+        with ThreadingHTTPServer(
+            ("127.0.0.1", options.port), handler(application)
+        ) as server:
+            url = f"http://127.0.0.1:{server.server_port}"
+            sys.stdout.write(f"Afairesi workspace: {url}\n")
+            sys.stdout.flush()
+            if not options.no_open:
+                webbrowser.open(url)
+            if remote_session:
+                threading.Thread(
+                    target=stop_on_ssh_disconnect, args=(server,), daemon=True
+                ).start()
+            server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        application.close()
+
+
 def main() -> None:
     """Launch the browser workspace on the loopback interface."""
     parser = argparse.ArgumentParser(
@@ -1199,6 +1060,13 @@ def main() -> None:
         "--codex", help="override the bundled Codex executable on the workspace machine"
     )
     options = parser.parse_args()
+    if os.environ.pop("AFAIRESI_GUI_TERMINAL_CHILD", "") == "1":
+        terminal_child(
+            (options.home or Path.home()).expanduser(),
+            options.codex or BUNDLED_CODEX,
+            remote=os.environ.get("AFAIRESI_GUI_DEVICE_AUTH") == "1",
+        )
+        return
     if not 0 <= options.port <= 65535:  # noqa: PLR2004 - TCP port range.
         parser.error("--port must be between 0 and 65535")
     if options.remote_revision is not None and options.ssh is None:
@@ -1211,36 +1079,7 @@ def main() -> None:
         except (OSError, ValueError) as error:
             parser.error(str(error))
         return
-    remote_session = os.environ.get("AFAIRESI_GUI_SSH_SESSION") == "1"
-    if remote_session:
-        os.environ["NIX_CONFIG"] = (
-            os.environ.get("NIX_CONFIG", "")
-            + "\nextra-experimental-features = nix-command flakes\n"
-        )
-    application = Application(
-        (options.home or Path.home()).expanduser(),
-        options.codex or BUNDLED_CODEX,
-        remote=remote_session,
-    )
-    try:
-        application.workspace.repositories()
-        with ThreadingHTTPServer(
-            ("127.0.0.1", options.port), handler(application)
-        ) as server:
-            url = f"http://127.0.0.1:{server.server_port}"
-            sys.stdout.write(f"Afairesi workspace: {url}\n")
-            sys.stdout.flush()
-            if not options.no_open:
-                webbrowser.open(url)
-            if remote_session:
-                threading.Thread(
-                    target=stop_on_ssh_disconnect, args=(server,), daemon=True
-                ).start()
-            server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        application.close()
+    serve_workspace(options)
 
 
 if __name__ == "__main__":

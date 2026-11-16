@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import http.client
 import json
 import os
@@ -13,7 +14,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -593,201 +594,183 @@ def test_http_serves_only_assets_and_rejects_foreign_origins(
         request(
             server,
             "POST",
-            "/api/agent/connect",
+            "/api/terminal/start",
             {"Content-Type": "application/json", "Origin": "https://attacker.invalid"},
         )[0]
         == HTTPStatus.FORBIDDEN,
         "accepted foreign origin",
     )
     expect(
-        request(server, "POST", "/api/agent/connect", {"Content-Type": "text/plain"})[0]
+        request(server, "POST", "/api/terminal/start", {"Content-Type": "text/plain"})[
+            0
+        ]
         == HTTPStatus.BAD_REQUEST,
         "accepted form-compatible body",
     )
 
 
-def test_codex_streams_and_routes_approvals_to_the_correct_repository(
-    tmp_path: Path,
-) -> None:
-    """Exercise the actual line protocol using a local fake, without model calls."""
-    executable = tmp_path / "fake-codex"
-    executable.write_text(
-        f"#!{sys.executable}\n"
-        """
-import json
-import sys
-loaded = False
-def emit(value):
-    print(json.dumps(value), flush=True)
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get("method")
-    result = {}
-    if method == "account/read":
-        result = {"account": {"type": "chatgpt", "planType": "plus"}}
-    elif method == "thread/start":
-        loaded = True
-        result = {"thread": {"id": "thread-one"}}
-    elif method == "thread/resume":
-        loaded = True
-    elif method == "turn/start":
-        if not loaded:
-            emit({"id": message["id"], "error": {"message": "Thread not loaded"}})
-            continue
-        emit({"method": "turn/started", "params": {
-            "threadId": "thread-one", "turn": {"id": "turn-one"}}})
-        emit({"method": "item/agentMessage/delta", "params": {
-            "threadId": "thread-one", "itemId": "message-one",
-            "delta": "Hello from Codex"}})
-        emit({"id": 500, "method": "item/commandExecution/requestApproval",
-            "params": {"threadId": "thread-one", "turnId": "turn-one",
-                "command": "nix build"}})
-    elif method is None and message.get("id") == 500:
-        emit({"method": "turn/completed", "params": {
-            "threadId": "thread-one", "turn": {
-                "id": "turn-one", "status": "completed"}}})
-    if method and "id" in message:
-        emit({"id": message["id"], "result": result})
-"""
-    )
-    executable.chmod(0o755)
-    codex = subject.Codex(str(executable))
-    try:
-        expect(codex.connect()["connected"], codex.status())
-        codex.send(tmp_path, "repository", "hello", "selected resource")
-        wait_for(lambda: bool(codex.snapshot("repository")["requests"]))
-        chat = codex.snapshot("repository")
-        expect(
-            chat["busy"] and chat["messages"][-1]["text"] == "Hello from Codex", chat
-        )
-        expect(not codex.snapshot("other")["messages"], codex.snapshot("other"))
-        with pytest.raises(ValueError, match="no longer pending"):
-            codex.reply("other", "500", {"decision": "accept"})
-        codex.reply("repository", "500", {"decision": "decline"})
-        wait_for(lambda: not codex.snapshot("repository")["busy"])
-        codex.close()
-        codex.connect()
-        codex.send(tmp_path, "repository", "continue", "same resource")
-        wait_for(lambda: bool(codex.snapshot("repository")["requests"]))
-        codex.reply("repository", "500", {"decision": "decline"})
-        wait_for(lambda: not codex.snapshot("repository")["busy"])
-    finally:
-        codex.close()
-
-
 @pytest.fixture
-def auth_codex(tmp_path: Path) -> Path:
-    """Provide controllable app-server sign-in without credentials or network calls."""
-    executable = tmp_path / "auth-codex"
+def native_codex(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Run an actual PTY with a local fixture instead of a paid model or account."""
+    executable = tmp_path / "native-codex"
+    monkeypatch.delenv("PYTHONPATH", raising=False)
+    monkeypatch.setenv("TERMINAL_TEST_LOG", str(tmp_path / "terminal-calls.jsonl"))
     executable.write_text(
         f"#!{sys.executable}\n"
-        """
-import json
-import sys
-account = None
-attempts = 0
-race = False
-def emit(value):
-    print(json.dumps(value), flush=True)
-for line in sys.stdin:
-    message = json.loads(line)
-    method = message.get("method")
-    params = message.get("params", {})
-    result = {}
-    if method == "account/read":
-        result = {"account": account}
-    elif method == "account/login/start":
-        attempts += 1
-        result = {"type": params["type"], "loginId": str(attempts),
-                  "accessToken": "must-not-reach-browser"}
-        if params["type"] == "chatgptDeviceCode":
-            result.update(verificationUrl="https://example.invalid/device",
-                          userCode="TEST-CODE")
-        else:
-            result["authUrl"] = "https://example.invalid/browser"
-        if race:
-            emit({"method": "account/login/completed", "params": {
-                "loginId": str(attempts), "success": False, "error": "Expired"}})
-    elif method == "test/event":
-        if params["method"] == "account/updated":
-            account = {"type": "chatgpt", "planType": "plus"}
-        emit(params)
-    elif method == "test/race":
-        race = True
-    elif method == "test/attempts":
-        result = {"count": attempts}
-    if method and "id" in message:
-        emit({"id": message["id"], "result": result})
+        r"""
+import json, os, signal, sys, termios, tty
+from pathlib import Path
+with Path(os.environ['TERMINAL_TEST_LOG']).open('a') as log:
+    log.write(json.dumps(sys.argv[1:]) + '\n')
+if sys.argv[1:3] == ['login', 'status']:
+    raise SystemExit(int(os.environ.get('TERMINAL_TEST_SIGNED_OUT', '0')))
+if sys.argv[1:3] == ['login', '--device-auth']:
+    print('https://example.invalid/device TEST-CODE', flush=True)
+    raise SystemExit(int(os.environ.get('TERMINAL_TEST_LOGIN_FAILURE', '0')))
+tty.setraw(0)
+def size(*args):
+    print('SIZE=' + str(termios.tcgetwinsize(0)), flush=True)
+signal.signal(signal.SIGWINCH, size)
+print('READY ' + json.dumps({'cwd': os.getcwd(), 'tty': os.isatty(0),
+    'controlling': os.tcgetpgrp(0) == os.getpgrp()}), flush=True)
+size()
+while True:
+    data = os.read(0, 4096)
+    if b'EXIT' in data:
+        print('FINISHED', flush=True)
+        break
+    print('BYTES=' + data.hex(), flush=True)
 """
     )
     executable.chmod(0o755)
     return executable
 
 
-@pytest.mark.parametrize("remote", [False, True])
-def test_codex_sign_in_survives_refresh_and_retries_expired_codes(
-    tmp_path: Path, auth_codex: Path, *, remote: bool
+def terminal_output(terminal: subject.Terminal) -> str:
+    """Decode the wire format without normalizing escapes or UTF-8."""
+    return base64.b64decode(terminal.snapshot()["output"]).decode()
+
+
+def test_native_terminal_preserves_keys_resize_and_session(
+    tmp_path: Path, native_codex: Path
 ) -> None:
-    """Choose the workspace's login flow and expose only public sign-in fields."""
-    application = subject.Application(tmp_path, str(auth_codex), remote=remote)
-    codex = application.codex
-    expected = (
-        {
-            "type": "chatgptDeviceCode",
-            "verificationUrl": "https://example.invalid/device",
-            "userCode": "TEST-CODE",
-        }
-        if remote
-        else {"type": "chatgpt", "authUrl": "https://example.invalid/browser"}
+    """Native commands, Unicode, paste, and refresh reach the same controlling PTY."""
+    terminal = subject.Terminal(tmp_path, str(native_codex))
+    try:
+        start = terminal.start(100, 20)
+        wait_for(lambda: "READY" in terminal_output(terminal))
+        output = terminal_output(terminal)
+        expect('"tty": true' in output and '"controlling": true' in output, output)
+        expect(str(tmp_path) in output and "SIZE=(20, 100)" in output, output)
+        session = start["session"]
+        expect(terminal.start(80, 15)["session"] == session, "duplicate process")
+        data = "/model\r@main.py\x1b[A\x1b[200~γειά\nworld\x1b[201~".encode()
+        terminal.write(base64.b64encode(data).decode(), session)
+        wait_for(lambda: data.hex() in terminal_output(terminal))
+        terminal.resize(120, 25, session)
+        wait_for(lambda: "SIZE=(25, 120)" in terminal_output(terminal))
+        snapshot = terminal.snapshot()
+        expect(snapshot["reset"] and "READY" in terminal_output(terminal), snapshot)
+        expect(terminal.snapshot(snapshot["offset"], session)["output"] == "", snapshot)
+        terminal.write(base64.b64encode(b"EXIT").decode(), session)
+        wait_for(lambda: not terminal.snapshot()["running"])
+        expect("FINISHED" in terminal_output(terminal), terminal.snapshot())
+        expect(terminal.snapshot()["exit_code"] == 0, terminal.snapshot())
+        restarted = terminal.start(100, 20)
+        expect(restarted["session"] != session, restarted)
+        with pytest.raises(ValueError, match="session ended"):
+            terminal.write(base64.b64encode(b"stale input").decode(), session)
+    finally:
+        terminal.close()
+    expect(
+        terminal.process is not None and terminal.process.poll() is not None,
+        "left a native process behind",
     )
-    try:
-        first = cast("dict[str, Any]", application.post("/api/agent/connect", {}))
-        expect(first["login"] == expected, first)
-        expect(application.get("/api/agent", {}) == first, "lost pending login")
-        expect(application.post("/api/agent/connect", {}) == first, first)
-        expect(codex.rpc("test/attempts", {}) == {"count": 1}, "duplicate login")
-        codex.rpc(
-            "test/event",
-            {
-                "method": "account/login/completed",
-                "params": {"loginId": "1", "success": False, "error": "Expired"},
-            },
-        )
-        expect(codex.status()["login"] is None, codex.status())
-        expect(codex.status()["error"] == "Expired", codex.status())
-        retry = cast("dict[str, Any]", application.post("/api/agent/connect", {}))
-        expect(retry["login"] == expected and retry["error"] is None, retry)
-        expect(codex.rpc("test/attempts", {}) == {"count": 2}, "missing retry")
-        codex.rpc(
-            "test/event",
-            {
-                "method": "account/updated",
-                "params": {"authMode": "chatgpt", "planType": "plus"},
-            },
-        )
-        connected = cast("dict[str, Any]", application.post("/api/agent/connect", {}))
-        expect(connected["connected"] and connected["login"] is None, connected)
-        expect(codex.rpc("test/attempts", {}) == {"count": 2}, "replaced account")
-    finally:
-        application.close()
+    expect(
+        terminal.reader is not None and not terminal.reader.is_alive(),
+        "left the PTY reader behind",
+    )
 
 
-def test_codex_clears_login_on_disconnect_and_early_completion(
-    auth_codex: Path,
+@pytest.mark.parametrize("signed_out", [False, True])
+def test_remote_terminal_uses_native_device_sign_in(
+    tmp_path: Path,
+    native_codex: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    signed_out: bool,
 ) -> None:
-    """Do not resurrect a finished login when its start response arrives later."""
-    codex = subject.Codex(str(auth_codex))
+    """Use existing remote login or complete device auth before launching the TUI."""
+    monkeypatch.setenv("TERMINAL_TEST_SIGNED_OUT", str(int(signed_out)))
+    terminal = subject.Terminal(tmp_path, str(native_codex), remote=True)
     try:
-        codex.sign_in(device=True)
-        codex.close()
-        expect(codex.status()["login"] is None, codex.status())
-        expect(not codex.status()["connected"], codex.status())
-        codex.connect()
-        codex.rpc("test/race", {})
-        status = codex.sign_in(device=True)
-        expect(status["login"] is None and status["error"] == "Expired", status)
+        terminal.start(100, 20)
+        wait_for(lambda: "READY" in terminal_output(terminal))
+        calls = [
+            json.loads(line)
+            for line in (tmp_path / "terminal-calls.jsonl").read_text().splitlines()
+        ]
+        expect(calls[0] == ["login", "status"], calls)
+        expect((["login", "--device-auth"] in calls) == signed_out, calls)
+        expect("--no-daemon" in calls[-1] and "app-server" not in calls[-1], calls)
     finally:
-        codex.close()
+        terminal.close()
+
+
+def test_remote_terminal_stops_after_failed_login(
+    tmp_path: Path, native_codex: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep failed device login visible without starting the TUI."""
+    monkeypatch.setenv("TERMINAL_TEST_SIGNED_OUT", "1")
+    failure_code = 7
+    monkeypatch.setenv("TERMINAL_TEST_LOGIN_FAILURE", str(failure_code))
+    terminal = subject.Terminal(tmp_path, str(native_codex), remote=True)
+    try:
+        terminal.start(100, 20)
+        wait_for(lambda: not terminal.snapshot()["running"])
+        expect(terminal.snapshot()["exit_code"] == failure_code, terminal.snapshot())
+        expect("TEST-CODE" in terminal_output(terminal), terminal.snapshot())
+        expect("READY" not in terminal_output(terminal), terminal.snapshot())
+    finally:
+        terminal.close()
+
+
+def test_terminal_http_bounds_and_foreign_origins(
+    workspace: subject.Workspace, native_codex: Path
+) -> None:
+    """Protect terminal mutation endpoints and reject malformed sizes and data."""
+    application = subject.Application(workspace.home, str(native_codex))
+    with ThreadingHTTPServer(("127.0.0.1", 0), subject.handler(application)) as server:
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            for path in ["start", "input", "resize"]:
+                code, _body = request(
+                    server,
+                    "POST",
+                    f"/api/terminal/{path}",
+                    {
+                        "Content-Type": "application/json",
+                        "Origin": "https://foreign.invalid",
+                    },
+                )
+                expect(code == HTTPStatus.FORBIDDEN, path)
+            code, _body = request(
+                server,
+                "POST",
+                "/api/terminal/start",
+                {"Content-Type": "application/json"},
+            )
+            expect(code == HTTPStatus.BAD_REQUEST, "accepted missing dimensions")
+            for columns, rows in [(0, 20), (100, 0), (501, 20), (100, 201)]:
+                with pytest.raises(ValueError, match="dimensions"):
+                    application.terminal.start(columns, rows)
+            with pytest.raises(ValueError, match="base64"):
+                application.terminal.write("not base64!", "")
+        finally:
+            server.shutdown()
+            thread.join(timeout=5)
+            application.close()
 
 
 def test_source_does_not_modify_home_registration(workspace: subject.Workspace) -> None:
@@ -1089,15 +1072,15 @@ def check_remote_workspace(url: str, home: Path) -> None:
         expect(response.status == HTTPStatus.OK and result == {"hello": {}}, result)
         connection.request(
             "POST",
-            "/api/agent/connect",
-            body="{}",
+            "/api/terminal/start",
+            body='{"columns":100,"rows":20}',
             headers={"Content-Type": "application/json", "Origin": url},
         )
         response = connection.getresponse()
         expect(response.status != HTTPStatus.FORBIDDEN, response.read())
         connection.request(
             "POST",
-            "/api/agent/connect",
+            "/api/terminal/start",
             body="{}",
             headers={
                 "Content-Type": "application/json",
