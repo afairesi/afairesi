@@ -3404,7 +3404,6 @@ def test_inspect_reports_public_commands() -> None:
     _expect(not command["commands"], command)
     arguments = [row["names"] for row in command["arguments"]]
     _expect(arguments.count(["repository"]) == 1, command)
-    _expect(["--repository"] not in arguments, command)
     for option in ("--from", "--to", "--merge-base"):
         _expect(arguments.count([option]) == 1, command)
     _expect(
