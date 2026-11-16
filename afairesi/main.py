@@ -1654,7 +1654,7 @@ def _inspection_git_report(
 ) -> dict[str, Any]:
     """Inspect tracked sources in a temporary directory without checkout filters."""
     files = _inspection_git_files(root, revision)
-    with tempfile.TemporaryDirectory(prefix="afairesi-inspect-diff-") as directory:
+    with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
         snapshot = Path(directory)
         if working_tree:
             for _mode, _oid, relative in files:
@@ -1694,7 +1694,7 @@ def _inspection_git_report(
         )
 
 
-def _inspection_diff_revisions(
+def _diff_revisions(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
     root: Path,
@@ -1702,10 +1702,10 @@ def _inspection_diff_revisions(
     """Resolve named comparison endpoints and an optional common ancestor."""
     left, right = options.from_revision, options.to_revision
     if options.cached and right is not None:
-        cli.error("inspect-diff --cached cannot be combined with --to")
+        cli.error("diff --cached cannot be combined with --to")
     if options.merge_base:
         if left is None or right is None:
-            cli.error("inspect-diff --merge-base requires --from and --to")
+            cli.error("diff --merge-base requires --from and --to")
         commits = [
             git(
                 root,
@@ -1717,14 +1717,14 @@ def _inspection_diff_revisions(
     return left, right
 
 
-def _dispatch_inspect_diff(
+def _dispatch_diff(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
     root: Path,
 ) -> None:
     """Render structural inspection changes with jd's native diff implementation."""
     root = repository_root(root)
-    left_revision, right_revision = _inspection_diff_revisions(options, cli, root)
+    left_revision, right_revision = _diff_revisions(options, cli, root)
     if options.cached:
         head = git(root, ["rev-parse", "--verify", "HEAD"], check=False)
         before = (
@@ -1742,7 +1742,7 @@ def _dispatch_inspect_diff(
         )
     if options.reverse:
         before, after = after, before
-    with tempfile.TemporaryDirectory(prefix="afairesi-inspect-diff-") as directory:
+    with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
         left, right = (Path(directory) / name for name in ("before.json", "after.json"))
         left.write_text(json.dumps(before), encoding="utf-8")
         right.write_text(json.dumps(after), encoding="utf-8")
@@ -1759,9 +1759,11 @@ def _dispatch_inspect_diff(
         raise SystemExit(1)
 
 
-def _dispatch_inspect(
+def _dispatch(
     options: argparse.Namespace,
     cli: argparse.ArgumentParser,
+    *,
+    comparing: bool,
 ) -> None:
     """Inspect local or remote sources without executing package code."""
     try:
@@ -1780,8 +1782,8 @@ def _dispatch_inspect(
             )
         )
         with repository as root:
-            if options.command == "inspect-diff":
-                _dispatch_inspect_diff(options, cli, root)
+            if comparing:
+                _dispatch_diff(options, cli, root)
                 return
             report = inspect_repository(root)
     except CommandError as error:
@@ -1802,8 +1804,58 @@ def _configure_inspection_target(inspection: argparse.ArgumentParser) -> None:
     )
 
 
-def _configure_inspect_diff_parser(difference: argparse.ArgumentParser) -> None:
-    """Configure named revisions and structural diff output."""
+def parser() -> argparse.ArgumentParser:
+    """Construct the default inspection parser before registering subcommands."""
+    result = argparse.ArgumentParser(
+        prog="afairesi",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Print JSON describing hosts, packages, CLI arguments, "
+            "and test identifiers. "
+            "Resource type is the package kind or 'host'. "
+            "Empty optional fields are omitted; for Python packages, cli: {} "
+            "denotes an executable without arguments. "
+            "Fail if CLI declarations cannot be resolved reliably. "
+            "Inspect source without executing it."
+        ),
+        epilog=(
+            "Commands:\n"
+            "  diff    diff inspected interfaces in jd format\n"
+            "\nRun 'afairesi diff --help' for comparison options.\n"
+            "Use './diff' or '-- diff' to inspect a repository named diff."
+        ),
+    )
+    _configure_inspection_target(result)
+    return result
+
+
+def _diff_parser(cli: argparse.ArgumentParser) -> argparse.ArgumentParser:
+    """Register the diff interface after parsing the default repository argument."""
+    commands = cli.add_subparsers(title="commands", metavar="COMMAND")
+    difference = commands.add_parser(
+        "diff",
+        prog="afairesi diff",
+        help="diff inspected interfaces in jd format",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description=(
+            "Print a jd-compatible structural diff of repository inspections. "
+            "Compare the index with tracked working-tree sources by default. "
+            "Select revisions with --from and --to; use --merge-base to compare "
+            "their common ancestor with --to. "
+            "Untracked files and implementation-only changes are omitted. "
+            "Inspect source without executing it or changing Git state."
+        ),
+        epilog=(
+            "Examples:\n"
+            "  afairesi diff ../project --from HEAD~1 --to HEAD\n"
+            "  afairesi diff --cached | less\n"
+            "  afairesi diff --cached --color | less -R\n"
+            "  afairesi diff --cached | jd -t jd2patch | jless\n"
+            "  afairesi diff --cached > change.jd\n"
+            "  jd -p change.jd before.json\n"
+            "\nFor patching, before.json must contain the baseline inspection."
+        ),
+    )
     _configure_inspection_target(difference)
     difference.add_argument(
         "--from",
@@ -1846,56 +1898,7 @@ def _configure_inspect_diff_parser(difference: argparse.ArgumentParser) -> None:
         help="reverse the comparison",
     )
 
-
-def parser() -> argparse.ArgumentParser:
-    """Construct the inspection command-line parser."""
-    result = argparse.ArgumentParser(
-        prog="afairesi",
-        description=("Inspect repositories in the afairesi computing environment."),
-    )
-    commands = result.add_subparsers(
-        dest="command", title="commands", metavar="COMMAND"
-    )
-    inspection = commands.add_parser(
-        "inspect",
-        help="inspect repository interfaces and test identifiers",
-        description=(
-            "Print JSON describing hosts, packages, CLI arguments, "
-            "and test identifiers. "
-            "Resource type is the package kind or 'host'. "
-            "Empty optional fields are omitted; for Python packages, cli: {} "
-            "denotes an executable without arguments. "
-            "Fail if CLI declarations cannot be resolved reliably. "
-            "Inspect source without executing it."
-        ),
-    )
-    _configure_inspection_target(inspection)
-    difference = commands.add_parser(
-        "inspect-diff",
-        help="diff inspected interfaces in jd format",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "Print a jd-compatible structural diff of repository inspections. "
-            "Compare the index with tracked working-tree sources by default. "
-            "Select revisions with --from and --to; use --merge-base to compare "
-            "their common ancestor with --to. "
-            "Untracked files and implementation-only changes are omitted. "
-            "Inspect source without executing it or changing Git state."
-        ),
-        epilog=(
-            "Examples:\n"
-            "  afairesi inspect-diff ../project --from HEAD~1 --to HEAD\n"
-            "  afairesi inspect-diff --cached | less\n"
-            "  afairesi inspect-diff --cached --color | less -R\n"
-            "  afairesi inspect-diff --cached | jd -t jd2patch | jless\n"
-            "  afairesi inspect-diff --cached > change.jd\n"
-            "  jd -p change.jd before.json\n"
-            "\nFor patching, before.json must contain the baseline inspection."
-        ),
-    )
-    _configure_inspect_diff_parser(difference)
-
-    return result
+    return difference
 
 
 def check_source_main() -> None:
@@ -1915,14 +1918,16 @@ def check_source_main() -> None:
 
 
 def main() -> None:
-    """Dispatch inspection commands."""
+    """Inspect by default, reserving the first argument 'diff' for comparisons."""
+    arguments = sys.argv[1:]
+    comparing = arguments[:1] == ["diff"]
     cli = parser()
-    options = cli.parse_args()
+    options = cli.parse_args([] if comparing else arguments)
+    difference = _diff_parser(cli)
+    diff_options = difference.parse_args(arguments[1:] if comparing else [])
+    options = diff_options if comparing else options
     try:
-        if options.command is None:
-            cli.print_help()
-        else:
-            _dispatch_inspect(options, cli)
+        _dispatch(options, difference if comparing else cli, comparing=comparing)
     except KeyboardInterrupt:
         sys.exit(130)
     except (

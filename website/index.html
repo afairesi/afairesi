@@ -31,7 +31,7 @@
     <main>
       <p class="intro">
         Define packages once. Derive builds, checks, and development environments from the
-        repository layout, then inspect interfaces and run tests with two CLI commands.
+        repository layout, then inspect interfaces and compare changes with the CLI.
       </p>
       <div class="overview">
         <section id="library" aria-labelledby="library-title">
@@ -137,24 +137,24 @@ nix develop .#example-test</code></pre>
             aria-label="Install or run the CLI"
           ><code>nix profile add github:afairesi/afairesi
 nix run github:afairesi/afairesi -- --help</code></pre>
-          <h3><code>afairesi inspect</code></h3>
+          <h3><code>afairesi</code></h3>
           <p>
             Read package metadata, CLI arguments, and test identifiers as JSON. Inspection reads
             source without executing it. Pass a local repository path or Git URL as the optional
             argument; omitting it selects the current repository.
           </p>
-          <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi inspect
-afairesi inspect ../project</code></pre>
+          <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi
+afairesi ../project</code></pre>
           <p>
-            Use <code>inspect-diff</code> to compare interfaces in the working tree, index, or Git
+            Use <code>diff</code> to compare interfaces in the working tree, index, or Git
             revisions. Pass an optional repository path and select revisions with
             <code>--from</code> and <code>--to</code>. Add <code>--merge-base</code> with both
             revisions to compare their common ancestor with <code>--to</code>. Implementation
             changes that leave the interface unchanged are omitted.
           </p>
-          <pre tabindex="0" aria-label="Interface comparison commands"><code>afairesi inspect-diff
-afairesi inspect-diff --cached
-afairesi inspect-diff --from HEAD~1 --to HEAD</code></pre>
+          <pre tabindex="0" aria-label="Interface comparison commands"><code>afairesi diff
+afairesi diff --cached
+afairesi diff --from HEAD~1 --to HEAD</code></pre>
           <h3>Tests and coverage</h3>
           <p>
             Run <code>nix flake check</code> to execute package tests alongside the repository's
