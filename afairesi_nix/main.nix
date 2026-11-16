@@ -242,57 +242,6 @@ let
         });
       };
     };
-  mkCoverage =
-    { check, packageDrv }:
-    let
-      context = builtins.toFile "coverage_context.py" (
-        "from _afairesi_coverage_support import _coverage_context_plugin\n"
-        + "pytest_runtest_protocol = _coverage_context_plugin()\n"
-      );
-      overrideCheck =
-        check.overrideAttrs or (update: builtins.derivation (check.drvAttrs // update check));
-      runtime = builtins.toFile "coverage_support.py" (
-        "from __future__ import annotations\n"
-        + builtins.elemAt (builtins.split "COVERAGE_RUNTIME_(START|END) = None\n" (
-          builtins.readFile (afairesiInputs.self.outPath + "/afairesi/main.py")
-        )) 2
-      );
-      startup = builtins.toFile "sitecustomize.py" ("import coverage\n" + "coverage.process_startup()\n");
-    in
-    overrideCheck (previous: {
-      buildCommand = ''
-        mkdir -p "$out/html" "$TMPDIR/coverage-startup"
-        export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
-        afairesi_pytest_args=(-p _afairesi_coverage_context)
-        unset AFAIRESI_TEST_CONTEXT
-        cp "${context}" "$TMPDIR/coverage-startup/_afairesi_coverage_context.py"
-        cp "${startup}" "$TMPDIR/coverage-startup/sitecustomize.py"
-        cp "${runtime}" "$TMPDIR/coverage-startup/_afairesi_coverage_support.py"
-        cat > "$COVERAGE_PROCESS_START" <<EOF
-        [run]
-        core = ctrace
-        context = \$AFAIRESI_TEST_CONTEXT
-        parallel = true
-        branch = true
-        data_file = $out/.coverage
-        source =
-            $src
-            ${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}
-        omit =
-            */test_main.py
-        EOF
-        export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
-      ''
-      + previous.buildCommand
-      + ''
-        unset COVERAGE_PROCESS_START
-        python -m coverage combine --rcfile="$TMPDIR/coverage.ini"
-        python -c 'from _afairesi_coverage_support import remap_coverage_paths; remap_coverage_paths("${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}/__init__.py")'
-        python -m coverage html --show-contexts --rcfile="$TMPDIR/coverage.ini" -d "$out/html"
-        python -m coverage json --show-contexts --rcfile="$TMPDIR/coverage.ini" -o "$out/coverage.json"
-      '';
-      name = "${previous.name}-coverage";
-    });
   mkFileFormatter =
     {
       name,
@@ -513,19 +462,6 @@ let
           inputs = afairesiInputs;
           pkgs = packageSets.${system};
         }
-      );
-      legacyPackages = lib.genAttrs systems (
-        system:
-        lib.mapAttrs' (
-          name: environment: lib.nameValuePair "${name}-test-environment" environment.manifest
-        ) (lib.filterAttrs (_: environment: environment ? manifest) environments.${system})
-        // lib.genAttrs' (testedNames system) (
-          name:
-          lib.nameValuePair "${name}-coverage" (mkCoverage {
-            check = self.checks.${system}.${name};
-            packageDrv = self.packages.${system}.${name};
-          })
-        )
       );
       nixosConfigurations = lib.genAttrs (discover "configuration.nix") (
         hostName:
@@ -1043,12 +979,6 @@ let
     else
       {
         inherit dependencies python;
-        manifest = pkgs.writeText "test-environment.json" (
-          builtins.toJSON {
-            path = pkgs.lib.makeBinPath dependencies;
-            python = "${python}/bin/python";
-          }
-        );
         shell = pkgs.mkShell {
           inputsFrom = [ packageDrv ];
           packages = dependencies ++ [ python ];
@@ -1099,7 +1029,53 @@ let
       pkgs,
       testEnvironment,
     }:
-    pkgs.runCommand packageName
+    let
+      runtime = builtins.toFile "coverage_support.py" ''
+        from __future__ import annotations
+
+        import os
+        from collections.abc import Generator
+        from pathlib import Path
+
+        import coverage
+        import pytest
+
+
+        def remap_coverage_paths(installed_path: str) -> None:
+            """Combine installed-module coverage with the corresponding source file."""
+            data = coverage.CoverageData()
+            data.read()
+            mapped = coverage.CoverageData(basename=".coverage-mapped")
+            mapped.update(
+                data,
+                map_path=lambda path: (
+                    os.environ["src"] + "/main.py"
+                    if path == installed_path
+                    else path
+                ),
+            )
+            mapped.write()
+            Path(mapped.data_filename()).replace(data.data_filename())
+
+
+        @pytest.hookimpl(wrapper=True)
+        def pytest_runtest_protocol(item: pytest.Item) -> Generator[None, object, object]:
+            """Attribute test setup, execution, teardown, and children to their test."""
+            previous = os.environ.get("AFAIRESI_TEST_CONTEXT", "")
+            os.environ["AFAIRESI_TEST_CONTEXT"] = item.nodeid
+            tracer = coverage.Coverage.current()
+            if tracer is not None:
+                tracer.switch_context(item.nodeid)
+            try:
+                return (yield)
+            finally:
+                os.environ["AFAIRESI_TEST_CONTEXT"] = previous
+                if tracer is not None:
+                    tracer.switch_context(previous)
+      '';
+      startup = builtins.toFile "sitecustomize.py" ("import coverage\n" + "coverage.process_startup()\n");
+    in
+    pkgs.runCommand "${packageName}-coverage"
       (
         (packageDrv.checkEnv or { })
         // {
@@ -1111,10 +1087,27 @@ let
         }
       )
       ''
+        mkdir -p "$out/html" "$TMPDIR/coverage-startup"
+        export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
+        unset AFAIRESI_TEST_CONTEXT
+        cp "${startup}" "$TMPDIR/coverage-startup/sitecustomize.py"
+        cp "${runtime}" "$TMPDIR/coverage-startup/_afairesi_coverage_support.py"
+        cat > "$COVERAGE_PROCESS_START" <<EOF
+        [run]
+        core = ctrace
+        context = \$AFAIRESI_TEST_CONTEXT
+        parallel = true
+        branch = true
+        data_file = $out/.coverage
+        source =
+            $src
+            ${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}
+        omit =
+            */test_main.py
+        EOF
+        export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
         export HOME="$(mktemp -d)"
-        mkdir -p "$out"
         ln -s "$src" "${builtins.replaceStrings [ "-" ] [ "_" ] packageName}"
-        export PYTHONPATH="$PWD:$PYTHONPATH"
         cd "$out"
         "${testEnvironment.python}/bin/python" -c '
         import sys
@@ -1123,11 +1116,16 @@ let
             @pytest.hookimpl(tryfirst=True)
             def pytest_load_initial_conftests(self, early_config, parser, args):
                 from hypothesis import settings
-                settings.register_profile("afairesi", max_examples=10)
+                settings.register_profile("afairesi", max_examples=100, derandomize=True)
                 settings.load_profile("afairesi")
         sys.exit(pytest.main(plugins=[Defaults()]))
-        ' -p no:cacheprovider --import-mode=importlib --durations=10 --maxfail=1 \
-          "$src/test_main.py" "''${afairesi_pytest_args[@]}"
+        ' -p _afairesi_coverage_support -p no:cacheprovider \
+          --import-mode=importlib --durations=10 --maxfail=1 "$src/test_main.py"
+        unset COVERAGE_PROCESS_START
+        python -m coverage combine --rcfile="$TMPDIR/coverage.ini"
+        python -c 'from _afairesi_coverage_support import remap_coverage_paths; remap_coverage_paths("${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}/__init__.py")'
+        python -m coverage html --show-contexts --rcfile="$TMPDIR/coverage.ini" -d "$out/html"
+        python -m coverage json --show-contexts --rcfile="$TMPDIR/coverage.ini" -o "$out/coverage.json"
       '';
   sourceCheck =
     {
@@ -1147,7 +1145,6 @@ in
   inherit formatter lint pythonCheck;
   lib = {
     inherit
-      mkCoverage
       mkFlake
       mkHtmlPackage
       mkLatexPackage

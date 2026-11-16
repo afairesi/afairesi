@@ -148,15 +148,6 @@ th {
   font-weight: 600;
   text-align: start;
 }
-.campaigns {
-  margin-block: 18px;
-}
-.campaigns dt {
-  font-weight: 600;
-}
-.campaigns dd + dt {
-  margin-top: 12px;
-}
 ::selection {
   background: var(--ink);
   color: var(--paper);

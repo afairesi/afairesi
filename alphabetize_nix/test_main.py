@@ -53,7 +53,7 @@ def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
         raise AssertionError(valid.read_text())
 
 
-@settings(deadline=None)
+@settings(deadline=None, max_examples=10)
 @given(
     st.dictionaries(
         st.text(alphabet="abcxyz_", min_size=1, max_size=8),

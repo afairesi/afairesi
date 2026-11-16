@@ -84,10 +84,7 @@ let
   };
   package = consumer.packages.${system}.example;
   system = pkgs.stdenv.hostPlatform.system;
-  vmCoverage = inputs.self.lib.mkCoverage {
-    check = pkgs.vmTools.runInLinuxVM consumer.checks.${system}.example;
-    packageDrv = package;
-  };
+
 in
 assert
   package.consumerConfig == {
@@ -109,7 +106,6 @@ assert
 assert leanExample.meta.mainProgram == "lean-example";
 assert !(leanLibrary.meta ? mainProgram);
 assert !(leanExample.drvAttrs ? runtimeHook);
-assert !(consumer.legacyPackages.${system} ? lean-example-coverage);
 assert !(consumer.apps.${system} ? test_main);
 assert inputs.self.lib ? mkLean4Package;
 assert !(acceptsLean { shellHook = "echo obsolete"; });
@@ -134,7 +130,6 @@ assert consumer.checks.${system} ? nix-tests;
 assert !(consumer.checks.${system} ? nix-untested);
 assert !(consumer.checks.${system} ? native);
 assert !(consumer.devShells.${system} ? nix-library-test);
-assert !(consumer.legacyPackages.${system} ? nix-library-coverage);
 assert consumer.packages.${system}.native.example == package;
 assert consumer.nixosConfigurations.example.pkgs.config.allowUnfree;
 assert consumer.nixosConfigurations.example.pkgs.config.cudaSupport;
@@ -151,19 +146,9 @@ assert
   ];
 assert empty.apps.${system} == { };
 assert empty.devShells.${system} == { };
-assert empty.legacyPackages.${system} == { };
 assert empty.nixosConfigurations == { };
 assert (consumer.checks.${system} ? exampleVm) == (system == "x86_64-linux");
 assert system != "x86_64-linux" || builtins.isString consumer.checks.${system}.exampleVm.drvPath;
-assert consumer.legacyPackages.${system} ? example-test-environment;
-assert consumer.legacyPackages.${system} ? example-coverage;
-assert !pkgs.stdenv.hostPlatform.isLinux || vmCoverage.requiredSystemFeatures == [ "kvm" ];
-assert
-  !pkgs.stdenv.hostPlatform.isLinux
-  || vmCoverage.origBuilder == consumer.checks.${system}.example.builder;
-assert
-  !pkgs.stdenv.hostPlatform.isLinux
-  || vmCoverage.drvPath != consumer.legacyPackages.${system}.example-coverage.drvPath;
 assert consumer.devShells.${system} ? example-test;
 assert consumer.apps.${system}.example.type == "app";
 assert consumer.apps.${system}.example.meta == package.meta;
@@ -187,7 +172,6 @@ pkgs.runCommand "afairesi-consumer-contract"
     leanShell = consumer.devShells.${system}.lean-example-test;
     nativeBuildInputs = [
       consumer.checks.${system}.example
-      consumer.legacyPackages.${system}.example-coverage
       consumer.checks.${system}.pkgs-native
       consumer.checks.${system}.pkgs-native-contract
       consumer.checks.${system}.nix-library
@@ -198,6 +182,8 @@ pkgs.runCommand "afairesi-consumer-contract"
     ];
   }
   ''
+    test -s ${consumer.checks.${system}.example}/coverage.json
+    test -s ${consumer.checks.${system}.example}/html/index.html
     head -c 5 ${latexPackage}/ms.pdf | grep -F '%PDF-'
     cmp ${package.src}/ms.tex ${package}/${package.python.sitePackages}/example/ms.tex
     test "$(cat ${consumer.packages.${system}.nix-untested})" = untested

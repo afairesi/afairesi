@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta
       name="description"
-      content="Afairesi combines a Nix library for repository builds, checks, and development environments with a CLI for inspecting interfaces and running Python test campaigns."
+      content="Afairesi combines a Nix library for repository builds, checks, and development environments with a CLI for inspecting and comparing repository interfaces."
     />
     <meta name="theme-color" content="#fdf6e3" />
     <title>Afairesi — Nix library and repository CLI</title>
@@ -155,32 +155,21 @@ afairesi inspect ../project</code></pre>
           <pre tabindex="0" aria-label="Interface comparison commands"><code>afairesi inspect-diff
 afairesi inspect-diff --cached
 afairesi inspect-diff --from HEAD~1 --to HEAD</code></pre>
-          <h3>Python test campaigns</h3>
+          <h3>Tests and coverage</h3>
           <p>
-            Choose a Python test campaign. The optional path selects one package or a whole flake;
-            omitting it selects the current repository. Repository campaigns skip packages without
-            Python tests.
+            Run <code>nix flake check</code> to execute package tests alongside the repository's
+            other checks. Python checks run the complete pytest suite, including Hypothesis
+            properties, and produce HTML and JSON coverage reports. Coverage is informational: test
+            failures fail the check, but there is no minimum coverage percentage.
           </p>
-          <dl class="campaigns">
-            <dt><code>test-coverage</code></dt>
-            <dd>Build coverage checks and print HTML report paths in the Nix store.</dd>
-            <dt><code>test-fuzz</code></dt>
-            <dd>Run Hypothesis tests named <code>test_fuzz_*</code>.</dd>
-            <dt><code>test-mutation</code></dt>
-            <dd>Change source expressions to check whether the tests catch them.</dd>
-            <dt><code>test-performance</code></dt>
-            <dd>Profile tests and package CLI calls with cProfile.</dd>
-            <dt><code>test-property</code></dt>
-            <dd>Run complete test suites, including Hypothesis property tests.</dd>
-          </dl>
-          <pre tabindex="0" aria-label="Python test campaign examples"><code>afairesi test-property
-afairesi test-coverage example
-afairesi test-fuzz example --max-examples 100
-afairesi test-mutation example --max-mutations 20
-afairesi test-performance example</code></pre>
+          <pre tabindex="0" aria-label="Tests and coverage reports"><code>nix flake check
+nix build .#checks.x86_64-linux.example --out-link coverage
+xdg-open coverage/html/index.html</code></pre>
           <p>
-            Use <code>-k</code> and <code>-m</code> to select tests in campaigns other than
-            coverage. Add <code>--help</code> to any command for its options.
+            Replace <code>example</code> with a Python package name and
+            <code>x86_64-linux</code> with your system. Building the check reuses the result from
+            <code>nix flake check</code>. Hypothesis uses deterministic generation with a default
+            budget of 100 examples per property; individual tests can override these settings.
           </p>
         </section>
       </div>
