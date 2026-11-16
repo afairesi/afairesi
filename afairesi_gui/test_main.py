@@ -13,7 +13,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from http import HTTPStatus
 from http.server import ThreadingHTTPServer
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
@@ -22,6 +22,8 @@ import afairesi_gui.main as subject
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
     from pathlib import Path
+
+REMOTE_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def expect(condition: bool, detail: object) -> None:  # noqa: FBT001
@@ -673,6 +675,121 @@ for line in sys.stdin:
         codex.close()
 
 
+@pytest.fixture
+def auth_codex(tmp_path: Path) -> Path:
+    """Provide controllable app-server sign-in without credentials or network calls."""
+    executable = tmp_path / "auth-codex"
+    executable.write_text(
+        f"#!{sys.executable}\n"
+        """
+import json
+import sys
+account = None
+attempts = 0
+race = False
+def emit(value):
+    print(json.dumps(value), flush=True)
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get("method")
+    params = message.get("params", {})
+    result = {}
+    if method == "account/read":
+        result = {"account": account}
+    elif method == "account/login/start":
+        attempts += 1
+        result = {"type": params["type"], "loginId": str(attempts),
+                  "accessToken": "must-not-reach-browser"}
+        if params["type"] == "chatgptDeviceCode":
+            result.update(verificationUrl="https://example.invalid/device",
+                          userCode="TEST-CODE")
+        else:
+            result["authUrl"] = "https://example.invalid/browser"
+        if race:
+            emit({"method": "account/login/completed", "params": {
+                "loginId": str(attempts), "success": False, "error": "Expired"}})
+    elif method == "test/event":
+        if params["method"] == "account/updated":
+            account = {"type": "chatgpt", "planType": "plus"}
+        emit(params)
+    elif method == "test/race":
+        race = True
+    elif method == "test/attempts":
+        result = {"count": attempts}
+    if method and "id" in message:
+        emit({"id": message["id"], "result": result})
+"""
+    )
+    executable.chmod(0o755)
+    return executable
+
+
+@pytest.mark.parametrize("remote", [False, True])
+def test_codex_sign_in_survives_refresh_and_retries_expired_codes(
+    tmp_path: Path, auth_codex: Path, *, remote: bool
+) -> None:
+    """Choose the workspace's login flow and expose only public sign-in fields."""
+    application = subject.Application(tmp_path, str(auth_codex), remote=remote)
+    codex = application.codex
+    expected = (
+        {
+            "type": "chatgptDeviceCode",
+            "verificationUrl": "https://example.invalid/device",
+            "userCode": "TEST-CODE",
+        }
+        if remote
+        else {"type": "chatgpt", "authUrl": "https://example.invalid/browser"}
+    )
+    try:
+        first = cast("dict[str, Any]", application.post("/api/agent/connect", {}))
+        expect(first["login"] == expected, first)
+        expect(application.get("/api/agent", {}) == first, "lost pending login")
+        expect(application.post("/api/agent/connect", {}) == first, first)
+        expect(codex.rpc("test/attempts", {}) == {"count": 1}, "duplicate login")
+        codex.rpc(
+            "test/event",
+            {
+                "method": "account/login/completed",
+                "params": {"loginId": "1", "success": False, "error": "Expired"},
+            },
+        )
+        expect(codex.status()["login"] is None, codex.status())
+        expect(codex.status()["error"] == "Expired", codex.status())
+        retry = cast("dict[str, Any]", application.post("/api/agent/connect", {}))
+        expect(retry["login"] == expected and retry["error"] is None, retry)
+        expect(codex.rpc("test/attempts", {}) == {"count": 2}, "missing retry")
+        codex.rpc(
+            "test/event",
+            {
+                "method": "account/updated",
+                "params": {"authMode": "chatgpt", "planType": "plus"},
+            },
+        )
+        connected = cast("dict[str, Any]", application.post("/api/agent/connect", {}))
+        expect(connected["connected"] and connected["login"] is None, connected)
+        expect(codex.rpc("test/attempts", {}) == {"count": 2}, "replaced account")
+    finally:
+        application.close()
+
+
+def test_codex_clears_login_on_disconnect_and_early_completion(
+    auth_codex: Path,
+) -> None:
+    """Do not resurrect a finished login when its start response arrives later."""
+    codex = subject.Codex(str(auth_codex))
+    try:
+        codex.sign_in(device=True)
+        codex.close()
+        expect(codex.status()["login"] is None, codex.status())
+        expect(not codex.status()["connected"], codex.status())
+        codex.connect()
+        codex.rpc("test/race", {})
+        status = codex.sign_in(device=True)
+        expect(status["login"] is None and status["error"] == "Expired", status)
+    finally:
+        codex.close()
+
+
 def test_source_does_not_modify_home_registration(workspace: subject.Workspace) -> None:
     """Reading the workspace preserves the registry, index, and working sources."""
     root = workspace.home
@@ -854,7 +971,9 @@ def test_all_resource_actions_share_one_nix_evaluation(
     )
 
 
-def test_ssh_arguments_preserve_remote_paths_and_loopback_origin() -> None:
+def test_ssh_arguments_preserve_remote_paths_and_loopback_origin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """Pass remote paths literally and retain the HTTP server's origin checks."""
     import argparse  # noqa: PLC0415 - Only used to supply launcher options.
     import shlex  # noqa: PLC0415 - Decode the command passed to the remote shell.
@@ -865,6 +984,7 @@ def test_ssh_arguments_preserve_remote_paths_and_loopback_origin() -> None:
         home=Path("/remote/home with 'quotes' $(touch unwanted)"),
         port=8766,
         codex="/remote/codex with spaces",
+        remote_revision=REMOTE_REVISION.upper(),
     )
     arguments, url = subject.ssh_arguments(options)
     expect(arguments[:4] == ["ssh", "-T", "-S", "none"], arguments)
@@ -884,7 +1004,7 @@ def test_ssh_arguments_preserve_remote_paths_and_loopback_origin() -> None:
             "--extra-experimental-features",
             "nix-command flakes",
             "run",
-            "github:afairesi/afairesi#afairesi_gui",
+            f"github:afairesi/afairesi/{REMOTE_REVISION}#afairesi_gui",
             "--",
             "--no-open",
             "--port",
@@ -898,11 +1018,28 @@ def test_ssh_arguments_preserve_remote_paths_and_loopback_origin() -> None:
     )
     options.home = None
     options.port = 0
+    options.codex = None
+    options.remote_revision = None
+    monkeypatch.setattr(subject, "SOURCE_REVISION", REMOTE_REVISION)
     arguments, url = subject.ssh_arguments(options)
     remote = shlex.split(arguments[-1])
     expect("--home" not in remote, remote)
+    expect("--codex" not in remote, remote)
+    expect(f"github:afairesi/afairesi/{REMOTE_REVISION}#afairesi_gui" in remote, remote)
     port = remote[remote.index("--port") + 1]
     expect(int(port) > 0 and url == f"http://127.0.0.1:{port}", arguments)
+
+
+@pytest.mark.parametrize("revision", [None, "main", "0123456", "x" * 40])
+def test_ssh_rejects_unpinned_development_builds(
+    monkeypatch: pytest.MonkeyPatch, revision: str | None
+) -> None:
+    """Never silently substitute the latest release for a development checkout."""
+    import argparse  # noqa: PLC0415 - Launcher options for this contract test.
+
+    monkeypatch.setattr(subject, "SOURCE_REVISION", "")
+    with pytest.raises(ValueError, match="--remote-revision"):
+        subject.ssh_arguments(argparse.Namespace(remote_revision=revision))
 
 
 @pytest.mark.parametrize("exit_code", [0, 255])
@@ -921,7 +1058,12 @@ def test_ssh_startup_failure_never_opens_browser(
     with pytest.raises(ValueError, match="Remote workspace exited"):
         subject.remote_workspace(
             argparse.Namespace(
-                ssh="test-host", home=None, port=0, codex="codex", no_open=False
+                ssh="test-host",
+                home=None,
+                port=0,
+                codex=None,
+                no_open=False,
+                remote_revision=REMOTE_REVISION,
             )
         )
     expect(opened == [], opened)
@@ -994,7 +1136,8 @@ def test_ssh_launcher_uses_remote_home_and_stops_its_server(
         "assert command[:2] == ['env', 'AFAIRESI_GUI_SSH_SESSION=1']\n"
         "os.environ['AFAIRESI_GUI_SSH_SESSION'] = '1'\n"
         "os.environ['HOME'] = os.environ['SSH_TEST_HOME']\n"
-        "source = command.index('github:afairesi/afairesi#afairesi_gui')\n"
+        f"source = command.index('github:afairesi/afairesi/{REMOTE_REVISION}"
+        "#afairesi_gui')\n"
         "command[source] = 'path:' + os.environ['SSH_TEST_FLAKE'] + '#afairesi_gui'\n"
         "os.execvp(command[2], command[2:])\n"
     )
@@ -1032,6 +1175,8 @@ def test_ssh_launcher_uses_remote_home_and_stops_its_server(
         str(Path(subject.__file__)),
         "--ssh",
         "test-host",
+        "--remote-revision",
+        REMOTE_REVISION,
         "--no-open",
         "--port",
         "0",

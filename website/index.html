@@ -171,26 +171,35 @@ nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
             Pass <code>--ssh user@host</code> or an SSH host alias to open a remote workspace in
             your local browser. The remote machine needs <code>nix</code> on its PATH and access to
             the package source. The launcher runs
-            <code>nix run github:afairesi/afairesi#afairesi_gui</code> remotely, enabling the needed
-            Nix features for the remote session. Nix fetches and builds the package as needed and
-            reuses its store on subsequent launches; no remote profile installation is needed.
-            Repository discovery, builds, tests, diffs, and Codex run there; SSH forwards the
-            loopback server using your existing SSH configuration and authentication. The default
-            home is the remote user's home, and <code>--home</code> selects a remote path.
+            <code>nix run github:afairesi/afairesi/&lt;commit&gt;#afairesi_gui</code> remotely,
+            using the same Git commit as the local release build and enabling the needed Nix
+            features for the remote session. Nix fetches and builds the package as needed and reuses
+            its store on subsequent launches; no remote profile installation is needed. Repository
+            discovery, builds, tests, diffs, and Codex run there; SSH forwards the loopback server
+            using your existing SSH configuration and authentication. The default home is the remote
+            user's home, and <code>--home</code> selects a remote path.
           </p>
           <pre tabindex="0" aria-label="Open a remote workspace"><code>afairesi_gui --ssh user@host
 nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></pre>
           <p>
-            The selected port must be free on both machines; <code>--port 0</code> chooses a local
-            free port and uses it on both ends. Keep the launcher running. Closing it stops the
-            tunnel and its remote workspace session. Remote chat uses Codex installed and signed in
-            on the remote machine.
+            The build's commit must be available on GitHub. For a development build with uncommitted
+            changes, pass <code>--remote-revision &lt;full published commit&gt;</code>
+            to select the remote version explicitly. Local edits are not transferred over SSH.
           </p>
           <p>
-            The server listens on <code>127.0.0.1</code>. Install Codex separately and make
-            <code>codex</code> available on your PATH, then select Connect to use your existing
-            account or sign in. Each repository has its own conversation. The GUI keeps activity and
-            conversations for the server session; stopping the server stops its running jobs.
+            The selected port must be free on both machines; <code>--port 0</code> chooses a local
+            free port and uses it on both ends. Keep the launcher running. Closing it stops the
+            tunnel and its remote workspace session.
+          </p>
+          <p>
+            The server listens on <code>127.0.0.1</code>. The GUI bundles Codex from the locked
+            Nixpkgs input, so it needs no separate installation. Select Connect Codex to use your
+            existing account or sign in. Over SSH, the chat displays a sign-in link and device code
+            that you complete in your local browser; credentials stay managed by Codex on the remote
+            machine. Local sessions use browser sign-in. Pass <code>--codex /path/to/codex</code>
+            to override the executable on the machine running the workspace. Each repository has its
+            own conversation. The GUI keeps activity and conversations for the server session;
+            stopping the server stops its running jobs.
           </p>
           <h3>Interface changes</h3>
           <p>

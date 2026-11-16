@@ -11,6 +11,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -37,6 +38,8 @@ if TYPE_CHECKING:
 MAX_LOG = 100_000
 MAX_BODY = 65_536
 MAX_JOBS = 4
+BUNDLED_CODEX = "codex"
+SOURCE_REVISION = ""
 ASSETS = {
     "/": "index.html",
     "/app.js": "app.js",
@@ -455,20 +458,21 @@ class Jobs:
 class Codex:
     """Bridge Codex's app-server protocol to repository-scoped chat panes."""
 
-    def __init__(self, executable: str = "codex") -> None:
+    def __init__(self, executable: str = BUNDLED_CODEX) -> None:
         """Defer Codex startup until the user connects."""
         self.executable = executable
         self.process: subprocess.Popen[str] | None = None
         self.reader: threading.Thread | None = None
         self.lock = threading.RLock()
         self.write_lock = threading.Lock()
-        self.connect_lock = threading.Lock()
+        self.connect_lock = threading.RLock()
         self.counter = 0
         self.pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
         self.chats: dict[str, dict[str, Any]] = {}
         self.requests: dict[str, dict[str, Any]] = {}
         self.account: dict[str, Any] | None = None
         self.login: dict[str, Any] | None = None
+        self.login_generation = 0
         self.error: str | None = None
 
     def connect(self) -> dict[str, Any]:
@@ -488,6 +492,8 @@ class Codex:
                     start_new_session=True,
                 )
                 self.error = None
+                self.login = None
+                self.login_generation += 1
                 self.requests.clear()
                 self.reader = threading.Thread(target=self._read, daemon=True)
                 self.reader.start()
@@ -507,6 +513,29 @@ class Codex:
                             {"threadId": chat["thread"], "excludeTurns": True},
                         )
         return self.status()
+
+    def sign_in(self, *, device: bool = False) -> dict[str, Any]:
+        """Reuse pending sign-in and let Codex own the account credentials."""
+        with self.connect_lock:
+            self.connect()
+            with self.lock:
+                if self.account is not None or self.login is not None:
+                    return self.status()
+                self.error = None
+                generation = self.login_generation
+            try:
+                login = self.rpc(
+                    "account/login/start",
+                    {"type": "chatgptDeviceCode" if device else "chatgpt"},
+                )
+            except ValueError as error:
+                with self.lock:
+                    self.error = str(error)
+                raise
+            with self.lock:
+                if generation == self.login_generation and self.account is None:
+                    self.login = login
+            return self.status()
 
     def _write(self, message: dict[str, Any]) -> None:
         """Serialize complete protocol messages to stdin."""
@@ -568,6 +597,8 @@ class Codex:
         finally:
             with self.lock:
                 self.account = None
+                self.login = None
+                self.login_generation += 1
                 self.error = self.error or "Codex disconnected. Reconnect to continue."
                 for event, response in self.pending.values():
                     response["error"] = {"message": self.error}
@@ -614,12 +645,15 @@ class Codex:
                     "type": params["authMode"],
                     "planType": params.get("planType"),
                 }
+                self.error = None
+                self.login = None
             else:
                 self.account = None
         if method == "account/login/completed" and not params.get("success"):
             self.error = params.get("error") or "Sign-in did not complete."
         if method == "account/login/completed":
             self.login = None
+            self.login_generation += 1
 
     def _item(self, chat: dict[str, Any], item: dict[str, Any]) -> None:
         """Render completed message, command, and file-change protocol items."""
@@ -655,6 +689,12 @@ class Codex:
                 "connected": self.account is not None,
                 "plan": (self.account or {}).get("planType"),
                 "error": self.error,
+                "login": {
+                    key: value
+                    for key, value in (self.login or {}).items()
+                    if key in {"type", "authUrl", "verificationUrl", "userCode"}
+                }
+                or None,
             }
 
     def snapshot(self, repository: str) -> dict[str, Any]:
@@ -787,11 +827,14 @@ class Codex:
 class Application:
     """Route local API calls to workspace inspection, actions, and Codex."""
 
-    def __init__(self, home: Path, codex: str = "codex") -> None:
+    def __init__(
+        self, home: Path, codex: str = BUNDLED_CODEX, *, remote: bool = False
+    ) -> None:
         """Own runtime state independently of HTTP request handlers."""
         self.workspace = Workspace(home)
         self.jobs = Jobs()
         self.codex = Codex(codex)
+        self.remote = remote
 
     def get(self, path: str, query: dict[str, list[str]]) -> object:
         """Handle read-only workspace requests."""
@@ -829,17 +872,7 @@ class Application:
     def post(self, path: str, body: dict[str, Any]) -> object:
         """Validate targets again before initiating user-requested operations."""
         if path == "/api/agent/connect":
-            status = self.codex.connect()
-            if not status["connected"]:
-                if self.codex.login is None:
-                    self.codex.login = self.codex.rpc(
-                        "account/login/start", {"type": "chatgpt"}
-                    )
-                return {
-                    **status,
-                    **self.codex.login,
-                }
-            return status
+            return self.codex.sign_in(device=self.remote)
         repository = str(body.get("repository", ""))
         root, _entry = self.workspace.repository(repository)
         if path == "/api/jobs":
@@ -1029,6 +1062,13 @@ def handler(application: Application) -> type[BaseHTTPRequestHandler]:  # noqa: 
 
 def ssh_arguments(options: argparse.Namespace) -> tuple[list[str], str]:
     """Quote one remote launcher command and forward its loopback port unchanged."""
+    revision = options.remote_revision or SOURCE_REVISION
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", revision):
+        message = (
+            "SSH needs a full 40-character published commit. Use a clean release "
+            "build or pass --remote-revision COMMIT for a development build."
+        )
+        raise ValueError(message)
     port = options.port
     if port == 0:
         with socket.socket() as listener:
@@ -1041,14 +1081,14 @@ def ssh_arguments(options: argparse.Namespace) -> tuple[list[str], str]:
         "--extra-experimental-features",
         "nix-command flakes",
         "run",
-        "github:afairesi/afairesi#afairesi_gui",
+        f"github:afairesi/afairesi/{revision.lower()}#afairesi_gui",
         "--",
         "--no-open",
         "--port",
         str(port),
-        "--codex",
-        options.codex,
     ]
+    if options.codex is not None:
+        remote.extend(["--codex", options.codex])
     if options.home is not None:
         remote.extend(["--home", str(options.home)])
     return [
@@ -1137,6 +1177,11 @@ def main() -> None:
         "--ssh", metavar="DESTINATION", help="remote SSH host alias or user@host"
     )
     parser.add_argument(
+        "--remote-revision",
+        metavar="COMMIT",
+        help="published remote GUI commit (default: this build's clean Git revision)",
+    )
+    parser.add_argument(
         "--home",
         type=Path,
         help="home Git repository (default: home on the machine running the workspace)",
@@ -1151,11 +1196,13 @@ def main() -> None:
         "--no-open", action="store_true", help="print the URL without opening a browser"
     )
     parser.add_argument(
-        "--codex", default="codex", help="Codex executable (default: codex on PATH)"
+        "--codex", help="override the bundled Codex executable on the workspace machine"
     )
     options = parser.parse_args()
     if not 0 <= options.port <= 65535:  # noqa: PLR2004 - TCP port range.
         parser.error("--port must be between 0 and 65535")
+    if options.remote_revision is not None and options.ssh is None:
+        parser.error("--remote-revision requires --ssh")
     if options.ssh is not None:
         if not options.ssh or options.ssh.startswith("-"):
             parser.error("--ssh requires an SSH host alias or user@host")
@@ -1170,7 +1217,11 @@ def main() -> None:
             os.environ.get("NIX_CONFIG", "")
             + "\nextra-experimental-features = nix-command flakes\n"
         )
-    application = Application((options.home or Path.home()).expanduser(), options.codex)
+    application = Application(
+        (options.home or Path.home()).expanduser(),
+        options.codex or BUNDLED_CODEX,
+        remote=remote_session,
+    )
     try:
         application.workspace.repositories()
         with ThreadingHTTPServer(

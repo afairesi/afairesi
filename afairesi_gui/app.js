@@ -28,7 +28,6 @@ const select = (selector) => document.querySelector(selector),
     connecting: false,
     forms: new Map(),
     jobs: [],
-    loginUrl: null,
     messageSignature: "",
     mentionIndex: 0,
     mentions: [],
@@ -1260,32 +1259,53 @@ function renderContext() {
 }
 
 function renderAgent() {
-  const { connected } = state.agent;
-  if (connected) {
-    state.loginUrl = null;
-  }
+  const { connected, login } = state.agent;
   select("#agent-status").textContent = connected
     ? `Connected${state.agent.plan ? ` · ${state.agent.plan}` : ""}`
     : state.agent.error ||
-      (state.agent.available === false ? "Install Codex to connect" : "Your coding companion");
+      (state.agent.available === false
+        ? "Codex executable is unavailable"
+        : "Your coding companion");
   select("#agent-status").hidden = Boolean(
-    connected || (!state.agent.error && state.agent.available !== false && !state.loginUrl),
+    connected || (!state.agent.error && state.agent.available !== false && !login),
   );
-  if (!connected && state.loginUrl) {
+  if (!connected && login) {
     select("#agent-status").replaceChildren(
       element(
         "a",
-        { href: state.loginUrl, target: "_blank", rel: "noopener noreferrer" },
+        {
+          href: login.verificationUrl || login.authUrl,
+          target: "_blank",
+          rel: "noopener noreferrer",
+        },
         "Sign in to Codex ↗",
       ),
     );
+    if (login.userCode) {
+      select("#agent-status").append(
+        element(
+          "span",
+          {},
+          " Enter code ",
+          element("code", { class: "login-code", "aria-label": "Sign-in code" }, login.userCode),
+        ),
+      );
+    }
   }
   select("#connect").replaceChildren(
     icon("link"),
-    state.connecting ? "Connecting…" : connected ? "Codex ✓" : "Connect Codex",
+    state.connecting
+      ? "Connecting…"
+      : connected
+        ? "Codex ✓"
+        : login
+          ? "Waiting for sign-in…"
+          : "Connect Codex",
   );
   select("#connect").title = select("#agent-status").textContent;
-  select("#connect").disabled = state.connecting || connected || state.agent.available === false;
+  select("#connect").disabled = Boolean(
+    state.connecting || connected || login || state.agent.available === false,
+  );
   select("#stop-chat").hidden = !state.chat.busy;
   select("#message").disabled = !connected || state.submitting;
   select("#send").disabled = !connected || state.submitting || !select("#message").value.trim();
@@ -1572,9 +1592,8 @@ async function connect() {
   try {
     const result = await api("/api/agent/connect", {});
     state.agent = result;
-    if (result.authUrl) {
-      state.loginUrl = result.authUrl;
-      window.open(result.authUrl, "_blank", "noopener,noreferrer");
+    if (result.login?.authUrl) {
+      window.open(result.login.authUrl, "_blank", "noopener,noreferrer");
       toast("Complete sign-in using the link above the chat.");
     }
     renderAgent();
@@ -1677,7 +1696,12 @@ async function pollActivity() {
     }
   }
   try {
+    state.agent = await api("/api/agent");
+    renderAgent();
     await inBatches([...repositories], refreshActivity);
+  } catch (error) {
+    select("#agent-status").textContent = `Connection interrupted: ${error.message}`;
+    select("#agent-status").hidden = false;
   } finally {
     polling = false;
   }
