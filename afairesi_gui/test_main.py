@@ -880,7 +880,12 @@ def test_ssh_arguments_preserve_remote_paths_and_loopback_origin() -> None:
         == [
             "env",
             "AFAIRESI_GUI_SSH_SESSION=1",
-            "afairesi_gui",
+            "nix",
+            "--extra-experimental-features",
+            "nix-command flakes",
+            "run",
+            "github:afairesi/afairesi#afairesi_gui",
+            "--",
             "--no-open",
             "--port",
             "8766",
@@ -922,6 +927,47 @@ def test_ssh_startup_failure_never_opens_browser(
     expect(opened == [], opened)
 
 
+def check_remote_workspace(url: str, home: Path) -> None:
+    """Check remote discovery, child Nix commands, and HTTP origin enforcement."""
+    port = int(url.rsplit(":", 1)[-1])
+    connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+    try:
+        connection.request("GET", "/api/workspace")
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        expect(response.status == HTTPStatus.OK, result)
+        expect(result["home"] == str(home), result)
+        expect(
+            [repo["id"] for repo in result["repositories"]] == ["projects/example"],
+            result,
+        )
+        connection.request("GET", "/api/actions?repository=projects/example")
+        response = connection.getresponse()
+        result = json.loads(response.read())
+        expect(response.status == HTTPStatus.OK and result == {"hello": {}}, result)
+        connection.request(
+            "POST",
+            "/api/agent/connect",
+            body="{}",
+            headers={"Content-Type": "application/json", "Origin": url},
+        )
+        response = connection.getresponse()
+        expect(response.status != HTTPStatus.FORBIDDEN, response.read())
+        connection.request(
+            "POST",
+            "/api/agent/connect",
+            body="{}",
+            headers={
+                "Content-Type": "application/json",
+                "Origin": "https://foreign.invalid",
+            },
+        )
+        response = connection.getresponse()
+        expect(response.status == HTTPStatus.FORBIDDEN, response.read())
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize("explicit_home", [False, True])
 def test_ssh_launcher_uses_remote_home_and_stops_its_server(
     workspace: subject.Workspace,
@@ -929,10 +975,13 @@ def test_ssh_launcher_uses_remote_home_and_stops_its_server(
     *,
     explicit_home: bool,
 ) -> None:
-    """Exercise the real server through a simulated SSH command and stdin lifetime."""
+    """Run Nix and the real server through simulated SSH without installing the GUI."""
     import signal  # noqa: PLC0415 - Interrupt only the test-owned launcher.
     from pathlib import Path  # noqa: PLC0415 - Locate the shipped entry point.
 
+    (workspace.home / "projects/example/flake.nix").write_text(
+        "{ outputs = { self }: {}; }"
+    )
     scratch = workspace.home / "ssh-test"
     scratch.mkdir()
     executable = scratch / "ssh"
@@ -945,21 +994,39 @@ def test_ssh_launcher_uses_remote_home_and_stops_its_server(
         "assert command[:2] == ['env', 'AFAIRESI_GUI_SSH_SESSION=1']\n"
         "os.environ['AFAIRESI_GUI_SSH_SESSION'] = '1'\n"
         "os.environ['HOME'] = os.environ['SSH_TEST_HOME']\n"
+        "source = command.index('github:afairesi/afairesi#afairesi_gui')\n"
+        "command[source] = 'path:' + os.environ['SSH_TEST_FLAKE'] + '#afairesi_gui'\n"
         "os.execvp(command[2], command[2:])\n"
     )
     executable.chmod(0o755)
-    entry = scratch / "afairesi_gui"
+    flake = scratch / "remote-flake"
+    flake.mkdir()
+    (flake / "flake.nix").write_text("""{
+      outputs = { self }: {
+        apps = builtins.listToAttrs (map (system: {
+          name = system;
+          value.afairesi_gui = { type = "app"; program = "${./launch}"; };
+        }) [ "x86_64-linux" "aarch64-linux" "x86_64-darwin" "aarch64-darwin" ]);
+      };
+    }""")
+    entry = flake / "launch"
     entry.write_text(
         f"#!{sys.executable}\nimport afairesi_gui.main as app\napp.main()\n"
     )
     entry.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{scratch}{os.pathsep}{os.environ['PATH']}")
-    monkeypatch.setenv("HOME", str(scratch / "not-a-local-repository"))
-    monkeypatch.setenv(
-        "SSH_TEST_HOME", str(workspace.home if not explicit_home else scratch)
-    )
-    monkeypatch.setenv("SSH_TEST_LOG", str(scratch / "arguments.json"))
-    monkeypatch.setenv("SSH_TEST_PID", str(scratch / "server.pid"))
+    for name, value in {
+        "PATH": f"{scratch}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(scratch / "not-a-local-repository"),
+        "SSH_TEST_HOME": str(workspace.home if not explicit_home else scratch),
+        "SSH_TEST_LOG": str(scratch / "arguments.json"),
+        "SSH_TEST_PID": str(scratch / "server.pid"),
+        "SSH_TEST_FLAKE": str(flake),
+        "NIX_REMOTE": f"local?store={scratch / 'store'}"
+        f"&state={scratch / 'state'}&log={scratch / 'log'}",
+        "NIX_CONFIG": "experimental-features =\nbuild-users-group =\n"
+        "sandbox = false\nsubstituters =\n",
+    }.items():
+        monkeypatch.setenv(name, value)
     launcher = [
         sys.executable,
         str(Path(subject.__file__)),
@@ -992,40 +1059,7 @@ def test_ssh_launcher_uses_remote_home_and_stops_its_server(
             )
             expect(process.poll() is None, (scratch / "stdout").read_text())
             url = (scratch / "stdout").read_text().strip().split()[-1]
-            port = int(url.rsplit(":", 1)[-1])
-            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
-            try:
-                connection.request("GET", "/api/workspace")
-                response = connection.getresponse()
-                result = json.loads(response.read())
-                expect(response.status == HTTPStatus.OK, result)
-                expect(result["home"] == str(workspace.home), result)
-                expect(
-                    [repo["id"] for repo in result["repositories"]]
-                    == ["projects/example"],
-                    result,
-                )
-                connection.request(
-                    "POST",
-                    "/api/agent/connect",
-                    body="{}",
-                    headers={"Content-Type": "application/json", "Origin": url},
-                )
-                response = connection.getresponse()
-                expect(response.status != HTTPStatus.FORBIDDEN, response.read())
-                connection.request(
-                    "POST",
-                    "/api/agent/connect",
-                    body="{}",
-                    headers={
-                        "Content-Type": "application/json",
-                        "Origin": "https://foreign.invalid",
-                    },
-                )
-                response = connection.getresponse()
-                expect(response.status == HTTPStatus.FORBIDDEN, response.read())
-            finally:
-                connection.close()
+            check_remote_workspace(url, workspace.home)
         finally:
             process.send_signal(signal.SIGINT)
             _stdout, errors = process.communicate(timeout=10)

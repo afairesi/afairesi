@@ -1037,7 +1037,12 @@ def ssh_arguments(options: argparse.Namespace) -> tuple[list[str], str]:
     remote = [
         "env",
         "AFAIRESI_GUI_SSH_SESSION=1",
-        "afairesi_gui",
+        "nix",
+        "--extra-experimental-features",
+        "nix-command flakes",
+        "run",
+        "github:afairesi/afairesi#afairesi_gui",
+        "--",
         "--no-open",
         "--port",
         str(port),
@@ -1096,8 +1101,8 @@ def remote_workspace(options: argparse.Namespace) -> None:
             if not ready or code:
                 message = (
                     f"Remote workspace exited (SSH status {code}). "
-                    "Ensure afairesi_gui is on the remote PATH and the selected "
-                    "port is free on both machines."
+                    "Ensure Nix is on the remote PATH, the package source is "
+                    "reachable, and the selected port is free on both machines."
                 )
                 raise ValueError(message)
         except KeyboardInterrupt:
@@ -1159,6 +1164,12 @@ def main() -> None:
         except (OSError, ValueError) as error:
             parser.error(str(error))
         return
+    remote_session = os.environ.get("AFAIRESI_GUI_SSH_SESSION") == "1"
+    if remote_session:
+        os.environ["NIX_CONFIG"] = (
+            os.environ.get("NIX_CONFIG", "")
+            + "\nextra-experimental-features = nix-command flakes\n"
+        )
     application = Application((options.home or Path.home()).expanduser(), options.codex)
     try:
         application.workspace.repositories()
@@ -1170,7 +1181,7 @@ def main() -> None:
             sys.stdout.flush()
             if not options.no_open:
                 webbrowser.open(url)
-            if os.environ.get("AFAIRESI_GUI_SSH_SESSION") == "1":
+            if remote_session:
                 threading.Thread(
                     target=stop_on_ssh_disconnect, args=(server,), daemon=True
                 ).start()

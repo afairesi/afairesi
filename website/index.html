@@ -169,11 +169,14 @@ afairesi ../project</code></pre>
 nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
           <p>
             Pass <code>--ssh user@host</code> or an SSH host alias to open a remote workspace in
-            your local browser. The remote machine must have this version of
-            <code>afairesi_gui</code> on its PATH. Repository discovery, builds, tests, diffs, and
-            Codex run there; SSH forwards the loopback server using your existing SSH configuration
-            and authentication. The default home is the remote user's home, and
-            <code>--home</code> selects a remote path.
+            your local browser. The remote machine needs <code>nix</code> on its PATH and access to
+            the package source. The launcher runs
+            <code>nix run github:afairesi/afairesi#afairesi_gui</code> remotely, enabling the needed
+            Nix features for the remote session. Nix fetches and builds the package as needed and
+            reuses its store on subsequent launches; no remote profile installation is needed.
+            Repository discovery, builds, tests, diffs, and Codex run there; SSH forwards the
+            loopback server using your existing SSH configuration and authentication. The default
+            home is the remote user's home, and <code>--home</code> selects a remote path.
           </p>
           <pre tabindex="0" aria-label="Open a remote workspace"><code>afairesi_gui --ssh user@host
 nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></pre>
