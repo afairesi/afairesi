@@ -330,18 +330,6 @@ def inspect_structure(
     return packages, issues
 
 
-def has_python_tests(path: Path) -> bool:
-    """Detect static Python test definitions without executing the source."""
-    try:
-        module = ast.parse(path.read_bytes(), filename=str(path))
-        return bool(python_test_definitions(module))
-    except (OSError, SyntaxError, UnicodeError) as error:
-        msg = f"{path}: Python source could not be parsed: {error}"
-        raise CommandError(
-            msg,
-        ) from error
-
-
 def _python_class_mro(
     classes: dict[str, ast.ClassDef],
     name: str,
@@ -464,20 +452,16 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
             issues.append(prefix + "main must be callable; the executable calls main()")
     tests = package.root / "test_main.py"
     if tests.relative_to(package.root.parent) in paths and tests.is_file():
-        has_python_tests(tests)
+        _source(tests)
     return issues
 
 
 def package_description(package: Package) -> str | None:
     """Extract declared package metadata where supported."""
-    default = read_regular(package.root / "default.nix")
-    return source_package_description(default) if default is not None else None
-
-
-def source_package_description(source: str) -> str | None:
-    """Extract a literal Nix package description without evaluation."""
-    with contextlib.suppress(nix_syntax.NixSyntaxError):
-        return _meta_description(source)
+    source = read_regular(package.root / "default.nix")
+    if source is not None:
+        with contextlib.suppress(nix_syntax.NixSyntaxError):
+            return _meta_description(source)
     return None
 
 
@@ -625,7 +609,7 @@ def _resource_variable_constructor(
                 ):
                     return _resource_constructor(document, value, visited)
         scope = scope.parent
-    return name if name == "derivation" else None
+    return None
 
 
 def _validate_flake_syntax(root: Path) -> None:
@@ -1930,23 +1914,15 @@ def check_source_main() -> None:
         raise SystemExit(1) from error
 
 
-def _dispatch_command(
-    options: argparse.Namespace,
-    cli: argparse.ArgumentParser,
-) -> None:
-    """Run the selected inspection command."""
-    if options.command is None:
-        cli.print_help()
-    elif options.command in {"inspect", "inspect-diff"}:
-        _dispatch_inspect(options, cli)
-
-
 def main() -> None:
     """Dispatch inspection commands."""
     cli = parser()
     options = cli.parse_args()
     try:
-        _dispatch_command(options, cli)
+        if options.command is None:
+            cli.print_help()
+        else:
+            _dispatch_inspect(options, cli)
     except KeyboardInterrupt:
         sys.exit(130)
     except (

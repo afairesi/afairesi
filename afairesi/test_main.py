@@ -1078,61 +1078,6 @@ def test_source_inspection_handles_deep_unrelated_calls(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        ("def test_result(): pass", True),
-        ("async def test_result(): pass", True),
-        ("class TestBehavior:\n    def test_result(self): pass", True),
-        (
-            (
-                "class Cases:\n    def test_result(self): pass\n"
-                "class Intermediate(Cases): pass\n"
-                "class TestBehavior(Intermediate): pass"
-            ),
-            True,
-        ),
-        (
-            (
-                "class Cases:\n    def test_result(self): pass\n"
-                "class TestBehavior(Cases):\n    test_result = None"
-            ),
-            False,
-        ),
-        (
-            (
-                "import unittest as unit\n"
-                "class Reports(unit.TestCase):\n    def test_result(self): pass"
-            ),
-            True,
-        ),
-        (
-            (
-                "from unittest import IsolatedAsyncioTestCase as Case\n"
-                "class Base(Case): pass\n"
-                "class Reports(Base):\n    async def test_result(self): pass"
-            ),
-            True,
-        ),
-        ("class Helper:\n    def test_hidden(self): pass", False),
-        ("def helper():\n    def test_hidden(): pass", False),
-        ("class TestEmpty: pass", False),
-        ("", False),
-    ],
-)
-def test_static_test_detection_does_not_execute_source(
-    tmp_path: Path,
-    source: str,
-    *,
-    expected: bool,
-) -> None:
-    """Recognize supported test definitions without running imports or bodies."""
-    subject = import_module("afairesi.main")
-    path = tmp_path / "test_main.py"
-    path.write_text("raise RuntimeError('must not execute')\n" + source)
-    _expect(subject.has_python_tests(path) == expected, source)
-
-
-@pytest.mark.parametrize(
     "source",
     [
         "def testCamelCase(): pass\ndef test(): pass\n",
@@ -1140,6 +1085,26 @@ def test_static_test_detection_does_not_execute_source(
         (
             "from unittest import TestCase\n"
             "class Reports(TestCase):\n    def testCamelCase(self): pass\n"
+        ),
+        (
+            "class Cases:\n    def test_result(self): pass\n"
+            "class Intermediate(Cases): pass\n"
+            "class TestBehavior(Intermediate): pass\n"
+        ),
+        (
+            "class Cases:\n    def test_result(self): pass\n"
+            "class TestBehavior(Cases):\n"
+            "    test_result = None\n"
+            "    def test_visible(self): pass\n"
+        ),
+        (
+            "import unittest as unit\n"
+            "class Reports(unit.TestCase):\n    def test_result(self): pass\n"
+        ),
+        (
+            "from unittest import IsolatedAsyncioTestCase as Case\n"
+            "class Base(Case): pass\n"
+            "class Reports(Base):\n    async def test_result(self): pass\n"
         ),
     ],
 )
@@ -1646,6 +1611,7 @@ inspection_subject = import_module("afairesi.main")
 
 @pytest.mark.parametrize("description", [None, "package"])
 def test_inspect_reports_package_descriptions_without_dependency_metadata(
+    tmp_path: Path,
     description: str | None,
 ) -> None:
     """Read only the returned package's description, including curried builders."""
@@ -1654,8 +1620,10 @@ def test_inspect_reports_package_descriptions_without_dependency_metadata(
         '{ pkgs }: let dependency = { meta.description = "dependency"; }; '
         f'in pkgs.runCommand "example" {{ {metadata} }} "touch $out"'
     )
+    (tmp_path / "default.nix").write_text(source)
+    package = inspection_subject.Package("example", "nix", tmp_path)
     _expect(
-        inspection_subject.source_package_description(source) == description,
+        inspection_subject.package_description(package) == description,
         source,
     )
 
@@ -2560,6 +2528,7 @@ def test_inspect_reports_sorted_test_names_with_class_context(
     _write_fixture_source(
         tmp_path / "example/test_main.py",
         """
+raise RuntimeError('must not execute')
 from unittest import TestCase as Case
 def test_default_output(): pass
 def helper():

@@ -727,9 +727,6 @@ let
       pname = baseNameOf src;
     in
     assert
-      !(arguments ? shellHook)
-      || throw "mkLean4Package does not accept shellHook; use runtimeHook for app initialization";
-    assert
       !(arguments ? runtimeHook) || executable || throw "runtimeHook requires an executable package";
     pkgs.leanPackages.buildLakePackage (
       {
@@ -897,9 +894,6 @@ let
         ])
       )
       || throw "mkPythonPackage requires a valid non-keyword Python module name: ${pname}";
-    assert
-      !(arguments ? shellHook)
-      || throw "mkPythonPackage does not accept shellHook; use runtimeHook for app initialization";
     assert
       !(arguments ? runtimeHook) || executable || throw "runtimeHook requires an executable package";
     python.pkgs.buildPythonPackage (

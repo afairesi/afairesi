@@ -108,7 +108,6 @@ assert !(leanLibrary.meta ? mainProgram);
 assert !(leanExample.drvAttrs ? runtimeHook);
 assert !(consumer.apps.${system} ? test_main);
 assert inputs.self.lib ? mkLean4Package;
-assert !(acceptsLean { shellHook = "echo obsolete"; });
 assert
   !(acceptsLean {
     executable = false;
@@ -156,7 +155,6 @@ assert consumer.apps.${system}.example.meta.description == "Afairesi consumer co
 assert descriptionless.apps.${system}.example.meta.description == "Run example";
 assert descriptionless.apps.${system}.example.meta.mainProgram == "example";
 assert !(package.drvAttrs ? runtimeHook);
-assert !(accepts { shellHook = "echo obsolete"; });
 assert !(accepts { src = "/invalid/123"; });
 assert !(accepts { src = "/invalid/class"; });
 assert
