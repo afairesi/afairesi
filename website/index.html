@@ -211,6 +211,39 @@ nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></
             tunnel and its remote workspace session.
           </p>
           <p>The server listens on <code>127.0.0.1</code> and serves read-only inspection APIs.</p>
+          <h3>Terminal inspection</h3>
+          <p>
+            The <code>afairesi_tui</code> package opens your whole home workspace as an expandable
+            text tree with vim-style navigation. It uses the same direct registered submodules as
+            the GUI and groups them by directory, such as github.com / owner / repository. Discovery
+            stops at that one level of submodules. The view uses your terminal's colors, plain
+            names, and small fold markers, with no panels or key bar. Only the home root starts
+            expanded. Expand directories and repositories to browse branches, tracked modifications,
+            resources, descriptions, arguments, tests, and dependencies. Missing or unreadable
+            repositories remain visible with errors. Pass <code>--home</code> to select another home
+            Git repository.
+          </p>
+          <pre tabindex="0" aria-label="Open the terminal workspace"><code>nix run .#afairesi_tui
+nix run .#afairesi_tui -- --home /home/user
+nix run .#afairesi_tui -- --refresh
+nix run .#afairesi_tui -- diff
+nix run .#afairesi_tui -- diff --cached</code></pre>
+          <p>
+            Use <kbd>j</kbd>/<kbd>k</kbd> to move, <kbd>h</kbd>/<kbd>l</kbd> to collapse or expand,
+            <kbd>Space</kbd> to toggle a node, <kbd>g</kbd>/<kbd>G</kbd> to jump to the first or
+            last visible row, and <kbd>q</kbd> to quit. Arrow keys and Page Up/Down also work. Pan
+            long lines with <kbd>H</kbd>/<kbd>L</kbd> and reset with <kbd>0</kbd>. Use
+            <code>diff</code> for unstaged changes or <code>diff --cached</code> for staged changes.
+            Additions and removals appear as readable <code>+</code> and <code>-</code> rows.
+          </p>
+          <p>
+            Inspections and diffs are cached in <code>$XDG_CACHE_HOME/afairesi_tui</code>, or
+            <code>~/.cache/afairesi_tui</code> by default. Cached results are reused while HEAD, the
+            index, tracked file metadata, and the CLI version are unchanged. Branch and tracked
+            status are read fresh. Pass <code>--refresh</code> to rebuild cached results. Startup
+            reports progress and does not scan untracked files, inspect nested submodules, or
+            compute diffs unless requested. Slow commands time out after 30 seconds.
+          </p>
           <h3>Interface changes</h3>
           <p>
             Use <code>diff</code> to compare interfaces in the working tree, index, or Git
