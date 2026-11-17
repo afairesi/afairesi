@@ -3,19 +3,19 @@ let
   source = sources.${pkgs.stdenv.hostPlatform.system};
   sources = {
     aarch64-darwin = {
-      hash = "b1a530dab7ab28ce359948d7770534d56ac3b0bc39319bc9f9eb4f4931793a75";
+      hash = "568d148a70b9ce30333435ffc06a64bf79e7c529f913f00cb6afb60f7b2d5961";
       target = "aarch64-apple-darwin";
     };
     aarch64-linux = {
-      hash = "0b05019a9a1eab1088c78c31e6133059d3c2bab6c0ed60ce7034047ba8e459fb";
+      hash = "cbb5b32d4f0f5ec3a5a50ffdfc735003023132be19f5163c27ead679ac08f7cf";
       target = "aarch64-unknown-linux-gnu";
     };
     x86_64-darwin = {
-      hash = "651dccb592a0a739c37ef03fa8ab3cf792167a2f4a323b969d6bcc1264df2d05";
+      hash = "9866f45701bbd19e0983fc5538ef16fc9115d8044c402258619852f8c95f73e0";
       target = "x86_64-apple-darwin";
     };
     x86_64-linux = {
-      hash = "206d97279c55b9c0dbc33f5a0bf5a8dfc00a4d828ec4c7e3988e4c7d509cf27d";
+      hash = "67e89fcd7dd31273d8910944a0532ebb8b2aaa13cf7169849a39db862697e8b9";
       target = "x86_64-unknown-linux-gnu";
     };
   };
@@ -45,8 +45,8 @@ pkgs.stdenv.mkDerivation rec {
   sourceRoot = ".";
   src = pkgs.fetchurl {
     sha256 = source.hash;
-    url = "https://github.com/Goldziher/${pname}/releases/download/v${version}/${pname}-${source.target}.tar.gz";
+    url = "https://github.com/polylint/${pname}/releases/download/v${version}/${pname}-${source.target}.tar.gz";
   };
   strictDeps = true;
-  version = "3.10.4";
+  version = "3.12.1";
 }

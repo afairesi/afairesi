@@ -145,26 +145,29 @@ nix run github:afairesi/afairesi -- --help</code></pre>
           </p>
           <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi
 afairesi ../project</code></pre>
-          <h3>Local workspace</h3>
+          <h3>Repository inspection</h3>
           <p>
-            The <code>afairesi_gui</code> package opens a local browser workspace for the direct
+            The <code>afairesi_gui</code> package opens a local browser inspector for the direct
             submodules registered in your home Git repository. All registered repositories load on
             one canvas inside nested directory boxes, such as github.com / owner / repository,
             arranged horizontally on desktop. Scroll to zoom around the pointer and drag to pan.
-            Resource boxes show build, run, and test controls, with collapsible sections for
-            declared CLI arguments and readable test names. Dependency arrows connect resources
-            within each repository. Compact workspace controls and a resizable native Codex terminal
-            float over the full-screen canvas. Codex handles slash commands, file mentions,
-            approvals, and conversation history directly. The terminal starts in the configured home
-            directory; use <code>/cd</code> to switch directories and <code>@</code> to mention
-            files. Ask Codex pastes job output into its composer for you to review and send. Staged
-            and unstaged interface differences from <code>afairesi diff</code> appear directly on
-            resource blocks, descriptions, argument controls, tests, and dependency edges, with
-            green additions and red removals. Removed resources remain visible with disabled
-            controls. Diffs refresh every ten seconds and reuse cached results while HEAD, the
-            index, and tracked files remain unchanged. Dragging boxes and their text pans the
-            canvas; argument inputs remain editable. Edges point from dependencies to consumers and
-            describe source declarations, not the full evaluated Nix closure.
+            Resource boxes show descriptions, languages, and collapsible sections for CLI argument
+            metadata and readable test names. Argument names, defaults, types, choices, and
+            subcommands are read-only. Dependency arrows connect resources within each repository.
+            Each argument name heads its own group of indented properties. Press <kbd>/</kbd> to
+            focus Find a box. Click a box name to enter that directory in the inspector; click
+            outside the outermost box to go to its parent. The current path appears in the toolbar,
+            and the afairesi button returns to the home overview.
+          </p>
+          <p>
+            Staged and unstaged interface differences from <code>afairesi diff</code> appear
+            directly on resource blocks, descriptions, arguments, tests, and dependency edges, with
+            green additions and red removals. The <strong>Diff</strong> checkbox hides unchanged
+            content. Directory labels and compact dependency endpoints remain as context. It works
+            together with search. Diffs refresh every ten seconds and reuse cached results while
+            HEAD, the index, and tracked files remain unchanged. Edges describe source declarations
+            rather than the full evaluated Nix closure. The GUI inspects source without running
+            resource builds, programs, tests, or Nix capability checks.
           </p>
           <pre tabindex="0" aria-label="Open the local workspace"><code>nix run .#afairesi_gui
 nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
@@ -176,9 +179,9 @@ nix run .#afairesi_gui -- --no-open --port 8765</code></pre>
             using the same Git commit as the local release build and enabling the needed Nix
             features for the remote session. Nix fetches and builds the package as needed and reuses
             its store on subsequent launches; no remote profile installation is needed. Repository
-            discovery, builds, tests, diffs, and Codex run there; SSH forwards the loopback server
-            using your existing SSH configuration and authentication. The default home is the remote
-            user's home, and <code>--home</code> selects a remote path.
+            discovery and interface diffs run there; SSH forwards the loopback server using your
+            existing SSH configuration and authentication. The default home is the remote user's
+            home, and <code>--home</code> selects a remote path.
           </p>
           <pre tabindex="0" aria-label="Open a remote workspace"><code>afairesi_gui --ssh user@host
 nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></pre>
@@ -192,18 +195,7 @@ nix run .#afairesi_gui -- --ssh my-server --home /home/user --port 8766</code></
             free port and uses it on both ends. Keep the launcher running. Closing it stops the
             tunnel and its remote workspace session.
           </p>
-          <p>
-            The server listens on <code>127.0.0.1</code>. The GUI bundles Codex from the locked
-            Nixpkgs input, so it needs no separate installation. Codex starts automatically in the
-            bottom terminal and uses its existing account or native sign-in. Over SSH, an
-            unsigned-in session first runs <code>codex login --device-auth</code>; open its link
-            locally and enter the displayed code. Credentials stay managed by Codex on the workspace
-            machine. Pass <code>--codex /path/to/codex</code> to override the executable on that
-            machine. Refreshing or reconnecting the browser reattaches to the same running terminal
-            and replays its recent output. Native <code>/resume</code> restores saved Codex
-            conversations after a workspace restart. Closing the launcher stops its terminal and
-            running jobs.
-          </p>
+          <p>The server listens on <code>127.0.0.1</code> and serves read-only inspection APIs.</p>
           <h3>Interface changes</h3>
           <p>
             Use <code>diff</code> to compare interfaces in the working tree, index, or Git

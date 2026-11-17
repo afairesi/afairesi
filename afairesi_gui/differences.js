@@ -117,7 +117,6 @@ export function versionEntries(versions, read, identify) {
           entries.set(key, {
             key,
             value,
-            current: (read(versions.working) || []).some((item) => identify(item) === key),
             changes: differences(versions, (root) =>
               (read(root) || []).find((item) => identify(item) === key),
             ),
