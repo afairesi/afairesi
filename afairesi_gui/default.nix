@@ -7,6 +7,9 @@ inputs.self.lib.mkPythonPackage {
     pkgs.nix
     pkgs.nodejs
   ];
+  postFixup = ''
+    touch "$out/${pkgs.python3.sitePackages}/$pname/py.typed"
+  '';
   postPatch = ''
     substituteInPlace main.py \
       --replace-fail 'SOURCE_REVISION = ""' 'SOURCE_REVISION = "${inputs.self.rev or ""}"'

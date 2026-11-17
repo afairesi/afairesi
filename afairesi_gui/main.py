@@ -162,6 +162,10 @@ class Workspace:
         message = "Repository is not a direct registered home submodule."
         raise ValueError(message)
 
+    def snapshot(self) -> dict[str, Any]:
+        """Describe the home catalog for an inspection frontend."""
+        return {"home": str(self.home), "repositories": self.repositories()}
+
     def inspect(self, identifier: str) -> dict[str, Any]:
         """Attach Git state to the existing Afairesi resource report."""
         root = self.repository(identifier)
@@ -227,8 +231,15 @@ class Workspace:
         return interfaces
 
 
-def handler(workspace: Workspace) -> type[BaseHTTPRequestHandler]:  # noqa: C901 - Factory contains all HTTP methods.
+def handler(  # noqa: C901 - Factory contains all HTTP methods.
+    workspace: Workspace, *, assets: dict[str, Path] | None = None
+) -> type[BaseHTTPRequestHandler]:
     """Create an HTTP handler serving only explicit assets and local APIs."""
+    static = (
+        assets
+        if assets is not None
+        else {url: Path(__file__).parent / filename for url, filename in ASSETS.items()}
+    )
 
     class Handler(BaseHTTPRequestHandler):
         """Enforce loopback host and origin checks for the local inspector."""
@@ -293,8 +304,8 @@ def handler(workspace: Workspace) -> type[BaseHTTPRequestHandler]:  # noqa: C901
 
             def respond() -> None:
                 url = urlsplit(self.path)
-                if url.path in ASSETS:
-                    asset = Path(__file__).parent / ASSETS[url.path]
+                if url.path in static:
+                    asset = static[url.path]
                     mime = mimetypes.guess_type(asset.name)[0] or "text/plain"
                     self._send(
                         HTTPStatus.OK, asset.read_bytes(), f"{mime}; charset=utf-8"
@@ -302,10 +313,7 @@ def handler(workspace: Workspace) -> type[BaseHTTPRequestHandler]:  # noqa: C901
                     return
                 repository = parse_qs(url.query).get("repository", [""])[0]
                 if url.path == "/api/workspace":
-                    result = {
-                        "home": str(workspace.home),
-                        "repositories": workspace.repositories(),
-                    }
+                    result = workspace.snapshot()
                 elif url.path == "/api/repository":
                     result = workspace.inspect(repository)
                 elif url.path == "/api/diff":
