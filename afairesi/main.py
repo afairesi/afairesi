@@ -697,17 +697,17 @@ class _PythonNames:
 
         try:
             syntax = cst.parse_module(source)
-            self.module = ast.parse(syntax.code, filename=filename)
+            code = syntax.code
+            self.module = ast.parse(code, filename=filename)
         except (cst.ParserSyntaxError, SyntaxError, UnicodeError) as error:
             message = f"{filename}: could not parse Python source: {error}"
             raise CommandError(message) from error
-        encoded = syntax.code.encode("utf-8")
+        encoded = code.encode("utf-8")
         self.line_offsets = [
             0,
             *(match.end() for match in re.finditer(rb"\r\n?|\n", encoded)),
         ]
         wrapper = metadata.MetadataWrapper(syntax, unsafe_skip_copy=True)
-        qualified = wrapper.resolve(metadata.QualifiedNameProvider)
         spans = wrapper.resolve(metadata.ByteSpanPositionProvider)
         scopes = wrapper.resolve(metadata.ScopeProvider)
         self.references: dict[int, set[str]] = {}
@@ -716,8 +716,8 @@ class _PythonNames:
         for node, span in spans.items():
             if not isinstance(node, (cst.Name, cst.FunctionDef, cst.ClassDef)):
                 continue
-            raw = qualified.get(node, set())
-            qualified_names = raw() if callable(raw) else raw
+            scope = scopes.get(node)
+            qualified_names = scope.get_qualified_names_for(node) if scope else set()
             names = {name.name for name in qualified_names}
             if isinstance(node, cst.Name):
                 sources = {name.source for name in qualified_names}
@@ -834,6 +834,8 @@ class ArgumentDiscovery:
         self.classes: dict[str, ast.ClassDef] = {}
         self.calls: list[tuple[str, ast.Call]] = []
         self.controls: dict[int, ast.expr] = {}
+        self._parser_candidates: set[int] = set()
+        self._non_parser_candidates: set[int] = set()
         self._collect(self.names.module, "")
         scopes = self._public_scopes()
         if "main" not in self.functions:
@@ -1137,13 +1139,33 @@ class ArgumentDiscovery:
                     result[cast("str", _value(key))] = value
         return result
 
+    def _may_resolve_parser(self, node: ast.expr) -> bool:
+        """Exclude source graphs with no parser constructor, including cycles."""
+        pending = [node]
+        visited: set[int] = set()
+        while pending:
+            current = pending.pop()
+            key = id(current)
+            if key in visited or key in self._non_parser_candidates:
+                continue
+            if key in self._parser_candidates or (
+                isinstance(current, ast.Call)
+                and self._qualified(current.func) == "argparse.ArgumentParser"
+            ):
+                self._parser_candidates.add(id(node))
+                return True
+            visited.add(key)
+            pending.extend(self._sources(current))
+        self._non_parser_candidates.update(visited)
+        return False
+
     def _resolve(
         self,
         node: ast.expr,
         seen: frozenset[int] = frozenset(),
     ) -> set[tuple[str, ...]]:
         key = id(node)
-        if key in seen:
+        if key in seen or not self._may_resolve_parser(node):
             return set()
         seen = seen | {key}
         if isinstance(node, ast.Name):

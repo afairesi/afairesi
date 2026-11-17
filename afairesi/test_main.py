@@ -2307,6 +2307,55 @@ def main():
     )
 
 
+def test_inspect_bounds_resolution_of_recursive_non_parser_helpers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Inspect recursive helpers without enumerating every route through a cycle."""
+    calls = "    recurse(value)\n" * 12
+    discovery = inspection_subject.ArgumentDiscovery(
+        "import argparse\ndef recurse(value):\n" + calls + "    return value\n"
+        "def main():\n"
+        "    cli = argparse.ArgumentParser()\n"
+        "    recurse('unrelated')\n"
+        "    cli.add_argument('--public')\n"
+        "    cli.parse_args()\n",
+    )
+    original = discovery._bindings  # noqa: SLF001 - Bound graph traversal work without timing-dependent assertions.
+    visits = 0
+    limit = 2000
+
+    def bindings(node: ast.Name) -> list[ast.expr]:
+        nonlocal visits
+        visits += 1
+        _expect(visits <= limit, "repeated recursive binding traversal")
+        return cast("list[ast.expr]", original(node))
+
+    monkeypatch.setattr(discovery, "_bindings", bindings)
+    report = discovery.report()
+    _expect(
+        report == {"arguments": [{"names": ["--public"]}], "commands": {}},
+        report,
+    )
+
+
+def test_inspect_preserves_parsers_returned_through_recursive_helpers() -> None:
+    """Keep parser-bearing cycles reachable while excluding unrelated cycles."""
+    report = _inspection_discovery("""
+import argparse
+def forward(value):
+    forward(value)
+    return value
+def main():
+    cli = forward(argparse.ArgumentParser())
+    cli.add_argument('--public')
+    cli.parse_args()
+""")
+    _expect(
+        report == {"arguments": [{"names": ["--public"]}], "commands": {}},
+        report,
+    )
+
+
 @pytest.mark.parametrize(
     "source",
     [
