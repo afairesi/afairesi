@@ -300,6 +300,7 @@ let
           }
         )
       );
+      genericNames = system: packageNamesFor self packageSets.${system} "generic";
       hostsFor =
         system:
         lib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
@@ -317,7 +318,6 @@ let
           result // group
         ) { } groups;
       namesFor = system: pythonNames system ++ lean4Names system;
-      nixNames = system: packageNamesFor self packageSets.${system} "nix";
       packageNames = discover "default.nix";
       packageSets = lib.genAttrs systems (
         system:
@@ -353,7 +353,9 @@ let
         builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.py")) (pythonNames system);
       testedNixNames =
         system:
-        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.nix")) (nixNames system);
+        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.nix")) (
+          genericNames system
+        );
     in
     {
       apps = lib.genAttrs systems (
@@ -486,7 +488,7 @@ let
         let
           moduleNames = map (name: builtins.replaceStrings [ "-" ] [ "_" ] name) (
             builtins.attrNames (
-              lib.filterAttrs (_: package: (package.afairesiKind or "nix") == "python") packages
+              lib.filterAttrs (_: package: (package.afairesiKind or "generic") == "python") packages
             )
           );
           packages = supported system (
@@ -1013,7 +1015,7 @@ let
       pkgs.lib.filterAttrs (
         name: package:
         builtins.pathExists (self.outPath + "/${name}/default.nix")
-        && (package.afairesiKind or "nix") == kind
+        && (package.afairesiKind or "generic") == kind
       ) self.packages.${pkgs.stdenv.system}
     );
   pythonCheck =

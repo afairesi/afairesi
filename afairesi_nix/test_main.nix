@@ -117,6 +117,15 @@ assert builtins.attrNames consumer.formatter == builtins.attrNames consumer.pack
 assert consumer.checks.${system}.formatter == consumer.formatter.${system}.passthru.tests.check;
 assert consumer.checks.${system}.pkgs-example == package;
 assert consumer.checks.${system}.pkgs-native == consumer.packages.${system}.native;
+assert consumer.checks.${system}.pkgs-python_native == consumer.packages.${system}.python_native;
+assert consumer.checks.${system}.pkgs-rust-native == consumer.packages.${system}.rust-native;
+assert
+  consumer.checks.${system}.pkgs-python_native-contract
+  == consumer.packages.${system}.python_native.passthru.tests.contract;
+assert !(consumer.packages.${system}.python_native ? afairesiKind);
+assert !(consumer.packages.${system}.rust-native ? afairesiKind);
+assert !(consumer.devShells.${system} ? python_native-test);
+assert !(consumer.devShells.${system} ? rust-native-test);
 assert
   consumer.checks.${system}.pkgs-native-contract
   == consumer.packages.${system}.native.passthru.tests.contract;
@@ -172,6 +181,8 @@ pkgs.runCommand "afairesi-consumer-contract"
       consumer.checks.${system}.example
       consumer.checks.${system}.pkgs-native
       consumer.checks.${system}.pkgs-native-contract
+      consumer.checks.${system}.pkgs-python_native-contract
+      consumer.checks.${system}.pkgs-rust-native
       consumer.checks.${system}.nix-library
       consumer.checks.${system}.nix-tests
       consumer.checks.${system}.lean-example
@@ -185,6 +196,7 @@ pkgs.runCommand "afairesi-consumer-contract"
     head -c 5 ${latexPackage}/ms.pdf | grep -F '%PDF-'
     cmp ${package.src}/ms.tex ${package}/${package.python.sitePackages}/example/ms.tex
     test "$(cat ${consumer.packages.${system}.nix-untested})" = untested
+    test "$(${pkgs.lib.getExe consumer.packages.${system}.rust-native})" = 42
     unset AFAIRESI_CONSUMER_HOOK
     expected=$(printf '%s\n' loaded "['two words', '--flag']")
     actual=$(${consumer.apps.${system}.example.program} 'two words' --flag)

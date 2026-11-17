@@ -110,7 +110,7 @@ inputs.afairesi.lib.mkPythonPackage {
                   <td><code>ms.tex</code></td>
                 </tr>
                 <tr>
-                  <th scope="row">Nix</th>
+                  <th scope="row">Generic</th>
                   <td>Any derivation</td>
                   <td><code>default.nix</code></td>
                 </tr>
@@ -118,9 +118,21 @@ inputs.afairesi.lib.mkPythonPackage {
             </table>
           </div>
           <p>
+            The builder in <code>default.nix</code> selects the package conventions. Use
+            <code>mkPythonPackage</code> or <code>mkLean4Package</code> for Afairesi's source layout
+            and automatic test environments. Other builders, including Nixpkgs'
+            <code>buildPythonPackage</code>, <code>buildRustPackage</code>, and Haskell builders,
+            keep their own source layouts. Supporting filenames such as <code>main.py</code> do not
+            select Afairesi conventions, and directories without a tracked
+            <code>default.nix</code> are not packages.
+          </p>
+          <p>
             Optional <code>test_main.py</code>, <code>test_main.lean</code>, and
-            <code>test_main.nix</code> files provide package checks. Python and Lean packages also
-            get a <code>&lt;name&gt;-test</code> development shell.
+            <code>test_main.nix</code> files provide checks for Afairesi Python, Afairesi Lean, and
+            generic packages respectively. Package builds and declared
+            <code>passthru.tests</code> also participate in checks. Afairesi Python and Lean
+            packages get a <code>&lt;name&gt;-test</code> development shell. Repository-wide
+            formatting and linting apply across package kinds.
           </p>
           <pre tabindex="0" aria-label="Nix repository commands"><code>nix flake lock
 nix fmt
@@ -140,8 +152,11 @@ nix run github:afairesi/afairesi -- --help</code></pre>
           <h3><code>afairesi</code></h3>
           <p>
             Read package metadata, CLI arguments, and test identifiers as JSON. Inspection reads
-            source without executing it. Pass a local repository path or Git URL as the optional
-            argument; omitting it selects the current repository.
+            source without executing it. It recognizes Afairesi builders and resolvable aliases;
+            standard builders and unresolved expressions have type <code>generic</code>. Detailed
+            CLI arguments and test identifiers are available for recognized Afairesi Python
+            packages. Pass a local repository path or Git URL as the optional argument; omitting it
+            selects the current repository.
           </p>
           <pre tabindex="0" aria-label="Repository inspection commands"><code>afairesi
 afairesi ../project</code></pre>

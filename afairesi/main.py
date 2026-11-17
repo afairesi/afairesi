@@ -29,13 +29,6 @@ if TYPE_CHECKING:
     from typing import Never
 
     from tree_sitter import Node
-KIND_MARKERS = {
-    "html": "index.html",
-    "latex": "ms.tex",
-    "lean4": "main.lean",
-    "nix": "main.nix",
-    "python": "main.py",
-}
 PACKAGE_BUILDERS = {
     "html": "mkHtmlPackage",
     "latex": "mkLatexPackage",
@@ -154,8 +147,8 @@ def source_paths(root: Path) -> set[Path]:
     return paths
 
 
-def _package_kind(name: str, markers: set[str], definition: str | None) -> str:
-    """Use recognizable builders or source markers without evaluating Nix."""
+def _package_kind(definition: str | None) -> str:
+    """Select conventions only from recognizable builders without evaluating Nix."""
     if definition:
         with contextlib.suppress(nix_syntax.NixSyntaxError):
             document = nix_syntax.parse(definition)
@@ -166,13 +159,7 @@ def _package_kind(name: str, markers: set[str], definition: str | None) -> str:
                 for kind, builder in PACKAGE_BUILDERS.items():
                     if constructor == builder:
                         return kind
-    matches = [kind for kind, marker in KIND_MARKERS.items() if marker in markers]
-    if len(matches) > 1:
-        if definition is not None:
-            return "nix"
-        msg = f"{name}: has ambiguous project markers: {', '.join(matches)}"
-        raise CommandError(msg)
-    return matches[0] if matches else "nix"
+    return "generic"
 
 
 def resource_directories(root: Path, paths: set[Path]) -> list[Path]:
@@ -198,27 +185,17 @@ def detect_hosts(root: Path, paths: set[Path]) -> list[Path]:
 
 
 def detect_packages(root: Path, paths: set[Path] | None = None) -> list[Package]:
-    """Detect declared packages, falling back to unambiguous entrypoint files."""
+    """Detect packages declared by tracked default.nix files."""
     result: list[Package] = []
     paths = source_paths(root) if paths is None else paths
     for package_root in resource_directories(root, paths):
-        markers = {
-            marker
-            for marker in KIND_MARKERS.values()
-            if Path(package_root.name) / marker in paths
-            and (package_root / marker).is_file()
-        }
         definition = Path(package_root.name) / "default.nix"
-        if not markers and definition not in paths:
+        if definition not in paths:
             continue
         result.append(
             Package(
                 package_root.name,
-                _package_kind(
-                    package_root.name,
-                    markers,
-                    read_regular(root / definition) if definition in paths else None,
-                ),
+                _package_kind(read_regular(root / definition)),
                 package_root,
             ),
         )
@@ -270,7 +247,7 @@ def package_files(package: Package) -> set[Path]:
         "html": {"index.html"},
         "latex": {"ms.tex"},
         "lean4": {"main.lean", "test_main.lean"},
-        "nix": {"main.nix", "test_main.nix"},
+        "generic": {"main.nix", "test_main.nix"},
     }[package.kind]
     return {relative / "default.nix", *(relative / item for item in kind_files)}
 
@@ -281,7 +258,7 @@ def required_package_files(package: Package) -> set[Path]:
         "html": set(),
         "latex": set(),
         "lean4": {"test_main.lean"},
-        "nix": {"main.nix", "test_main.nix"},
+        "generic": {"main.nix", "test_main.nix"},
         "python": {"test_main.py"},
     }[package.kind]
     return {path for path in package_files(package) if path.name not in optional}
@@ -633,7 +610,7 @@ def validate_flake_source(root: Path) -> None:
         raise CommandError(msg)
     for package in packages:
         for relative in sorted(package_files(package) & paths):
-            if relative.name == "default.nix" or package.kind == "nix":
+            if relative.suffix == ".nix":
                 source = root / relative
                 if source.is_file():
                     nix_syntax.parse(source.read_bytes(), str(source))
@@ -1823,7 +1800,7 @@ def inspect_repository(root: Path) -> dict[str, Any]:
             and Path(package.name) / "test_main.lean" in paths
             and (package.root / "test_main.lean").is_file()
             else ["test_main.nix"]
-            if package.kind == "nix"
+            if package.kind == "generic"
             and Path(package.name) / "test_main.nix" in paths
             and (package.root / "test_main.nix").is_file()
             else []

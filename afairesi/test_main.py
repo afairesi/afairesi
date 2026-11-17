@@ -174,7 +174,10 @@ def _make_source_package(root: Path, name: str, source: str) -> Path:
     package = root / name
     package.mkdir(parents=True)
     (root / "flake.nix").touch()
-    (package / "default.nix").touch()
+    (package / "default.nix").write_text(
+        "{ inputs, pkgs, ... }: inputs.self.lib.mkPythonPackage { "
+        "inherit pkgs; src = ./.; executable = true; }\n",
+    )
     (package / "main.py").touch()
     _write_fixture_source(package / "test_main.py", source)
     if (root / ".git").exists():
@@ -215,7 +218,7 @@ def _fixture_add(
             )
         },
         "lean4": {"main.lean": "def main : IO Unit := pure ()\n"},
-        "nix": {},
+        "generic": {},
     }[kind]
     if kind != "host":
         builder = {
@@ -223,11 +226,11 @@ def _fixture_add(
             "html": "inputs.self.lib.mkHtmlPackage",
             "latex": "inputs.self.lib.mkLatexPackage",
             "lean4": "inputs.self.lib.mkLean4Package",
-            "nix": "pkgs.writeTextFile",
+            "generic": "pkgs.writeTextFile",
         }[kind]
         settings = (
             '  name = baseNameOf ./.;\n  text = "";\n'
-            if kind == "nix"
+            if kind == "generic"
             else "  inherit pkgs;\n  src = ./.;\n"
         )
         if kind in {"python", "lean4"}:
@@ -486,7 +489,7 @@ def test_inspect_finds_nix_optional_sources_after_git_move(
 ) -> None:
     """Keep all four optional-file combinations without evaluating Nix source."""
     with _fresh_repository() as root:
-        _fixture_add(root, "example", "nix")
+        _fixture_add(root, "example", "generic")
         files = {"default.nix": (root / "example/default.nix").read_text()}
         for name, enabled in (("main.nix", implementation), ("test_main.nix", tests)):
             if enabled:
@@ -504,7 +507,7 @@ def test_inspect_finds_nix_optional_sources_after_git_move(
             "optional Nix sources were not tracked",
         )
         report = json.loads(_run(root).stdout)["renamed"]
-        _expect(report["type"] == "nix", report)
+        _expect(report["type"] == "generic", report)
         _expect(report.get("tests", []) == (["test_main.nix"] if tests else []), report)
 
 
@@ -512,7 +515,7 @@ def test_inspect_finds_nix_optional_sources_after_git_move(
 def test_nix_optional_sources_are_syntax_checked(filename: str) -> None:
     """Reject malformed optional Nix files during source validation."""
     with _fresh_repository() as root:
-        _fixture_add(root, "example", "nix")
+        _fixture_add(root, "example", "generic")
         _write_fixture_source(root / "example" / filename, "{ invalid = ; }\n")
         result = _check_flake_source(root, code=1)
         _expect(f"example/{filename}:" in result.stderr, result)
@@ -600,6 +603,12 @@ def test_declared_package_kind_allows_supporting_entrypoint_names(
 ) -> None:
     """Keep the declared build kind when supporting files resemble entrypoints."""
     subject = import_module("afairesi.main")
+    markers = {
+        "html": "index.html",
+        "latex": "ms.tex",
+        "lean4": "main.lean",
+        "python": "main.py",
+    }
     with _fresh_repository() as root:
         _fixture_add(root, "example", kind)
         package = root / "example"
@@ -613,33 +622,34 @@ def test_declared_package_kind_allows_supporting_entrypoint_names(
                 1,
             ),
         )
-        for marker in subject.KIND_MARKERS.values():
+        for marker in (*markers.values(), "main.nix"):
             if not (package / marker).exists():
                 _write_fixture_source(package / marker, "")
         _git(root, "add", "--force", "example")
         report = subject.inspect_repository(root)
         _expect(report["example"]["type"] == kind, report)
         _check_flake_source(root)
-        (package / subject.KIND_MARKERS[kind]).unlink()
+        (package / markers[kind]).unlink()
         _expect(subject.detect_packages(root)[0].kind == kind, "lost declared kind")
         rejected = _check_flake_source(root, code=1)
-        _expect(subject.KIND_MARKERS[kind] in rejected.stderr, rejected)
+        _expect(markers[kind] in rejected.stderr, rejected)
 
 
-def test_untracked_definition_does_not_resolve_ambiguous_sources() -> None:
-    """Use only selected source when choosing among multiple entrypoint files."""
+def test_untracked_definition_does_not_discover_supporting_sources() -> None:
+    """Require a tracked package declaration regardless of supporting filenames."""
     with _fresh_repository() as root:
         _fixture_add(root, "example", "python")
         _write_fixture_source(root / "example/ms.tex", "")
         _git(root, "add", "--force", "example/ms.tex")
         _git(root, "rm", "--cached", "example/default.nix")
         before = _snapshot(root)
-        rejected = _check_flake_source(root, code=1)
-        _expect("ambiguous project markers" in rejected.stderr, rejected)
+        _check_flake_source(root)
+        report = json.loads(_run(root).stdout)
+        _expect(report == {}, report)
         _expect(_snapshot(root) == before, "untracked definition changed state")
 
 
-@pytest.mark.parametrize("kind", ["html", "latex", "lean4", "nix"])
+@pytest.mark.parametrize("kind", ["html", "latex", "lean4", "generic"])
 def test_inspect_selects_tests_by_package_kind(kind: str) -> None:
     """Supporting Python files never replace another package kind's test report."""
     with _fresh_repository() as root:
@@ -649,7 +659,9 @@ def test_inspect_selects_tests_by_package_kind(kind: str) -> None:
         _write_fixture_source(package / "test_main.lean", "example : 1 = 1 := rfl\n")
         _write_fixture_source(package / "test_main.nix", "{}\n")
         report = json.loads(_run(root).stdout)["example"]
-        expected = {"lean4": ["test_main.lean"], "nix": ["test_main.nix"]}.get(kind, [])
+        expected = {"lean4": ["test_main.lean"], "generic": ["test_main.nix"]}.get(
+            kind, []
+        )
         _expect(report.get("tests", []) == expected, report)
 
 
@@ -697,7 +709,7 @@ def test_source_validation_respects_excluded_trees() -> None:
         ("html", "web-site", "Δ report", False),
         ("html", "Web.Site+v2", "Versioned site", False),
         ("latex", "my-document", "LaTeX\tresources", False),
-        ("nix", "my-package", "é", False),
+        ("generic", "my-package", "é", False),
         ("python", "a", "x", False),
     ],
 )
@@ -1041,20 +1053,64 @@ def test_source_validation_rejects_malformed_nix(relative: str) -> None:
         _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
-def test_opaque_package_definitions_allow_supporting_language_markers() -> None:
-    """Keep opaque definitions generic when source markers cannot identify a kind."""
+@pytest.mark.parametrize(
+    "builder",
+    [
+        "pkgs.python3Packages.buildPythonPackage",
+        "pkgs.rustPlatform.buildRustPackage",
+        'pkgs.haskellPackages.callCabal2nix "example" ./.',
+        "import ./builder.nix",
+    ],
+)
+@pytest.mark.parametrize("extra_markers", [False, True])
+def test_generic_builders_do_not_inherit_language_conventions(
+    builder: str,
+    *,
+    extra_markers: bool,
+) -> None:
+    """Keep native and opaque builders generic regardless of supporting sources."""
     with _fresh_repository() as root:
-        _fixture_add(root, "example", "python")
-        (root / "example/default.nix").write_text(
-            "{ inputs, pkgs, ... }: import ./builder.nix { inherit inputs pkgs; }\n",
-        )
-        _write_fixture_source(root / "example/ms.tex", "Supporting LaTeX")
+        for name in ("class", "dash-name", "dash_name"):
+            _fixture_add(root, name, "generic")
+            package = root / name
+            (package / "default.nix").write_text(
+                f"{{ inputs, pkgs, ... }}: {builder} {{ "
+                'meta.description = "Generic package"; }\n',
+            )
+            (package / "__init__.py").write_text("VALUE = 42\n")
+            (package / "main.py").write_text("not valid Python!\n")
+            (package / "test_main.py").write_text("not valid Python tests!\n")
+            if extra_markers:
+                for marker in ("main.lean", "ms.tex", "index.html"):
+                    (package / marker).write_text("Supporting source\n")
         _git(root, "add", ".")
         before = _snapshot(root)
         _check_flake_source(root)
-        _expect(_snapshot(root) == before, "opaque definition was rewritten")
-        subject = import_module("afairesi.main")
-        _expect(subject.detect_packages(root)[0].kind == "nix", "guessed a language")
+        report = json.loads(_run(root).stdout)
+        _expect(
+            report
+            == {
+                name: {"type": "generic", "description": "Generic package"}
+                for name in ("class", "dash-name", "dash_name")
+            },
+            report,
+        )
+        _expect(_snapshot(root) == before, "generic packages were rewritten")
+
+
+def test_native_package_fixtures_are_inspected_as_generic(tmp_path: Path) -> None:
+    """Inspect real native Python and Rust packages without assuming entrypoints."""
+    _repository(tmp_path)
+    for name in ("python_native", "rust-native"):
+        shutil.copytree(_nix_source() / "fixtures" / name, tmp_path / name)
+    _git(tmp_path, "add", ".")
+    _check_flake_source(tmp_path)
+    report = json.loads(_run(tmp_path).stdout)
+    _expect(set(report) == {"python_native", "rust-native"}, report)
+    for package in report.values():
+        _expect(package["type"] == "generic", package)
+        _expect("cli" not in package and "tests" not in package, package)
+        _expect(bool(package.get("description")), package)
 
 
 def test_source_inspection_handles_deep_unrelated_calls(tmp_path: Path) -> None:
@@ -1144,8 +1200,8 @@ def test_static_test_names_match_native_collection(tmp_path: Path, source: str) 
         ("html", "Web.Site+v2"),
         ("latex", "Report.v2"),
         ("lean4", "Proof_Library-v2"),
-        ("nix", "Package Name"),
-        ("nix", "δοκιμή"),
+        ("generic", "Package Name"),
+        ("generic", "δοκιμή"),
         ("host", "workLaptop"),
     ],
 )
@@ -1164,7 +1220,7 @@ def test_resource_names_have_no_spelling_convention(kind: str, name: str) -> Non
 def test_nix_optional_sources_are_formatted(filename: str) -> None:
     """Apply the same formatting to entry files and nested supporting Nix files."""
     with _fresh_repository() as root:
-        _fixture_add(root, "example", "nix")
+        _fixture_add(root, "example", "generic")
         source = root / "example" / filename
         original = "{z=2;a=1;}\n"
         _write_fixture_source(source, original)
@@ -1332,7 +1388,7 @@ def test_formatting_normalizes_metadata_and_supporting_sources() -> None:
             "flake.lock": "{\n\n}\n",
         }
         for name in ("prm", "tmp"):
-            _fixture_add(root, name, "nix")
+            _fixture_add(root, name, "generic")
             _write_fixture_source(root / name / "main.nix", "{z=2;a=1;}\n")
         for name, source in metadata.items():
             (root / name).write_text(source)
@@ -1614,7 +1670,7 @@ def test_inspect_reports_package_descriptions_without_dependency_metadata(
         f'in pkgs.runCommand "example" {{ {metadata} }} "touch $out"'
     )
     (tmp_path / "default.nix").write_text(source)
-    package = inspection_subject.Package("example", "nix", tmp_path)
+    package = inspection_subject.Package("example", "generic", tmp_path)
     _expect(
         inspection_subject.package_description(package) == description,
         source,
@@ -2603,7 +2659,12 @@ def _inspection_repository(root: Path) -> None:
     (root / "flake.nix").touch()
     package = root / "example"
     package.mkdir(parents=True)
-    _write_fixture_source(package / "default.nix", '{ meta.description = "Example"; }')
+    _write_fixture_source(
+        package / "default.nix",
+        "{ inputs, pkgs, ... }: inputs.self.lib.mkPythonPackage { "
+        "inherit pkgs; src = ./.; executable = true; "
+        'meta.description = "Example"; }',
+    )
     _write_fixture_source(
         package / "main.py",
         """
@@ -2678,7 +2739,7 @@ def test_inspect_is_read_only(tmp_path: Path) -> None:
         "wrong hosts",
     )
     _expect(
-        report["library"] == {"type": "nix"},
+        report["library"] == {"type": "generic"},
         "empty optional fields leaked into the package inventory",
     )
     _expect(report["example"]["tests"] == ["test_default_output"], report)
@@ -3461,7 +3522,7 @@ def test_inspect_reports_public_commands() -> None:
     )
 
 
-@pytest.mark.parametrize("kind", ["python", "nix", "lean4"])
+@pytest.mark.parametrize("kind", ["python", "generic", "lean4"])
 def test_source_validation_ignores_local_packages_and_optional_tests(
     tmp_path: Path,
     kind: str,
@@ -3471,7 +3532,7 @@ def test_source_validation_ignores_local_packages_and_optional_tests(
     root.mkdir()
     _repository(root)
     _fixture_add(root, "example", kind)
-    extension = {"python": "py", "nix": "nix", "lean4": "lean"}[kind]
+    extension = {"python": "py", "generic": "nix", "lean4": "lean"}[kind]
     tests = f"example/test_main.{extension}"
     (root / tests).write_bytes(b"def broken(:")
     local = root / "experiments"
