@@ -19,8 +19,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from afairesi_gui import Workspace, command, git, interface_fingerprint
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
@@ -34,6 +32,101 @@ READ_ERRORS = (
     ValueError,
     subprocess.SubprocessError,
 )
+
+
+def command(arguments: list[str], root: Path, *, input_text: str | None = None) -> str:
+    """Read a command result without a shell or optional Git index writes."""
+    result = subprocess.run(  # noqa: S603 - Argument vectors are constructed here, never shell source.
+        arguments,
+        cwd=root,
+        capture_output=True,
+        text=True,
+        input=input_text,
+        check=False,
+        timeout=30,
+        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
+    )
+    if result.returncode:
+        raise ValueError(result.stderr.strip() or "Command failed")
+    return result.stdout
+
+
+def git(root: Path, *arguments: str) -> str:
+    """Read Git data in the selected working tree."""
+    return command(["git", *arguments], root)
+
+
+def interface_fingerprint(root: Path) -> str:
+    """Track HEAD, index entries, and source metadata without inspecting sources."""
+    entries = git(root, "ls-files", "--stage", "-z")
+    digest = hashlib.sha256()
+    digest.update(git(root, "rev-parse", "--revs-only", "HEAD").encode())
+    digest.update(entries.encode())
+    paths: set[Path] = set()
+    for entry in entries.split("\0"):
+        if not entry:
+            continue
+        metadata, relative = entry.split("\t", 1)
+        if metadata.startswith("160000 "):
+            continue
+        path = Path(relative)
+        paths.update((path, *path.parents))
+    for tracked in sorted(paths):
+        digest.update(str(tracked).encode())
+        try:
+            stat = (root / tracked).lstat()
+            digest.update(
+                repr(
+                    (
+                        stat.st_dev,
+                        stat.st_ino,
+                        stat.st_mode,
+                        stat.st_size,
+                        stat.st_mtime_ns,
+                        stat.st_ctime_ns,
+                    )
+                ).encode()
+            )
+        except (FileNotFoundError, NotADirectoryError):
+            digest.update(b"missing")
+    return digest.hexdigest()
+
+
+def repositories(home: Path) -> list[dict[str, Any]]:
+    """Join .gitmodules paths with gitlinks in the current home index."""
+    root = git(home, "rev-parse", "--show-toplevel").strip()
+    if Path(root).resolve() != home:
+        message = "The selected home must be a Git repository root."
+        raise ValueError(message)
+    modules = home / ".gitmodules"
+    if not modules.is_file():
+        return []
+    configured = git(home, "config", "--null", "--file", str(modules), "--list")
+    paths = {
+        entry.partition("\n")[2]
+        for entry in configured.split("\0")
+        if entry.partition("\n")[0].startswith("submodule.")
+        and entry.partition("\n")[0].endswith(".path")
+    }
+    result = []
+    for entry in git(home, "ls-files", "--stage", "-z").split("\0"):
+        if not entry:
+            continue
+        metadata, path = entry.split("\t", 1)
+        mode, _revision, stage = metadata.split()
+        if mode != "160000" or stage != "0" or path not in paths:
+            continue
+        location = (home / path).resolve()
+        if not location.is_relative_to(home) or location == home:
+            continue
+        initialized = (location / ".git").exists()
+        result.append(
+            {
+                "id": path,
+                "initialized": initialized,
+            }
+        )
+    return sorted(result, key=lambda item: item["id"])
 
 
 def fingerprint(root: Path) -> str:
@@ -165,15 +258,15 @@ def snapshot(
     cache: Path | None = None,
     refresh: bool = False,
 ) -> dict[str, Any]:
-    """Nest the GUI's direct registered submodules beneath their home directories."""
-    workspace = Workspace(home.expanduser())
-    entries = workspace.repositories()
+    """Nest direct registered submodules beneath their home directories."""
+    home = home.expanduser().resolve()
+    entries = repositories(home)
     compact_progress = progress and sys.stderr.isatty()
     if progress:
         sys.stderr.write(
             f"Reading 0/{len(entries)} repositories…"
             if compact_progress
-            else f"Reading {len(entries)} direct submodules of {workspace.home}…\n"
+            else f"Reading {len(entries)} direct submodules of {home}…\n"
         )
         sys.stderr.flush()
     reports = {}
@@ -182,7 +275,7 @@ def snapshot(
         futures = [
             pool.submit(
                 repository_report,
-                workspace.home,
+                home,
                 entry,
                 comparison=comparison,
                 cache=cache,
@@ -212,7 +305,7 @@ def snapshot(
         for directory in parts[:-1]:
             parent = parent.setdefault(directory, {})
         parent[parts[-1]] = report
-    return {str(workspace.home): tree}
+    return {str(home): tree}
 
 
 @dataclass(eq=False)
@@ -363,6 +456,21 @@ class Viewer:
                 return True
         return False
 
+    def handle_search(self, key: str | int, query: str) -> tuple[str | None, str]:
+        """Edit or finish the search query and return its status message."""
+        if key in ("\n", "\r", curses.KEY_ENTER):
+            message = (
+                f"No match for {query}" if query and not self.search(query) else ""
+            )
+            return None, message
+        if key == "\x1b":
+            return None, ""
+        if key in ("\b", "\x7f", curses.KEY_BACKSPACE):
+            return query[:-1], ""
+        if isinstance(key, str) and key.isprintable():
+            query += key
+        return query, ""
+
     def handle(self, key: str | int, height: int) -> bool:
         """Apply vim or arrow navigation; return false when the user quits."""
         rows = list(self.root.visible())
@@ -486,16 +594,7 @@ def browse(
         key = screen.get_wch()
         message = ""
         if query is not None:
-            if key in ("\n", "\r", curses.KEY_ENTER):
-                if query and not viewer.search(query):
-                    message = f"No match for {query}"
-                query = None
-            elif key == "\x1b":
-                query = None
-            elif key in ("\b", "\x7f", curses.KEY_BACKSPACE):
-                query = query[:-1]
-            elif isinstance(key, str) and key.isprintable():
-                query += key
+            query, message = viewer.handle_search(key, query)
         elif key == "/":
             query = ""
         elif key == "d":

@@ -4,7 +4,9 @@ inputs.self.lib.mkPythonPackage {
   executable = true;
   meta.description = "Browse home repositories and interface diffs in a cached, expandable terminal tree.";
   propagatedBuildInputs = [
-    inputs.self.packages.${pkgs.stdenv.system}.afairesi_gui
+    inputs.self.packages.${pkgs.stdenv.system}.afairesi
+    pkgs.git
+    pkgs.jd-diff-patch
   ];
   src = ./.;
 }

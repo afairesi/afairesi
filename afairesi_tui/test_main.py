@@ -10,7 +10,6 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-import afairesi_gui
 import afairesi_tui.main as subject
 
 if TYPE_CHECKING:
@@ -126,7 +125,6 @@ def test_home_snapshot_groups_all_registered_repositories_without_writes(
         return original(arguments, root, input_text=input_text)
 
     monkeypatch.setattr(subject, "command", counted)
-    monkeypatch.setattr(afairesi_gui, "command", counted)
     first = home / "github.com/owner/project"
     paths = [home / ".git/index", first / ".git/index", first / "example/default.nix"]
     before = [path.read_bytes() for path in paths]
