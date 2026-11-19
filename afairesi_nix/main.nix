@@ -171,6 +171,23 @@ let
             );
             enable = true;
           };
+          shellcheck = {
+            enable = true;
+            package = pkgs.writeShellApplication {
+              name = "shellcheck";
+              runtimeInputs = [ pkgs.shellcheck ];
+              text = ''
+                for file in "$@"; do
+                  IFS= read -r -n 2 prefix < "$file" || true
+                  config=--norc
+                  if [[ $prefix != '#!' ]]; then
+                    config=--rcfile=${pkgs.writeText "shellcheckrc" "shell=bash\n"}
+                  fi
+                  shellcheck "$config" -- "$file"
+                done
+              '';
+            };
+          };
           yamllint = {
             enable = true;
             settings.extends = "default";
@@ -230,6 +247,26 @@ let
               '';
             };
             includes = [ "*.nix" ];
+          };
+          tflint = {
+            command = pkgs.writeShellApplication {
+              name = "tflint-check";
+              runtimeInputs = [
+                pkgs.coreutils
+                pkgs.tflint
+              ];
+              text = ''
+                declare -A checked
+                for file in "$@"; do
+                  directory=$(dirname -- "$file")
+                  if [[ ! -v 'checked[$directory]' ]]; then
+                    tflint --chdir="$directory" --config=/dev/null --call-module-type=none
+                    checked[$directory]=1
+                  fi
+                done
+              '';
+            };
+            includes = [ "*.tf" ];
           };
         }
         // pkgs.lib.genAttrs' pythonPackageNames (name: {
