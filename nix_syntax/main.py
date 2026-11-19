@@ -1,6 +1,7 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Shared, lossless-enough Nix parsing and rewriting helpers."""
+
+# ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
 from __future__ import annotations
 

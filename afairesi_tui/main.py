@@ -18,8 +18,9 @@ import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from afairesi import CommandError, cache_home, diff_inputs
 
@@ -29,6 +30,7 @@ if TYPE_CHECKING:
 CACHE_VERSION = 2
 XTERM_ORANGE = 208
 Payload = dict[str, Any] | list[dict[str, Any]]
+type View = Literal["resources", "diff"]
 
 READ_ERRORS = (CommandError, OSError, ValueError, subprocess.SubprocessError)
 
@@ -55,11 +57,11 @@ def git(root: Path, *arguments: str) -> str:
     return command(["git", *arguments], root)
 
 
-def fingerprint(root: Path, comparison: str | None = None) -> str | None:
+def fingerprint(root: Path, view: View) -> str | None:
     """Track each view's inputs, bypassing diffs with independently staged links."""
     entries = git(root, "ls-files", "--stage", "-z")
     digest = hashlib.sha256()
-    if comparison:
+    if view == "diff":
         files = diff_inputs(root, entries)
         if any(mode == "120000" for mode, _, _ in files):
             return None
@@ -67,7 +69,6 @@ def fingerprint(root: Path, comparison: str | None = None) -> str | None:
         for mode, oid, path in files:
             digest.update(f"{mode} {oid}\t{path}\0".encode())
     else:
-        digest.update(git(root, "rev-parse", "--revs-only", "HEAD").encode())
         digest.update(entries.encode())
         paths = {
             Path(entry.split("\t", 1)[1])
@@ -84,7 +85,7 @@ def fingerprint(root: Path, comparison: str | None = None) -> str | None:
             digest.update(b"missing")
             continue
         stats = [entry_stat]
-        if comparison and stat.S_ISDIR(entry_stat.st_mode):
+        if view == "diff" and stat.S_ISDIR(entry_stat.st_mode):
             digest.update(
                 repr(
                     (entry_stat.st_dev, entry_stat.st_ino, entry_stat.st_mode)
@@ -143,43 +144,46 @@ def repositories(home: Path) -> list[str]:
     return sorted(result)
 
 
-def read_output(root: Path, comparison: str | None) -> Payload:
+def read_output(root: Path, view: View) -> Payload:
     """Read only the requested CLI result; errors are never cached."""
-    if comparison is None:
-        resources: dict[str, Any] = json.loads(command(["afairesi"], root))
+    commands = {"resources": ["afairesi"], "diff": ["afairesi", "diff"]}
+    output = command(commands[view], root)
+    if view == "resources":
+        resources: dict[str, Any] = json.loads(output)
         return resources
-    difference = command(["afairesi", "diff"], root)
     patch: list[dict[str, Any]] = (
-        json.loads(command(["jd", "-t", "jd2patch"], root, input_text=difference))
-        if difference
+        json.loads(command(["jd", "-t", "jd2patch"], root, input_text=output))
+        if output
         else []
     )
     return patch
 
 
 def cached_output(
-    root: Path, comparison: str | None, cache: Path, *, refresh: bool
+    root: Path, view: View, cache: Path, *, refresh: bool
 ) -> tuple[Payload, bool]:
     """Reuse a stable CLI result, with atomic writes and disposable cache failures."""
     tools = [
         str(Path(shutil.which(name) or name).resolve()) for name in ("afairesi", "jd")
     ]
     key = hashlib.sha256(
-        json.dumps([CACHE_VERSION, str(root), comparison, tools]).encode()
+        json.dumps([CACHE_VERSION, str(root), view, tools]).encode()
     ).hexdigest()
     path = cache / f"{key}.json"
-    before = fingerprint(root, comparison)
+    before = fingerprint(root, view)
     if before is not None and not refresh:
         with contextlib.suppress(OSError, ValueError):
             saved = json.loads(path.read_text(encoding="utf-8"))
             if (
                 isinstance(saved, dict)
                 and saved.get("fingerprint") == before
-                and isinstance(saved.get("value"), dict if comparison is None else list)
+                and isinstance(
+                    saved.get("value"), dict if view == "resources" else list
+                )
             ):
                 return saved["value"], True
-    value = read_output(root, comparison)
-    if before is not None and fingerprint(root, comparison) == before:
+    value = read_output(root, view)
+    if before is not None and fingerprint(root, view) == before:
         with contextlib.suppress(OSError):
             cache.mkdir(mode=0o700, parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -199,7 +203,7 @@ def _repository_node(
     home: Path,
     path: str,
     *,
-    comparison: str | None,
+    view: View,
     cache: Path,
     refresh: bool,
 ) -> tuple[str, Node, str]:
@@ -216,7 +220,7 @@ def _repository_node(
         if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
             message = "The registered path is not a repository checkout within home."
             raise ValueError(message)
-        if comparison is None:
+        if view == "resources":
             branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
             node.add(f"branch: {branch}")
             if git(
@@ -227,7 +231,7 @@ def _repository_node(
                 "--ignore-submodules=all",
             ):
                 node.add("modified").change = "~"
-        value, hit = cached_output(root, comparison, cache, refresh=refresh)
+        value, hit = cached_output(root, view, cache, refresh=refresh)
         if isinstance(value, dict):
             add_resources(node, value)
             if any(child.change == "~" for child in node.children):
@@ -243,22 +247,25 @@ def _repository_node(
 def build_tree(
     home: Path,
     *,
-    comparison: str | None = None,
-    progress: bool = False,
+    view: View = "resources",
+    progress: bool | Callable[[int, int], None] = False,
     cache: Path,
     refresh: bool = False,
 ) -> Node:
     """Group repository rows beneath their home directories in path order."""
     home = home.expanduser().resolve()
     entries = repositories(home)
-    compact_progress = progress and sys.stderr.isatty()
-    if progress:
-        sys.stderr.write(
-            f"Reading 0/{len(entries)} repositories…"
-            if compact_progress
-            else f"Reading {len(entries)} direct submodules of {home}…\n"
-        )
-        sys.stderr.flush()
+    compact_progress = progress is True and sys.stderr.isatty()
+
+    def report(completed: int, detail: str) -> None:
+        if callable(progress):
+            progress(completed, len(entries))
+        elif progress:
+            line = f"\rReading {completed}/{len(entries)} repositories…"
+            sys.stderr.write(line if compact_progress else detail + "\n")
+            sys.stderr.flush()
+
+    report(0, f"Reading {len(entries)} direct submodules of {home}…")
     repositories_by_path = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [
@@ -266,7 +273,7 @@ def build_tree(
                 _repository_node,
                 home,
                 path,
-                comparison=comparison,
+                view=view,
                 cache=cache,
                 refresh=refresh,
             )
@@ -276,13 +283,7 @@ def build_tree(
             identifier, node, status = future.result()
             if node.children:
                 repositories_by_path[identifier] = node
-            if progress:
-                sys.stderr.write(
-                    f"\rReading {completed}/{len(entries)} repositories…"
-                    if compact_progress
-                    else f"[{completed}/{len(entries)}] {identifier}: {status}\n"
-                )
-                sys.stderr.flush()
+            report(completed, f"[{completed}/{len(entries)}] {identifier}: {status}")
     if compact_progress:
         sys.stderr.write("\r\033[K")
         sys.stderr.flush()
@@ -292,7 +293,7 @@ def build_tree(
         parent = _tree_branch(tree, Path(path).parts[:-1], directories)
         parent.children.append(node)
     if not tree.children:
-        tree.add("No changes" if comparison else "No direct registered submodules.")
+        tree.add("No changes" if view == "diff" else "No direct registered submodules.")
     return tree
 
 
@@ -583,26 +584,39 @@ def _draw(
     return page
 
 
+def _show_loading(
+    screen: curses.window, view: View, completed: int = 0, total: int | None = None
+) -> None:
+    """Show the requested view and its repository count in the center of the screen."""
+    height, width = screen.getmaxyx()
+    label = f"Loading {view}…"
+    if total is not None:
+        label += f" {completed}/{total}"
+    screen.erase()
+    with contextlib.suppress(curses.error):
+        screen.addnstr(
+            height // 2, max(0, (width - len(label)) // 2), label, width, curses.A_BOLD
+        )
+    screen.refresh()
+
+
 def browse(
     screen: curses.window,
     root: Node,
-    comparison: str | None,
-    load: Callable[[str | None], Node],
+    view: View,
+    load: Callable[[View, Callable[[int, int], None]], Node],
 ) -> None:
     """Draw the outline with colored changes and a highlighted selection."""
     with contextlib.suppress(curses.error):
         curses.curs_set(0)
     colors = _change_colors()
     viewer = Viewer(root)
-    views = {comparison: viewer}
+    views = {view: viewer}
     query = None
     message = ""
     while True:
-        other = None if comparison else "diff"
-        help_line = (
-            f"{comparison or 'resources'}   / search   d {other or 'resources'}"
-            "   r refresh"
-        )
+        other: View = "resources" if view == "diff" else "diff"
+        help_line = f"{view}   / search   d {other}   r refresh"
         footer = "/" + query if query is not None else message or help_line
         page = _draw(screen, viewer, colors, footer)
         key = screen.get_wch()
@@ -612,11 +626,12 @@ def browse(
         elif key == "/":
             query = ""
         elif key in ("d", "r"):
-            target = other if key == "d" else comparison
+            target = other if key == "d" else view
             if key == "r" or target not in views:
-                _draw(screen, viewer, colors, f"Reading {target or 'resources'}…")
+                show_loading = partial(_show_loading, screen, target)
+                show_loading()
                 try:
-                    updated = load(target)
+                    updated = load(target, show_loading)
                 except READ_ERRORS as error:
                     message = f"error: {error}"
                     continue
@@ -625,7 +640,7 @@ def browse(
                     views = {target: viewer}
                 else:
                     views[target] = Viewer(updated)
-            comparison, viewer = target, views[target]
+            view, viewer = target, views[target]
         elif not viewer.handle(key, page):
             return
 
@@ -662,17 +677,13 @@ def main() -> None:
     try:
         cache = cache_home() / "afairesi_tui"
 
-        def load(mode: str | None, *, progress: bool = False) -> Node:
-            return build_tree(
-                options.home,
-                comparison=mode,
-                progress=progress,
-                cache=cache,
-                refresh=options.refresh,
-            )
-
+        load = partial(build_tree, options.home, cache=cache, refresh=options.refresh)
+        view: View = options.command or "resources"
         curses.wrapper(
-            browse, load(options.command, progress=True), options.command, load
+            browse,
+            load(view=view, progress=True),
+            view,
+            lambda target, report: load(view=target, progress=report),
         )
     except (*READ_ERRORS, curses.error) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")

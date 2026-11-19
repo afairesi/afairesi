@@ -94,10 +94,10 @@ def git(
     return completed
 
 
-def repository_root(path: Path = Path()) -> Path:
+def repository_root() -> Path:
     """Discover the current Git worktree root."""
     completed = git(
-        path,
+        Path(),
         ["rev-parse", "--path-format=absolute", "--show-toplevel"],
         check=False,
     )
@@ -1759,8 +1759,9 @@ def cache_home() -> Path:
     return base if base.is_absolute() else Path.home() / ".cache"
 
 
-def _dispatch_diff() -> None:
+def _dispatch_diff(arguments: list[str]) -> None:
     """Render tracked interface changes between the index and the working tree."""
+    _diff_parser().parse_args(arguments)
     root = repository_root()
     files = diff_inputs(root, git(root, ["ls-files", "--stage", "-z"]).stdout)
     cache = cache_home() / "afairesi" / "arguments"
@@ -1785,8 +1786,9 @@ def _dispatch_diff() -> None:
     sys.stdout.write(completed.stdout)
 
 
-def _dispatch_inspection(value: str | None) -> None:
+def _dispatch_inspection(arguments: list[str]) -> None:
     """Inspect local or remote sources without executing package code."""
+    value = parser().parse_args(arguments).repository
     repository: contextlib.AbstractContextManager[Path]
     if value is not None and (
         "://" in value or (":" in value.split("/", 1)[0] and not Path(value).exists())
@@ -1804,7 +1806,7 @@ def _dispatch_inspection(value: str | None) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    """Construct the default inspection parser before registering subcommands."""
+    """Construct the parser for the default repository inventory."""
     result = argparse.ArgumentParser(
         prog="afairesi",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1836,13 +1838,12 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
-def _diff_parser(cli: argparse.ArgumentParser) -> argparse.ArgumentParser:
-    """Register the diff interface after parsing the default repository argument."""
-    commands = cli.add_subparsers(title="commands", metavar="COMMAND")
+def _diff_parser() -> argparse.ArgumentParser:
+    """Construct the parser for the diff subcommand."""
+    commands = parser().add_subparsers()
     return commands.add_parser(
         "diff",
         prog="afairesi diff",
-        help="diff inspected interfaces in jd format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Print a jd-compatible structural diff of repository inspections. "
@@ -1872,7 +1873,7 @@ def check_source_main() -> None:
     try:
         validate_flake_source(options.source.resolve())
     except (CommandError, OSError, SyntaxError, ValueError) as error:
-        sys.stderr.write((f"error: {error}") + "\n")
+        sys.stderr.write(f"error: {error}\n")
         raise SystemExit(1) from error
 
 
@@ -1880,22 +1881,20 @@ def main() -> None:
     """Inspect by default, reserving the first argument 'diff' for comparisons."""
     arguments = sys.argv[1:]
     comparing = arguments[:1] == ["diff"]
-    cli = parser()
-    options = cli.parse_args([] if comparing else arguments)
-    difference = _diff_parser(cli)
-    difference.parse_args(arguments[1:] if comparing else [])
     try:
         if comparing:
-            _dispatch_diff()
+            _dispatch_diff(arguments[1:])
         else:
-            _dispatch_inspection(options.repository)
+            _dispatch_inspection(arguments)
     except KeyboardInterrupt:
         sys.exit(130)
     except CommandError as error:
-        command = difference if comparing else cli
-        command.exit(1, f"{command.prog}: {error}\n")
+        program = "afairesi diff" if comparing else "afairesi"
+        sys.stderr.write(f"{program}: {error}\n")
+        raise SystemExit(1) from error
     except (OSError, SyntaxError, ValueError) as error:
-        cli.exit(1, f"error: {error}\n")
+        sys.stderr.write(f"error: {error}\n")
+        raise SystemExit(1) from error
 
 
 if __name__ == "__main__":

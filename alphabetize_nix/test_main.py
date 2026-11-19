@@ -30,7 +30,7 @@ def test_formatting_nested_bindings_requires_work_proportional_to_source_size(
     formatted = alphabetize.format_text(source)
     if renderer.call_count > len(source) * 4:
         raise AssertionError(renderer.call_count)
-    if alphabetize.format_text(formatted) != formatted:
+    if formatted != "{ " + ".".join(["a"] * depth) + " = 1; }":
         raise AssertionError(formatted)
 
 
@@ -139,7 +139,7 @@ def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
     [
         "[ 3 1 2 1 ]",
         "let z = 3; a = 1; in [ z a z ]",
-        "builtins.head [ false true ]",
+        'let key = "dynamic"; in { ${key} = {}; "" = 2; z = 1; }',
         "builtins.concatLists [ [ 3 1 ] [ 2 ] ]",
         "[ { z = 3; a = 1; } { b = 2; a = 0; } ]",
         "({ z ? 3, a ? z, ... }: [ z a ]) {}",
@@ -157,29 +157,20 @@ def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
         "{ z = { # nested comment\n y = 2; x = 1; }; a = 0; }",
     ],
 )
-def test_formatting_preserves_nix_values_list_order_and_comments(
-    tmp_path: Path, source: str
-) -> None:
+def test_formatting_preserves_nix_values_list_order_and_comments(source: str) -> None:
     """Rewriting preserves the value that Nix evaluates, including list order."""
-    formatted = tmp_path / "formatted.nix"
-    formatted.write_text(source, encoding="utf-8")
+    rendered = alphabetize.format_text(source)
     expected = _evaluate(source)
-    for _ in range(2):
-        subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-            [os.environ["PACKAGE_E2E_EXECUTABLE"], str(formatted)],
-            capture_output=True,
-            check=True,
-            timeout=10,
-        )
-        rendered = formatted.read_text()
-        actual = _evaluate(rendered)
-        if expected.returncode or actual.returncode or actual.stdout != expected.stdout:
-            raise AssertionError((expected, actual, rendered))
-        for line in source.splitlines():
-            if "#" in line and line.split("#", 1)[1] not in rendered:
-                raise AssertionError(rendered)
-        if "/* key comment */" in source and "/* key comment */" not in rendered:
+    actual = _evaluate(rendered)
+    if expected.returncode or actual.returncode or actual.stdout != expected.stdout:
+        raise AssertionError((expected, actual, rendered))
+    if alphabetize.format_text(rendered) != rendered:
+        raise AssertionError(rendered)
+    for line in source.splitlines():
+        if "#" in line and line.split("#", 1)[1] not in rendered:
             raise AssertionError(rendered)
+    if "/* key comment */" in source and "/* key comment */" not in rendered:
+        raise AssertionError(rendered)
 
 
 def _evaluate(source: str) -> subprocess.CompletedProcess[str]:
@@ -212,21 +203,12 @@ def _evaluate(source: str) -> subprocess.CompletedProcess[str]:
     ],
 )
 def test_formatting_preserves_nix_evaluation_errors(
-    tmp_path: Path,
     source: str,
     diagnostic: str,
 ) -> None:
     """Nix continues to reject semantic errors after canonicalization."""
-    path = tmp_path / "error.nix"
-    path.write_text(source, encoding="utf-8")
     expected = _evaluate(source)
-    subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
-        capture_output=True,
-        check=True,
-        timeout=10,
-    )
-    actual = _evaluate(path.read_text())
+    actual = _evaluate(alphabetize.format_text(source))
     if (
         not expected.returncode
         or actual.returncode != expected.returncode

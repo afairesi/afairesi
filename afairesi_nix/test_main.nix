@@ -84,7 +84,7 @@ let
   leanExample = consumer.packages.${system}.lean-example;
   leanLibrary = consumer.packages.${system}.test_main;
   lintTool = (import ./main.nix inputs).lint {
-    inherit inputs pkgs;
+    inherit pkgs;
     self = consumerSelf;
   };
   overridden = inputs.self.lib.mkFlake {
@@ -147,8 +147,6 @@ assert htmlPackage.afairesiKind == "html";
 assert htmlPackage.meta.description == "Source listing";
 assert leanExample.afairesiKind == "lean4";
 assert consumer.checks.${system} ? example;
-assert consumer.checks.${system}.pkgs-lean-example == leanExample;
-assert consumer.checks.${system}.pkgs-test_main == leanLibrary;
 assert
   consumer.checks.${system}.devshell-lean-example-test
   == consumer.devShells.${system}.lean-example-test;
@@ -163,10 +161,9 @@ assert
   });
 assert builtins.attrNames consumer.formatter == builtins.attrNames consumer.packages;
 assert consumer.checks.${system}.formatter == consumer.formatter.${system}.passthru.tests.check;
-assert consumer.checks.${system}.pkgs-example == package;
-assert consumer.checks.${system}.pkgs-native == consumer.packages.${system}.native;
-assert consumer.checks.${system}.pkgs-python_native == consumer.packages.${system}.python_native;
-assert consumer.checks.${system}.pkgs-rust-native == consumer.packages.${system}.rust-native;
+assert pkgs.lib.all (
+  name: consumer.checks.${system}."pkgs-${name}" == consumer.packages.${system}.${name}
+) (builtins.attrNames consumer.packages.${system});
 assert
   consumer.checks.${system}.pkgs-python_native-contract
   == consumer.packages.${system}.python_native.passthru.tests.contract;
@@ -416,10 +413,9 @@ pkgs.runCommand "afairesi-consumer-contract"
     assert Path(".gitignore").read_text() == "*\n\n!*/\n"
     assert Path("supporting/data.json").stat().st_mtime == 1
     assert Path("supporting/ordered.nix").stat().st_mtime == 1
-    for name in ["supporting/data.json", "flake.lock"]:
-        text = Path(name).read_text()
-        assert "\n" in text
-        assert json.loads(text) == {"value": "first\nsecond", "items": [1, 2]}
+    text = Path("supporting/data.json").read_text()
+    assert text.endswith("\n")
+    assert json.loads(text) == {"value": "first\nsecond", "items": [1, 2]}
     PY
     cmp expected-lock flake.lock
     cat > supporting/parse.js <<'JS'

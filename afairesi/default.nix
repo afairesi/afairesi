@@ -6,11 +6,7 @@ inputs.self.lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   meta.description = "afairesi CLI for inspecting repositories in the afairesi computing environment.";
-  passthru.checkInputs = [
-    ((import ../afairesi_nix/main.nix inputs).formatter {
-      inherit inputs pkgs;
-    })
-  ];
+  passthru.checkInputs = [ inputs.self.formatter.${pkgs.stdenv.system} ];
   postFixup = ''
     touch "$out/${python.sitePackages}/$pname/py.typed"
   '';

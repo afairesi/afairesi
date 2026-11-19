@@ -1,14 +1,10 @@
 afairesiInputs:
 let
   formatter =
-    {
-      inputs,
-      pkgs,
-      self ? inputs.self,
-    }:
+    { pkgs, self }:
     mkTreefmtTool {
       inherit pkgs self;
-      treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
+      treefmtEval = afairesiInputs.treefmt-nix.lib.evalModule pkgs {
         enableDefaultExcludes = false;
         programs = {
           oxfmt = {
@@ -130,11 +126,7 @@ let
       version = "4.35.0";
     };
   lint =
-    {
-      inputs,
-      pkgs,
-      self ? inputs.self,
-    }:
+    { pkgs, self }:
     let
       pythonPackageNames = packageNamesFor self pkgs "python";
       pythonSources =
@@ -152,7 +144,7 @@ let
     in
     mkTreefmtTool {
       inherit pkgs self;
-      treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs {
+      treefmtEval = afairesiInputs.treefmt-nix.lib.evalModule pkgs {
         programs = {
           mypy = {
             directories = pkgs.lib.genAttrs pythonPackageNames (
@@ -498,11 +490,9 @@ let
               lint =
                 (lint {
                   inherit self;
-                  inputs = afairesiInputs;
                   pkgs = packageSets.${system};
                 }).passthru.tests.check;
               structure = sourceCheck {
-                inputs = afairesiInputs;
                 pkgs = packageSets.${system};
                 src = source;
               };
@@ -530,7 +520,6 @@ let
         system:
         formatter {
           inherit self;
-          inputs = afairesiInputs;
           pkgs = packageSets.${system};
         }
       );
@@ -1201,13 +1190,11 @@ let
         python -m coverage json --show-contexts --rcfile="$TMPDIR/coverage.ini" -o "$out/coverage.json"
       '';
   sourceCheck =
-    {
-      inputs,
-      pkgs,
-      src,
-    }:
+    { pkgs, src }:
     let
-      python = pkgs.python3.withPackages (_: [ inputs.self.packages.${pkgs.stdenv.system}.afairesi ]);
+      python = pkgs.python3.withPackages (_: [
+        afairesiInputs.self.packages.${pkgs.stdenv.system}.afairesi
+      ]);
     in
     pkgs.runCommand "afairesi-structure-check" { } ''
       ${python}/bin/python -c 'from afairesi import check_source_main; check_source_main()' ${src}
@@ -1215,7 +1202,7 @@ let
     '';
 in
 {
-  inherit formatter lint;
+  inherit lint;
   lib = {
     inherit
       mkBashPackage

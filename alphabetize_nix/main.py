@@ -19,12 +19,11 @@ if TYPE_CHECKING:
 
 @dataclass(frozen=True)
 class Binding:
-    """A Nix binding and its optional nested attributes."""
+    """Rendered Nix text for an assignment value or a whole binding with no path."""
 
-    path: tuple[str, ...] | None
-    value: str | None
-    raw: str
-    nested: tuple[Binding, ...] | None = None
+    path: tuple[str, ...]
+    value: str
+    nested: tuple[Binding, ...] = ()
 
 
 def _replace_children(document: nix_syntax.Document, node: Node) -> str:
@@ -43,14 +42,11 @@ def _binding(document: nix_syntax.Document, node: Node) -> Binding:
     expression = node.child_by_field_name("expression")
     path = None if attrpath is None else nix_syntax.static_attrpath(document, attrpath)
     if path is None or expression is None:
-        return Binding(None, None, _replace_children(document, node))
+        return Binding((), _replace_children(document, node))
     nested = _nested_bindings(document, expression)
-    value = (
-        render_node(document, expression)
-        if nested is None
-        else _render_set(_normalize(list(nested)))
-    )
-    return Binding(path, value, "", nested)
+    if nested is None:
+        return Binding(path, render_node(document, expression))
+    return Binding(path, _render_set(_normalize(list(nested))), nested)
 
 
 def _nested_bindings(
@@ -82,13 +78,12 @@ def _nested_bindings(
         attrs = child.child_by_field_name("attrs")
         if child.type == "inherit" and attrs is not None:
             expanded.extend(
-                Binding((document.text(attr),), document.text(attr), "")
+                Binding((document.text(attr),), document.text(attr))
                 for attr in attrs.named_children
             )
         else:
             expanded.append(_binding(document, child))
-    bindings = tuple(expanded)
-    return bindings if all(binding.path is not None for binding in bindings) else None
+    return tuple(expanded)
 
 
 def _paths_unambiguous(paths: list[tuple[str, ...]]) -> bool:
@@ -97,61 +92,43 @@ def _paths_unambiguous(paths: list[tuple[str, ...]]) -> bool:
 
 
 def _normalize(bindings: list[Binding]) -> list[Binding]:
-    static = [binding for binding in bindings if binding.path]
-    opaque = [binding for binding in bindings if not binding.path]
     groups: dict[str, list[Binding]] = {}
-    for binding in static:
-        if binding.path is None:
-            raise AssertionError
-        groups.setdefault(binding.path[0], []).append(binding)
-    result = opaque
+    result = []
+    for binding in bindings:
+        if binding.path:
+            groups.setdefault(binding.path[0], []).append(binding)
+        else:
+            result.append(binding)
     for root in sorted(groups):
         group = groups[root]
-        paths = [binding.path for binding in group if binding.path is not None]
-        compatible = (
-            len(group) == 1
-            and (
-                len(paths[0]) > 1
-                or (group[0].nested is not None and bool(group[0].nested))
+        paths = [binding.path for binding in group]
+        if len(group) == 1:
+            compatible = len(paths[0]) > 1 or bool(group[0].nested)
+        else:
+            compatible = all(len(path) > 1 for path in paths) and _paths_unambiguous(
+                paths
             )
-        ) or (
-            len(group) > 1
-            and all(len(path) > 1 for path in paths)
-            and _paths_unambiguous(paths)
-        )
         if not compatible:
-            result.extend(sorted(group, key=lambda item: item.path or ()))
+            result.extend(sorted(group, key=lambda item: item.path))
             continue
         nested: list[Binding] = []
         for binding in group:
-            if binding.path is None:
-                raise AssertionError
             if len(binding.path) > 1:
-                nested.append(
-                    Binding(
-                        binding.path[1:],
-                        binding.value,
-                        binding.raw,
-                        binding.nested,
-                    ),
-                )
-            elif binding.nested is not None:
+                nested.append(Binding(binding.path[1:], binding.value, binding.nested))
+            else:
                 nested.extend(binding.nested)
         normalized = _normalize(nested)
         if len(normalized) == 1 and normalized[0].path:
             child = normalized[0]
-            child_path = cast("tuple[str, ...]", child.path)
-            result.append(
-                Binding((root, *child_path), child.value, child.raw, child.nested),
-            )
+            result.append(Binding((root, *child.path), child.value, child.nested))
         else:
-            result.append(Binding((root,), _render_set(normalized), ""))
+            result.append(Binding((root,), _render_set(normalized)))
     return result
 
 
 def _render_binding(binding: Binding) -> str:
-    if binding.path is None or binding.value is None:
-        return binding.raw.strip()
+    if not binding.path:
+        return binding.value.strip()
     keys = ".".join(_render_key(key) for key in binding.path)
     return f"{keys} = {binding.value.strip()};"
 
@@ -174,8 +151,7 @@ def _render_set(bindings: list[Binding]) -> str:
     assignments = []
     for binding in bindings:
         if (
-            binding.path is not None
-            and len(binding.path) == 1
+            len(binding.path) == 1
             and binding.value == binding.path[0]
             and _render_key(binding.path[0]) == binding.path[0]
         ):

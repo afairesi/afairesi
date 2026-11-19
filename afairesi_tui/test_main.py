@@ -198,7 +198,7 @@ def test_home_diff_shows_working_changes_across_registered_repositories(
         return original(arguments, root, input_text=input_text)
 
     monkeypatch.setattr(subject, "command", counted)
-    tree = subject.build_tree(home, comparison="diff", cache=home.parent / "cache")
+    tree = subject.build_tree(home, view="diff", cache=home.parent / "cache")
     project = ("github.com", "owner", "project")
     expect(labels(tree, *project) == ["example"], tree)
     expect(
@@ -262,7 +262,7 @@ def test_home_tree_requires_a_git_root_and_accepts_one_without_submodules(
         and labels(tree) == ["No direct registered submodules."],
         tree,
     )
-    differences = subject.build_tree(tmp_path, cache=cache, comparison="diff")
+    differences = subject.build_tree(tmp_path, cache=cache, view="diff")
     expect(labels(differences) == ["No changes"], differences)
     child = tmp_path / "directory"
     child.mkdir()
@@ -270,28 +270,28 @@ def test_home_tree_requires_a_git_root_and_accepts_one_without_submodules(
         subject.build_tree(child, cache=cache)
 
 
-def test_cached_results_are_reused_until_a_tracked_change_or_explicit_refresh(
+def test_inventory_cache_tracks_index_and_file_changes_and_survives_a_commit(
     home: Path,
 ) -> None:
-    """Refresh for tracked edits, staging, commits, and explicit refresh requests."""
+    """Refresh on changed inputs or an explicit request, and reuse committed results."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
     source = root / "example/default.nix"
-    first, hit = subject.cached_output(root, None, cache, refresh=False)
+    first, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(not hit, "first inspection was cached")
-    second, hit = subject.cached_output(root, None, cache, refresh=False)
+    second, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(hit and first == second, "unchanged inspection was repeated")
     nested = root / "nested/example/default.nix"
     nested.write_text(nested.read_text() + "\n")
-    _, hit = subject.cached_output(root, None, cache, refresh=False)
+    _, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(hit, "nested checkout invalidated the direct repository cache")
     metadata = source.stat()
     source.write_text(source.read_text().replace('"working"', '"updated"'))
     os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
-    changed, hit = subject.cached_output(root, None, cache, refresh=False)
+    changed, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(not hit and changed["example"]["description"] == "updated", changed)
     git(root, "add", "example/default.nix")
-    _, hit = subject.cached_output(root, None, cache, refresh=False)
+    _, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(not hit, "index change was missed")
     git(
         root,
@@ -306,23 +306,20 @@ def test_cached_results_are_reused_until_a_tracked_change_or_explicit_refresh(
         "-m",
         "updated",
     )
-    _, hit = subject.cached_output(root, None, cache, refresh=False)
-    expect(not hit, "HEAD change was missed")
-    _, hit = subject.cached_output(root, None, cache, refresh=True)
+    _, hit = subject.cached_output(root, "resources", cache, refresh=False)
+    expect(hit, "committing the same index invalidated the inventory")
+    _, hit = subject.cached_output(root, "resources", cache, refresh=True)
     expect(not hit, "explicit refresh used cached data")
 
 
-def test_home_tree_shows_the_current_branch_even_with_a_cached_inspection(
+def test_home_tree_shows_the_current_branch_with_a_cached_inventory(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Cache each operation independently while reading Git state fresh."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
-    for comparison in (None, "diff"):
-        _, hit = subject.cached_output(root, comparison, cache, refresh=False)
-        expect(not hit, comparison)
-        _, hit = subject.cached_output(root, comparison, cache, refresh=False)
-        expect(hit, comparison)
+    subject.cached_output(root, "resources", cache, refresh=False)
+    subject.cached_output(root, "diff", cache, refresh=False)
     git(root, "checkout", "--quiet", "-b", "cached-branch")
     tree = subject.build_tree(home, cache=cache, progress=True)
     expect(
@@ -332,19 +329,19 @@ def test_home_tree_shows_the_current_branch_even_with_a_cached_inspection(
     expect("github.com/owner/project: cached" in progress, progress)
 
 
-def test_inspection_returns_resources_even_if_the_cache_is_corrupt_or_unavailable(
+def test_resource_view_recovers_from_a_corrupt_or_unavailable_cache(
     home: Path,
 ) -> None:
     """Treat cache data as disposable; cache I/O failures must not hide resources."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
-    expected, _ = subject.cached_output(root, None, cache, refresh=False)
+    expected, _ = subject.cached_output(root, "resources", cache, refresh=False)
     next(cache.glob("*.json")).write_text("partial {")
-    actual, hit = subject.cached_output(root, None, cache, refresh=False)
+    actual, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(not hit and actual == expected, actual)
     blocked = home / "blocked-cache"
     blocked.write_text("not a directory")
-    actual, hit = subject.cached_output(root, None, blocked, refresh=False)
+    actual, hit = subject.cached_output(root, "resources", blocked, refresh=False)
     expect(not hit and actual == expected, actual)
 
 
@@ -364,7 +361,7 @@ def test_diff_cache_survives_unrelated_files_and_detects_staging(home: Path) -> 
     expect(staged == [] and not hit, staged)
 
 
-def test_inspection_caches_only_successful_results_from_unchanged_sources(
+def test_inventory_cache_only_stores_successful_reads_of_unchanged_sources(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Retry errors and avoid persisting a result read while the source was changing."""
@@ -373,23 +370,23 @@ def test_inspection_caches_only_successful_results_from_unchanged_sources(
     flake = root / "flake.nix"
     flake.unlink()
     with pytest.raises(ValueError, match=r"flake\.nix"):
-        subject.cached_output(root, None, cache, refresh=False)
+        subject.cached_output(root, "resources", cache, refresh=False)
     expect(not cache.exists(), "failed inspection was cached")
     flake.write_text("{}")
     original = subject.read_output
 
-    def changing(path: Path, comparison: str | None) -> object:
-        value = original(path, comparison)
+    def changing(path: Path, view: subject.View) -> object:
+        value = original(path, view)
         source = root / "example/default.nix"
         source.write_text(source.read_text().replace('"working"', '"changed"'))
         return value
 
     monkeypatch.setattr(subject, "read_output", changing)
-    subject.cached_output(root, None, cache, refresh=False)
+    subject.cached_output(root, "resources", cache, refresh=False)
     expect(not cache.exists(), "changing source was cached")
 
 
-def test_inspection_refreshes_when_a_symlinked_entrypoint_changes(home: Path) -> None:
+def test_inventory_cache_refreshes_when_a_symlink_target_changes(home: Path) -> None:
     """A tracked Python entrypoint can change through an unchanged symlink."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
@@ -404,9 +401,9 @@ def test_inspection_refreshes_when_a_symlinked_entrypoint_changes(home: Path) ->
     )
     (root / "example/main.py").symlink_to(target)
     git(root, "add", "example/default.nix", "example/main.py")
-    subject.cached_output(root, None, cache, refresh=False)
+    subject.cached_output(root, "resources", cache, refresh=False)
     target.write_text(target.read_text().replace('"first"', '"other"'))
-    value, hit = subject.cached_output(root, None, cache, refresh=False)
+    value, hit = subject.cached_output(root, "resources", cache, refresh=False)
     expect(not hit and value["example"]["arguments"][0]["default"] == "other", value)
 
 
@@ -534,15 +531,15 @@ def test_browse_refreshes_both_views_and_preserves_navigation(
     monkeypatch.setattr(curses, "color_pair", lambda pair: pair << 8)
     calls = []
 
-    def load(mode: str | None) -> subject.Node:
-        calls.append(mode)
+    def load(view: subject.View, _report: Callable[[int, int], None]) -> subject.Node:
+        calls.append(view)
         tree = subject.Node("home", expanded=True)
         group = tree.add("group")
         group.add(f"generation {len(calls)}")
         return tree
 
-    subject.browse(screen, subject.Node("home"), None, load)
-    expect(calls == ["diff", "diff", None, None], calls)
+    subject.browse(screen, subject.Node("home"), "resources", load)
+    expect(calls == ["diff", "diff", "resources", "resources"], calls)
     pairs.assert_has_calls(
         [
             call(1, curses.COLOR_GREEN, -1),
@@ -553,6 +550,34 @@ def test_browse_refreshes_both_views_and_preserves_navigation(
     lines = [args.args[2] for args in screen.addnstr.call_args_list]
     expect("/r" in lines and any("r refresh" in line for line in lines), lines)
     expect("  ▸ group" in lines, lines)
+
+
+def test_switching_to_diff_shows_repository_progress_until_the_view_is_ready(
+    home: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Show progress before discovery and after each repository, then reuse the view."""
+    screen = Mock(spec=curses.window)
+    screen.getmaxyx.return_value = (24, 80)
+    screen.get_wch.side_effect = ["d", "d", "d", "q"]
+    monkeypatch.setattr(curses, "has_colors", lambda: False)
+    frames: list[str] = []
+    screen.refresh.side_effect = lambda: frames.append(screen.addnstr.call_args.args[2])
+
+    def load(view: subject.View, report: Callable[[int, int], None]) -> subject.Node:
+        expect(frames[-1] == "Loading diff…", frames)
+        return subject.build_tree(
+            home, view=view, cache=home / "cache", progress=report
+        )
+
+    subject.browse(screen, subject.Node("home"), "resources", load)
+    expect(
+        frames[1:-3] == ["Loading diff…", *(f"Loading diff… {n}/4" for n in range(5))],
+        frames,
+    )
+    expect(
+        [line.split()[0] for line in frames[-3:]] == ["diff", "resources", "diff"],
+        frames,
+    )
 
 
 def test_viewer_refresh_keeps_an_expanded_selection_when_rows_move() -> None:
