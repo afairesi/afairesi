@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -20,18 +21,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 Payload = dict[str, Any] | list[dict[str, Any]]
 
-READ_ERRORS = (
-    curses.error,
-    OSError,
-    SyntaxError,
-    ValueError,
-    subprocess.SubprocessError,
-)
+READ_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 
 
 def command(arguments: list[str], root: Path, *, input_text: str | None = None) -> str:
@@ -56,8 +51,8 @@ def git(root: Path, *arguments: str) -> str:
     return command(["git", *arguments], root)
 
 
-def interface_fingerprint(root: Path) -> str:
-    """Track HEAD, index entries, and source metadata without inspecting sources."""
+def fingerprint(root: Path) -> str:
+    """Track HEAD, index entries, source metadata, and symlink targets."""
     entries = git(root, "ls-files", "--stage", "-z")
     digest = hashlib.sha256()
     digest.update(git(root, "rev-parse", "--revs-only", "HEAD").encode())
@@ -72,27 +67,36 @@ def interface_fingerprint(root: Path) -> str:
         path = Path(relative)
         paths.update((path, *path.parents))
     for tracked in sorted(paths):
+        path = root / tracked
         digest.update(str(tracked).encode())
         try:
-            stat = (root / tracked).lstat()
+            entry_stat = path.lstat()
+        except (FileNotFoundError, NotADirectoryError):
+            digest.update(b"missing")
+            continue
+        stats = [entry_stat]
+        if stat.S_ISLNK(entry_stat.st_mode):
+            try:
+                stats.append(path.stat())
+            except OSError as error:
+                digest.update(f"unreadable target: {error.errno}".encode())
+        for info in stats:
             digest.update(
                 repr(
                     (
-                        stat.st_dev,
-                        stat.st_ino,
-                        stat.st_mode,
-                        stat.st_size,
-                        stat.st_mtime_ns,
-                        stat.st_ctime_ns,
+                        info.st_dev,
+                        info.st_ino,
+                        info.st_mode,
+                        info.st_size,
+                        info.st_mtime_ns,
+                        info.st_ctime_ns,
                     )
                 ).encode()
             )
-        except (FileNotFoundError, NotADirectoryError):
-            digest.update(b"missing")
     return digest.hexdigest()
 
 
-def repositories(home: Path) -> list[dict[str, Any]]:
+def repositories(home: Path) -> list[str]:
     """Join .gitmodules paths with gitlinks in the current home index."""
     root = git(home, "rev-parse", "--show-toplevel").strip()
     if Path(root).resolve() != home:
@@ -119,39 +123,8 @@ def repositories(home: Path) -> list[dict[str, Any]]:
         location = (home / path).resolve()
         if not location.is_relative_to(home) or location == home:
             continue
-        initialized = (location / ".git").exists()
-        result.append(
-            {
-                "id": path,
-                "initialized": initialized,
-            }
-        )
-    return sorted(result, key=lambda item: item["id"])
-
-
-def fingerprint(root: Path) -> str:
-    """Track HEAD, index, tracked files, and the targets of tracked symlinks."""
-    digest = hashlib.sha256(interface_fingerprint(root).encode())
-    for relative in git(root, "ls-files", "-z").split("\0"):
-        path = root / relative
-        if relative and path.is_symlink():
-            try:
-                stat = path.stat()
-                digest.update(
-                    repr(
-                        (
-                            stat.st_dev,
-                            stat.st_ino,
-                            stat.st_mode,
-                            stat.st_size,
-                            stat.st_mtime_ns,
-                            stat.st_ctime_ns,
-                        )
-                    ).encode()
-                )
-            except OSError as error:
-                digest.update(f"unreadable target: {error.errno}".encode())
-    return digest.hexdigest()
+        result.append(path)
+    return sorted(result)
 
 
 def read_output(root: Path, comparison: str | None) -> Payload:
@@ -172,11 +145,9 @@ def read_output(root: Path, comparison: str | None) -> Payload:
 
 
 def cached_output(
-    root: Path, comparison: str | None, cache: Path | None, *, refresh: bool
+    root: Path, comparison: str | None, cache: Path, *, refresh: bool
 ) -> tuple[Payload, bool]:
     """Reuse a stable CLI result, with atomic writes and disposable cache failures."""
-    if cache is None:
-        return read_output(root, comparison), False
     tools = [
         str(Path(shutil.which(name) or name).resolve()) for name in ("afairesi", "jd")
     ]
@@ -186,7 +157,7 @@ def cached_output(
     path = cache / f"{key}.json"
     before = fingerprint(root)
     if not refresh:
-        with contextlib.suppress(OSError, ValueError, TypeError):
+        with contextlib.suppress(OSError, ValueError):
             saved = json.loads(path.read_text(encoding="utf-8"))
             if (
                 isinstance(saved, dict)
@@ -211,54 +182,58 @@ def cached_output(
     return value, False
 
 
-def repository_report(
+def _repository_node(
     home: Path,
-    entry: dict[str, Any],
+    path: str,
     *,
     comparison: str | None,
-    cache: Path | None = None,
-    refresh: bool = False,
-) -> tuple[str, dict[str, Any], bool]:
-    """Run just the requested CLI operation in one direct home submodule."""
-    identifier = entry["id"]
-    hit = False
-    report: dict[str, Any] = {"initialized": entry["initialized"]}
-    if not entry["initialized"]:
-        report["error"] = "This submodule is not initialized."
-        return identifier, report, hit
+    cache: Path,
+    refresh: bool,
+) -> tuple[str, Node, str]:
+    """Build a repository row and return its progress status."""
+    node = Node(Path(path).name)
     try:
-        root = (home / identifier).resolve()
-        actual = Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve()
-        if actual != root or not root.is_relative_to(home) or root == home:
+        root = (home / path).resolve()
+        if not root.is_relative_to(home) or root == home:
+            message = "The registered path must be inside the home repository."
+            raise ValueError(message)
+        if not (root / ".git").exists():
+            message = "This submodule is not initialized."
+            raise ValueError(message)
+        if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
             message = "The registered path is not a repository checkout within home."
             raise ValueError(message)
         if comparison is None:
-            report["branch"] = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
-            report["dirty"] = bool(
-                git(
-                    root,
-                    "status",
-                    "--porcelain",
-                    "--untracked-files=no",
-                    "--ignore-submodules=all",
-                )
-            )
+            branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
+            node.add(f"branch: {branch}")
+            if git(
+                root,
+                "status",
+                "--porcelain",
+                "--untracked-files=no",
+                "--ignore-submodules=all",
+            ):
+                node.add("modified")
         value, hit = cached_output(root, comparison, cache, refresh=refresh)
-        report["resources" if comparison is None else "patch"] = value
+        if isinstance(value, dict):
+            add_resources(node, value)
+        else:
+            add_changes(node, value)
     except READ_ERRORS as error:
-        report["error"] = str(error)
-    return identifier, report, hit
+        node.add(f"error: {error}")
+        return path, node, "error"
+    return path, node, "cached" if hit else "done"
 
 
-def snapshot(
+def build_tree(
     home: Path,
     *,
     comparison: str | None = None,
     progress: bool = False,
-    cache: Path | None = None,
+    cache: Path,
     refresh: bool = False,
-) -> dict[str, Any]:
-    """Nest direct registered submodules beneath their home directories."""
+) -> Node:
+    """Group repository rows beneath their home directories in path order."""
     home = home.expanduser().resolve()
     entries = repositories(home)
     compact_progress = progress and sys.stderr.isatty()
@@ -269,25 +244,24 @@ def snapshot(
             else f"Reading {len(entries)} direct submodules of {home}…\n"
         )
         sys.stderr.flush()
-    reports = {}
-    tree: dict[str, Any] = {}
+    repositories_by_path = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [
             pool.submit(
-                repository_report,
+                _repository_node,
                 home,
-                entry,
+                path,
                 comparison=comparison,
                 cache=cache,
                 refresh=refresh,
             )
-            for entry in entries
+            for path in entries
         ]
         for completed, future in enumerate(as_completed(futures), 1):
-            identifier, report, hit = future.result()
-            reports[identifier] = report
+            identifier, node, status = future.result()
+            if node.children:
+                repositories_by_path[identifier] = node
             if progress:
-                status = "error" if "error" in report else "cached" if hit else "done"
                 sys.stderr.write(
                     f"\rReading {completed}/{len(entries)} repositories…"
                     if compact_progress
@@ -297,15 +271,14 @@ def snapshot(
     if compact_progress:
         sys.stderr.write("\r\033[K")
         sys.stderr.flush()
-    for identifier, report in sorted(reports.items()):
-        if "patch" in report and not any(op["op"] != "test" for op in report["patch"]):
-            continue
-        parts = Path(identifier).parts
-        parent = tree
-        for directory in parts[:-1]:
-            parent = parent.setdefault(directory, {})
-        parent[parts[-1]] = report
-    return {str(home): tree}
+    tree = Node(str(home), expanded=True)
+    directories: dict[tuple[Node, str], Node] = {}
+    for path, node in sorted(repositories_by_path.items()):
+        parent = _tree_branch(tree, Path(path).parts[:-1], directories)
+        parent.children.append(node)
+    if not tree.children:
+        tree.add("No changes" if comparison else "No direct registered submodules.")
+    return tree
 
 
 @dataclass(eq=False)
@@ -350,28 +323,35 @@ def add_value(parent: Node, label: str, value: object) -> None:
                     name,
                     {key: data for key, data in item.items() if key != "names"},
                 )
-            elif isinstance(item, dict) and "resource" in item:
-                node.add(f"{item['resource']} ({item.get('kind', 'dependency')})")
             else:
                 add_value(node, "item" if isinstance(item, (dict, list)) else "", item)
 
 
-def add_repository(parent: Node, name: str, report: dict[str, Any]) -> None:
-    """Keep repository and resource summaries short, with details folded beneath."""
-    node = parent.add(name)
-    if "branch" in report:
-        node.add(f"branch: {report['branch']}")
-    if report.get("dirty"):
-        node.add("modified")
-    if "error" in report:
-        node.add(f"error: {report['error']}")
-    for resource, fields in report.get("resources", {}).items():
+def add_resources(node: Node, resources: dict[str, Any]) -> None:
+    """Add the CLI's resource fields and group dependencies by target."""
+    for resource, fields in resources.items():
         child = node.add(resource)
         for key, value in fields.items():
-            add_value(child, key, value)
-    add_changes(node, report.get("patch", []))
-    if not node.children:
-        node.add("No changes" if "patch" in report else "No resources")
+            if key == "dependencies":
+                dependencies = child.add(key)
+                for target, roles in value.items():
+                    dependencies.add(f"{target} ({', '.join(roles)})")
+            else:
+                add_value(child, key, value)
+
+
+def _tree_branch(
+    parent: Node,
+    parts: Sequence[str],
+    branches: dict[tuple[Node, str], Node],
+) -> Node:
+    """Find or create the shared parent for a directory or patch path."""
+    for part in parts:
+        key = (parent, part)
+        if key not in branches:
+            branches[key] = parent.add(part)
+        parent = branches[key]
+    return parent
 
 
 def add_changes(node: Node, patch: list[dict[str, Any]]) -> None:
@@ -384,12 +364,7 @@ def add_changes(node: Node, patch: list[dict[str, Any]]) -> None:
             part.replace("~1", "/").replace("~0", "~")
             for part in operation["path"].split("/")[1:]
         ] or ["repository"]
-        parent = node
-        for part in parts[:-1]:
-            key = (parent, part)
-            if key not in branches:
-                branches[key] = parent.add(part)
-            parent = branches[key]
+        parent = _tree_branch(node, parts[:-1], branches)
         marker = "+" if operation["op"] == "add" else "-"
         value = operation.get("value")
         structured = isinstance(value, (dict, list))
@@ -398,25 +373,6 @@ def add_changes(node: Node, patch: list[dict[str, Any]]) -> None:
         change.change = marker
         if structured:
             add_value(change, "value", value)
-
-
-def populate_tree(parent: Node, directories: dict[str, Any]) -> None:
-    """Build the home hierarchy with all children initially folded."""
-    for name, value in directories.items():
-        if isinstance(value.get("initialized"), bool):
-            add_repository(parent, name, value)
-        else:
-            populate_tree(parent.add(name), value)
-
-
-def build_tree(report: dict[str, Any], *, diff: bool = False) -> Node:
-    """Show just home and its first directory level until the user expands it."""
-    home, directories = next(iter(report.items()))
-    root = Node(home, expanded=True)
-    populate_tree(root, directories)
-    if not root.children:
-        root.add("No changes" if diff else "No direct registered submodules.")
-    return root
 
 
 class Viewer:
@@ -653,18 +609,15 @@ def main() -> None:
 
         def load(mode: str | None, *, progress: bool = False) -> Node:
             return build_tree(
-                snapshot(
-                    options.home,
-                    comparison=mode,
-                    progress=progress,
-                    cache=base / "afairesi_tui",
-                    refresh=options.refresh,
-                ),
-                diff=mode is not None,
+                options.home,
+                comparison=mode,
+                progress=progress,
+                cache=base / "afairesi_tui",
+                refresh=options.refresh,
             )
 
         curses.wrapper(browse, load(comparison, progress=True), comparison, load)
-    except READ_ERRORS as error:
+    except (*READ_ERRORS, curses.error) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")
     except KeyboardInterrupt:
         raise SystemExit(130) from None

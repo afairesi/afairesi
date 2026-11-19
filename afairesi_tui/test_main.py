@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 
 import pytest
 
-import afairesi_tui.main as subject
+import afairesi_tui as subject
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -18,9 +18,16 @@ if TYPE_CHECKING:
 
 
 def expect(condition: bool, detail: object) -> None:  # noqa: FBT001
-    """Report an incorrect workspace snapshot."""
+    """Report an unexpected result with its observed value."""
     if not condition:
         raise AssertionError(detail)
+
+
+def labels(node: subject.Node, *path: str) -> list[str]:
+    """Read the child labels at a displayed tree path."""
+    for name in path:
+        node = next(child for child in node.children if child.label == name)
+    return [child.label for child in node.children]
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -86,20 +93,22 @@ def register(home: Path, child: Path) -> None:
 @pytest.fixture
 def home(tmp_path: Path) -> Path:
     """Include duplicate basenames, both diff stages, and unavailable repositories."""
-    git(tmp_path, "init", "--quiet")
-    first = tmp_path / "github.com/owner/project"
+    root = tmp_path / "home"
+    root.mkdir()
+    git(root, "init", "--quiet")
+    first = root / "github.com/owner/project"
     for name in (
         "github.com/owner/project",
         "gitlab.com/owner/project",
         "missing",
         "broken",
     ):
-        child = tmp_path / name
+        child = root / name
         initialize(child)
-        register(tmp_path, child)
-    (tmp_path / "missing").rename(tmp_path / "parked")
-    (tmp_path / "broken/flake.nix").unlink()
-    initialize(tmp_path / "unregistered")
+        register(root, child)
+    (root / "missing").rename(root / "parked")
+    (root / "broken/flake.nix").unlink()
+    initialize(root / "unregistered")
     nested = first / "nested"
     initialize(nested)
     register(first, nested)
@@ -107,10 +116,10 @@ def home(tmp_path: Path) -> Path:
     source.write_text(source.read_text().replace('"original"', '"staged"'))
     git(first, "add", "example/default.nix")
     source.write_text(source.read_text().replace('"staged"', '"working"'))
-    return tmp_path
+    return root
 
 
-def test_home_snapshot_groups_all_registered_repositories_without_writes(
+def test_home_tree_groups_all_registered_repositories_without_writes(
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -128,19 +137,20 @@ def test_home_snapshot_groups_all_registered_repositories_without_writes(
     first = home / "github.com/owner/project"
     paths = [home / ".git/index", first / ".git/index", first / "example/default.nix"]
     before = [path.read_bytes() for path in paths]
-    tree = subject.snapshot(home)[str(home)]
-    expect(set(tree) == {"github.com", "gitlab.com", "missing", "broken"}, tree)
-    project = tree["github.com"]["owner"]["project"]
-    expect(project["resources"]["example"]["description"] == "working", project)
-    expect(project["dirty"] and "nested" not in project, project)
+    tree = subject.build_tree(home, cache=home.parent / "cache")
+    expect(labels(tree) == ["broken", "github.com", "gitlab.com", "missing"], tree)
+    project = ("github.com", "owner", "project")
+    expect("description: working" in labels(tree, *project, "example"), tree)
+    expect("modified" in labels(tree, *project), tree)
     expect(
-        tree["gitlab.com"]["owner"]["project"]["resources"]["example"]["description"]
-        == "original",
+        "description: original"
+        in labels(tree, "gitlab.com", "owner", "project", "example"),
         tree,
     )
-    expect(not tree["missing"]["initialized"] and "error" in tree["missing"], tree)
-    expect("error" in tree["broken"], tree)
-    expect("diff" not in project, project)
+    expect(
+        labels(tree, "missing") == ["error: This submodule is not initialized."], tree
+    )
+    expect(any("flake.nix" in label for label in labels(tree, "broken")), tree)
     roots = {first, home / "gitlab.com/owner/project", home / "broken"}
     inspections = [(args, root) for args, root in calls if args[0] == "afairesi"]
     expect(
@@ -162,13 +172,10 @@ def test_home_snapshot_groups_all_registered_repositories_without_writes(
     expect([path.read_bytes() for path in paths] == before, "inspection modified files")
 
 
-@pytest.mark.parametrize(
-    ("comparison", "value"), [("working", "working"), ("staged", "staged")]
-)
+@pytest.mark.parametrize("comparison", ["working", "staged"])
 def test_diff_mode_covers_the_whole_home(
     home: Path,
     comparison: str,
-    value: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Run only the requested diff stage once for each initialized direct checkout."""
@@ -183,17 +190,19 @@ def test_diff_mode_covers_the_whole_home(
         return original(arguments, root, input_text=input_text)
 
     monkeypatch.setattr(subject, "command", counted)
-    tree = subject.snapshot(home, comparison=comparison)[str(home)]
-    project = tree["github.com"]["owner"]["project"]
-    expect("resources" not in project and "diff" not in project, project)
+    tree = subject.build_tree(home, comparison=comparison, cache=home.parent / "cache")
+    project = ("github.com", "owner", "project")
+    expect(labels(tree, *project) == ["example"], tree)
+    baseline = "staged" if comparison == "working" else "original"
     expect(
-        any(
-            item["op"] == "add" and item["value"] == value for item in project["patch"]
-        ),
-        project,
+        labels(tree, *project, "example")
+        == [f"- description: {baseline}", f"+ description: {comparison}"],
+        tree,
     )
-    expect("gitlab.com" not in tree, tree)
-    expect("error" in tree["missing"], tree)
+    expect("gitlab.com" not in labels(tree), tree)
+    expect(
+        labels(tree, "missing") == ["error: This submodule is not initialized."], tree
+    )
     expected = ["afairesi", "diff", *(["--cached"] if comparison == "staged" else [])]
     expect(calls == [expected] * 3, calls)
 
@@ -214,23 +223,37 @@ def test_timeout_is_visible_without_losing_other_repositories(
         return original(arguments, root, input_text=input_text)
 
     monkeypatch.setattr(subject, "command", timeout)
-    tree = subject.snapshot(home, progress=True)[str(home)]
-    expect("timed out" in tree["github.com"]["owner"]["project"]["error"], tree)
-    expect("resources" in tree["gitlab.com"]["owner"]["project"], tree)
+    tree = subject.build_tree(home, progress=True, cache=home.parent / "cache")
+    expect(
+        any(
+            "timed out" in label
+            for label in labels(tree, "github.com", "owner", "project")
+        ),
+        tree,
+    )
+    expect("example" in labels(tree, "gitlab.com", "owner", "project"), tree)
     progress = capsys.readouterr().err
     expect("4 direct submodules" in progress and "[4/4]" in progress, progress)
 
 
 def test_empty_and_invalid_homes_are_distinct(tmp_path: Path) -> None:
     """Show an empty valid home, but reject a nested directory or a non-repository."""
+    cache = tmp_path / "cache"
     with pytest.raises(ValueError, match="not a git repository"):
-        subject.snapshot(tmp_path)
+        subject.build_tree(tmp_path, cache=cache)
     git(tmp_path, "init", "--quiet")
-    expect(subject.snapshot(tmp_path) == {str(tmp_path): {}}, tmp_path)
+    tree = subject.build_tree(tmp_path, cache=cache)
+    expect(
+        tree.label == str(tmp_path)
+        and labels(tree) == ["No direct registered submodules."],
+        tree,
+    )
+    differences = subject.build_tree(tmp_path, cache=cache, comparison="working")
+    expect(labels(differences) == ["No changes"], differences)
     child = tmp_path / "directory"
     child.mkdir()
     with pytest.raises(ValueError, match="repository root"):
-        subject.snapshot(child)
+        subject.build_tree(child, cache=cache)
 
 
 def test_cache_reuses_results_and_invalidates_tracked_changes(home: Path) -> None:
@@ -273,7 +296,9 @@ def test_cache_reuses_results_and_invalidates_tracked_changes(home: Path) -> Non
     expect(not hit, "explicit refresh used cached data")
 
 
-def test_cache_separates_operations_and_keeps_branch_metadata_live(home: Path) -> None:
+def test_cache_separates_operations_and_keeps_branch_metadata_live(
+    home: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     """Cache each operation independently while reading Git state fresh."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
@@ -283,13 +308,12 @@ def test_cache_separates_operations_and_keeps_branch_metadata_live(home: Path) -
         _, hit = subject.cached_output(root, comparison, cache, refresh=False)
         expect(hit, comparison)
     git(root, "checkout", "--quiet", "-b", "cached-branch")
-    _, report, hit = subject.repository_report(
-        home,
-        {"id": "github.com/owner/project", "initialized": True},
-        comparison=None,
-        cache=cache,
+    tree = subject.build_tree(home, cache=cache, progress=True)
+    expect(
+        "branch: cached-branch" in labels(tree, "github.com", "owner", "project"), tree
     )
-    expect(hit and report["branch"] == "cached-branch", report)
+    progress = capsys.readouterr().err
+    expect("github.com/owner/project: cached" in progress, progress)
 
 
 def test_cache_recovers_from_corruption_and_unavailable_storage(home: Path) -> None:
@@ -349,40 +373,28 @@ def test_cache_tracks_symlink_targets(home: Path) -> None:
     subject.cached_output(root, None, cache, refresh=False)
     target.write_text(target.read_text().replace('"first"', '"other"'))
     value, hit = subject.cached_output(root, None, cache, refresh=False)
-    expect(
-        not hit and value["example"]["cli"]["arguments"][0]["default"] == "other", value
-    )
+    expect(not hit and value["example"]["arguments"][0]["default"] == "other", value)
 
 
 def test_plain_tree_starts_folded_and_supports_vim_navigation() -> None:
     """Show meaningful labels and let h/l fold and unfold details without JSON noise."""
-    report = {
-        "/home/test": {
-            "github.com": {
-                "owner": {
-                    "project": {
-                        "initialized": True,
-                        "branch": "main",
-                        "dirty": True,
-                        "resources": {
-                            "hello": {
-                                "type": "python",
-                                "description": "Hello [red]literal[/red]",
-                                "cli": {
-                                    "arguments": [
-                                        {"names": ["--name"], "default": "world"}
-                                    ]
-                                },
-                                "tests": ["test_hello"],
-                            }
-                        },
-                    }
-                }
+    root = subject.Node("/home/test", expanded=True)
+    project = root.add("github.com").add("owner").add("project")
+    project.add("branch: main")
+    project.add("modified")
+    subject.add_resources(
+        project,
+        {
+            "hello": {
+                "type": "python",
+                "description": "Hello [red]literal[/red]",
+                "arguments": [{"names": ["--name"], "default": "world"}],
+                "tests": ["test_hello"],
+                "dependencies": {"library": ["runtime", "test"]},
             }
-        }
-    }
-
-    viewer = subject.Viewer(subject.build_tree(report))
+        },
+    )
+    viewer = subject.Viewer(root)
     expect(
         viewer.frame(30) == [("▾ /home/test", True, ""), ("  ▸ github.com", False, "")],
         viewer.frame(30),
@@ -404,8 +416,11 @@ def test_plain_tree_starts_folded_and_supports_vim_navigation() -> None:
         resource.children[1].label == "description: Hello [red]literal[/red]",
         resource.children,
     )
-    cli = resource.children[2]
-    expect(cli.children[0].children[0].label == "--name", cli.children)
+    arguments = resource.children[2]
+    expect(arguments.label == "arguments", arguments)
+    expect(arguments.children[0].label == "--name", arguments.children)
+    dependencies = resource.children[4]
+    expect(dependencies.children[0].label == "library (runtime, test)", dependencies)
     for key in "hhh":
         viewer.handle(key, 30)
     expect(
@@ -465,27 +480,3 @@ def test_viewer_pans_and_displays_control_characters_as_text() -> None:
     viewer.handle("0", 1)
     viewer.handle("H", 1)
     expect(viewer.frame(1) == [(label, True, "")], viewer.frame(1))
-
-
-def test_plain_diff_tree_shows_values_instead_of_patch_metadata() -> None:
-    """Display additions and removals without duplicate JSON Patch test operations."""
-    tree = subject.Node("home")
-    subject.add_repository(
-        tree,
-        "repo",
-        {
-            "initialized": True,
-            "patch": [
-                {"op": "test", "path": "/hello/description", "value": "before"},
-                {"op": "remove", "path": "/hello/description", "value": "before"},
-                {"op": "add", "path": "/hello/description", "value": "after"},
-            ],
-        },
-    )
-    [resource] = tree.children[0].children
-    expect(resource.label == "hello", resource.label)
-    labels = [node.label for node in resource.children]
-    expect(
-        labels == ["- description: before", "+ description: after"],
-        labels,
-    )

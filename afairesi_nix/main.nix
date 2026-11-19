@@ -36,7 +36,7 @@ let
                 pkgs.nixfmt
               ];
               text = ''
-                nixfmt < "$temporary" > /dev/null
+                nixfmt - < "$temporary" > /dev/null
                 uncomment --config ${pkgs.writeText "uncomment.toml" ""} --no-gitignore "$temporary"
                 alphabetize_nix "$temporary"
                 nixfmt "$temporary"
@@ -900,7 +900,6 @@ let
       !(arguments ? runtimeHook) || executable || throw "runtimeHook requires an executable package";
     python.pkgs.buildPythonPackage (
       {
-        propagatedBuildInputs = [ ];
         version = "0.0.0";
       }
       // builtins.removeAttrs arguments [
@@ -934,7 +933,6 @@ let
         passthru =
           (arguments.passthru or { })
           // {
-            inherit python;
             afairesiKind = "python";
           }
           // pkgs.lib.optionalAttrs (arguments ? runtimeHook) { inherit (arguments) runtimeHook; };
@@ -953,17 +951,18 @@ let
         "propagatedBuildInputs"
         "propagatedNativeBuildInputs"
       ];
-      python = packageDrv.python.withPackages (
+      python = packageDrv.pythonModule.withPackages (
         ps:
         dependencies
         ++ [
+          packageDrv
           ps.hypothesis
           ps.pytest
         ]
       );
     in
-    if packageDrv ? lean4 then
-      {
+    {
+      lean4 = {
         inherit dependencies;
         inherit (packageDrv) lean4;
         shell = pkgs.mkShell {
@@ -971,43 +970,35 @@ let
           inputsFrom = [ packageDrv ];
           packages = dependencies ++ [ packageDrv.lean4 ];
         };
-      }
-    else
-      {
+      };
+      python = {
         inherit dependencies python;
         shell = pkgs.mkShell {
           inputsFrom = [ packageDrv ];
           packages = dependencies ++ [ python ];
         };
       };
+    }
+    .${packageDrv.afairesiKind};
   mkTreefmtTool =
     {
       pkgs,
       self,
       treefmtEval,
     }:
-    let
-      raw = treefmtEval.config.build.wrapper;
-      wrapper = pkgs.writeShellApplication {
-        name = "treefmt";
-        runtimeInputs = [ pkgs.git ];
-        text = ''
-          exec ${raw}/bin/treefmt --walk git "$@"
-        '';
-      };
-    in
-    wrapper
-    // {
-      passthru = wrapper.passthru // {
-        inherit raw;
-        tests.check = (treefmtEval.config.build.check self.outPath).overrideAttrs (previous: {
-          buildCommand =
-            builtins.replaceStrings
-              [ "git add ." "treefmt --no-cache" ]
-              [ "git add --force -- ." "treefmt --no-cache --walk git" ]
-              previous.buildCommand;
-        });
-      };
+    pkgs.writeShellApplication {
+      name = "treefmt";
+      passthru.tests.check = (treefmtEval.config.build.check self.outPath).overrideAttrs (previous: {
+        buildCommand =
+          builtins.replaceStrings
+            [ "git add ." "treefmt --no-cache" ]
+            [ "git add --force -- ." "treefmt --no-cache --walk git" ]
+            previous.buildCommand;
+      });
+      runtimeInputs = [ pkgs.git ];
+      text = ''
+        exec ${treefmtEval.config.build.wrapper}/bin/treefmt --walk git "$@"
+      '';
     };
   packageNamesFor =
     self: pkgs: kind:
@@ -1026,6 +1017,8 @@ let
       testEnvironment,
     }:
     let
+      inherit (packageDrv) pythonModule;
+      installedModule = "${packageDrv}/${pythonModule.sitePackages}/${packageDrv.pname}";
       runtime = builtins.toFile "coverage_support.py" ''
         from __future__ import annotations
 
@@ -1073,8 +1066,7 @@ let
     in
     pkgs.runCommand "${packageName}-coverage"
       (
-        (packageDrv.checkEnv or { })
-        // {
+        {
           inherit (packageDrv) src;
           nativeBuildInputs = testEnvironment.dependencies ++ [ testEnvironment.python ];
         }
@@ -1097,13 +1089,12 @@ let
         data_file = $out/.coverage
         source =
             $src
-            ${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}
+            ${installedModule}
         omit =
             */test_main.py
         EOF
-        export PYTHONPATH="$TMPDIR/coverage-startup:$PWD:${packageDrv.python.pkgs.coverage}/${packageDrv.python.sitePackages}:$PYTHONPATH"
+        export PYTHONPATH="$TMPDIR/coverage-startup:${pythonModule.pkgs.coverage}/${pythonModule.sitePackages}:$PYTHONPATH"
         export HOME="$(mktemp -d)"
-        ln -s "$src" "${builtins.replaceStrings [ "-" ] [ "_" ] packageName}"
         cd "$out"
         "${testEnvironment.python}/bin/python" -c '
         import sys
@@ -1119,7 +1110,7 @@ let
           --import-mode=importlib --durations=10 --maxfail=1 "$src/test_main.py"
         unset COVERAGE_PROCESS_START
         python -m coverage combine --rcfile="$TMPDIR/coverage.ini"
-        python -c 'from _afairesi_coverage_support import remap_coverage_paths; remap_coverage_paths("${packageDrv}/${packageDrv.python.sitePackages}/${packageDrv.pname}/__init__.py")'
+        python -c 'from _afairesi_coverage_support import remap_coverage_paths; remap_coverage_paths("${installedModule}/__init__.py")'
         python -m coverage html --show-contexts --rcfile="$TMPDIR/coverage.ini" -d "$out/html"
         python -m coverage json --show-contexts --rcfile="$TMPDIR/coverage.ini" -o "$out/coverage.json"
       '';
@@ -1138,7 +1129,7 @@ let
     '';
 in
 {
-  inherit formatter lint pythonCheck;
+  inherit formatter lint;
   lib = {
     inherit
       mkFlake

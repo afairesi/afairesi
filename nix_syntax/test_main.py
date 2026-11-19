@@ -3,15 +3,13 @@
 
 from __future__ import annotations
 
-import json
-import subprocess
 from typing import TYPE_CHECKING
 
 import pytest
 from hypothesis import given
 from hypothesis import strategies as st
 
-from nix_syntax import main as nix_syntax
+import nix_syntax
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -35,35 +33,24 @@ def test_fuzz_parsing_preserves_valid_source_or_reports_a_syntax_error(
         raise AssertionError(document)
 
 
-@pytest.fixture(autouse=True)
-def _isolated_nix_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Run native commands against a private store without host configuration."""
-    monkeypatch.setenv("NIX_REMOTE", f"local?root={tmp_path / 'store'}")
-    monkeypatch.setenv("NIX_CONFIG", "build-users-group =\n")
-
-
 @pytest.mark.parametrize(
-    "source",
+    ("source", "expected"),
     [
-        '"a\r\nb"',
-        '"a\rb"',
-        '"a\\\r\nb"',
-        r'"\q"',
-        r'"\${name}"',
-        r'"back\\slash\"quote\n\t\r"',
-        '"é"',
+        ('"a\r\nb"', "a\nb"),
+        ('"a\rb"', "a\nb"),
+        ('"a\\\r\nb"', "a\r\nb"),
+        (r'"\q"', "q"),
+        (r'"\${name}"', "${name}"),
+        (r'"back\\slash\"quote\n\t\r"', 'back\\slash"quote\n\t\r'),
+        ('"é"', "é"),
     ],
 )
-def test_string_literals_follow_native_nix_decoding_rules(source: str) -> None:
-    """Decode literals with Nix's own escape and line-ending rules."""
-    native = subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
-        ["nix-instantiate", "--eval", "--strict", "--json", "--expr", source],  # noqa: S607
-        capture_output=True,
-        check=True,
-        timeout=10,
-    )
+def test_string_literals_follow_native_nix_decoding_rules(
+    source: str, expected: str
+) -> None:
+    """Preserve the decoded value of escapes, line endings, and Unicode."""
     document = nix_syntax.parse(source)
-    if nix_syntax.string_value(document, document.root) != json.loads(native.stdout):
+    if nix_syntax.string_value(document, document.root) != expected:
         raise AssertionError(source)
 
 
@@ -75,16 +62,19 @@ def test_literal_inspection_leaves_expressions_unevaluated(source: str) -> None:
         raise AssertionError(source)
 
 
-def test_literal_inspection_preserves_home_and_nix_store(
+def test_long_literal_inspection_preserves_home_and_nix_store(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Inspecting a literal leaves HOME and the configured store untouched."""
+    """Read a literal larger than a command argument and leave Nix state untouched."""
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
-    document = nix_syntax.parse('"metadata"')
-    if nix_syntax.string_value(document, document.root) != "metadata":
+    monkeypatch.setenv("NIX_REMOTE", f"local?root={tmp_path / 'store'}")
+    monkeypatch.setenv("NIX_CONFIG", "build-users-group =\n")
+    value = "metadata" * 32768
+    document = nix_syntax.parse(nix_syntax.quote_string(value))
+    if nix_syntax.string_value(document, document.root) != value:
         msg = "literal value changed"
         raise AssertionError(msg)
     if list(home.rglob("*")) or (tmp_path / "store").exists():

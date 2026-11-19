@@ -8,5 +8,12 @@ import sys
 
 def main() -> None:
     """Report the runtime hook state and arguments."""
-    sys.stdout.write(os.environ.get("AFAIRESI_CONSUMER_HOOK", "unloaded") + "\n")
+    hook = os.environ.get("AFAIRESI_CONSUMER_HOOK")
+    if hook is None:
+        hook = "unloaded"
+    sys.stdout.write(hook + "\n")
     sys.stdout.write(repr(sys.argv[1:]) + "\n")
+
+
+if __name__ == "__main__":
+    main()

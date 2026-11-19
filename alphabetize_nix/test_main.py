@@ -3,17 +3,20 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
-from pathlib import Path
-from tempfile import TemporaryDirectory
+from typing import TYPE_CHECKING
 from unittest.mock import Mock
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
-from alphabetize_nix import main as alphabetize
+import alphabetize_nix as alphabetize
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 
 def test_formatting_nested_bindings_requires_work_proportional_to_source_size(
@@ -71,19 +74,9 @@ def test_fuzz_formatting_preserves_values_and_is_repeatable(
     formatted = alphabetize.format_text(source)
     if alphabetize.format_text(formatted) != formatted:
         raise AssertionError(formatted)
-    with TemporaryDirectory(prefix="alphabetize-fuzz-") as directory:
-        root = Path(directory)
-        original = root / "original.nix"
-        rewritten = root / "rewritten.nix"
-        original.write_text(source)
-        rewritten.write_text(formatted)
-        environment = dict(os.environ)
-        environment["NIX_CONFIG"] = "build-users-group =\n"
-        environment["NIX_REMOTE"] = f"local?root={root / 'nix'}"
-        before = _evaluate(original, environment)
-        after = _evaluate(rewritten, environment)
-        if before.returncode or after.returncode or before.stdout != after.stdout:
-            raise AssertionError((source, formatted, before, after))
+    result = _evaluate(formatted)
+    if result.returncode or json.loads(result.stdout) != bindings:
+        raise AssertionError((source, formatted, result))
 
 
 @pytest.mark.parametrize(
@@ -164,16 +157,9 @@ def test_cli_canonicalizes_nix_expressions_and_is_repeatable(
 )
 def test_cli_preserves_native_nix_value(tmp_path: Path, source: str) -> None:
     """Rewriting preserves the value that Nix evaluates, including list order."""
-    original = tmp_path / "original.nix"
     formatted = tmp_path / "formatted.nix"
-    original.write_text(source, encoding="utf-8")
     formatted.write_text(source, encoding="utf-8")
-    environment = dict(os.environ)
-    environment["NIX_CONFIG"] = "build-users-group =\n"
-    environment["NIX_REMOTE"] = (
-        f"local?store={tmp_path / 'store'}&state={tmp_path / 'state'}"
-    )
-    expected = _evaluate(original, environment)
+    expected = _evaluate(source)
     for _ in range(2):
         subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
             [os.environ["PACKAGE_E2E_EXECUTABLE"], str(formatted)],
@@ -181,24 +167,31 @@ def test_cli_preserves_native_nix_value(tmp_path: Path, source: str) -> None:
             check=True,
             timeout=10,
         )
-        actual = _evaluate(formatted, environment)
-        if expected.returncode or actual.returncode or actual.stdout != expected.stdout:
-            raise AssertionError((expected, actual, formatted.read_text()))
-        for line in source.splitlines():
-            if "#" in line and line.split("#", 1)[1] not in formatted.read_text():
-                raise AssertionError(formatted.read_text())
         rendered = formatted.read_text()
+        actual = _evaluate(rendered)
+        if expected.returncode or actual.returncode or actual.stdout != expected.stdout:
+            raise AssertionError((expected, actual, rendered))
+        for line in source.splitlines():
+            if "#" in line and line.split("#", 1)[1] not in rendered:
+                raise AssertionError(rendered)
         if "/* key comment */" in source and "/* key comment */" not in rendered:
             raise AssertionError(rendered)
 
 
-def _evaluate(
-    path: Path,
-    environment: dict[str, str],
-) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(  # noqa: S603 - Fixed Nix executable with fixture paths or expressions.
-        ["nix-instantiate", "--eval", "--strict", "--json", str(path)],  # noqa: S607
-        env=environment,
+def _evaluate(source: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        [  # noqa: S607
+            "nix",
+            "--extra-experimental-features",
+            "nix-command",
+            "eval",
+            "--store",
+            "dummy://",
+            "--json",
+            "--file",
+            "-",
+        ],
+        input=source,
         capture_output=True,
         text=True,
         check=False,
@@ -222,19 +215,14 @@ def test_cli_preserves_native_nix_errors(
     """Nix continues to reject semantic errors after canonicalization."""
     path = tmp_path / "error.nix"
     path.write_text(source, encoding="utf-8")
-    environment = dict(os.environ)
-    environment["NIX_CONFIG"] = "build-users-group =\n"
-    environment["NIX_REMOTE"] = (
-        f"local?store={tmp_path / 'store'}&state={tmp_path / 'state'}"
-    )
-    expected = _evaluate(path, environment)
+    expected = _evaluate(source)
     subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
         [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
         capture_output=True,
         check=True,
         timeout=10,
     )
-    actual = _evaluate(path, environment)
+    actual = _evaluate(path.read_text())
     if (
         not expected.returncode
         or actual.returncode != expected.returncode

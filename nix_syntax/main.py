@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import contextlib
-import json
 import os
 import subprocess
 import tempfile
@@ -104,22 +103,23 @@ def string_value(document: Document, node: Node) -> str | None:
         child.type == "interpolation" for child in walk(node)
     ):
         return None
-    completed = subprocess.run(  # noqa: S603 - Evaluate only a parsed string without interpolation.
+    completed = subprocess.run(
         [  # noqa: S607
-            "nix-instantiate",
+            "nix",
+            "--extra-experimental-features",
+            "nix-command",
+            "eval",
             "--store",
             "dummy://",
-            "--eval",
-            "--strict",
-            "--json",
-            "--expr",
-            document.text(node),
+            "--raw",
+            "--file",
+            "-",
         ],
+        input=document.source[node.start_byte : node.end_byte],
         capture_output=True,
         check=True,
-        text=True,
     )
-    return str(json.loads(completed.stdout))
+    return completed.stdout.decode("utf-8")
 
 
 def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | None:

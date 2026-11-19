@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,17 +30,25 @@ if TYPE_CHECKING:
     from typing import Never
 
     from tree_sitter import Node
-PACKAGE_BUILDERS = {
-    "html": "mkHtmlPackage",
-    "latex": "mkLatexPackage",
-    "python": "mkPythonPackage",
-    "lean4": "mkLean4Package",
+BUILDER_KINDS = {
+    "mkHtmlPackage": "html",
+    "mkLatexPackage": "latex",
+    "mkLean4Package": "lean4",
+    "mkPythonPackage": "python",
 }
-ROOT_FILES = {
-    "flake.lock",
-    "flake.nix",
+PACKAGE_MAIN_FILES = {
+    "generic": "main.nix",
+    "html": "index.html",
+    "latex": "ms.tex",
+    "lean4": "main.lean",
+    "python": "main.py",
 }
-RESOURCE_PATH_COMPONENTS = 1
+PACKAGE_TEST_FILES = {
+    "generic": "test_main.nix",
+    "lean4": "test_main.lean",
+    "python": "test_main.py",
+}
+ROOT_FILES = ("flake.lock", "flake.nix")
 
 
 class CommandError(RuntimeError):
@@ -48,35 +57,11 @@ class CommandError(RuntimeError):
 
 @dataclass(frozen=True)
 class Package:
-    """A repository package with its kind and source directory."""
+    """A repository package and its parsed declaration."""
 
-    name: str
-    kind: str
     root: Path
-
-
-def run(
-    arguments: list[str],
-    cwd: Path | None = None,
-    *,
-    check: bool = True,
-    capture_output: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    """Run a process with captured output or inherited terminal streams."""
-    completed = subprocess.run(  # noqa: S603 - Callers construct argv; commands run without a shell.
-        arguments,
-        cwd=cwd,
-        capture_output=capture_output,
-        check=False,
-        text=True,
-    )
-    if check and completed.returncode != 0:
-        if completed.stdout:
-            sys.stdout.write(completed.stdout)
-        if completed.stderr:
-            sys.stderr.write(completed.stderr)
-        raise SystemExit(completed.returncode)
-    return completed
+    kind: str
+    definition: nix_syntax.Document
 
 
 def git(
@@ -85,11 +70,18 @@ def git(
     *,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
-    """Run Git in a selected repository."""
-    return run(
-        ["git", "-C", str(root), *arguments],
-        check=check,
+    """Run Git in a selected repository, forwarding diagnostics on failure."""
+    completed = subprocess.run(  # noqa: S603 - Git arguments are passed without a shell.
+        ["git", "-C", str(root), *arguments],  # noqa: S607
+        capture_output=True,
+        check=False,
+        text=True,
     )
+    if check and completed.returncode:
+        sys.stdout.write(completed.stdout)
+        sys.stderr.write(completed.stderr)
+        raise SystemExit(completed.returncode)
+    return completed
 
 
 def repository_root(path: Path = Path()) -> Path:
@@ -116,7 +108,7 @@ def resolve_repository_path(path: Path) -> Path:
     return (root / path).resolve()
 
 
-def read_regular(path: Path) -> str | None:
+def read_regular(path: Path) -> bytes | None:
     """Read an optional regular file, rejecting other filesystem entries."""
     try:
         mode = path.lstat().st_mode
@@ -125,96 +117,83 @@ def read_regular(path: Path) -> str | None:
     if not stat.S_ISREG(mode):
         msg = f"{path}: must be a regular file"
         raise CommandError(msg)
-    return path.read_text(encoding="utf-8")
-
-
-def _tracked_paths(root: Path) -> set[Path]:
-    """Return paths represented in the index."""
-    completed = git(root, ["ls-files", "-z"])
-    return {Path(item) for item in completed.stdout.split("\0") if item}
+    return path.read_bytes()
 
 
 def source_paths(root: Path) -> set[Path]:
-    """Select tracked working files, or files in an exported source tree."""
+    """Select root and resource files from the Git index or an exported tree."""
     if (root / ".git").exists():
-        return _tracked_paths(root)
+        entries = git(root, ["ls-files", "-z"]).stdout
+        return {
+            Path(item) for item in entries.split("\0") if item and item.count("/") <= 1
+        }
     paths: set[Path] = set()
     for directory, directories, filenames in root.walk():
-        directories[:] = [name for name in directories if name != ".git"]
-        paths.update(
-            (directory / name).relative_to(root) for name in filenames if name != ".git"
-        )
+        if directory != root:
+            directories.clear()
+        relative = directory.relative_to(root)
+        paths.update(relative / name for name in filenames)
     return paths
 
 
-def _package_kind(definition: str | None) -> str:
+def _package_kind(document: nix_syntax.Document) -> str:
     """Select conventions only from recognizable builders without evaluating Nix."""
-    if definition:
-        with contextlib.suppress(nix_syntax.NixSyntaxError):
-            document = nix_syntax.parse(definition)
-            body = _package_body(document)
-            function = body.child_by_field_name("function")
-            if body.type == "apply_expression" and function is not None:
-                constructor = _resource_constructor(document, function)
-                for kind, builder in PACKAGE_BUILDERS.items():
-                    if constructor == builder:
-                        return kind
+    function = _package_body(document).child_by_field_name("function")
+    seen = set()
+    while function is not None and function.type in {
+        "parenthesized_expression",
+        "variable_expression",
+    }:
+        if function.id in seen:
+            return "generic"
+        seen.add(function.id)
+        function = (
+            function.child_by_field_name("expression")
+            if function.type == "parenthesized_expression"
+            else _alias_value(document, function)
+        )
+    if function is not None and function.type == "select_expression":
+        attrs = function.child_by_field_name("attrpath")
+        if attrs is not None and (parts := nix_syntax.static_attrpath(document, attrs)):
+            return BUILDER_KINDS.get(parts[-1], "generic")
     return "generic"
 
 
-def resource_directories(root: Path, paths: set[Path]) -> list[Path]:
-    """List top-level source directories without traversing local files."""
-    directories = {
-        root / path.parts[0]
-        for path in paths
-        if len(path.parts) > 1 and path.parts[0] != ".git"
-    }
-    return sorted(
-        path for path in directories if path.is_dir() and not path.is_symlink()
-    )
+def _resource_definitions(root: Path, paths: set[Path], filename: str) -> list[Path]:
+    """Select declarations directly under top-level resource directories."""
+    definitions = []
+    for path in paths:
+        if path.name != filename or len(path.parent.parts) != 1:
+            continue
+        definition = root / path
+        if not definition.parent.is_symlink() and definition.parent.is_dir():
+            definitions.append(definition)
+    return sorted(definitions)
 
 
 def detect_hosts(root: Path, paths: set[Path]) -> list[Path]:
     """Detect hosts under the same directory rules as packages."""
     return [
-        path
-        for path in resource_directories(root, paths)
-        if Path(path.name) / "configuration.nix" in paths
-        and (path / "configuration.nix").is_file()
+        definition.parent
+        for definition in _resource_definitions(root, paths, "configuration.nix")
+        if definition.is_file()
     ]
 
 
-def detect_packages(root: Path, paths: set[Path] | None = None) -> list[Package]:
-    """Detect packages declared by tracked default.nix files."""
-    result: list[Package] = []
-    paths = source_paths(root) if paths is None else paths
-    for package_root in resource_directories(root, paths):
-        definition = Path(package_root.name) / "default.nix"
-        if definition not in paths:
+def detect_packages(root: Path, paths: set[Path]) -> tuple[list[Package], list[Path]]:
+    """Read package declarations and identify tracked declarations missing on disk."""
+    result = []
+    missing = []
+    for path in _resource_definitions(root, paths, "default.nix"):
+        source = read_regular(path)
+        relative = path.relative_to(root)
+        if source is None:
+            missing.append(relative)
             continue
-        result.append(
-            Package(
-                package_root.name,
-                _package_kind(read_regular(root / definition)),
-                package_root,
-            ),
-        )
+        document = nix_syntax.parse(source, str(relative))
+        result.append(Package(path.parent, _package_kind(document), document))
     validate_python_package_names(result)
-    return result
-
-
-def validate_name(name: str) -> None:
-    """Require one directory name without imposing a spelling convention."""
-    path = Path(name)
-    if (
-        path.is_absolute()
-        or len(path.parts) != RESOURCE_PATH_COMPONENTS
-        or name != path.name
-        or name in {"..", ".git"}
-        or "\0" in name
-    ):
-        msg = f"resource path must be a root directory name: {name}"
-        raise CommandError(msg)
+    return result, missing
 
 
 def validate_python_package_names(packages: list[Package]) -> None:
@@ -223,88 +202,52 @@ def validate_python_package_names(packages: list[Package]) -> None:
     for package in packages:
         if package.kind != "python":
             continue
-        module = package.name.replace("-", "_")
+        name = package.root.name
+        module = name.replace("-", "_")
         if not module.isidentifier() or keyword.iskeyword(module):
             msg = (
-                f"{package.name}: installed Python module must be "
+                f"{name}: installed Python module must be "
                 "a valid non-keyword identifier"
             )
             raise CommandError(msg)
         if module in modules:
             msg = (
-                f"{package.name} and {modules[module]}: "
+                f"{name} and {modules[module]}: "
                 f"installed Python module names collide: {module}"
             )
             raise CommandError(msg)
-        modules[module] = package.name
+        modules[module] = name
 
 
-def package_files(package: Package) -> set[Path]:
-    """Return conventional source files for a package kind."""
-    relative = Path() / package.name
-    kind_files = {
-        "python": {"main.py", "test_main.py"},
-        "html": {"index.html"},
-        "latex": {"ms.tex"},
-        "lean4": {"main.lean", "test_main.lean"},
-        "generic": {"main.nix", "test_main.nix"},
-    }[package.kind]
-    return {relative / "default.nix", *(relative / item for item in kind_files)}
-
-
-def required_package_files(package: Package) -> set[Path]:
-    """Return regular files required for a package kind."""
-    optional = {
-        "html": set(),
-        "latex": set(),
-        "lean4": {"test_main.lean"},
-        "generic": {"main.nix", "test_main.nix"},
-        "python": {"test_main.py"},
-    }[package.kind]
-    return {path for path in package_files(package) if path.name not in optional}
-
-
-def _conventional_paths(
+def _structure_issues(
     root: Path, packages: list[Package], paths: set[Path]
-) -> set[Path]:
-    """Select tracked conventional files for source validation."""
-    conventional = {Path(item) for item in ROOT_FILES} & paths
-    for host in detect_hosts(root, paths):
-        validate_name(host.name)
-        conventional.update(
-            {
-                Path(host.name) / "configuration.nix",
-                Path(host.name) / "hardware-configuration.nix",
-            }
-            & paths,
-        )
-    for package in packages:
-        conventional.update(package_files(package) & paths)
-    return conventional
-
-
-def inspect_structure(
-    root: Path, paths: set[Path] | None = None
-) -> tuple[list[Package], list[str]]:
-    """Validate recognized tracked resources, permitting arbitrary supporting files."""
-    paths = source_paths(root) if paths is None else paths
-    packages = detect_packages(root, paths)
+) -> list[str]:
+    """Check tracked resource files for layout and Python source errors."""
     issues: list[str] = []
-    for package in packages:
-        validate_name(package.name)
-        issues.extend(_python_source_issues(package, paths))
-        issues.extend(
-            f"{relative}: missing required tracked regular file"
-            for relative in sorted(required_package_files(package))
-            if relative not in paths or not (root / relative).is_file()
+    conventional = {Path(item) for item in ROOT_FILES}
+    for host in detect_hosts(root, paths):
+        conventional.update(
+            Path(host.name) / filename
+            for filename in ("configuration.nix", "hardware-configuration.nix")
         )
-    for relative in sorted(_conventional_paths(root, packages, paths)):
+    for package in packages:
+        issues.extend(_python_source_issues(package, paths))
+        directory = package.root.relative_to(root)
+        main = directory / PACKAGE_MAIN_FILES[package.kind]
+        conventional.add(main)
+        if test_name := PACKAGE_TEST_FILES.get(package.kind):
+            conventional.add(directory / test_name)
+        if package.kind != "generic" and (
+            main not in paths or not (root / main).is_file()
+        ):
+            issues.append(f"{main}: missing required tracked regular file")
+    for relative in sorted(conventional & paths):
         path = root / relative
         if path.is_symlink():
             issues.append(
                 f"{relative}: expected regular file or directory, found symbolic link",
             )
-    return packages, issues
+    return issues
 
 
 def _python_class_mro(
@@ -393,9 +336,10 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
     if package.kind != "python":
         return []
     issues = []
-    if Path(package.name) / "__init__.py" in paths:
+    name = package.root.name
+    if Path(name) / "__init__.py" in paths:
         issues.append(
-            f"{package.name}/__init__.py: reserved for the installed main.py; "
+            f"{name}/__init__.py: reserved for the installed main.py; "
             "move initialization into main.py"
         )
     source = read_regular(package.root / "main.py")
@@ -403,15 +347,12 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
         module = ast.parse(source, filename=str(package.root / "main.py"))
         if python_test_definitions(module):
             issues.append(
-                f"{package.name}/main.py: move test definitions to test_main.py",
+                f"{name}/main.py: move test definitions to test_main.py",
             )
-        binding = _module_main_binding(module)
         entrypoint = (
-            binding.value
-            if isinstance(binding, (ast.Assign, ast.AnnAssign))
-            else binding
+            None if _python_library(package.definition) else _python_entrypoint(module)
         )
-        prefix = f"{package.name}/main.py: "
+        prefix = f"{name}/main.py: "
         if isinstance(entrypoint, ast.AsyncFunctionDef):
             issues.append(
                 prefix + "main must be synchronous; the executable calls main()",
@@ -422,24 +363,14 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
             or any(default is None for default in entrypoint.args.kw_defaults)
         ):
             issues.append(prefix + "main must accept a call without arguments")
-        elif isinstance(binding, (ast.Assign, ast.AnnAssign)) and isinstance(
-            binding.value,
-            (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict),
+        elif isinstance(
+            entrypoint, (ast.Constant, ast.List, ast.Tuple, ast.Set, ast.Dict)
         ):
             issues.append(prefix + "main must be callable; the executable calls main()")
     tests = package.root / "test_main.py"
     if tests.relative_to(package.root.parent) in paths and tests.is_file():
         _source(tests)
     return issues
-
-
-def package_description(package: Package) -> str | None:
-    """Extract declared package metadata where supported."""
-    source = read_regular(package.root / "default.nix")
-    if source is not None:
-        with contextlib.suppress(nix_syntax.NixSyntaxError):
-            return _meta_description(source)
-    return None
 
 
 def _attrset_expression(
@@ -461,9 +392,8 @@ def _attrset_expression(
     ]
 
 
-def _meta_description(source: str) -> str | None:
+def _meta_description(document: nix_syntax.Document) -> str | None:
     """Read the returned package's description without searching dependencies."""
-    document = nix_syntax.parse(source)
     container = _package_body(document)
     while container.type == "apply_expression":
         argument = container.child_by_field_name("argument")
@@ -483,30 +413,27 @@ def _meta_description(source: str) -> str | None:
     return nix_syntax.string_value(document, matches[0]) if len(matches) == 1 else None
 
 
-def _module_main_binding(module: ast.Module) -> ast.stmt | None:
-    """Find the last explicit module-level binding used by the executable."""
+def _python_entrypoint(
+    module: ast.Module,
+) -> ast.FunctionDef | ast.AsyncFunctionDef | ast.expr | None:
+    """Find the local value the executable will call as main()."""
     for node in reversed(module.body):
         if (
-            (
-                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-                and node.name == "main"
-            )
-            or (
-                isinstance(node, (ast.Import, ast.ImportFrom))
-                and any((alias.asname or alias.name) == "main" for alias in node.names)
-            )
-            or (
-                isinstance(node, (ast.Assign, ast.AnnAssign))
-                and node.value is not None
-                and any(
-                    isinstance(target, ast.Name) and target.id == "main"
-                    for target in (
-                        node.targets if isinstance(node, ast.Assign) else [node.target]
-                    )
-                )
-            )
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and node.name == "main"
         ):
             return node
+        if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
+            (alias.asname or alias.name) == "main" for alias in node.names
+        ):
+            return None
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if any(
+                isinstance(target, ast.Name) and target.id == "main"
+                for target in targets
+            ):
+                return node.value
     return None
 
 
@@ -528,67 +455,6 @@ def _package_body(document: nix_syntax.Document) -> Node:
     return body
 
 
-def _resource_constructor(
-    document: nix_syntax.Document,
-    expression: Node,
-    visited: frozenset[int] = frozenset(),
-) -> str | None:
-    """Resolve static constructor references and lexical let aliases."""
-    if expression.start_byte in visited:
-        return None
-    visited = visited | {expression.start_byte}
-    if expression.type == "parenthesized_expression":
-        inner = expression.child_by_field_name("expression")
-        return (
-            None if inner is None else _resource_constructor(document, inner, visited)
-        )
-    if expression.type == "select_expression":
-        attrpath = expression.child_by_field_name("attrpath")
-        path = (
-            None if attrpath is None else nix_syntax.static_attrpath(document, attrpath)
-        )
-        return None if path is None else path[-1]
-    if expression.type != "variable_expression":
-        return None
-    return _resource_variable_constructor(document, expression, visited)
-
-
-def _resource_variable_constructor(
-    document: nix_syntax.Document,
-    expression: Node,
-    visited: frozenset[int],
-) -> str | None:
-    """Resolve aliases without crossing a binding that shadows their names."""
-    name = document.text(expression)
-    scope = expression.parent
-    while scope is not None:
-        if scope.type == "function_expression":
-            parameters = [
-                child
-                for field in ("universal", "formals")
-                if (child := scope.child_by_field_name(field)) is not None
-            ]
-            if any(
-                node.type == "identifier" and document.text(node) == name
-                for parameter in parameters
-                for node in nix_syntax.walk(parameter)
-            ):
-                return None
-        if scope.type in {"let_expression", "rec_attrset_expression"}:
-            bindings = nix_syntax.binding_set(scope)
-            for binding in [] if bindings is None else bindings.named_children:
-                path = binding.child_by_field_name("attrpath")
-                value = binding.child_by_field_name("expression")
-                if (
-                    path is not None
-                    and nix_syntax.static_attrpath(document, path) == (name,)
-                    and value is not None
-                ):
-                    return _resource_constructor(document, value, visited)
-        scope = scope.parent
-    return None
-
-
 def _validate_flake_syntax(root: Path) -> None:
     """Parse the flake without restricting its resource definitions."""
     source = read_regular(root / "flake.nix")
@@ -599,9 +465,11 @@ def _validate_flake_syntax(root: Path) -> None:
 def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     paths = source_paths(root)
-    packages, issues = inspect_structure(root, paths)
+    packages, missing = detect_packages(root, paths)
+    issues = _structure_issues(root, packages, paths)
+    issues.extend(f"{path}: missing required tracked regular file" for path in missing)
     _validate_flake_syntax(root)
-    for required in ("flake.lock", "flake.nix"):
+    for required in ROOT_FILES:
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
     if issues:
@@ -609,10 +477,13 @@ def validate_flake_source(root: Path) -> None:
         msg = f"repository layout validation failed:\n{formatted_issues}"
         raise CommandError(msg)
     for package in packages:
-        for relative in sorted(package_files(package) & paths):
-            if relative.suffix == ".nix":
-                source = root / relative
-                if source.is_file():
+        if package.kind == "generic":
+            for filename in (
+                PACKAGE_MAIN_FILES["generic"],
+                PACKAGE_TEST_FILES["generic"],
+            ):
+                source = package.root / filename
+                if source.relative_to(root) in paths and source.is_file():
                     nix_syntax.parse(source.read_bytes(), str(source))
 
 
@@ -651,7 +522,12 @@ def inspection_remote_repository(remote: str) -> Iterator[Path]:
     """Inspect a native Git clone without changing existing repositories."""
     with tempfile.TemporaryDirectory(prefix="afairesi-inspect-") as temporary:
         checkout = Path(temporary) / "repository"
-        run(["git", "clone", "--", remote, str(checkout)], capture_output=False)
+        clone = subprocess.run(  # noqa: S603 - Git receives the remote after the option delimiter.
+            ["git", "clone", "--", remote, str(checkout)],  # noqa: S607
+            check=False,
+        )
+        if clone.returncode:
+            raise SystemExit(clone.returncode)
         yield checkout
 
 
@@ -767,7 +643,7 @@ def _command_node(tree: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]
     """Find or create the command node at a resolved path."""
     node = tree
     for name in path:
-        node = node["commands"].setdefault(name, {"arguments": [], "commands": {}})
+        node = node.setdefault("commands", {}).setdefault(name, {})
     return node
 
 
@@ -815,15 +691,6 @@ class ArgumentDiscovery:
         self._non_parser_candidates: set[int] = set()
         self._collect(self.names.module, "")
         scopes = self._public_scopes()
-        if "main" not in self.functions:
-            scopes = self._public_scopes(
-                scopes
-                | {
-                    scope
-                    for scope, call in self.calls
-                    if self._qualified(call.func) == "argparse.ArgumentParser"
-                },
-            )
         self.calls = [(scope, call) for scope, call in self.calls if scope in scopes]
         for _scope, call in self.calls:
             if (key := self._function(call.func)) is not None:
@@ -1085,14 +952,9 @@ class ArgumentDiscovery:
             result.update(self._conditions(value, seen))
         return result
 
-    def _check_structure(self, call: ast.Call, roots: set[str]) -> None:
-        """Reject runtime-dependent construction only for the selected CLI."""
-        paths = self._resolve(call)
-        if not paths and isinstance(call.func, ast.Attribute):
-            paths = self._resolve(call.func.value)
-        if any(not roots or path[0] in roots for path in paths) and self._conditions(
-            call,
-        ):
+    def _check_structure(self, call: ast.Call) -> None:
+        """Reject runtime-dependent construction of the selected CLI."""
+        if self._conditions(call):
             self._error(call, "CLI construction depends on unresolved control flow")
 
     def _parser_keywords(self, call: ast.Call) -> dict[str, ast.expr]:
@@ -1195,9 +1057,18 @@ class ArgumentDiscovery:
                 }
         return set()
 
-    def _public_scopes(self, initial: set[str] | None = None) -> set[str]:
-        """Find functions reachable from the public entry point."""
-        scopes = initial or {"", "main"}
+    def _public_scopes(self) -> set[str]:
+        """Follow module-level calls and the installed main entry point."""
+        entrypoint = _python_entrypoint(self.names.module)
+        scopes = {""} if isinstance(entrypoint, ast.Name) else {"", "main"}
+        seen: set[int] = set()
+        while isinstance(entrypoint, ast.Name) and id(entrypoint) not in seen:
+            seen.add(id(entrypoint))
+            if (function := self._function(entrypoint)) is not None:
+                scopes.add(function)
+                break
+            bindings = self._bindings(entrypoint)
+            entrypoint = bindings[0] if len(bindings) == 1 else None
         while True:
             reachable = scopes | {
                 key
@@ -1212,10 +1083,7 @@ class ArgumentDiscovery:
     def _public_roots(self) -> set[str]:
         """Select consumed parsers, rejecting unsupported public construction."""
         roots: set[str] = set()
-        scopes = self._public_scopes()
-        for scope, call in self.calls:
-            if scope not in scopes:
-                continue
+        for _scope, call in self.calls:
             if isinstance(call.func, ast.Name):
                 if self._function(call.func) in self.ambiguous_functions:
                     self._error(
@@ -1249,9 +1117,11 @@ class ArgumentDiscovery:
             }:
                 continue
             paths = self._resolve(call.func.value)
-            if not paths and self.has_argparse:
-                self._error(call, "cannot resolve the public argparse parser")
-            self._check_structure(call, set())
+            if not paths:
+                if self.has_argparse:
+                    self._error(call, "cannot resolve the public argparse parser")
+                continue
+            self._check_structure(call)
             roots.update(path[0] for path in paths)
             if len(roots) > 1:
                 self._error(call, "multiple public parsers cannot form one CLI")
@@ -1260,9 +1130,9 @@ class ArgumentDiscovery:
     def _check_parents(self, call: ast.Call, roots: set[str]) -> None:
         """Reject inherited interfaces until their argument scopes can be resolved."""
         contexts = self._resolve(call)
-        if not any(not roots or context[0] in roots for context in contexts):
+        if not any(context[0] in roots for context in contexts):
             return
-        self._check_structure(call, roots)
+        self._check_structure(call)
         options = self._parser_keywords(call)
         if "parents" in options and _value(options["parents"]) not in ([], ()):
             self._error(call, "argparse parents= inheritance is not supported")
@@ -1447,7 +1317,7 @@ class ArgumentDiscovery:
                         options,
                     )
                 continue
-            self._check_structure(call, roots)
+            self._check_structure(call)
             for name, value in zip(("title", "description"), call.args, strict=False):
                 options[name] = _value(value)
             members = self._group_members(call, contexts, roots)
@@ -1473,12 +1343,10 @@ class ArgumentDiscovery:
             if self.has_argparse:
                 self._error(call, "cannot resolve the argument parser")
             return
-        public_contexts = {
-            context[1:] for context in contexts if not roots or context[0] in roots
-        }
+        public_contexts = {context[1:] for context in contexts if context[0] in roots}
         if not public_contexts:
             return
-        self._check_structure(call, roots)
+        self._check_structure(call)
         names = [_value(argument) for argument in call.args]
         if not names or any(not isinstance(name, str) for name in names):
             self._error(call, "argument names must be literal strings")
@@ -1487,29 +1355,15 @@ class ArgumentDiscovery:
             for keyword in call.keywords
         }
         for context in sorted(public_contexts):
-            _command_node(result, context)["arguments"].append(
+            _command_node(result, context).setdefault("arguments", []).append(
                 {"names": names, **options},
             )
 
-    def _inspection_roots(self) -> set[str]:
-        """Require a single root, falling back to unconsumed parser factories."""
-        roots = self._public_roots()
-        if not roots:
-            for _scope, call in self.calls:
-                if self._qualified(call.func) == "argparse.ArgumentParser":
-                    roots.update(path[0] for path in self._resolve(call))
-                    if len(roots) > 1:
-                        self._error(call, "multiple public parsers cannot form one CLI")
-        return roots
-
     def report(self) -> dict[str, Any]:
         """Return a command tree, failing when its interface cannot be resolved."""
-        roots = self._inspection_roots()
+        roots = self._public_roots()
         self._check_helpers(roots)
-        result: dict[str, Any] = {
-            "arguments": [],
-            "commands": {},
-        }
+        result: dict[str, Any] = {}
         for _scope, call in self.calls:
             if self._qualified(call.func) == "argparse.ArgumentParser":
                 self._check_parents(call, roots)
@@ -1522,27 +1376,20 @@ class ArgumentDiscovery:
                 if not contexts and self.has_argparse:
                     self._error(call, "cannot resolve the subcommand parser")
                 self._check_parents(call, roots)
-                paths = {path[1:] for path in contexts if not roots or path[0] in roots}
+                paths = {path[1:] for path in contexts if path[0] in roots}
                 for path in sorted(paths):
                     _command_node(result, path)
             if call.func.attr == "add_argument":
                 self._report_argument(result, call, call.func.value, roots)
-        if not self.argument_free and not any(
-            self._qualified(call.func) == "argparse.ArgumentParser"
-            for _scope, call in self.calls
-        ):
+        if not self.argument_free and not roots:
             message = f"{self.filename}: cannot inspect CLI: no supported parser found"
             raise CommandError(message)
         self._report_metadata(result, roots)
-        return result
+        return result or {"arguments": []}
 
 
-def _python_library(package: Package) -> bool:
+def _python_library(document: nix_syntax.Document) -> bool:
     """Recognize an explicitly non-executable package without evaluating Nix."""
-    source = read_regular(package.root / "default.nix")
-    if source is None:
-        return False
-    document = nix_syntax.parse(source)
     body = _package_body(document)
     argument = body.child_by_field_name("argument")
     values = _attrset_expression(
@@ -1551,20 +1398,6 @@ def _python_library(package: Package) -> bool:
         ("executable",),
     )
     return len(values) == 1 and document.text(values[0]) == "false"
-
-
-def _compact_cli(command: dict[str, Any]) -> dict[str, Any]:
-    """Omit empty command containers while preserving declared argument values."""
-    result = {
-        key: value
-        for key, value in command.items()
-        if key not in {"arguments", "commands"} or value
-    }
-    if "commands" in result:
-        result["commands"] = {
-            name: _compact_cli(child) for name, child in result["commands"].items()
-        }
-    return result
 
 
 _DEPENDENCY_FIELDS = {
@@ -1581,32 +1414,27 @@ _DEPENDENCY_FIELDS = {
 }
 
 
-def _dependency_alias(
+def _alias_value(
     document: nix_syntax.Document,
     node: Node,
-    name: str,
 ) -> Node | None:
-    """Find an alias in its lexical let/recursive-set scope, respecting formals."""
+    """Find a let or recursive-set alias in the reference's lexical scope."""
+    name = document.text(node)
     parent = node.parent
     while parent is not None:
         if parent.type == "function_expression":
+            parameter = parent.child_by_field_name("universal")
+            if parameter is not None and document.text(parameter) == name:
+                return None
             formals = parent.child_by_field_name("formals")
             if formals is not None and any(
-                child.type == "formal"
-                and (formal := child.child_by_field_name("name")) is not None
+                (formal := child.child_by_field_name("name")) is not None
                 and document.text(formal) == name
-                for child in formals.named_children
+                for child in formals.children_by_field_name("formal")
             ):
                 return None
         if parent.type in {"let_expression", "rec_attrset_expression"}:
-            bindings = next(
-                (
-                    child
-                    for child in parent.named_children
-                    if child.type == "binding_set"
-                ),
-                None,
-            )
+            bindings: Node | None = nix_syntax.binding_set(parent)
             for binding in [] if bindings is None else bindings.named_children:
                 attrpath = binding.child_by_field_name("attrpath")
                 if attrpath is not None and nix_syntax.static_attrpath(
@@ -1628,11 +1456,10 @@ def _dependency_parts(
         return None
     seen = seen | {node.id}
     if node.type in {"variable_expression", "identifier"}:
-        name = document.text(node)
-        alias = _dependency_alias(document, node, name)
+        alias = _alias_value(document, node)
         if alias is not None:
             return _dependency_parts(document, alias, seen)
-        return [name]
+        return [document.text(node)]
     if node.type == "select_expression":
         base = node.child_by_field_name("expression")
         attrs = node.child_by_field_name("attrpath")
@@ -1657,17 +1484,15 @@ def _dependency_target(parts: list[str | None] | None) -> str | None:
     return None
 
 
-def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax form
+def _dependency_values(  # noqa: PLR0911 - one case per supported syntax form
     document: nix_syntax.Document,
     node: Node,
     seen: frozenset[int] = frozenset(),
-) -> list[tuple[Node, list[str | None] | None]]:
-    """Expand lists and aliases while retaining unresolved expressions."""
-    if node.id in seen:
-        return [(node, None)]
-    seen = seen | {node.id}
-    if node.type == "comment":
+) -> list[list[str | None]]:
+    """Collect attribute paths from dependency declarations."""
+    if node.id in seen or node.type == "comment":
         return []
+    seen = seen | {node.id}
     if node.type == "list_expression":
         return [
             value
@@ -1675,14 +1500,14 @@ def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax f
             for value in _dependency_values(document, child, seen)
         ]
     if node.type in {"variable_expression", "identifier"}:
-        alias = _dependency_alias(document, node, document.text(node))
+        alias = _alias_value(document, node)
         if alias is not None:
             if alias.type in {
                 "apply_expression",
                 "attrset_expression",
                 "rec_attrset_expression",
             }:
-                return [(node, [document.text(node)])]
+                return [[document.text(node)]]
             return _dependency_values(document, alias, seen)
     if node.type == "with_expression":
         body = node.child_by_field_name("body")
@@ -1692,8 +1517,7 @@ def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax f
         )
         values = [] if body is None else _dependency_values(document, body, seen)
         return [
-            (item, prefix + parts if prefix and parts and len(parts) == 1 else parts)
-            for item, parts in values
+            prefix + parts if prefix and len(parts) == 1 else parts for parts in values
         ]
     if node.type == "parenthesized_expression":
         return _dependency_values(document, node.named_children[0], seen)
@@ -1712,54 +1536,82 @@ def _dependency_values(  # noqa: C901, PLR0911 - one case per supported syntax f
                 right,
                 seen,
             )
-    return [(node, _dependency_parts(document, node))]
+    parts = _dependency_parts(document, node)
+    return [parts] if parts is not None else []
 
 
-def resource_dependencies(  # noqa: C901 - Traverse declarations and source references separately.
-    root: Path,
+def resource_dependencies(  # noqa: C901 - Recognize dependency declarations, package selections, and source paths.
     name: str,
-    paths: set[Path],
+    documents: list[nix_syntax.Document],
     resources: set[str],
-) -> list[dict[str, str]]:
-    """Read declared local dependencies; do not evaluate the Nix dependency closure."""
-    records: set[tuple[str, str]] = set()
-    for filename in ("default.nix", "configuration.nix"):
-        relative = Path(name) / filename
-        if relative not in paths or not (root / relative).is_file():
-            continue
-        document = nix_syntax.parse((root / relative).read_bytes(), str(relative))
-        for binding in nix_syntax.walk(document.root):
-            if binding.type != "binding":
-                continue
-            attrs = binding.child_by_field_name("attrpath")
-            parts = (
-                None if attrs is None else nix_syntax.static_attrpath(document, attrs)
-            )
-            expression = binding.child_by_field_name("expression")
-            if not parts or parts[-1] not in _DEPENDENCY_FIELDS or expression is None:
-                continue
-            for _node, reference in _dependency_values(document, expression):
-                target = _dependency_target(reference)
-                if target in resources and target != name:
-                    records.add((target, _DEPENDENCY_FIELDS[parts[-1]]))
-        known = {target for target, _kind in records}
+) -> dict[str, list[str]]:
+    """Group declared local dependency roles by resource without evaluating Nix."""
+    roles: defaultdict[str, set[str]] = defaultdict(set)
+    for document in documents:
         for node in nix_syntax.walk(document.root):
-            target = (
-                _dependency_target(_dependency_parts(document, node))
-                if node.type == "select_expression"
-                else None
-            )
-            if target in resources and target != name and target not in known:
-                records.add((target, "reference"))
-            if node.type == "path_expression":
+            if node.type == "binding":
+                attrs = node.child_by_field_name("attrpath")
+                parts = (
+                    None
+                    if attrs is None
+                    else nix_syntax.static_attrpath(document, attrs)
+                )
+                expression = node.child_by_field_name("expression")
+                if (
+                    not parts
+                    or parts[-1] not in _DEPENDENCY_FIELDS
+                    or expression is None
+                ):
+                    continue
+                for reference in _dependency_values(document, expression):
+                    target = _dependency_target(reference)
+                    if target in resources:
+                        roles[target].add(_DEPENDENCY_FIELDS[parts[-1]])
+            elif node.type == "select_expression":
+                target = _dependency_target(_dependency_parts(document, node))
+                if target in resources:
+                    roles.setdefault(target, set())
+            elif node.type == "path_expression":
                 text = document.text(node)
                 if text.startswith(("./", "../")) and "${" not in text:
-                    normalized = os.path.normpath(str(relative.parent / text))
+                    normalized = os.path.normpath(str(Path(name) / text))
                     components = Path(normalized).parts
                     target = components[0] if components else None
-                    if target in resources and target != name:
-                        records.add((target, "source"))
-    return [{"resource": target, "kind": kind} for target, kind in sorted(records)]
+                    if target in resources:
+                        roles[target].add("source")
+    return {
+        target: sorted(kinds) or ["reference"]
+        for target, kinds in sorted(roles.items())
+        if target != name
+    }
+
+
+def _package_report(package: Package, paths: set[Path]) -> dict[str, Any]:
+    """Describe a package's metadata, public CLI, and test identifiers."""
+    resource: dict[str, Any] = {"type": package.kind}
+    if description := _meta_description(package.definition):
+        resource["description"] = description
+    if package.kind == "python":
+        path = package.root / "main.py"
+        if _python_library(package.definition):
+            _source(path)
+        else:
+            resource.update(ArgumentDiscovery(path.read_bytes(), str(path)).report())
+    test_name = PACKAGE_TEST_FILES.get(package.kind)
+    if test_name is not None and Path(package.root.name) / test_name in paths:
+        tests = package.root / test_name
+        if tests.is_file():
+            identifiers = (
+                sorted(
+                    f"{owner}::{definition.name}" if owner else definition.name
+                    for owner, definition in python_test_definitions(_source(tests))
+                )
+                if package.kind == "python"
+                else [test_name]
+            )
+            if identifiers:
+                resource["tests"] = identifiers
+    return resource
 
 
 def inspect_repository(root: Path) -> dict[str, Any]:
@@ -1769,59 +1621,30 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         raise CommandError(message)
     paths = source_paths(root)
     host_names = {host.name for host in detect_hosts(root, paths)}
-    resources: dict[str, Any] = {name: {"type": "host"} for name in host_names}
-    for package in detect_packages(root, paths):
-        cli = None
-        if package.kind == "python":
-            path = package.root / "main.py"
-            if _python_library(package):
-                _source(path)
-            else:
-                cli = _compact_cli(
-                    ArgumentDiscovery(path.read_bytes(), str(path)).report(),
-                )
-        tests = package.root / "test_main.py"
-        test_module = (
-            _source(tests)
-            if package.kind == "python"
-            and tests.relative_to(root) in paths
-            and tests.is_file()
-            else None
-        )
-        description = package_description(package)
-        identifiers = (
-            sorted(
-                f"{owner}::{definition.name}" if owner else definition.name
-                for owner, definition in python_test_definitions(test_module)
+    declared, _ = detect_packages(root, paths)
+    packages = {package.root.name: package for package in declared}
+    resource_names = host_names | packages.keys()
+    resources = {}
+    for name in sorted(resource_names):
+        documents = []
+        package = packages.get(name)
+        if package is None:
+            resource: dict[str, Any] = {"type": "host"}
+        else:
+            resource = _package_report(package, paths)
+            documents.append(package.definition)
+        if name in host_names:
+            relative = Path(name) / "configuration.nix"
+            documents.append(
+                nix_syntax.parse((root / relative).read_bytes(), str(relative))
             )
-            if test_module is not None
-            else ["test_main.lean"]
-            if package.kind == "lean4"
-            and Path(package.name) / "test_main.lean" in paths
-            and (package.root / "test_main.lean").is_file()
-            else ["test_main.nix"]
-            if package.kind == "generic"
-            and Path(package.name) / "test_main.nix" in paths
-            and (package.root / "test_main.nix").is_file()
-            else []
-        )
-        resource: dict[str, Any] = {
-            "type": [package.kind, "host"]
-            if package.name in host_names
-            else package.kind,
-        }
-        if description:
-            resource["description"] = description
-        if cli is not None:
-            resource["cli"] = cli
-        if identifiers:
-            resource["tests"] = identifiers
-        resources[package.name] = resource
-    for name, resource in resources.items():
-        dependencies = resource_dependencies(root, name, paths, set(resources))
+            if package is not None:
+                resource["type"] = [package.kind, "host"]
+        dependencies = resource_dependencies(name, documents, resource_names)
         if dependencies:
             resource["dependencies"] = dependencies
-    return dict(sorted(resources.items()))
+        resources[name] = resource
+    return resources
 
 
 def _inspection_git_files(
@@ -1951,10 +1774,12 @@ def _dispatch_diff(
         left, right = (Path(directory) / name for name in ("before.json", "after.json"))
         left.write_text(json.dumps(before), encoding="utf-8")
         right.write_text(json.dumps(after), encoding="utf-8")
-        completed = run(
-            ["jd", *(["-color"] if options.color else []), left.name, right.name],
-            cwd=Path(directory),
+        completed = subprocess.run(  # noqa: S603 - The filenames and jd option are fixed.
+            ["jd", *(["-color"] if options.color else []), left.name, right.name],  # noqa: S607
+            cwd=directory,
+            capture_output=True,
             check=False,
+            text=True,
         )
     if completed.returncode not in {0, 1}:
         sys.stderr.write(completed.stderr)
@@ -1971,28 +1796,24 @@ def _dispatch(
     comparing: bool,
 ) -> None:
     """Inspect local or remote sources without executing package code."""
-    try:
-        value = options.repository
-        remote = value is not None and (
-            "://" in value
-            or (":" in value.split("/", 1)[0] and not Path(value).exists())
+    value = options.repository
+    remote = value is not None and (
+        "://" in value or (":" in value.split("/", 1)[0] and not Path(value).exists())
+    )
+    repository = (
+        inspection_remote_repository(value)
+        if remote
+        else contextlib.nullcontext(
+            resolve_repository_path(Path(value))
+            if value is not None
+            else repository_root(),
         )
-        repository = (
-            inspection_remote_repository(value)
-            if remote
-            else contextlib.nullcontext(
-                resolve_repository_path(Path(value))
-                if value is not None
-                else repository_root(),
-            )
-        )
-        with repository as root:
-            if comparing:
-                _dispatch_diff(options, cli, root)
-                return
-            report = inspect_repository(root)
-    except CommandError as error:
-        cli.exit(1, f"{cli.prog}: {error}\n")
+    )
+    with repository as root:
+        if comparing:
+            _dispatch_diff(options, cli, root)
+            return
+        report = inspect_repository(root)
     sys.stdout.write(json.dumps(report, indent=2) + "\n")
 
 
@@ -2018,8 +1839,9 @@ def parser() -> argparse.ArgumentParser:
             "Print JSON describing hosts, packages, CLI arguments, "
             "and test identifiers. "
             "Resource type is the package kind or 'host'. "
-            "Empty optional fields are omitted; for Python packages, cli: {} "
-            "denotes an executable without arguments. "
+            "CLI fields appear directly on each resource. An executable with "
+            "an otherwise empty interface has an empty arguments list. "
+            "Dependencies map local resource names to their roles. "
             "Fail if CLI declarations cannot be resolved reliably. "
             "Inspect source without executing it."
         ),
@@ -2130,19 +1952,16 @@ def main() -> None:
     options = cli.parse_args([] if comparing else arguments)
     difference = _diff_parser(cli)
     diff_options = difference.parse_args(arguments[1:] if comparing else [])
-    options = diff_options if comparing else options
+    if comparing:
+        cli, options = difference, diff_options
     try:
-        _dispatch(options, difference if comparing else cli, comparing=comparing)
+        _dispatch(options, cli, comparing=comparing)
     except KeyboardInterrupt:
         sys.exit(130)
-    except (
-        CommandError,
-        OSError,
-        SyntaxError,
-        ValueError,
-    ) as error:
-        sys.stderr.write((f"error: {error}") + "\n")
-        raise SystemExit(1) from error
+    except CommandError as error:
+        cli.exit(1, f"{cli.prog}: {error}\n")
+    except (OSError, SyntaxError, ValueError) as error:
+        cli.exit(1, f"error: {error}\n")
 
 
 if __name__ == "__main__":
