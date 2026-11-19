@@ -141,6 +141,8 @@ assert package.meta.mainProgram == "example";
 assert package.afairesiKind == "python";
 assert pythonLibrary.pname == "lean_example";
 assert !(pythonLibrary.meta ? mainProgram);
+assert consumer.packages.${system}.bash-example.afairesiKind == "bash";
+assert consumer.devShells.${system} ? bash-example-test;
 assert htmlPackage.afairesiKind == "html";
 assert htmlPackage.meta.description == "Source listing";
 assert leanExample.afairesiKind == "lean4";
@@ -251,6 +253,7 @@ pkgs.runCommand "afairesi-consumer-contract"
             assert settings.default.derandomize
             assert value != 0, "generated assertion failed"
       '' "AssertionError: generated assertion failed")
+      consumer.checks.${system}.bash-example
       consumer.checks.${system}.pkgs-native
       consumer.checks.${system}.pkgs-native-contract
       consumer.checks.${system}.pkgs-python_native-contract
@@ -362,6 +365,10 @@ pkgs.runCommand "afairesi-consumer-contract"
       grep -F "formatter lean4-$name not found in config" selection.log
     done
     mkdir -p supporting fixtures
+    printf '%s\n' 'locals { value="hello" }' > supporting/main.tf
+    if treefmt --no-cache --fail-on-change supporting/main.tf; then exit 1; fi
+    grep -Fx 'locals { value = "hello" }' supporting/main.tf
+    treefmt --no-cache --fail-on-change supporting/main.tf
     cat > pyproject.toml <<'TOML'
     [tool.ruff.lint]
     ignore = ["ALL"]

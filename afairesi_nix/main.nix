@@ -19,6 +19,14 @@ let
             enable = true;
             priority = 5;
           };
+          shfmt = {
+            enable = true;
+            indent_size = 2;
+          };
+          terraform = {
+            enable = true;
+            includes = [ "*.tf" ];
+          };
           texfmt = {
             enable = true;
             priority = 5;
@@ -242,6 +250,22 @@ let
         });
       };
     };
+  mkBashPackage =
+    arguments@{ pkgs, src, ... }:
+    pkgs.writeShellApplication (
+      builtins.removeAttrs arguments [
+        "pkgs"
+        "src"
+      ]
+      // {
+        name = baseNameOf src;
+        passthru = (arguments.passthru or { }) // {
+          afairesiKind = "bash";
+          runtimeInputs = arguments.runtimeInputs or [ ];
+        };
+        text = builtins.readFile (src + "/main.sh");
+      }
+    );
   mkFileFormatter =
     {
       name,
@@ -283,6 +307,7 @@ let
     }:
     let
       inherit (repositoryInputs) self;
+      bashNames = system: packageNamesFor self packageSets.${system} "bash";
       discover =
         marker:
         builtins.attrNames (
@@ -300,7 +325,6 @@ let
           }
         )
       );
-      genericNames = system: packageNamesFor self packageSets.${system} "generic";
       hostsFor =
         system:
         lib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
@@ -317,7 +341,7 @@ let
           ) "Afairesi generated check names collide";
           result // group
         ) { } groups;
-      namesFor = system: pythonNames system ++ lean4Names system;
+      namesFor = system: bashNames system ++ pythonNames system ++ lean4Names system;
       packageNames = discover "default.nix";
       packageSets = lib.genAttrs systems (
         system:
@@ -343,18 +367,10 @@ let
           (package.meta.platforms or [ ]) == [ ]
           || lib.meta.availableOn packageSets.${system}.stdenv.hostPlatform package
         );
-      testedLean4Names =
-        system:
-        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.lean")) (
-          lean4Names system
-        );
       testedNames =
-        system:
-        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.py")) (pythonNames system);
-      testedNixNames =
-        system:
-        builtins.filter (name: builtins.pathExists (source + "/${name}/test_main.nix")) (
-          genericNames system
+        system: kind: filename:
+        builtins.filter (name: builtins.pathExists (source + "/${name}/${filename}")) (
+          packageNamesFor self packageSets.${system} kind
         );
     in
     {
@@ -385,7 +401,17 @@ let
         system:
         mergeChecks (
           [
-            (lib.genAttrs (testedNixNames system) (
+            (lib.genAttrs (testedNames system "bash" "test_main.sh") (
+              name:
+              packageSets.${system}.runCommand name environments.${system}.${name}.environment ''
+                cp -R ${source + "/${name}"} source
+                chmod -R u+w source
+                cd source
+                ${packageSets.${system}.bash}/bin/bash -euo pipefail test_main.sh
+                touch "$out"
+              ''
+            ))
+            (lib.genAttrs (testedNames system "generic" "test_main.nix") (
               pname:
               lib.callPackageWith {
                 inherit system pname;
@@ -394,7 +420,7 @@ let
                 pkgs = packageSets.${system};
               } (source + "/${pname}/test_main.nix") { }
             ))
-            (lib.genAttrs (testedLean4Names system) (
+            (lib.genAttrs (testedNames system "lean4" "test_main.lean") (
               name:
               mkLean4Check {
                 packageDrv = self.packages.${system}.${name};
@@ -403,7 +429,7 @@ let
                 testEnvironment = environments.${system}.${name};
               }
             ))
-            (lib.genAttrs (testedNames system) (
+            (lib.genAttrs (testedNames system "python" "test_main.py") (
               name:
               pythonCheck {
                 packageDrv = self.packages.${system}.${name};
@@ -962,6 +988,23 @@ let
       );
     in
     {
+      bash =
+        let
+          environment = {
+            PACKAGE_E2E_EXECUTABLE = pkgs.lib.getExe packageDrv;
+            nativeBuildInputs =
+              dependencies
+              ++ packageDrv.runtimeInputs
+              ++ [
+                packageDrv
+                pkgs.bash
+              ];
+          };
+        in
+        {
+          inherit environment;
+          shell = pkgs.mkShell environment;
+        };
       lean4 = {
         inherit dependencies;
         inherit (packageDrv) lean4;
@@ -1132,6 +1175,7 @@ in
   inherit formatter lint;
   lib = {
     inherit
+      mkBashPackage
       mkFlake
       mkHtmlPackage
       mkLatexPackage

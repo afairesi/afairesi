@@ -31,12 +31,14 @@ if TYPE_CHECKING:
 
     from tree_sitter import Node
 BUILDER_KINDS = {
+    "mkBashPackage": "bash",
     "mkHtmlPackage": "html",
     "mkLatexPackage": "latex",
     "mkLean4Package": "lean4",
     "mkPythonPackage": "python",
 }
 PACKAGE_MAIN_FILES = {
+    "bash": "main.sh",
     "generic": "main.nix",
     "html": "index.html",
     "latex": "ms.tex",
@@ -44,6 +46,7 @@ PACKAGE_MAIN_FILES = {
     "python": "main.py",
 }
 PACKAGE_TEST_FILES = {
+    "bash": "test_main.sh",
     "generic": "test_main.nix",
     "lean4": "test_main.lean",
     "python": "test_main.py",

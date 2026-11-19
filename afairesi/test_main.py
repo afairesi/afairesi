@@ -99,6 +99,7 @@ def _fixture_add(
 ) -> None:
     """Write the minimal tracked source needed by a test."""
     sources = {
+        "bash": {"main.sh": "echo hello\n"},
         "host": {"configuration.nix": "{ ... }: {}\n"},
         "python": {"main.py": "def main():\n    pass\n"},
         "html": {"index.html": "<!doctype html><html><body></body></html>\n"},
@@ -112,6 +113,7 @@ def _fixture_add(
     }[kind]
     if kind != "host":
         builder = {
+            "bash": "inputs.afairesi.lib.mkBashPackage",
             "python": "inputs.self.lib.mkPythonPackage",
             "html": "inputs.self.lib.mkHtmlPackage",
             "latex": "inputs.self.lib.mkLatexPackage",
@@ -260,6 +262,7 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests(
 @pytest.mark.parametrize(
     ("kind", "constructor"),
     [
+        ("bash", "inputs.afairesi.lib.mkBashPackage"),
         ("html", "inputs.self.lib.mkHtmlPackage"),
         ("latex", "inputs.afairesi.lib.mkLatexPackage"),
         ("lean4", "(inputs.self).lib.mkLean4Package"),
@@ -280,6 +283,7 @@ def test_declared_package_kind_allows_supporting_entrypoint_names(
 ) -> None:
     """Keep the declared build kind when supporting files resemble entrypoints."""
     entrypoints = {
+        "bash": "main.sh",
         "html": "index.html",
         "latex": "ms.tex",
         "lean4": "main.lean",
@@ -304,17 +308,22 @@ def test_declared_package_kind_allows_supporting_entrypoint_names(
     _expect(entrypoints[kind] in rejected.stderr, rejected)
 
 
-@pytest.mark.parametrize("kind", ["html", "latex", "lean4", "generic"])
+@pytest.mark.parametrize("kind", ["bash", "html", "latex", "lean4", "generic"])
 def test_inspect_selects_tests_by_package_kind(root: Path, kind: str) -> None:
     """Supporting Python files never replace another package kind's test report."""
     _fixture_add(root, "example", kind)
     package = root / "example"
     (package / "test_main.py").write_text("not valid python!")
+    (package / "test_main.sh").write_text("exit 1\n")
     (package / "test_main.lean").write_text("example : 1 = 1 := rfl\n")
     (package / "test_main.nix").write_text("{}\n")
     _git(root, "add", "--", "example")
     report = json.loads(_run(root).stdout)["example"]
-    expected = {"lean4": ["test_main.lean"], "generic": ["test_main.nix"]}.get(kind, [])
+    expected = {
+        "bash": ["test_main.sh"],
+        "lean4": ["test_main.lean"],
+        "generic": ["test_main.nix"],
+    }.get(kind, [])
     _expect(report.get("tests", []) == expected, report)
 
 
