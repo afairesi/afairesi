@@ -15,18 +15,22 @@ import stat
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from afairesi import CommandError, cache_home, diff_inputs
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
 CACHE_VERSION = 2
+XTERM_ORANGE = 208
 Payload = dict[str, Any] | list[dict[str, Any]]
 
-READ_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
+READ_ERRORS = (CommandError, OSError, ValueError, subprocess.SubprocessError)
 
 
 def command(arguments: list[str], root: Path, *, input_text: str | None = None) -> str:
@@ -51,21 +55,26 @@ def git(root: Path, *arguments: str) -> str:
     return command(["git", *arguments], root)
 
 
-def fingerprint(root: Path) -> str:
-    """Track HEAD, index entries, source metadata, and symlink targets."""
+def fingerprint(root: Path, comparison: str | None = None) -> str | None:
+    """Track each view's inputs, bypassing diffs with independently staged links."""
     entries = git(root, "ls-files", "--stage", "-z")
     digest = hashlib.sha256()
-    digest.update(git(root, "rev-parse", "--revs-only", "HEAD").encode())
-    digest.update(entries.encode())
-    paths: set[Path] = set()
-    for entry in entries.split("\0"):
-        if not entry:
-            continue
-        metadata, relative = entry.split("\t", 1)
-        if metadata.startswith("160000 "):
-            continue
-        path = Path(relative)
-        paths.update((path, *path.parents))
+    if comparison:
+        files = diff_inputs(root, entries)
+        if any(mode == "120000" for mode, _, _ in files):
+            return None
+        paths = {path for _, _, path in files}
+        for mode, oid, path in files:
+            digest.update(f"{mode} {oid}\t{path}\0".encode())
+    else:
+        digest.update(git(root, "rev-parse", "--revs-only", "HEAD").encode())
+        digest.update(entries.encode())
+        paths = {
+            Path(entry.split("\t", 1)[1])
+            for entry in entries.split("\0")
+            if entry and not entry.startswith("160000 ")
+        }
+    paths.update(parent for path in list(paths) for parent in path.parents)
     for tracked in sorted(paths):
         path = root / tracked
         digest.update(str(tracked).encode())
@@ -75,6 +84,13 @@ def fingerprint(root: Path) -> str:
             digest.update(b"missing")
             continue
         stats = [entry_stat]
+        if comparison and stat.S_ISDIR(entry_stat.st_mode):
+            digest.update(
+                repr(
+                    (entry_stat.st_dev, entry_stat.st_ino, entry_stat.st_mode)
+                ).encode()
+            )
+            continue
         if stat.S_ISLNK(entry_stat.st_mode):
             try:
                 stats.append(path.stat())
@@ -132,10 +148,7 @@ def read_output(root: Path, comparison: str | None) -> Payload:
     if comparison is None:
         resources: dict[str, Any] = json.loads(command(["afairesi"], root))
         return resources
-    arguments = ["afairesi", "diff"]
-    if comparison == "staged":
-        arguments.append("--cached")
-    difference = command(arguments, root)
+    difference = command(["afairesi", "diff"], root)
     patch: list[dict[str, Any]] = (
         json.loads(command(["jd", "-t", "jd2patch"], root, input_text=difference))
         if difference
@@ -155,8 +168,8 @@ def cached_output(
         json.dumps([CACHE_VERSION, str(root), comparison, tools]).encode()
     ).hexdigest()
     path = cache / f"{key}.json"
-    before = fingerprint(root)
-    if not refresh:
+    before = fingerprint(root, comparison)
+    if before is not None and not refresh:
         with contextlib.suppress(OSError, ValueError):
             saved = json.loads(path.read_text(encoding="utf-8"))
             if (
@@ -166,7 +179,7 @@ def cached_output(
             ):
                 return saved["value"], True
     value = read_output(root, comparison)
-    if fingerprint(root) == before:
+    if before is not None and fingerprint(root, comparison) == before:
         with contextlib.suppress(OSError):
             cache.mkdir(mode=0o700, parents=True, exist_ok=True)
             with tempfile.NamedTemporaryFile(
@@ -213,10 +226,12 @@ def _repository_node(
                 "--untracked-files=no",
                 "--ignore-submodules=all",
             ):
-                node.add("modified")
+                node.add("modified").change = "~"
         value, hit = cached_output(root, comparison, cache, refresh=refresh)
         if isinstance(value, dict):
             add_resources(node, value)
+            if any(child.change == "~" for child in node.children):
+                node.change = "~"
         else:
             add_changes(node, value)
     except READ_ERRORS as error:
@@ -365,7 +380,7 @@ def add_changes(node: Node, patch: list[dict[str, Any]]) -> None:
             for part in operation["path"].split("/")[1:]
         ] or ["repository"]
         parent = _tree_branch(node, parts[:-1], branches)
-        marker = "+" if operation["op"] == "add" else "-"
+        marker = {"add": "+", "remove": "-", "replace": "~"}[operation["op"]]
         value = operation.get("value")
         structured = isinstance(value, (dict, list))
         label = f"{marker} {parts[-1]}"
@@ -373,6 +388,10 @@ def add_changes(node: Node, patch: list[dict[str, Any]]) -> None:
         change.change = marker
         if structured:
             add_value(change, "value", value)
+    if node.children:
+        node.change = "~"
+    for branch in branches.values():
+        branch.change = "~"
 
 
 class Viewer:
@@ -384,6 +403,31 @@ class Viewer:
         self.selected = 0
         self.top = 0
         self.horizontal = 0
+
+    def refresh(self, root: Node) -> None:
+        """Keep surviving folds and the selected row when reloading a view."""
+        selected = list(self.root.visible())[self.selected][0]
+        replacement = None
+        pairs = [(self.root, root)]
+        while pairs:
+            old, new = pairs.pop()
+            new.expanded = old.expanded
+            if old is selected:
+                replacement = new
+            siblings: defaultdict[str, list[Node]] = defaultdict(list)
+            for child in reversed(old.children):
+                siblings[child.label].append(child)
+            pairs.extend(
+                (siblings[child.label].pop(), child)
+                for child in new.children
+                if siblings[child.label]
+            )
+        self.root = root
+        rows = list(root.visible())
+        self.selected = next(
+            (index for index, (row, _) in enumerate(rows) if row is replacement),
+            min(self.selected, len(rows) - 1),
+        )
 
     def search(self, query: str) -> bool:
         """Select the next matching label, expanding its ancestors and wrapping once."""
@@ -496,15 +540,8 @@ class Viewer:
         return result
 
 
-def browse(
-    screen: curses.window,
-    root: Node,
-    comparison: str | None,
-    load: Callable[[str | None], Node],
-) -> None:
-    """Draw the outline with colored changes and a highlighted selection."""
-    with contextlib.suppress(curses.error):
-        curses.curs_set(0)
+def _change_colors() -> dict[str, int]:
+    """Use orange for modifications on terminals with an xterm-256 palette."""
     colors = {}
     if curses.has_colors():
         background = curses.COLOR_BLACK
@@ -515,50 +552,81 @@ def browse(
             curses.init_pair(1, curses.COLOR_GREEN, background)
             curses.init_pair(2, curses.COLOR_RED, background)
             colors = {"+": curses.color_pair(1), "-": curses.color_pair(2)}
+        with contextlib.suppress(curses.error):
+            orange = (
+                XTERM_ORANGE if curses.COLORS > XTERM_ORANGE else curses.COLOR_YELLOW
+            )
+            curses.init_pair(3, orange, background)
+            colors["~"] = curses.color_pair(3)
+    return colors
+
+
+def _draw(
+    screen: curses.window, viewer: Viewer, colors: dict[str, int], footer: str
+) -> int:
+    """Draw the visible tree and status line, returning the page height."""
+    height, width = screen.getmaxyx()
+    page = max(1, height - 1)
+    screen.erase()
+    for row, (text, selected, change) in enumerate(viewer.frame(page)):
+        with contextlib.suppress(curses.error):
+            screen.addnstr(
+                row,
+                0,
+                text,
+                max(0, width - 1),
+                colors.get(change, 0) | (curses.A_REVERSE if selected else 0),
+            )
+    with contextlib.suppress(curses.error):
+        screen.addnstr(height - 1, 0, footer, max(0, width - 1))
+    screen.refresh()
+    return page
+
+
+def browse(
+    screen: curses.window,
+    root: Node,
+    comparison: str | None,
+    load: Callable[[str | None], Node],
+) -> None:
+    """Draw the outline with colored changes and a highlighted selection."""
+    with contextlib.suppress(curses.error):
+        curses.curs_set(0)
+    colors = _change_colors()
     viewer = Viewer(root)
     views = {comparison: viewer}
-    diff = comparison or "working"
     query = None
     message = ""
     while True:
-        height, width = screen.getmaxyx()
-        screen.erase()
-        for row, (text, selected, change) in enumerate(
-            viewer.frame(max(1, height - 1))
-        ):
-            if width > 1:
-                with contextlib.suppress(curses.error):
-                    screen.addnstr(
-                        row,
-                        0,
-                        text,
-                        width - 1,
-                        colors.get(change, 0) | (curses.A_REVERSE if selected else 0),
-                    )
-        mode = f"{comparison} diff" if comparison else "resources"
-        footer = (
-            "/" + query
-            if query is not None
-            else (
-                message
-                or f"{mode}   / search   d {'resources' if comparison else 'diff'}"
-            )
+        other = None if comparison else "diff"
+        help_line = (
+            f"{comparison or 'resources'}   / search   d {other or 'resources'}"
+            "   r refresh"
         )
-        with contextlib.suppress(curses.error):
-            screen.addnstr(height - 1, 0, footer, max(0, width - 1))
-        screen.refresh()
+        footer = "/" + query if query is not None else message or help_line
+        page = _draw(screen, viewer, colors, footer)
         key = screen.get_wch()
         message = ""
         if query is not None:
             query, message = viewer.handle_search(key, query)
         elif key == "/":
             query = ""
-        elif key == "d":
-            comparison = None if comparison else diff
-            if comparison not in views:
-                views[comparison] = Viewer(load(comparison))
-            viewer = views[comparison]
-        elif not viewer.handle(key, max(1, height - 1)):
+        elif key in ("d", "r"):
+            target = other if key == "d" else comparison
+            if key == "r" or target not in views:
+                _draw(screen, viewer, colors, f"Reading {target or 'resources'}…")
+                try:
+                    updated = load(target)
+                except READ_ERRORS as error:
+                    message = f"error: {error}"
+                    continue
+                if key == "r":
+                    viewer.refresh(updated)
+                    views = {target: viewer}
+                else:
+                    views[target] = Viewer(updated)
+            comparison, viewer = target, views[target]
+        elif not viewer.handle(key, page):
             return
 
 
@@ -568,7 +636,7 @@ def main() -> None:
         description=__doc__,
         epilog=(
             "j/k move, h/l collapse or expand, Space toggles, g/G jump, "
-            "H/L pan, 0 resets pan, / searches, d toggles diff, q quits."
+            "H/L pan, 0 resets pan, / searches, d toggles diff, r refreshes, q quits."
         ),
     )
     parser.add_argument(
@@ -584,39 +652,28 @@ def main() -> None:
         help="home Git repository (default: your home directory)",
     )
     parser.add_argument(
-        "--cached",
-        "--staged",
-        action="store_true",
-        help="with diff, show staged changes instead of unstaged changes",
-    )
-    parser.add_argument(
         "--refresh",
         action="store_true",
         help="reinspect repositories and replace cached results",
     )
     options = parser.parse_args()
-    if options.cached and options.command != "diff":
-        parser.error("--cached requires diff")
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("an interactive terminal is required")
-    comparison = (
-        ("staged" if options.cached else "working") if options.command else None
-    )
     try:
-        base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-        if not base.is_absolute():
-            base = Path.home() / ".cache"
+        cache = cache_home() / "afairesi_tui"
 
         def load(mode: str | None, *, progress: bool = False) -> Node:
             return build_tree(
                 options.home,
                 comparison=mode,
                 progress=progress,
-                cache=base / "afairesi_tui",
+                cache=cache,
                 refresh=options.refresh,
             )
 
-        curses.wrapper(browse, load(comparison, progress=True), comparison, load)
+        curses.wrapper(
+            browse, load(options.command, progress=True), options.command, load
+        )
     except (*READ_ERRORS, curses.error) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")
     except KeyboardInterrupt:

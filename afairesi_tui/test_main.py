@@ -7,6 +7,7 @@ import curses
 import os
 import subprocess
 from typing import TYPE_CHECKING
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -142,6 +143,15 @@ def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
     project = ("github.com", "owner", "project")
     expect("description: working" in labels(tree, *project, "example"), tree)
     expect("modified" in labels(tree, *project), tree)
+    viewer = subject.Viewer(tree)
+    expect(viewer.search("github.com"), tree)
+    expect(viewer.search("modified"), tree)
+    frame = viewer.frame(30)
+    expect(
+        any(text.strip() == "▾ project" and color == "~" for text, _, color in frame),
+        frame,
+    )
+    expect(any(selected and color == "~" for _, selected, color in frame), frame)
     expect(
         "description: original"
         in labels(tree, "gitlab.com", "owner", "project", "example"),
@@ -172,13 +182,11 @@ def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
     expect([path.read_bytes() for path in paths] == before, "inspection modified files")
 
 
-@pytest.mark.parametrize("comparison", ["working", "staged"])
-def test_home_diff_shows_staged_or_working_changes_across_registered_repositories(
+def test_home_diff_shows_working_changes_across_registered_repositories(
     home: Path,
-    comparison: str,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Run only the requested diff stage once for each initialized direct checkout."""
+    """Run afairesi diff once for each initialized direct checkout."""
     calls = []
     original: Callable[..., str] = subject.command
 
@@ -190,21 +198,25 @@ def test_home_diff_shows_staged_or_working_changes_across_registered_repositorie
         return original(arguments, root, input_text=input_text)
 
     monkeypatch.setattr(subject, "command", counted)
-    tree = subject.build_tree(home, comparison=comparison, cache=home.parent / "cache")
+    tree = subject.build_tree(home, comparison="diff", cache=home.parent / "cache")
     project = ("github.com", "owner", "project")
     expect(labels(tree, *project) == ["example"], tree)
-    baseline = "staged" if comparison == "working" else "original"
     expect(
         labels(tree, *project, "example")
-        == [f"- description: {baseline}", f"+ description: {comparison}"],
+        == ["- description: staged", "+ description: working"],
         tree,
     )
     expect("gitlab.com" not in labels(tree), tree)
+    viewer = subject.Viewer(tree)
+    expect(viewer.search("description: staged"), tree)
+    colors = {text.strip(): color for text, _, color in viewer.frame(30)}
+    expect(colors["▾ example"] == "~", colors)
+    expect(colors["- description: staged"] == "-", colors)
+    expect(colors["+ description: working"] == "+", colors)
     expect(
         labels(tree, "missing") == ["error: This submodule is not initialized."], tree
     )
-    expected = ["afairesi", "diff", *(["--cached"] if comparison == "staged" else [])]
-    expect(calls == [expected] * 3, calls)
+    expect(calls == [["afairesi", "diff"]] * 3, calls)
 
 
 def test_home_tree_shows_a_timeout_alongside_results_from_other_repositories(
@@ -250,7 +262,7 @@ def test_home_tree_requires_a_git_root_and_accepts_one_without_submodules(
         and labels(tree) == ["No direct registered submodules."],
         tree,
     )
-    differences = subject.build_tree(tmp_path, cache=cache, comparison="working")
+    differences = subject.build_tree(tmp_path, cache=cache, comparison="diff")
     expect(labels(differences) == ["No changes"], differences)
     child = tmp_path / "directory"
     child.mkdir()
@@ -306,7 +318,7 @@ def test_home_tree_shows_the_current_branch_even_with_a_cached_inspection(
     """Cache each operation independently while reading Git state fresh."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
-    for comparison in (None, "working", "staged"):
+    for comparison in (None, "diff"):
         _, hit = subject.cached_output(root, comparison, cache, refresh=False)
         expect(not hit, comparison)
         _, hit = subject.cached_output(root, comparison, cache, refresh=False)
@@ -334,6 +346,22 @@ def test_inspection_returns_resources_even_if_the_cache_is_corrupt_or_unavailabl
     blocked.write_text("not a directory")
     actual, hit = subject.cached_output(root, None, blocked, refresh=False)
     expect(not hit and actual == expected, actual)
+
+
+def test_diff_cache_survives_unrelated_files_and_detects_staging(home: Path) -> None:
+    """Reuse a patch until the index or working copy of an inspection input changes."""
+    root = home / "github.com/owner/project"
+    cache = home.parent / "cache"
+    patch, hit = subject.cached_output(root, "diff", cache, refresh=False)
+    expect(bool(patch) and not hit, patch)
+    asset = root / "asset"
+    asset.write_text("irrelevant")
+    git(root, "add", "asset")
+    again, hit = subject.cached_output(root, "diff", cache, refresh=False)
+    expect(hit and patch == again, again)
+    git(root, "add", "example/default.nix")
+    staged, hit = subject.cached_output(root, "diff", cache, refresh=False)
+    expect(staged == [] and not hit, staged)
 
 
 def test_inspection_caches_only_successful_results_from_unchanged_sources(
@@ -486,3 +514,57 @@ def test_viewer_pans_and_displays_control_characters_as_text() -> None:
     viewer.handle("0", 1)
     viewer.handle("H", 1)
     expect(viewer.frame(1) == [(label, True, "")], viewer.frame(1))
+
+
+@pytest.mark.parametrize(
+    ("palette", "modified"), [(256, 208), (8, curses.COLOR_YELLOW)]
+)
+def test_browse_refreshes_both_views_and_preserves_navigation(
+    monkeypatch: pytest.MonkeyPatch, palette: int, modified: int
+) -> None:
+    """Reload each mode and allow r in search queries."""
+    screen = Mock(spec=curses.window)
+    screen.getmaxyx.return_value = (24, 80)
+    screen.get_wch.side_effect = ["d", "/", "r", "\n", "r", "d", "r", "q"]
+    monkeypatch.setattr(curses, "has_colors", lambda: True)
+    monkeypatch.setattr(curses, "use_default_colors", lambda: None)
+    monkeypatch.setattr(curses, "COLORS", palette, raising=False)
+    pairs = Mock()
+    monkeypatch.setattr(curses, "init_pair", pairs)
+    monkeypatch.setattr(curses, "color_pair", lambda pair: pair << 8)
+    calls = []
+
+    def load(mode: str | None) -> subject.Node:
+        calls.append(mode)
+        tree = subject.Node("home", expanded=True)
+        group = tree.add("group")
+        group.add(f"generation {len(calls)}")
+        return tree
+
+    subject.browse(screen, subject.Node("home"), None, load)
+    expect(calls == ["diff", "diff", None, None], calls)
+    pairs.assert_has_calls(
+        [
+            call(1, curses.COLOR_GREEN, -1),
+            call(2, curses.COLOR_RED, -1),
+            call(3, modified, -1),
+        ]
+    )
+    lines = [args.args[2] for args in screen.addnstr.call_args_list]
+    expect("/r" in lines and any("r refresh" in line for line in lines), lines)
+    expect("  ▸ group" in lines, lines)
+
+
+def test_viewer_refresh_keeps_an_expanded_selection_when_rows_move() -> None:
+    """Match selected rows by their tree location and clamp after removals."""
+    root = subject.Node("home", expanded=True)
+    root.add("repository").add("field")
+    viewer = subject.Viewer(root)
+    viewer.search("field")
+    updated = subject.Node("home", expanded=True)
+    updated.add("another")
+    updated.add("repository").add("field")
+    viewer.refresh(updated)
+    expect(viewer.frame(10)[-1] == ("      field", True, ""), viewer.frame(10))
+    viewer.refresh(subject.Node("home"))
+    expect(viewer.selected == 0, viewer.selected)

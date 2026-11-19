@@ -240,11 +240,16 @@ def test_cli_shows_help_and_rejects_unknown_arguments_outside_a_repository(
     _expect("[PATH_OR_REMOTE]" in help_output, help_output)
     _expect("  diff " in help_output, help_output)
     option = _run(tmp_path, "diff", "--help").stdout
-    _expect("usage: afairesi diff" in option, option)
-    _expect("--cached" in option and "jd-compatible" in option, option)
-    _expect("--color | less -R" in option, option)
+    _expect(option.splitlines()[0] == "usage: afairesi diff [-h]", option)
     _expect("| jd -t jd2patch | jless" in option, option)
-    for arguments in (("--unknown",), (".", "extra"), ("--cached",)):
+    for arguments in (
+        ("--unknown",),
+        (".", "extra"),
+        ("--cached",),
+        ("diff", "."),
+        ("diff", "--cached"),
+        ("diff", "--from", "HEAD"),
+    ):
         rejected = _run(tmp_path, *arguments, code=2)
         _expect("unrecognized arguments" in rejected.stderr, rejected)
     _expect(_snapshot(tmp_path) == before, "CLI help changed state")
@@ -2019,45 +2024,17 @@ def _apply_diff(
     return cast("dict[str, Any]", json.loads(completed.stdout))
 
 
-@pytest.mark.parametrize(
-    ("arguments", "left", "right", "code"),
-    [
-        ((), "index", "working", 0),
-        (("--cached",), "head", "index", 0),
-        (("--staged",), "head", "index", 0),
-        (("--from", "HEAD"), "head", "working", 0),
-        (("--to", "HEAD"), "index", "head", 0),
-        (("--cached", "--from", "initial"), "initial", "index", 0),
-        (("--from", "initial", "--to", "HEAD"), "initial", "head", 0),
-        (("--exit-code",), "index", "working", 1),
-        (("-R",), "working", "index", 0),
-    ],
-)
-def test_diff_emits_a_jd_patch_between_the_selected_git_states(
-    tmp_path: Path,
-    arguments: tuple[str, ...],
-    left: str,
-    right: str,
-    code: int,
-) -> None:
-    """Keep staged, working, and historical inventories distinct and read-only."""
-    reports = {"initial": _diff_repository(tmp_path)}
-    _git(tmp_path, "tag", "initial")
-    _diff_description(tmp_path, "Committed")
-    _git(tmp_path, "add", ".")
-    _fixture_git(tmp_path, "commit", "--quiet", "-m", "change description")
-    reports["head"] = inspection_subject.inspect_repository(tmp_path)
+def test_diff_emits_a_jd_patch_from_index_to_working_tree(tmp_path: Path) -> None:
+    """Use the staged interface as the baseline even from a nested directory."""
+    _diff_repository(tmp_path)
     _diff_description(tmp_path, "Staged")
     _git(tmp_path, "add", ".")
-    reports["index"] = inspection_subject.inspect_repository(tmp_path)
+    index = inspection_subject.inspect_repository(tmp_path)
     _diff_description(tmp_path, "Working")
-    reports["working"] = inspection_subject.inspect_repository(tmp_path)
+    working = inspection_subject.inspect_repository(tmp_path)
     before = _snapshot(tmp_path)
-    completed = _run(tmp_path / "example", "diff", *arguments, code=code)
-    _expect(
-        _apply_diff(reports[left], completed.stdout) == reports[right],
-        completed,
-    )
+    completed = _run(tmp_path / "example", "diff")
+    _expect(_apply_diff(index, completed.stdout) == working, completed)
     _expect(not completed.stderr, completed)
     _expect(
         _snapshot(tmp_path) == before,
@@ -2084,9 +2061,52 @@ def test_diff_ignores_implementation_edits_and_untracked_resources(
     (tmp_path / "untracked").mkdir()
     (tmp_path / "untracked/configuration.nix").touch()
     before = _snapshot(tmp_path)
-    completed = _run(tmp_path, "diff", "--exit-code")
+    completed = _run(tmp_path, "diff")
     _expect(not completed.stdout and not completed.stderr, completed)
     _expect(_snapshot(tmp_path) == before, "empty diff changed state")
+
+
+def test_diff_reuses_cli_analysis_across_snapshots_and_inspections(
+    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Analyze identical entrypoints once and invalidate by their actual bytes."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    _inspection_repository(root)
+    _git(root, "add", ".")
+    analyze = inspection_subject.ArgumentDiscovery.report
+    calls = []
+
+    def count(discovery: inspection_subject.ArgumentDiscovery) -> dict[str, Any]:
+        calls.append(discovery.filename)
+        return analyze(discovery)
+
+    monkeypatch.setattr(inspection_subject.ArgumentDiscovery, "report", count)
+    monkeypatch.chdir(root)
+    monkeypatch.setattr(sys, "argv", ["afairesi", "diff"])
+    inspection_subject.main()
+    inspection_subject.main()
+    _expect(len(calls) == 1, calls)
+    calls.clear()
+    source = root / "example/main.py"
+    source.write_text(source.read_text().replace("--output", "--user"))
+    inspection_subject.main()
+    _expect(len(calls) == 1, calls)
+
+
+def test_diff_includes_tracked_targets_of_symlinked_entrypoints(tmp_path: Path) -> None:
+    """Keep deeply nested symlink targets in both snapshots."""
+    _diff_repository(tmp_path)
+    source = tmp_path / "example/main.py"
+    target = tmp_path / "assets/deep/entry"
+    target.parent.mkdir(parents=True)
+    source.rename(target)
+    source.symlink_to("../assets/deep/entry")
+    _git(tmp_path, "add", ".")
+    before = inspection_subject.inspect_repository(tmp_path)
+    target.write_text(target.read_text().replace("--output", "--user"))
+    after = inspection_subject.inspect_repository(tmp_path)
+    _expect(before != after, after)
+    _expect(_apply_diff(before, _run(tmp_path, "diff").stdout) == after, after)
 
 
 def test_diff_reconstructs_changes_to_hosts_tests_and_subcommand_arguments(
@@ -2106,11 +2126,8 @@ def test_diff_reconstructs_changes_to_hosts_tests_and_subcommand_arguments(
     )
     (tmp_path / "example/test_main.py").write_text("def test_new(): pass\n")
     (tmp_path / "laptop/configuration.nix").unlink()
-    (tmp_path / "new-host").mkdir()
-    (tmp_path / "new-host/configuration.nix").touch()
-    _git(tmp_path, "add", ".")
     after = inspection_subject.inspect_repository(tmp_path)
-    completed = _run(tmp_path, "diff", "--cached")
+    completed = _run(tmp_path, "diff")
     _expect(_apply_diff(before, completed.stdout) == after, completed)
 
 
@@ -2174,87 +2191,40 @@ def test_diff_output_can_be_applied_as_json_patch_after_conversion(
     )
 
 
-def test_diff_with_merge_base_shows_changes_since_the_branches_diverged(
-    tmp_path: Path,
-) -> None:
-    """Exclude the other branch's changes and ignore malformed working sources."""
-    base = _diff_repository(tmp_path)
-    _git(tmp_path, "tag", "base")
-    _git(tmp_path, "checkout", "--quiet", "-b", "topic")
-    _diff_description(tmp_path, "Topic")
-    _git(tmp_path, "add", ".")
-    _fixture_git(tmp_path, "commit", "--quiet", "-m", "topic interface")
-    topic = inspection_subject.inspect_repository(tmp_path)
-    _git(tmp_path, "checkout", "--quiet", "-b", "other", "base")
-    (tmp_path / "other-host").mkdir()
-    (tmp_path / "other-host/configuration.nix").touch()
-    _git(tmp_path, "add", ".")
-    _fixture_git(tmp_path, "commit", "--quiet", "-m", "other interface")
-    other = inspection_subject.inspect_repository(tmp_path)
-    (tmp_path / "example/main.py").write_text("def invalid(")
-    before = _snapshot(tmp_path)
-    for arguments, report in ((("--merge-base",), base), ((), other)):
-        completed = _run(
-            tmp_path, "diff", "--from", "other", "--to", "topic", *arguments
-        )
-        _expect(_apply_diff(report, completed.stdout) == topic, completed)
-    _expect(_snapshot(tmp_path) == before, "range diff changed state")
-
-
-def test_diff_treats_the_inventory_before_the_first_commit_as_empty(
-    tmp_path: Path,
-) -> None:
-    """Compare the first staged interface against an empty inventory."""
+def test_diff_uses_the_index_before_the_first_commit(tmp_path: Path) -> None:
+    """Compare against the index even when the repository has no HEAD."""
     _git(tmp_path, "init", "--quiet")
-    _expect(not _run(tmp_path, "diff", "--cached").stdout, "nonempty diff")
+    _expect(not _run(tmp_path, "diff").stdout, "nonempty diff")
     _inspection_repository(tmp_path)
     _git(tmp_path, "add", ".")
     staged = inspection_subject.inspect_repository(tmp_path)
     _diff_description(tmp_path, "Unstaged")
     before = _snapshot(tmp_path)
-    completed = _run(tmp_path, "diff", "--cached", "--exit-code", code=1)
-    _expect(_apply_diff({}, completed.stdout) == staged, completed)
+    completed = _run(tmp_path, "diff")
+    _expect(
+        _apply_diff(staged, completed.stdout)
+        == inspection_subject.inspect_repository(tmp_path),
+        completed,
+    )
     _expect(_snapshot(tmp_path) == before, "initial diff changed state")
 
 
-@pytest.mark.parametrize(
-    ("arguments", "failure", "code"),
-    [
-        (("--from", "missing-revision"), "Needed a single revision", 128),
-        (("--to", "missing-revision"), "Needed a single revision", 128),
-        ((".", "HEAD", "HEAD"), "unrecognized arguments", 2),
-        (("--cached", "--to", "HEAD"), "cannot be combined with --to", 2),
-        (("--merge-base",), "requires --from and --to", 2),
-        (("--merge-base", "--from", "HEAD"), "requires --from and --to", 2),
-        (("--merge-base", "--to", "HEAD"), "requires --from and --to", 2),
-        (
-            ("--cached", "--from", "HEAD", "--to", "HEAD", "--merge-base"),
-            "cannot be combined with --to",
-            2,
-        ),
-        ((), "could not parse Python source", 1),
-    ],
-)
 def test_diff_errors_leave_no_partial_output_or_temporary_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    arguments: tuple[str, ...],
-    failure: str,
-    code: int,
 ) -> None:
-    """Reject invalid comparisons atomically and clean failed snapshots."""
+    """Clean failed snapshots when a tracked source cannot be inspected."""
     root = tmp_path / "repository"
     root.mkdir()
     _diff_repository(root)
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     monkeypatch.setenv("TMPDIR", str(scratch))
-    if not arguments:
-        (root / "example/main.py").write_text("def invalid(")
+    (root / "example/main.py").write_text("def invalid(")
     before = _snapshot(root)
-    completed = _run(root, "diff", *arguments, code=code)
+    completed = _run(root, "diff", code=1)
     _expect(not completed.stdout, completed)
-    _expect(failure in completed.stderr, completed)
+    _expect("could not parse Python source" in completed.stderr, completed)
     _expect(not list(scratch.iterdir()), "failed diff left temporary sources")
     _expect(_snapshot(root) == before, "failed diff changed state")
 
@@ -2274,16 +2244,6 @@ def test_cli_accepts_explicit_repository_paths_that_resemble_commands_or_revisio
     for arguments in paths:
         completed = _run(tmp_path, *arguments)
         _expect(json.loads(completed.stdout) == report, completed)
-    _diff_description(root, "Changed")
-    for target in (name, str(root)):
-        completed = _run(tmp_path, "diff", target)
-        _expect(
-            _apply_diff(report, completed.stdout)
-            == inspection_subject.inspect_repository(root),
-            completed,
-        )
-        completed = _run(tmp_path, "diff", "--from", "HEAD", "--to", "HEAD", target)
-        _expect(not completed.stdout, completed)
 
 
 def test_diff_reports_unresolved_merge_conflicts_and_leaves_the_index_untouched(
@@ -2338,19 +2298,12 @@ def test_diff_reads_the_selected_linked_worktree_without_modifying_it(
     )
 
 
-def test_afairesi_lists_its_own_repository_argument_and_diff_options() -> None:
-    """Inventory every public command without nested command groups."""
+def test_afairesi_lists_its_repository_argument_and_argument_free_diff() -> None:
+    """Expose the repository argument only on the top-level inspection command."""
     report = inspection_subject.ArgumentDiscovery(
         Path(__file__).with_name("main.py").read_bytes(),
     ).report()
-    commands = report["commands"]
-    _expect(set(commands) == {"diff"}, commands)
-    command = commands["diff"]
-    _expect("commands" not in command, command)
-    arguments = [row["names"] for row in command["arguments"]]
-    _expect(arguments.count(["repository"]) == 1, command)
-    for option in ("--from", "--to", "--merge-base"):
-        _expect(arguments.count([option]) == 1, command)
+    _expect(report["commands"] == {"diff": {}}, report["commands"])
     _expect(
         [row["names"] for row in report["arguments"]] == [["repository"]],
         report["arguments"],

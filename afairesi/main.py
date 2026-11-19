@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import ast
 import contextlib
+import hashlib
 import io
 import json
 import keyword
@@ -52,6 +53,12 @@ PACKAGE_TEST_FILES = {
     "python": "test_main.py",
 }
 ROOT_FILES = ("flake.lock", "flake.nix")
+INSPECTION_FILENAMES = {
+    "configuration.nix",
+    "default.nix",
+    "main.py",
+    *PACKAGE_TEST_FILES.values(),
+}
 
 
 class CommandError(RuntimeError):
@@ -1587,7 +1594,32 @@ def resource_dependencies(  # noqa: C901 - Recognize dependency declarations, pa
     }
 
 
-def _package_report(package: Package, paths: set[Path]) -> dict[str, Any]:
+def _inspect_arguments(path: Path, cache: Path | None) -> dict[str, Any]:
+    """Reuse successful CLI analysis of identical sources when diffing snapshots."""
+    source = path.read_bytes()
+    if cache is None:
+        return ArgumentDiscovery(source, str(path)).report()
+    analyzer = f"1:{__file__}:{sys.implementation.cache_tag}\0".encode()
+    digest = hashlib.sha256(analyzer)
+    digest.update(source)
+    entry = cache / f"{digest.hexdigest()}.json"
+    with contextlib.suppress(OSError, ValueError):
+        saved = json.loads(entry.read_bytes())
+        if isinstance(saved, dict):
+            return saved
+    report = ArgumentDiscovery(source, str(path)).report()
+    with contextlib.suppress(OSError):
+        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=cache) as temporary:
+            pending = Path(temporary) / entry.name
+            pending.write_text(json.dumps(report), encoding="utf-8")
+            pending.replace(entry)
+    return report
+
+
+def _package_report(
+    package: Package, paths: set[Path], argument_cache: Path | None
+) -> dict[str, Any]:
     """Describe a package's metadata, public CLI, and test identifiers."""
     resource: dict[str, Any] = {"type": package.kind}
     if description := _meta_description(package.definition):
@@ -1597,7 +1629,7 @@ def _package_report(package: Package, paths: set[Path]) -> dict[str, Any]:
         if _python_library(package.definition):
             _source(path)
         else:
-            resource.update(ArgumentDiscovery(path.read_bytes(), str(path)).report())
+            resource.update(_inspect_arguments(path, argument_cache))
     test_name = PACKAGE_TEST_FILES.get(package.kind)
     if test_name is not None and Path(package.root.name) / test_name in paths:
         tests = package.root / test_name
@@ -1612,7 +1644,9 @@ def _package_report(package: Package, paths: set[Path]) -> dict[str, Any]:
     return resource
 
 
-def inspect_repository(root: Path) -> dict[str, Any]:
+def inspect_repository(
+    root: Path, *, argument_cache: Path | None = None
+) -> dict[str, Any]:
     """Describe root resources by name, with their interfaces and test identifiers."""
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
@@ -1629,7 +1663,7 @@ def inspect_repository(root: Path) -> dict[str, Any]:
         if package is None:
             resource: dict[str, Any] = {"type": "host"}
         else:
-            resource = _package_report(package, paths)
+            resource = _package_report(package, paths, argument_cache)
             documents.append(package.definition)
         if name in host_names:
             relative = Path(name) / "configuration.nix"
@@ -1645,41 +1679,38 @@ def inspect_repository(root: Path) -> dict[str, Any]:
     return resources
 
 
-def _inspection_git_files(
-    root: Path,
-    revision: str | None,
-) -> list[tuple[str, str, Path]]:
-    """List raw blobs from a tree or the index without refreshing Git state."""
-    if revision is None:
-        listing = git(root, ["ls-files", "--stage", "-z"]).stdout
-    else:
-        tree = git(
-            root,
-            ["rev-parse", "--verify", "--end-of-options", f"{revision}^{{tree}}"],
-        ).stdout.strip()
-        listing = git(root, ["ls-tree", "-r", "-z", "--full-tree", tree]).stdout
+def diff_inputs(root: Path, listing: str) -> list[tuple[str, str, Path]]:
+    """Select inspection inputs, retaining possible targets of source symlinks."""
     files = []
     for entry in listing.split("\0"):
         if not entry:
             continue
         metadata, name = entry.split("\t", 1)
-        mode, middle, last = metadata.split()
-        if revision is None and last != "0":
+        mode, oid, stage = metadata.split()
+        if stage != "0":
             message = "cannot inspect an unmerged index; resolve conflicts first"
             raise CommandError(message)
         if mode != "160000":
-            files.append((mode, middle if revision is None else last, Path(name)))
-    return files
+            files.append((mode, oid, Path(name)))
+    inputs = [
+        (mode, oid, path)
+        for mode, oid, path in files
+        if path == Path("flake.nix")
+        or (len(path.parent.parts) == 1 and path.name in INSPECTION_FILENAMES)
+    ]
+    if any(mode == "120000" or (root / path).is_symlink() for mode, _, path in inputs):
+        return files
+    return inputs
 
 
 def _inspection_git_report(
     root: Path,
-    revision: str | None = None,
+    files: list[tuple[str, str, Path]],
+    argument_cache: Path,
     *,
     working_tree: bool = False,
 ) -> dict[str, Any]:
     """Inspect tracked sources in a temporary directory without checkout filters."""
-    files = _inspection_git_files(root, revision)
     with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
         snapshot = Path(directory)
         if working_tree:
@@ -1716,64 +1747,33 @@ def _inspection_git_report(
                 else:
                     target.write_bytes(source_bytes)
         return (
-            inspect_repository(snapshot) if (snapshot / "flake.nix").is_file() else {}
-        )
-
-
-def _diff_revisions(
-    options: argparse.Namespace,
-    cli: argparse.ArgumentParser,
-    root: Path,
-) -> tuple[str | None, str | None]:
-    """Resolve named comparison endpoints and an optional common ancestor."""
-    left, right = options.from_revision, options.to_revision
-    if options.cached and right is not None:
-        cli.error("diff --cached cannot be combined with --to")
-    if options.merge_base:
-        if left is None or right is None:
-            cli.error("diff --merge-base requires --from and --to")
-        commits = [
-            git(
-                root,
-                ["rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"],
-            ).stdout.strip()
-            for ref in (left, right)
-        ]
-        left = git(root, ["merge-base", *commits]).stdout.strip()
-    return left, right
-
-
-def _dispatch_diff(
-    options: argparse.Namespace,
-    cli: argparse.ArgumentParser,
-    root: Path,
-) -> None:
-    """Render structural inspection changes with jd's native diff implementation."""
-    root = repository_root(root)
-    left_revision, right_revision = _diff_revisions(options, cli, root)
-    if options.cached:
-        head = git(root, ["rev-parse", "--verify", "HEAD"], check=False)
-        before = (
-            _inspection_git_report(root, left_revision or "HEAD")
-            if left_revision is not None or head.returncode == 0
+            inspect_repository(snapshot, argument_cache=argument_cache)
+            if (snapshot / "flake.nix").is_file()
             else {}
         )
-        after = _inspection_git_report(root)
-    else:
-        before = _inspection_git_report(root, left_revision)
-        after = (
-            _inspection_git_report(root, right_revision)
-            if right_revision is not None
-            else _inspection_git_report(root, working_tree=True)
-        )
-    if options.reverse:
-        before, after = after, before
+
+
+def cache_home() -> Path:
+    """Locate the user's XDG cache directory."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base if base.is_absolute() else Path.home() / ".cache"
+
+
+def _dispatch_diff() -> None:
+    """Render tracked interface changes between the index and the working tree."""
+    root = repository_root()
+    files = diff_inputs(root, git(root, ["ls-files", "--stage", "-z"]).stdout)
+    cache = cache_home() / "afairesi" / "arguments"
+    before = json.dumps(_inspection_git_report(root, files, cache))
+    after = json.dumps(_inspection_git_report(root, files, cache, working_tree=True))
+    if before == after:
+        return
     with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
         left, right = (Path(directory) / name for name in ("before.json", "after.json"))
-        left.write_text(json.dumps(before), encoding="utf-8")
-        right.write_text(json.dumps(after), encoding="utf-8")
-        completed = subprocess.run(  # noqa: S603 - The filenames and jd option are fixed.
-            ["jd", *(["-color"] if options.color else []), left.name, right.name],  # noqa: S607
+        left.write_text(before, encoding="utf-8")
+        right.write_text(after, encoding="utf-8")
+        completed = subprocess.run(  # noqa: S603 - The filenames are fixed.
+            ["jd", left.name, right.name],  # noqa: S607
             cwd=directory,
             capture_output=True,
             check=False,
@@ -1783,49 +1783,24 @@ def _dispatch_diff(
         sys.stderr.write(completed.stderr)
         raise SystemExit(completed.returncode)
     sys.stdout.write(completed.stdout)
-    if options.exit_code and completed.returncode:
-        raise SystemExit(1)
 
 
-def _dispatch(
-    options: argparse.Namespace,
-    cli: argparse.ArgumentParser,
-    *,
-    comparing: bool,
-) -> None:
+def _dispatch_inspection(value: str | None) -> None:
     """Inspect local or remote sources without executing package code."""
-    value = options.repository
-    remote = value is not None and (
+    repository: contextlib.AbstractContextManager[Path]
+    if value is not None and (
         "://" in value or (":" in value.split("/", 1)[0] and not Path(value).exists())
-    )
-    repository = (
-        inspection_remote_repository(value)
-        if remote
-        else contextlib.nullcontext(
+    ):
+        repository = inspection_remote_repository(value)
+    else:
+        repository = contextlib.nullcontext(
             resolve_repository_path(Path(value))
             if value is not None
             else repository_root(),
         )
-    )
     with repository as root:
-        if comparing:
-            _dispatch_diff(options, cli, root)
-            return
         report = inspect_repository(root)
     sys.stdout.write(json.dumps(report, indent=2) + "\n")
-
-
-def _configure_inspection_target(inspection: argparse.ArgumentParser) -> None:
-    """Declare an optional repository path or remote for inspection commands."""
-    inspection.add_argument(
-        "repository",
-        nargs="?",
-        metavar="PATH_OR_REMOTE",
-        help=(
-            "repository directory or Git URL (default: current repository); "
-            "relative paths use the Git root, or the current directory outside Git"
-        ),
-    )
 
 
 def parser() -> argparse.ArgumentParser:
@@ -1846,84 +1821,43 @@ def parser() -> argparse.ArgumentParser:
         epilog=(
             "Commands:\n"
             "  diff    diff inspected interfaces in jd format\n"
-            "\nRun 'afairesi diff --help' for comparison options.\n"
             "Use './diff' or '-- diff' to inspect a repository named diff."
         ),
     )
-    _configure_inspection_target(result)
+    result.add_argument(
+        "repository",
+        nargs="?",
+        metavar="PATH_OR_REMOTE",
+        help=(
+            "repository directory or Git URL (default: current repository); "
+            "relative paths use the Git root, or the current directory outside Git"
+        ),
+    )
     return result
 
 
 def _diff_parser(cli: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Register the diff interface after parsing the default repository argument."""
     commands = cli.add_subparsers(title="commands", metavar="COMMAND")
-    difference = commands.add_parser(
+    return commands.add_parser(
         "diff",
         prog="afairesi diff",
         help="diff inspected interfaces in jd format",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
             "Print a jd-compatible structural diff of repository inspections. "
-            "Compare the index with tracked working-tree sources by default. "
-            "Select revisions with --from and --to; use --merge-base to compare "
-            "their common ancestor with --to. "
+            "Compare the current repository's index with tracked working-tree sources. "
             "Untracked files and implementation-only changes are omitted. "
             "Inspect source without executing it or changing Git state."
         ),
         epilog=(
             "Examples:\n"
-            "  afairesi diff ../project --from HEAD~1 --to HEAD\n"
-            "  afairesi diff --cached | less\n"
-            "  afairesi diff --cached --color | less -R\n"
-            "  afairesi diff --cached | jd -t jd2patch | jless\n"
-            "  afairesi diff --cached > change.jd\n"
+            "  afairesi diff | jd -t jd2patch | jless\n"
+            "  afairesi diff > change.jd\n"
             "  jd -p change.jd before.json\n"
             "\nFor patching, before.json must contain the baseline inspection."
         ),
     )
-    _configure_inspection_target(difference)
-    difference.add_argument(
-        "--from",
-        dest="from_revision",
-        metavar="REV",
-        help="baseline revision (default: index, or HEAD with --cached)",
-    )
-    difference.add_argument(
-        "--to",
-        dest="to_revision",
-        metavar="REV",
-        help="target revision (default: working tree); incompatible with --cached",
-    )
-    difference.add_argument(
-        "--merge-base",
-        action="store_true",
-        help="compare the common ancestor of --from and --to with --to; requires both",
-    )
-    difference.add_argument(
-        "--cached",
-        "--staged",
-        dest="cached",
-        action="store_true",
-        help="compare HEAD (or --from REV) with index; before first commit use {}",
-    )
-    difference.add_argument(
-        "--color",
-        action="store_true",
-        help="colorize the diff with ANSI escapes, including when piped",
-    )
-    difference.add_argument(
-        "--exit-code",
-        action="store_true",
-        help="exit 1 for interface changes, 0 for no changes (default: exit 0)",
-    )
-    difference.add_argument(
-        "-R",
-        "--reverse",
-        action="store_true",
-        help="reverse the comparison",
-    )
-
-    return difference
 
 
 def check_source_main() -> None:
@@ -1949,15 +1883,17 @@ def main() -> None:
     cli = parser()
     options = cli.parse_args([] if comparing else arguments)
     difference = _diff_parser(cli)
-    diff_options = difference.parse_args(arguments[1:] if comparing else [])
-    if comparing:
-        cli, options = difference, diff_options
+    difference.parse_args(arguments[1:] if comparing else [])
     try:
-        _dispatch(options, cli, comparing=comparing)
+        if comparing:
+            _dispatch_diff()
+        else:
+            _dispatch_inspection(options.repository)
     except KeyboardInterrupt:
         sys.exit(130)
     except CommandError as error:
-        cli.exit(1, f"{cli.prog}: {error}\n")
+        command = difference if comparing else cli
+        command.exit(1, f"{command.prog}: {error}\n")
     except (OSError, SyntaxError, ValueError) as error:
         cli.exit(1, f"error: {error}\n")
 
