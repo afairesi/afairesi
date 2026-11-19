@@ -143,6 +143,12 @@ let
           "${name}/main.py"
           "${name}/test_main.py"
         ];
+      tflintConfig = pkgs.writeText "tflint.hcl" ''
+        plugin "terraform" {
+          enabled = true
+          preset  = "all"
+        }
+      '';
     in
     mkTreefmtTool {
       inherit pkgs self;
@@ -260,7 +266,7 @@ let
                 for file in "$@"; do
                   directory=$(dirname -- "$file")
                   if [[ ! -v 'checked[$directory]' ]]; then
-                    tflint --chdir="$directory" --config=/dev/null --call-module-type=none
+                    tflint --chdir="$directory" --config=${tflintConfig} --minimum-failure-severity=notice
                     checked[$directory]=1
                   fi
                 done
