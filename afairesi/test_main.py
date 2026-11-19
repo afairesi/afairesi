@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import os
 import re
@@ -20,6 +19,7 @@ import pytest
 import afairesi as inspection_subject
 
 if TYPE_CHECKING:
+    import ast
     from collections.abc import Iterator
 
 
@@ -445,7 +445,8 @@ def test_generic_builders_do_not_inherit_language_conventions(
 )
 def test_static_test_names_match_native_collection(tmp_path: Path, source: str) -> None:
     """Use pytest's collection as the oracle for ordinary and unittest test names."""
-    path = tmp_path / "test_main.py"
+    _inspection_repository(tmp_path)
+    path = tmp_path / "example/test_main.py"
     path.write_text(source)
     result = subprocess.run(  # noqa: S603 - Use this interpreter with test-authored code and arguments.
         [
@@ -469,12 +470,7 @@ def test_static_test_names_match_native_collection(tmp_path: Path, source: str) 
     collected = sorted(
         line.split("::", 1)[1] for line in result.stdout.splitlines() if "::" in line
     )
-    declared = sorted(
-        f"{owner}::{definition.name}" if owner else definition.name
-        for owner, definition in inspection_subject.python_test_definitions(
-            ast.parse(source)
-        )
-    )
+    declared = inspection_subject.inspect_repository(tmp_path)["example"]["tests"]
     _expect(declared == collected, (declared, collected))
 
 
@@ -720,6 +716,12 @@ def test_inspect_reports_argument_free_executables(tmp_path: Path, source: str) 
     [
         "import argparse",
         "import argparse\ndef unused(): return argparse.ArgumentParser()",
+        """\
+import argparse
+def main():
+    argparse.ArgumentParser().parse_args()
+from replacement import main
+""",
         """
 import argparse
 import sys
@@ -1071,6 +1073,11 @@ cli.parse_args()
         ("def main(): start()", "parse_args"),
         ("start()", "parse_intermixed_args"),
         ("run = start\nmain = run", "parse_known_intermixed_args"),
+        (
+            "def main(): internal.parse_args()\nclass main: pass\nstart()\nmain()",
+            "parse_args",
+        ),
+        ("def main(): start()\nmain()\ndel main", "parse_args"),
     ],
 )
 def test_inspect_ignores_unreachable_configuration(
@@ -1784,28 +1791,6 @@ cli.parse_args()
     )
 
 
-def test_inspect_omits_docstrings_and_test_implementation(tmp_path: Path) -> None:
-    """Return stable identifiers without test bodies or source docstrings."""
-    _inspection_repository(tmp_path)
-    source = tmp_path / "example/main.py"
-    source.write_text('"""Source description."""\n' + source.read_text())
-    tests = tmp_path / "example/test_main.py"
-    template = (
-        "def test_default_output():\n"
-        '    """DOCUMENTATION"""\n'
-        '    assert render() == "EXPECTED"\n'
-    )
-    tests.write_text(template)
-    before = inspection_subject.inspect_repository(tmp_path)
-    tests.write_text(
-        template.replace("DOCUMENTATION", "Changed").replace("EXPECTED", "second"),
-    )
-    after = inspection_subject.inspect_repository(tmp_path)
-    _expect(before == after, "test implementation or docstrings leaked into inventory")
-    _expect(before["example"]["description"] == "Example", before)
-    _expect(before["example"]["tests"] == ["test_default_output"], before)
-
-
 @pytest.mark.parametrize("location", ["outside", "root", "nested"])
 def test_inspect_reports_the_same_repository_through_equivalent_paths(
     tmp_path: Path,
@@ -2098,10 +2083,15 @@ def test_diff_ignores_implementation_edits_and_untracked_resources(
     """Emit nothing for changes outside the tracked interface contract."""
     _diff_repository(tmp_path)
     source = tmp_path / "example/main.py"
-    source.write_text(source.read_text() + "\ndef internal(): return 42\n")
+    source.write_text(
+        '"""Implementation notes."""\n'
+        + source.read_text()
+        + "\ndef internal(): return 42\n"
+    )
     tests = tmp_path / "example/test_main.py"
     tests.write_text(
-        tests.read_text().replace("pass", "raise RuntimeError('changed')"),
+        'def test_default_output():\n    """Updated notes."""\n'
+        '    raise RuntimeError("changed")\n',
     )
     (tmp_path / "untracked").mkdir()
     (tmp_path / "untracked/configuration.nix").touch()

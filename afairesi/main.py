@@ -285,50 +285,40 @@ def _python_class_mro(
     return result
 
 
-def python_test_definitions(
-    module: ast.Module,
-) -> list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]]:
-    """Find static test definitions, including methods inherited from local bases."""
+def _python_test_names(module: ast.Module) -> list[str]:
+    """List sorted pytest identifiers, including methods inherited from local bases."""
     classes = {
         node.name: node for node in module.body if isinstance(node, ast.ClassDef)
     }
     case_classes = _unittest_classes(module)
-
-    def methods(name: str) -> dict[str, ast.stmt]:
-        result: dict[str, ast.stmt] = {}
+    names = [
+        node.name
+        for node in module.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name.startswith("test")
+    ]
+    for name in classes:
+        if not (name.startswith("Test") or name in case_classes):
+            continue
+        methods: set[str] = set()
         for ancestor in reversed(_python_class_mro(classes, name, set())):
             if ancestor not in classes:
                 continue
             for statement in classes[ancestor].body:
                 if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                    result[statement.name] = statement
+                    if statement.name.startswith("test"):
+                        methods.add(statement.name)
                 elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
                     targets = (
                         statement.targets
                         if isinstance(statement, ast.Assign)
                         else [statement.target]
                     )
-                    for target in targets:
-                        if isinstance(target, ast.Name):
-                            result[target.id] = statement
-        return result
-
-    result: list[tuple[str, ast.FunctionDef | ast.AsyncFunctionDef]] = []
-    for node in module.body:
-        owner = node.name if isinstance(node, ast.ClassDef) else ""
-        definitions = (
-            methods(owner).values()
-            if isinstance(node, ast.ClassDef)
-            and (owner.startswith("Test") or owner in case_classes)
-            else [node]
-        )
-        result.extend(
-            (owner, definition)
-            for definition in definitions
-            if isinstance(definition, (ast.FunctionDef, ast.AsyncFunctionDef))
-            and definition.name.startswith("test")
-        )
-    return result
+                    methods.difference_update(
+                        target.id for target in targets if isinstance(target, ast.Name)
+                    )
+        names.extend(f"{name}::{method}" for method in methods)
+    return sorted(names)
 
 
 def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
@@ -345,7 +335,7 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
     source = read_regular(package.root / "main.py")
     if source is not None:
         module = ast.parse(source, filename=str(package.root / "main.py"))
-        if python_test_definitions(module):
+        if _python_test_names(module):
             issues.append(
                 f"{name}/main.py: move test definitions to test_main.py",
             )
@@ -415,12 +405,17 @@ def _meta_description(document: nix_syntax.Document) -> str | None:
 
 def _python_entrypoint(
     module: ast.Module,
-) -> ast.FunctionDef | ast.AsyncFunctionDef | ast.expr | None:
-    """Find the local value the executable will call as main()."""
+) -> ast.stmt | ast.expr | None:
+    """Find the last direct binding or deletion of the installed main name."""
     for node in reversed(module.body):
         if (
-            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
             and node.name == "main"
+        ):
+            return node
+        if isinstance(node, ast.Delete) and any(
+            isinstance(target, ast.Name) and target.id == "main"
+            for target in node.targets
         ):
             return node
         if isinstance(node, (ast.Import, ast.ImportFrom)) and any(
@@ -672,6 +667,7 @@ class ArgumentDiscovery:
         """Index parser assignments and helper call arguments."""
         self.filename = filename
         self.names = _PythonNames(source, filename)
+        self.entrypoint = _python_entrypoint(self.names.module)
         self.has_argparse = "argparse" in self.names.imports
         self.argument_free = not self.names.imports.intersection(
             {"argparse", "click", "typer", "fire", "docopt", "getopt"},
@@ -722,6 +718,13 @@ class ArgumentDiscovery:
     def _function(self, node: ast.expr) -> str | None:
         if isinstance(node, ast.Name) and not self._bindings(node):
             names = self.names.names(node) & self.functions.keys()
+            if (
+                names == {"main"}
+                and isinstance(self.entrypoint, (ast.ClassDef, ast.Delete))
+                and (node.lineno, node.col_offset)
+                > (self.entrypoint.lineno, self.entrypoint.col_offset)
+            ):
+                return None
             if len(names) == 1:
                 return next(iter(names))
         return None
@@ -1059,8 +1062,10 @@ class ArgumentDiscovery:
 
     def _public_scopes(self) -> set[str]:
         """Follow module-level calls and the installed main entry point."""
-        entrypoint = _python_entrypoint(self.names.module)
-        scopes = {""} if isinstance(entrypoint, ast.Name) else {"", "main"}
+        entrypoint = self.entrypoint
+        scopes = {""}
+        if isinstance(entrypoint, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            scopes.add(self.names.definition(entrypoint))
         seen: set[int] = set()
         while isinstance(entrypoint, ast.Name) and id(entrypoint) not in seen:
             seen.add(id(entrypoint))
@@ -1602,10 +1607,7 @@ def _package_report(package: Package, paths: set[Path]) -> dict[str, Any]:
         tests = package.root / test_name
         if tests.is_file():
             identifiers = (
-                sorted(
-                    f"{owner}::{definition.name}" if owner else definition.name
-                    for owner, definition in python_test_definitions(_source(tests))
-                )
+                _python_test_names(_source(tests))
                 if package.kind == "python"
                 else [test_name]
             )
