@@ -21,7 +21,7 @@ if TYPE_CHECKING:
         st.sampled_from([b"{}", b"[ 1 2 ]", b"let a = 1; in a", b'"${toString 1}"']),
     ),
 )
-def test_fuzz_parsing_preserves_valid_source_or_reports_a_syntax_error(
+def test_parsing_returns_the_original_bytes_or_raises_a_nix_syntax_error(
     source: bytes,
 ) -> None:
     """Arbitrary bytes produce a document or the documented syntax error."""
@@ -55,14 +55,16 @@ def test_string_literals_follow_native_nix_decoding_rules(
 
 
 @pytest.mark.parametrize("source", ['"${undefined}"', "42", "''indented''"])
-def test_literal_inspection_leaves_expressions_unevaluated(source: str) -> None:
+def test_literal_inspection_reads_only_double_quoted_strings_without_interpolation(
+    source: str,
+) -> None:
     """Source inspection only evaluates quoted literals without interpolation."""
     document = nix_syntax.parse(source)
     if nix_syntax.string_value(document, document.root) is not None:
         raise AssertionError(source)
 
 
-def test_long_literal_inspection_preserves_home_and_nix_store(
+def test_reading_long_string_literals_leaves_the_home_directory_and_nix_store_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

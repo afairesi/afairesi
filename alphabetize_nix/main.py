@@ -28,20 +28,14 @@ class Binding:
 
 
 def _replace_children(document: nix_syntax.Document, node: Node) -> str:
-    source = document.source[node.start_byte : node.end_byte]
-    edits = []
+    parts = []
+    start = node.start_byte
     for child in node.named_children:
-        rendered = render_node(document, child).encode()
-        original = document.source[child.start_byte : child.end_byte]
-        if rendered != original:
-            edits.append(
-                (
-                    child.start_byte - node.start_byte,
-                    child.end_byte - node.start_byte,
-                    rendered,
-                ),
-            )
-    return cast("bytes", nix_syntax.apply_edits(source, edits)).decode()
+        parts.append(document.source[start : child.start_byte].decode())
+        parts.append(render_node(document, child))
+        start = child.end_byte
+    parts.append(document.source[start : node.end_byte].decode())
+    return "".join(parts)
 
 
 def _binding(document: nix_syntax.Document, node: Node) -> Binding:

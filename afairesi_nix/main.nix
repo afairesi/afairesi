@@ -122,10 +122,10 @@ let
       meta.mainProgram = "lean-fmt";
       pname = "lean-fmt";
       src = pkgs.fetchFromGitHub {
+        hash = "sha256-jIgeAE5km36uFre/EPymroFNSt2ixM7v7qrM13QBD7g=";
         owner = "jcreinhold";
         repo = "lean-fmt";
         rev = "v4.35.0";
-        sha256 = "1f0g05sdgk5axvpwxi52vm54v0dflvy11gxp2sp7x6v49q01x24c";
       };
       version = "4.35.0";
     };

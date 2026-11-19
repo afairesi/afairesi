@@ -137,19 +137,6 @@ def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | Non
     return tuple(parts) if parts else None
 
 
-def apply_edits(source: bytes, edits: Iterable[tuple[int, int, bytes]]) -> bytes:
-    """Apply non-overlapping edits in source-coordinate order."""
-    result = source
-    previous_start = len(source) + 1
-    for start, end, replacement in sorted(edits, reverse=True):
-        if not (0 <= start <= end <= len(source)) or end > previous_start:
-            msg = "overlapping or invalid source edits"
-            raise ValueError(msg)
-        result = result[:start] + replacement + result[end:]
-        previous_start = start
-    return result
-
-
 def write_if_changed(path: Path, contents: str) -> None:
     """Atomically replace a regular file only when its contents changed."""
     original = path.read_text(encoding="utf-8")

@@ -34,7 +34,9 @@ def test_formatting_nested_bindings_requires_work_proportional_to_source_size(
         raise AssertionError(formatted)
 
 
-def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
+def test_formatting_reports_an_invalid_file_and_still_formats_the_next_file(
+    tmp_path: Path,
+) -> None:
     """Preserve invalid input while reporting it and formatting subsequent files."""
     invalid = tmp_path / "invalid.nix"
     source = "{ broken = ; }"
@@ -64,7 +66,7 @@ def test_cli_continues_after_an_invalid_file(tmp_path: Path) -> None:
         max_size=12,
     ),
 )
-def test_fuzz_formatting_preserves_values_and_is_repeatable(
+def test_formatting_integer_bindings_preserves_their_values_and_stabilizes_in_one_pass(
     bindings: dict[str, int],
 ) -> None:
     """Generated bindings retain their Nix value and stabilize after one pass."""
@@ -113,7 +115,7 @@ def test_fuzz_formatting_preserves_values_and_is_repeatable(
         ),
     ],
 )
-def test_cli_canonicalizes_nix_expressions_and_is_repeatable(
+def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
     tmp_path: Path, source: str, expected: str
 ) -> None:
     """Canonicalize representative expressions without losing significant text."""
@@ -155,7 +157,9 @@ def test_cli_canonicalizes_nix_expressions_and_is_repeatable(
         "{ z = { # nested comment\n y = 2; x = 1; }; a = 0; }",
     ],
 )
-def test_cli_preserves_native_nix_value(tmp_path: Path, source: str) -> None:
+def test_formatting_preserves_nix_values_list_order_and_comments(
+    tmp_path: Path, source: str
+) -> None:
     """Rewriting preserves the value that Nix evaluates, including list order."""
     formatted = tmp_path / "formatted.nix"
     formatted.write_text(source, encoding="utf-8")
@@ -207,7 +211,7 @@ def _evaluate(source: str) -> subprocess.CompletedProcess[str]:
         ("({ z, a }: z + a) { z = 1; }", "without required argument 'a'"),
     ],
 )
-def test_cli_preserves_native_nix_errors(
+def test_formatting_preserves_nix_evaluation_errors(
     tmp_path: Path,
     source: str,
     diagnostic: str,

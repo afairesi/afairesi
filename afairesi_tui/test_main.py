@@ -119,7 +119,7 @@ def home(tmp_path: Path) -> Path:
     return root
 
 
-def test_home_tree_groups_all_registered_repositories_without_writes(
+def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -173,7 +173,7 @@ def test_home_tree_groups_all_registered_repositories_without_writes(
 
 
 @pytest.mark.parametrize("comparison", ["working", "staged"])
-def test_diff_mode_covers_the_whole_home(
+def test_home_diff_shows_staged_or_working_changes_across_registered_repositories(
     home: Path,
     comparison: str,
     monkeypatch: pytest.MonkeyPatch,
@@ -207,7 +207,7 @@ def test_diff_mode_covers_the_whole_home(
     expect(calls == [expected] * 3, calls)
 
 
-def test_timeout_is_visible_without_losing_other_repositories(
+def test_home_tree_shows_a_timeout_alongside_results_from_other_repositories(
     home: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
@@ -236,7 +236,9 @@ def test_timeout_is_visible_without_losing_other_repositories(
     expect("4 direct submodules" in progress and "[4/4]" in progress, progress)
 
 
-def test_empty_and_invalid_homes_are_distinct(tmp_path: Path) -> None:
+def test_home_tree_requires_a_git_root_and_accepts_one_without_submodules(
+    tmp_path: Path,
+) -> None:
     """Show an empty valid home, but reject a nested directory or a non-repository."""
     cache = tmp_path / "cache"
     with pytest.raises(ValueError, match="not a git repository"):
@@ -256,7 +258,9 @@ def test_empty_and_invalid_homes_are_distinct(tmp_path: Path) -> None:
         subject.build_tree(child, cache=cache)
 
 
-def test_cache_reuses_results_and_invalidates_tracked_changes(home: Path) -> None:
+def test_cached_results_are_reused_until_a_tracked_change_or_explicit_refresh(
+    home: Path,
+) -> None:
     """Refresh for tracked edits, staging, commits, and explicit refresh requests."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
@@ -296,7 +300,7 @@ def test_cache_reuses_results_and_invalidates_tracked_changes(home: Path) -> Non
     expect(not hit, "explicit refresh used cached data")
 
 
-def test_cache_separates_operations_and_keeps_branch_metadata_live(
+def test_home_tree_shows_the_current_branch_even_with_a_cached_inspection(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Cache each operation independently while reading Git state fresh."""
@@ -316,7 +320,9 @@ def test_cache_separates_operations_and_keeps_branch_metadata_live(
     expect("github.com/owner/project: cached" in progress, progress)
 
 
-def test_cache_recovers_from_corruption_and_unavailable_storage(home: Path) -> None:
+def test_inspection_returns_resources_even_if_the_cache_is_corrupt_or_unavailable(
+    home: Path,
+) -> None:
     """Treat cache data as disposable; cache I/O failures must not hide resources."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
@@ -330,7 +336,7 @@ def test_cache_recovers_from_corruption_and_unavailable_storage(home: Path) -> N
     expect(not hit and actual == expected, actual)
 
 
-def test_cache_does_not_store_failures_or_changing_sources(
+def test_inspection_caches_only_successful_results_from_unchanged_sources(
     home: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Retry errors and avoid persisting a result read while the source was changing."""
@@ -355,7 +361,7 @@ def test_cache_does_not_store_failures_or_changing_sources(
     expect(not cache.exists(), "changing source was cached")
 
 
-def test_cache_tracks_symlink_targets(home: Path) -> None:
+def test_inspection_refreshes_when_a_symlinked_entrypoint_changes(home: Path) -> None:
     """A tracked Python entrypoint can change through an unchanged symlink."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
@@ -376,7 +382,7 @@ def test_cache_tracks_symlink_targets(home: Path) -> None:
     expect(not hit and value["example"]["arguments"][0]["default"] == "other", value)
 
 
-def test_plain_tree_starts_folded_and_supports_vim_navigation() -> None:
+def test_viewer_starts_with_folded_directories_and_supports_vim_navigation() -> None:
     """Show meaningful labels and let h/l fold and unfold details without JSON noise."""
     root = subject.Node("/home/test", expanded=True)
     project = root.add("github.com").add("owner").add("project")
@@ -435,7 +441,7 @@ def test_plain_tree_starts_folded_and_supports_vim_navigation() -> None:
     expect(not viewer.handle("q", 30), "q did not quit")
 
 
-def test_viewer_scrolls_and_clamps_selection_after_resize() -> None:
+def test_viewer_keeps_the_selection_visible_when_paging_or_resizing() -> None:
     """Keep navigation visible across viewport changes, paging, and collapsed roots."""
     root = subject.Node("home", expanded=True)
     for number in range(12):

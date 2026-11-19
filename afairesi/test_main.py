@@ -142,7 +142,7 @@ def _fixture_add(
 
 
 @pytest.mark.parametrize("exported", [False, True], ids=["git", "export"])
-def test_source_validation_respects_excluded_trees(
+def test_source_validation_skips_nested_assets_without_running_package_code(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, exported: bool
 ) -> None:
     """Validate resource files without executing code or traversing nested assets."""
@@ -216,7 +216,9 @@ def _snapshot(root: Path) -> dict[Path, tuple[int, bytes]]:
     return files
 
 
-def test_inspect_uses_tracked_names_after_git_move(tmp_path: Path) -> None:
+def test_inspect_lists_a_moved_package_and_its_tests_under_the_new_name(
+    tmp_path: Path,
+) -> None:
     """Report the renamed package and its tests from the Git index."""
     root = _repository(tmp_path)
     _fixture_add(root, "example", "generic")
@@ -228,18 +230,7 @@ def test_inspect_uses_tracked_names_after_git_move(tmp_path: Path) -> None:
     _expect(report["renamed"]["tests"] == ["test_main.nix"], report)
 
 
-@pytest.mark.parametrize("filename", ["main.nix", "test_main.nix"])
-def test_nix_optional_sources_are_syntax_checked(root: Path, filename: str) -> None:
-    """Reject malformed optional Nix files during source validation."""
-    _fixture_add(root, "example", "generic")
-    (root / "example" / filename).write_text("{ invalid = ; }\n")
-    _git(root, "add", "--", f"example/{filename}")
-    result = _check_flake_source(root, code=1)
-    _expect(f"example/{filename}:" in result.stderr, result)
-    _expect("parse error" in result.stderr, result)
-
-
-def test_cli_help_lists_current_commands_and_rejects_invalid_requests(
+def test_cli_shows_help_and_rejects_unknown_arguments_outside_a_repository(
     tmp_path: Path,
 ) -> None:
     """Expose the CLI and reject invalid requests outside a repository."""
@@ -276,7 +267,7 @@ def test_cli_help_lists_current_commands_and_rejects_invalid_requests(
         ),
     ],
 )
-def test_declared_package_kind_allows_supporting_entrypoint_names(
+def test_declared_package_kind_determines_the_required_entrypoint(
     tmp_path: Path,
     kind: str,
     constructor: str,
@@ -327,7 +318,9 @@ def test_inspect_selects_tests_by_package_kind(root: Path, kind: str) -> None:
     _expect(report.get("tests", []) == expected, report)
 
 
-def test_python_initializer_collision_is_rejected_before_build(root: Path) -> None:
+def test_source_validation_rejects_a_tracked_python_package_initializer(
+    root: Path,
+) -> None:
     """Reject a selected initializer without changing source or installing over main."""
     _fixture_add(root, "example", "python")
     initializer = root / "example/__init__.py"
@@ -368,15 +361,20 @@ def test_source_validation_accepts_custom_package_expressions(
     _expect(_snapshot(root) == before, "validation changed repository")
 
 
-@pytest.mark.parametrize("relative", ["flake.nix", "example/default.nix"])
-def test_source_validation_rejects_malformed_nix(root: Path, relative: str) -> None:
-    """Separate expression flexibility from Nix syntax errors."""
-    _fixture_add(root, "example", "python")
+@pytest.mark.parametrize(
+    "relative",
+    ["flake.nix", "example/default.nix", "example/main.nix", "example/test_main.nix"],
+)
+def test_source_validation_identifies_the_file_with_invalid_nix_syntax(
+    root: Path, relative: str
+) -> None:
+    """Report syntax errors in tracked flake, package, source, and test files."""
+    _fixture_add(root, "example", "generic")
     (root / relative).write_text("{ inputs, pkgs, ... }: (\n")
+    _git(root, "add", "--", relative)
     before = _snapshot(root)
     result = _check_flake_source(root, code=1)
-    _expect("parse error" in result.stderr, result)
-    _expect(relative in result.stderr, result)
+    _expect(f"{relative}:" in result.stderr and "parse error" in result.stderr, result)
     _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
@@ -389,7 +387,7 @@ def test_source_validation_rejects_malformed_nix(root: Path, relative: str) -> N
         "import ./builder.nix",
     ],
 )
-def test_generic_builders_do_not_inherit_language_conventions(
+def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
     root: Path,
     builder: str,
 ) -> None:
@@ -424,8 +422,22 @@ def test_generic_builders_do_not_inherit_language_conventions(
 @pytest.mark.parametrize(
     "source",
     [
-        "def testCamelCase(): pass\ndef test(): pass\n",
-        "class TestBehavior:\n    def testCamelCase(self): pass\n",
+        """
+from unittest import TestCase as Case
+def testCamelCase(): pass
+def test(): pass
+def helper():
+    def test_nested(): pass
+class TestArguments:
+    def testCamelCase(self): pass
+    async def test_missing_input(self): pass
+class Arguments(Case):
+    def test_valid_input(self): pass
+class Derived(Arguments):
+    def test_other_input(self): pass
+class Helper:
+    def test_not_collected(self): pass
+""",
         (
             "from unittest import TestCase\n"
             "class Reports(TestCase):\n    def testCamelCase(self): pass\n"
@@ -452,7 +464,9 @@ def test_generic_builders_do_not_inherit_language_conventions(
         ),
     ],
 )
-def test_static_test_names_match_native_collection(tmp_path: Path, source: str) -> None:
+def test_inspect_lists_the_python_functions_and_methods_collected_by_pytest(
+    tmp_path: Path, source: str
+) -> None:
     """Use pytest's collection as the oracle for ordinary and unittest test names."""
     _inspection_repository(tmp_path)
     path = tmp_path / "example/test_main.py"
@@ -497,7 +511,7 @@ def test_static_test_names_match_native_collection(tmp_path: Path, source: str) 
         ("host", "workLaptop"),
     ],
 )
-def test_resource_names_have_no_spelling_convention(
+def test_inspect_preserves_package_and_host_names_as_spelled(
     root: Path, kind: str, name: str
 ) -> None:
     """Validate and inspect names without a shared style rule."""
@@ -509,7 +523,9 @@ def test_resource_names_have_no_spelling_convention(
     _expect(_snapshot(root) == before, "validation changed resource spelling")
 
 
-def test_web_formatting_preserves_literal_line_breaks(root: Path) -> None:
+def test_formatting_preserves_line_breaks_in_javascript_strings_and_html_pre_blocks(
+    root: Path,
+) -> None:
     """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
     _fixture_add(root, "site", "html")
     script = root / "site/script.js"
@@ -529,7 +545,9 @@ def test_web_formatting_preserves_literal_line_breaks(root: Path) -> None:
     _expect("first\n\nsecond" in html.read_text(), html.read_text())
 
 
-def test_formatting_transforms_tracked_sources_without_staging(root: Path) -> None:
+def test_formatting_updates_only_tracked_sources_and_leaves_the_index_untouched(
+    root: Path,
+) -> None:
     """Remove ordinary comments while preserving lint findings and Git selection."""
     _fixture_add(root, "site", "html")
     (root / "flake.nix").write_text("{}\n")
@@ -628,7 +646,9 @@ def test_formatting_ignores_repository_tool_configuration(
         _expect(b"ordinary explanation" not in content, name)
 
 
-def test_formatting_normalizes_metadata_and_supporting_sources(root: Path) -> None:
+def test_formatting_preserves_repository_metadata_and_formats_nested_sources(
+    root: Path,
+) -> None:
     """Normalize selected metadata and supporting files consistently at every depth."""
     _fixture_add(root, "site", "html")
     metadata = {
@@ -673,7 +693,7 @@ def test_formatting_normalizes_metadata_and_supporting_sources(root: Path) -> No
 
 
 @pytest.mark.parametrize("description", [None, "package"])
-def test_inspect_reports_package_descriptions_without_dependency_metadata(
+def test_inspect_excludes_dependency_descriptions_from_package_metadata(
     tmp_path: Path,
     description: str | None,
 ) -> None:
@@ -711,7 +731,9 @@ def main():
 """,
     ],
 )
-def test_inspect_reports_argument_free_executables(tmp_path: Path, source: str) -> None:
+def test_inspect_lists_no_arguments_for_argument_free_executables(
+    tmp_path: Path, source: str
+) -> None:
     """Argument-free scripts need no parser and remain statically inspectable."""
     _inspection_repository(tmp_path)
     (tmp_path / "example/main.py").write_text(source)
@@ -746,7 +768,9 @@ def main():
         "from sys import argv as args\ndef main(): return args[1:]",
     ],
 )
-def test_inspect_requires_supported_cli(tmp_path: Path, source: str) -> None:
+def test_inspect_rejects_python_clis_it_cannot_identify(
+    tmp_path: Path, source: str
+) -> None:
     """Fail inspection when a Python package's interface cannot be discovered."""
     _inspection_repository(tmp_path)
     path = tmp_path / "example/main.py"
@@ -868,7 +892,9 @@ cli.parse_args()
         'if enabled:\n    target = cli\ntarget.add_argument("--token")',
     ],
 )
-def test_inspect_rejects_runtime_dependent_structure(declaration: str) -> None:
+def test_inspect_rejects_arguments_whose_presence_depends_on_runtime_values(
+    declaration: str,
+) -> None:
     """Reject uncertain argument membership, including helper and alias dependencies."""
     source = (
         "import argparse\ncli = argparse.ArgumentParser()\n"
@@ -893,7 +919,7 @@ def test_inspect_rejects_runtime_dependent_structure(declaration: str) -> None:
         "cli.customize()",
     ],
 )
-def test_inspect_rejects_argument_configuration_outside_the_inspected_source(
+def test_inspect_fails_when_it_cannot_follow_how_arguments_are_configured(
     configure: str,
 ) -> None:
     """Fail when parser flow escapes the supported helper and method patterns."""
@@ -905,7 +931,7 @@ def test_inspect_rejects_argument_configuration_outside_the_inspected_source(
         _inspection_discovery(source)
 
 
-def test_inspect_rejects_ambiguous_public_interfaces() -> None:
+def test_inspect_rejects_executables_with_multiple_public_argument_parsers() -> None:
     """Require an unambiguous root instead of merging distinct command interfaces."""
     source = """
 import argparse
@@ -952,7 +978,7 @@ cli.parse_args()
     )
 
 
-def test_inspect_includes_interfaces_declared_in_the_main_guard() -> None:
+def test_inspect_lists_arguments_declared_in_the_python_main_guard() -> None:
     """Treat the standard main guard as active when describing an executable CLI."""
     report = _inspection_discovery("""
 import argparse
@@ -973,7 +999,7 @@ if __name__ == '__main__':
         "{path: process(path) for path in cli.parse_args().files}",
     ],
 )
-def test_inspect_recognizes_arguments_used_to_generate_collections(
+def test_inspect_lists_arguments_used_as_the_input_to_a_comprehension(
     expression: str,
 ) -> None:
     """Recognize a parser consumed while evaluating the first comprehension iterable."""
@@ -997,7 +1023,7 @@ def main():
         "(item for item in items for path in cli.parse_args().files)",
     ],
 )
-def test_inspect_rejects_conditionally_used_command_interfaces(
+def test_inspect_rejects_conditional_argument_parsing_inside_comprehensions(
     expression: str,
 ) -> None:
     """Reject parser consumption that depends on comprehension iterations or filters."""
@@ -1022,7 +1048,7 @@ def main():
         "while cli.parse_args().files:\n        break",
     ],
 )
-def test_inspect_recognizes_arguments_used_to_control_loops(loop: str) -> None:
+def test_inspect_lists_arguments_read_before_a_loop_body_runs(loop: str) -> None:
     """Loop iterables and initial while conditions execute before their bodies."""
     report = _inspection_discovery(
         """
@@ -1089,7 +1115,7 @@ cli.parse_args()
         ("def main(): start()\nmain()\ndel main", "parse_args"),
     ],
 )
-def test_inspect_ignores_unreachable_configuration(
+def test_inspect_omits_arguments_unreachable_from_the_entrypoint(
     entrypoint: str, method: str
 ) -> None:
     """Follow the executable entry point and ignore an uncalled parser factory."""
@@ -1111,25 +1137,6 @@ def start():
 """
     report = _inspection_discovery(source + entrypoint)
     _expect(report == {"arguments": [{"names": ["--public"]}]}, report)
-
-
-def test_inspect_preserves_aliases_declared_in_static_settings() -> None:
-    """Expand literal parser settings while retaining subcommand aliases."""
-    report = _inspection_discovery("""
-import argparse
-cli = argparse.ArgumentParser(**{'parents': []})
-run = cli.add_subparsers().add_parser('run', **{'aliases': ['r']})
-run.add_argument('--token')
-cli.parse_args()
-""")
-    _expect(
-        report["commands"]
-        == {
-            "run": {"arguments": [{"names": ["--token"]}]},
-            "r": {"arguments": [{"names": ["--token"]}]},
-        },
-        report,
-    )
 
 
 @pytest.mark.parametrize(
@@ -1191,7 +1198,7 @@ cli.parse_args()
         ),
     ],
 )
-def test_inspect_rejects_unresolved_interfaces_with_source_context(
+def test_inspect_pinpoints_the_source_expression_it_cannot_resolve(
     source: str, reason: str
 ) -> None:
     """Fail discovery with source context instead of a partial successful report."""
@@ -1211,7 +1218,7 @@ def test_inspect_rejects_unresolved_interfaces_with_source_context(
 
 
 @pytest.mark.parametrize("constructor", ["argparse.ArgumentParser()", "Parser()"])
-def test_inspect_rejects_unsupported_class_based_interfaces(
+def test_inspect_rejects_argparse_interfaces_defined_in_class_methods(
     constructor: str,
 ) -> None:
     """Do not report a class-based CLI as an empty successful interface."""
@@ -1230,7 +1237,7 @@ def main():
         _inspection_discovery(source)
 
 
-def test_inspect_keeps_command_arguments_in_their_declared_scope() -> None:
+def test_inspect_keeps_subcommand_options_separate_when_helpers_share_a_name() -> None:
     """Keep same-named helpers attached to their own subcommands."""
     source = """
 import argparse
@@ -1264,7 +1271,7 @@ def main():
     )
 
 
-def test_inspect_rejects_ambiguous_argument_definitions() -> None:
+def test_inspect_rejects_conflicting_definitions_of_an_argument_helper() -> None:
     """Retain an explicit failure when helper definitions remain ambiguous."""
     with pytest.raises(inspection_subject.CommandError, match="ambiguous helper"):
         _inspection_discovery("""
@@ -1319,7 +1326,7 @@ def main():
     )
 
 
-def test_inspect_bounds_resolution_of_recursive_non_parser_helpers(
+def test_inspect_finds_public_arguments_despite_unrelated_recursive_calls(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Inspect recursive helpers without enumerating every route through a cycle."""
@@ -1350,7 +1357,7 @@ def test_inspect_bounds_resolution_of_recursive_non_parser_helpers(
     )
 
 
-def test_inspect_preserves_parsers_returned_through_recursive_helpers() -> None:
+def test_inspect_lists_arguments_on_parsers_returned_by_recursive_helpers() -> None:
     """Keep parser-bearing cycles reachable while excluding unrelated cycles."""
     report = _inspection_discovery("""
 import argparse
@@ -1394,13 +1401,15 @@ cli.parse_args()
 """,
     ],
 )
-def test_inspect_rejects_shadowed_constructor_aliases(source: str) -> None:
+def test_inspect_rejects_parsers_whose_argparse_import_has_been_shadowed(
+    source: str,
+) -> None:
     """Do not treat reassigned names or parameters as their shadowed imports."""
     with pytest.raises(inspection_subject.CommandError, match="cannot resolve"):
         _inspection_discovery(source)
 
 
-def test_inspect_rejects_arguments_from_replaced_definitions() -> None:
+def test_inspect_rejects_argument_helpers_replaced_by_an_external_function() -> None:
     """An opaque callable must not inherit the interface of a replaced helper."""
     with pytest.raises(inspection_subject.CommandError, match="external helper"):
         _inspection_discovery("""
@@ -1445,7 +1454,9 @@ def main():
     )
 
 
-def test_inspect_preserves_declared_source_encoding(root: Path) -> None:
+def test_inspect_reads_option_names_and_defaults_in_the_declared_python_encoding(
+    root: Path,
+) -> None:
     """Respect the Python encoding declaration in validation and CLI discovery."""
     _fixture_add(root, "example", "python")
     (root / "example/main.py").write_bytes(
@@ -1467,9 +1478,9 @@ def test_inspect_reports_the_same_interface_for_command_aliases() -> None:
     """Expose aliases with the same interface as their canonical command."""
     report = _inspection_discovery("""
 import argparse
-cli = argparse.ArgumentParser()
+cli = argparse.ArgumentParser(**{'parents': []})
 commands = cli.add_subparsers()
-listing = commands.add_parser(name='list', aliases=['ls'])
+listing = commands.add_parser(name='list', **{'aliases': ['ls']})
 listing.add_argument('--all', action='store_true')
 listing.add_subparsers().add_parser('files', aliases=['f'])
 cli.parse_args()
@@ -1548,42 +1559,6 @@ def parse(cli):
     _expect(list(report["commands"]) == ["repo"], "internal command leaked")
 
 
-def test_inspect_reports_sorted_test_names_with_class_context(
-    tmp_path: Path,
-) -> None:
-    """Retain sorted test identifiers and class context."""
-    _inspection_repository(tmp_path)
-    (tmp_path / "example/test_main.py").write_text(
-        """
-raise RuntimeError('must not execute')
-from unittest import TestCase as Case
-def test_default_output(): pass
-def helper():
-    def test_nested(): pass
-class TestArguments:
-    async def test_missing_input(self): pass
-class Arguments(Case):
-    def test_valid_input(self): pass
-class Derived(Arguments):
-    def test_other_input(self): pass
-class Helper:
-    def test_not_collected(self): pass
-""",
-    )
-    rows = inspection_subject.inspect_repository(tmp_path)["example"]["tests"]
-    _expect(
-        rows
-        == [
-            "Arguments::test_valid_input",
-            "Derived::test_other_input",
-            "Derived::test_valid_input",
-            "TestArguments::test_missing_input",
-            "test_default_output",
-        ],
-        "wrong test identifiers or collection scope",
-    )
-
-
 def _inspection_repository(root: Path) -> None:
     (root / "flake.nix").touch()
     package = root / "example"
@@ -1620,7 +1595,9 @@ def test_default_output(): pass
 
 
 @pytest.mark.parametrize("directory", ["prm", "tmp", "experiments"])
-def test_resource_discovery_requires_tracking(tmp_path: Path, directory: str) -> None:
+def test_inspect_lists_a_package_once_git_tracks_its_declaration(
+    tmp_path: Path, directory: str
+) -> None:
     """Discover a package when its declaration joins its tracked supporting files."""
     _repository(tmp_path)
     _fixture_add(tmp_path, "example", "python")
@@ -1647,7 +1624,9 @@ def test_resource_discovery_requires_tracking(tmp_path: Path, directory: str) ->
     )
 
 
-def test_inspect_is_read_only(tmp_path: Path) -> None:
+def test_inspect_lists_hosts_and_packages_without_running_or_modifying_source(
+    tmp_path: Path,
+) -> None:
     """Inspect source containing failing statements without executing or writing."""
     _inspection_repository(tmp_path)
     before = _snapshot(tmp_path)
@@ -1711,7 +1690,7 @@ in inputs.self.lib.mkPythonPackage {
     _expect("main must accept a call without arguments" in rejected.stderr, rejected)
 
 
-def test_inspect_uses_package_executable_settings_without_dependency_metadata(
+def test_inspect_uses_the_package_executable_setting_to_identify_its_cli(
     tmp_path: Path,
 ) -> None:
     """Read executable metadata from the outer package rather than dependencies."""
@@ -1734,7 +1713,7 @@ in inputs.self.lib.mkPythonPackage {
     )
 
 
-def test_inspect_cli_failure_has_context_and_no_partial_json(
+def test_inspect_reports_cli_errors_on_stderr_without_emitting_partial_json(
     tmp_path: Path,
 ) -> None:
     """Surface discovery errors on stderr with a failing status and no JSON output."""
@@ -1749,7 +1728,7 @@ def test_inspect_cli_failure_has_context_and_no_partial_json(
     _expect("Traceback" not in completed.stderr, completed)
 
 
-def test_inspect_compacts_commands_without_losing_declared_values(
+def test_inspect_preserves_empty_commands_and_falsy_argument_defaults(
     tmp_path: Path,
 ) -> None:
     """Keep empty commands, aliases, and literal defaults when pruning containers."""
@@ -1801,7 +1780,7 @@ cli.parse_args()
 
 
 @pytest.mark.parametrize("location", ["outside", "root", "nested"])
-def test_inspect_reports_the_same_repository_through_equivalent_paths(
+def test_inspect_returns_the_same_inventory_for_equivalent_repository_paths(
     tmp_path: Path,
     location: str,
 ) -> None:
@@ -1833,7 +1812,7 @@ def test_inspect_reports_the_same_repository_through_equivalent_paths(
         )
 
 
-def test_inspect_rejects_invalid_repositories_and_source_with_context(
+def test_inspect_reports_a_missing_flake_or_malformed_python_source(
     tmp_path: Path,
 ) -> None:
     """Report invalid repositories and malformed source with useful errors."""
@@ -1886,7 +1865,7 @@ def remote_repository(
     _expect(not list(home.iterdir()), "remote inspection changed HOME")
 
 
-def test_inspect_remote_is_fresh_and_read_only(
+def test_inspect_remote_sees_new_commits_on_each_run(
     tmp_path: Path,
     remote_repository: tuple[Path, str],
 ) -> None:
@@ -1908,7 +1887,7 @@ def test_inspect_remote_is_fresh_and_read_only(
     )
 
 
-def test_inspect_remote_reports_malformed_source(
+def test_inspect_remote_reports_invalid_python_without_emitting_partial_json(
     tmp_path: Path,
     remote_repository: tuple[Path, str],
 ) -> None:
@@ -1951,7 +1930,7 @@ def test_inspect_includes_uncommitted_changes_only_for_local_paths(
     )
 
 
-def test_inspect_remote_accepts_native_file_urls(
+def test_inspect_remote_accepts_git_file_urls(
     tmp_path: Path,
     remote_repository: tuple[Path, str],
 ) -> None:
@@ -1966,7 +1945,7 @@ def test_inspect_remote_accepts_native_file_urls(
 
 @pytest.mark.parametrize("remote_kind", ["missing", "unsupported", "invalid"])
 @pytest.mark.usefixtures("remote_repository")
-def test_inspect_remote_preserves_native_clone_errors(
+def test_inspect_remote_forwards_the_error_and_exit_status_from_git_clone(
     tmp_path: Path,
     remote_kind: str,
 ) -> None:
@@ -2054,7 +2033,7 @@ def _apply_diff(
         (("-R",), "working", "index", 0),
     ],
 )
-def test_diff_uses_git_comparisons_and_emits_jd_patches(
+def test_diff_emits_a_jd_patch_between_the_selected_git_states(
     tmp_path: Path,
     arguments: tuple[str, ...],
     left: str,
@@ -2110,7 +2089,7 @@ def test_diff_ignores_implementation_edits_and_untracked_resources(
     _expect(_snapshot(tmp_path) == before, "empty diff changed state")
 
 
-def test_diff_covers_structural_and_nested_cli_changes(
+def test_diff_reconstructs_changes_to_hosts_tests_and_subcommand_arguments(
     tmp_path: Path,
 ) -> None:
     """Round-trip resource changes, nested arguments, and lists with jd context."""
@@ -2135,7 +2114,9 @@ def test_diff_covers_structural_and_nested_cli_changes(
     _expect(_apply_diff(before, completed.stdout) == after, completed)
 
 
-def test_unstaged_package_removal_matches_working_tree_diff(root: Path) -> None:
+def test_removing_a_package_drops_its_references_and_preserves_a_colocated_host(
+    root: Path,
+) -> None:
     """Remove packages and their dependency edges while retaining a colocated host."""
     _fixture_add(root, "app", "python")
     _fixture_add(root, "shared", "host")
@@ -2165,7 +2146,9 @@ def test_unstaged_package_removal_matches_working_tree_diff(root: Path) -> None:
         )
 
 
-def test_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
+def test_diff_output_can_be_applied_as_json_patch_after_conversion(
+    tmp_path: Path,
+) -> None:
     """Translate native diff stdin to JSON Patch for JSON viewers and patching."""
     before = _diff_repository(tmp_path)
     _diff_description(tmp_path, "Changed")
@@ -2191,7 +2174,9 @@ def test_diff_pipes_through_jd_translation(tmp_path: Path) -> None:
     )
 
 
-def test_diff_uses_the_merge_base(tmp_path: Path) -> None:
+def test_diff_with_merge_base_shows_changes_since_the_branches_diverged(
+    tmp_path: Path,
+) -> None:
     """Exclude the other branch's changes and ignore malformed working sources."""
     base = _diff_repository(tmp_path)
     _git(tmp_path, "tag", "base")
@@ -2216,7 +2201,7 @@ def test_diff_uses_the_merge_base(tmp_path: Path) -> None:
     _expect(_snapshot(tmp_path) == before, "range diff changed state")
 
 
-def test_diff_compares_initial_staging_against_an_empty_repository(
+def test_diff_treats_the_inventory_before_the_first_commit_as_empty(
     tmp_path: Path,
 ) -> None:
     """Compare the first staged interface against an empty inventory."""
@@ -2275,7 +2260,7 @@ def test_diff_errors_leave_no_partial_output_or_temporary_sources(
 
 
 @pytest.mark.parametrize("name", ["diff", "HEAD", "repository with spaces"])
-def test_cli_selects_repositories_outside_git(
+def test_cli_accepts_explicit_repository_paths_that_resemble_commands_or_revisions(
     tmp_path: Path,
     name: str,
 ) -> None:
@@ -2301,7 +2286,7 @@ def test_cli_selects_repositories_outside_git(
         _expect(not completed.stdout, completed)
 
 
-def test_diff_rejects_unmerged_index_without_changes(
+def test_diff_reports_unresolved_merge_conflicts_and_leaves_the_index_untouched(
     tmp_path: Path,
 ) -> None:
     """Reject conflict stages instead of emitting an incomplete interface diff."""
@@ -2331,7 +2316,9 @@ def test_diff_rejects_unmerged_index_without_changes(
     )
 
 
-def test_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
+def test_diff_reads_the_selected_linked_worktree_without_modifying_it(
+    tmp_path: Path,
+) -> None:
     """Read the selected worktree's index while preserving shared Git metadata."""
     root, linked = tmp_path / "repository", tmp_path / "linked"
     root.mkdir()
@@ -2351,7 +2338,7 @@ def test_diff_preserves_linked_worktrees(tmp_path: Path) -> None:
     )
 
 
-def test_inspect_reports_public_commands() -> None:
+def test_afairesi_lists_its_own_repository_argument_and_diff_options() -> None:
     """Inventory every public command without nested command groups."""
     report = inspection_subject.ArgumentDiscovery(
         Path(__file__).with_name("main.py").read_bytes(),
@@ -2371,7 +2358,7 @@ def test_inspect_reports_public_commands() -> None:
 
 
 @pytest.mark.parametrize("kind", ["python", "generic", "lean4"])
-def test_source_validation_ignores_local_packages_and_optional_tests(
+def test_source_validation_ignores_untracked_packages_and_test_files(
     tmp_path: Path,
     kind: str,
 ) -> None:
@@ -2393,7 +2380,9 @@ def test_source_validation_ignores_local_packages_and_optional_tests(
     _expect(set(report) == {"example"} and "tests" not in report["example"], report)
 
 
-def test_inspection_reports_declared_local_dependency_edges(tmp_path: Path) -> None:
+def test_inspect_groups_package_and_host_dependencies_by_role(
+    tmp_path: Path,
+) -> None:
     """Combine a package and host's local dependency roles without evaluating Nix."""
     root = _repository(tmp_path)
     for name in ("consumer", "library", "other", "tool", "helper"):
@@ -2444,7 +2433,7 @@ def test_inspection_reports_declared_local_dependency_edges(tmp_path: Path) -> N
     )
 
 
-def test_inspection_handles_shared_non_parser_aliases() -> None:
+def test_inspect_ignores_nested_aliases_unrelated_to_cli_arguments() -> None:
     """Traverse shared containers once while finding actual parser arguments."""
     source = "import argparse\nvalue0 = []\n"
     for index in range(1, 24):

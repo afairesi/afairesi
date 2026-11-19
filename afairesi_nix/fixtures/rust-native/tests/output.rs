@@ -1,5 +1,5 @@
 #[test]
-fn prints_answer() {
+fn executable_prints_42() {
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_rust-native"))
         .output()
         .expect("run the built executable");

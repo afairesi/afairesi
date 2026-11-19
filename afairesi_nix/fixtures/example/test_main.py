@@ -8,7 +8,9 @@ import pytest
 
 
 @pytest.mark.parametrize("hook", [None, "loaded"], ids=["unset", "set"])
-def test_cli(hook: str | None, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_executable_reports_the_inherited_runtime_hook_setting(
+    hook: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """The installed executable sees the environment inherited by its subprocess."""
     if hook is None:
         monkeypatch.delenv("AFAIRESI_CONSUMER_HOOK", raising=False)

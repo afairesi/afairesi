@@ -1032,36 +1032,29 @@ class ArgumentDiscovery:
             return set().union(
                 *(self._resolve(value, seen) for value in self.returns.get(key, [])),
             )
-        if isinstance(node.func, ast.Attribute) and node.func.attr in {
+        if not isinstance(node.func, ast.Attribute):
+            return set()
+        if node.func.attr in {
             "add_subparsers",
             "add_argument_group",
             "add_mutually_exclusive_group",
-            "add_parser",
         }:
-            parents = self._resolve(node.func.value, seen)
-            if node.func.attr in {
-                "add_subparsers",
-                "add_argument_group",
-                "add_mutually_exclusive_group",
-            }:
-                return parents
-            if node.func.attr == "add_parser":
-                if not parents:
-                    return set()
-                keywords = self._parser_keywords(node)
-                name_node = node.args[0] if node.args else keywords.get("name")
-                name = _value(name_node) if name_node is not None else None
-                aliases = _value(keywords["aliases"]) if "aliases" in keywords else []
-                if not isinstance(name, str):
-                    self._error(node, "subcommand name must be a literal string")
-                if not isinstance(aliases, (list, tuple)) or not all(
-                    isinstance(alias, str) for alias in aliases
-                ):
-                    self._error(node, "subcommand aliases must be literal strings")
-                return {
-                    (*parent, label) for parent in parents for label in [name, *aliases]
-                }
-        return set()
+            return self._resolve(node.func.value, seen)
+        if node.func.attr != "add_parser" or not (
+            parents := self._resolve(node.func.value, seen)
+        ):
+            return set()
+        keywords = self._parser_keywords(node)
+        name_node = node.args[0] if node.args else keywords.get("name")
+        name = _value(name_node) if name_node is not None else None
+        aliases = _value(keywords["aliases"]) if "aliases" in keywords else []
+        if not isinstance(name, str):
+            self._error(node, "subcommand name must be a literal string")
+        if not isinstance(aliases, (list, tuple)) or not all(
+            isinstance(alias, str) for alias in aliases
+        ):
+            self._error(node, "subcommand aliases must be literal strings")
+        return {(*parent, label) for parent in parents for label in [name, *aliases]}
 
     def _public_scopes(self) -> set[str]:
         """Follow module-level calls and the installed main entry point."""

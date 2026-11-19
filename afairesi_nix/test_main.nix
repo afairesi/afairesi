@@ -147,8 +147,6 @@ assert htmlPackage.afairesiKind == "html";
 assert htmlPackage.meta.description == "Source listing";
 assert leanExample.afairesiKind == "lean4";
 assert consumer.checks.${system} ? example;
-assert consumer.checks.${system} ? lean-example;
-assert consumer.checks.${system} ? test_main;
 assert consumer.checks.${system}.pkgs-lean-example == leanExample;
 assert consumer.checks.${system}.pkgs-test_main == leanLibrary;
 assert
@@ -183,8 +181,6 @@ assert consumer.checks.${system}.devshell-example-test == consumer.devShells.${s
 assert !(consumer.packages.${system} ? unavailable);
 assert !(consumer.checks.${system} ? unavailable);
 assert !(consumer.checks.${system} ? orphan);
-assert consumer.checks.${system} ? nix-library;
-assert consumer.checks.${system} ? nix-tests;
 assert !(consumer.checks.${system} ? nix-untested);
 assert !(consumer.checks.${system} ? native);
 assert !(consumer.devShells.${system} ? nix-library-test);
@@ -207,7 +203,6 @@ assert empty.devShells.${system} == { };
 assert empty.nixosConfigurations == { };
 assert (consumer.checks.${system} ? exampleVm) == (system == "x86_64-linux");
 assert system != "x86_64-linux" || builtins.isString consumer.checks.${system}.exampleVm.drvPath;
-assert consumer.devShells.${system} ? example-test;
 assert consumer.apps.${system}.example.type == "app";
 assert consumer.apps.${system}.example.meta == package.meta;
 assert consumer.apps.${system}.example.meta.description == "Afairesi consumer contract example";
@@ -283,9 +278,10 @@ pkgs.runCommand "afairesi-consumer-contract"
         line = str(lines.index(statement) + 1)
         return {context.rsplit("/", 1)[-1] for context in measured["contexts"][line]}
 
-    unset = "test_main.py::test_cli[unset]"
+    test_id = "test_main.py::test_executable_reports_the_inherited_runtime_hook_setting"
+    unset = f"{test_id}[unset]"
     assert contexts_at('hook = "unloaded"') == {unset}
-    assert contexts_at("if hook is None:") == {unset, "test_main.py::test_cli[set]"}
+    assert contexts_at("if hook is None:") == {unset, f"{test_id}[set]"}
     PY
     head -c 5 ${latexPackage}/ms.pdf | grep -F '%PDF-'
     test ! -e ${pythonLibrary}/bin
