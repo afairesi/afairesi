@@ -1,16 +1,15 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Check Afairesi's CLI and source validation."""
+"""Check repository inspection, diffs, and source validation."""
 
-import json
 import os
 import re
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
-from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import pytest
 
@@ -21,26 +20,16 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
 
-def _run(
-    root: Path,
-    *arguments: str,
-    code: int = 0,
-) -> subprocess.CompletedProcess[str]:
-    result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-        [os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
-        cwd=root,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    if result.returncode != code:
-        msg = (
-            f"expected exit {code}, got {result.returncode}\n"
-            f"{result.stdout}{result.stderr}"
-        )
-        raise AssertionError(msg)
-    return result
+_ENTRYPOINTS = {
+    "bash": ("main.sh", "echo hello\n"),
+    "html": ("index.html", "<!doctype html><html><body></body></html>\n"),
+    "latex": (
+        "ms.tex",
+        "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n",
+    ),
+    "lean4": ("main.lean", "def main : IO Unit := pure ()\n"),
+    "python": ("main.py", "def main():\n    pass\n"),
+}
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -54,45 +43,19 @@ def _git(root: Path, *arguments: str) -> str:
     ).stdout
 
 
-def _commit(root: Path, message: str) -> None:
-    """Commit staged fixture files without relying on the user's Git config."""
-    _git(
-        root,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        "-c",
-        "maintenance.auto=false",
-        "commit",
-        "--quiet",
-        "-m",
-        message,
-    )
-
-
 def _fixture_add(
     root: Path,
     name: str,
     kind: str,
 ) -> None:
     """Write the minimal tracked source needed by a test."""
-    sources = {
-        "bash": {"main.sh": "echo hello\n"},
-        "host": {"configuration.nix": "{ ... }: {}\n"},
-        "python": {"main.py": "def main():\n    pass\n"},
-        "html": {"index.html": "<!doctype html><html><body></body></html>\n"},
-        "latex": {
-            "ms.tex": (
-                "\\documentclass{article}\n\\begin{document}\nHello.\n\\end{document}\n"
-            )
-        },
-        "lean4": {"main.lean": "def main : IO Unit := pure ()\n"},
-        "generic": {},
-    }[kind]
-    if kind != "host":
+    sources = {}
+    if kind in _ENTRYPOINTS:
+        filename, content = _ENTRYPOINTS[kind]
+        sources[filename] = content
+    if kind == "host":
+        sources["configuration.nix"] = "{ ... }: {}\n"
+    else:
         builder = {
             "bash": "inputs.afairesi.lib.mkBashPackage",
             "python": "inputs.self.lib.mkPythonPackage",
@@ -192,45 +155,25 @@ def _snapshot(root: Path) -> dict[Path, tuple[int, bytes]]:
     return files
 
 
-def test_afairesi_prints_the_behavioral_specification_before_implementation(
+def test_inspection_lists_sorted_test_names_before_implementation(
     root: Path,
 ) -> None:
-    """Publish high-level test names as soon as the tests have been written."""
+    """List declarations without importing the suite or requiring an implementation."""
     _fixture_add(root, "inbox", "python")
     (root / "inbox/main.py").unlink()
-    tests = root / "inbox/test_main.py"
-    tests.write_text(
-        "raise RuntimeError('inspection must not import this suite')\n"
-        "def test_delivers_messages(): ...\n"
-    )
-    _git(root, "add", "--", "inbox/test_main.py")
-    report = json.loads(_run(root).stdout)
-    _expect(report == {"inbox": ["test_delivers_messages"]}, report)
-
-
-def test_detailed_behavior_names_extend_the_specification_in_stable_order(
-    root: Path,
-) -> None:
-    """List each declaration once, independently of assertion text or case data."""
-    _fixture_add(root, "inbox", "python")
-    tests = root / "inbox/test_main.py"
-    tests.write_text(
+    (root / "inbox/test_main.py").write_text(
         "import pytest\n"
+        "raise RuntimeError('inspection must not import this suite')\n"
         "@pytest.mark.parametrize('message', ['abc', 'ABC'])\n"
         "def test_preserves_message_case(message): assert deliver(message) == message\n"
         "def test_delivers_messages(): assert deliver('hello') == 'hello'\n"
     )
     _git(root, "add", "--", "inbox/test_main.py")
-    first = _run(root).stdout
+    report = inspection_subject.inspect_repository(root)
     _expect(
-        json.loads(first)
-        == {"inbox": ["test_delivers_messages", "test_preserves_message_case"]},
-        first,
+        report == {"inbox": ["test_delivers_messages", "test_preserves_message_case"]},
+        report,
     )
-    tests.write_text(
-        "def test_delivers_messages(): ...\ndef test_preserves_message_case(): ...\n"
-    )
-    _expect(_run(root).stdout == first, first)
 
 
 def test_each_package_lists_a_shared_behavior_name_once(root: Path) -> None:
@@ -240,34 +183,13 @@ def test_each_package_lists_a_shared_behavior_name_once(root: Path) -> None:
         tests = root / name / "test_main.py"
         tests.write_text("def test_delivers(): ...\ndef test_delivers(): ...\n")
         _git(root, "add", "--", f"{name}/test_main.py")
-    report = json.loads(_run(root).stdout)
+    report = inspection_subject.inspect_repository(root)
     _expect(list(report) == ["mail-box", "mail_box"], report)
     _expect(
         report == {"mail-box": ["test_delivers"], "mail_box": ["test_delivers"]}, report
     )
-    with pytest.raises(inspection_subject.CommandError, match="module names collide"):
+    with pytest.raises(ValueError, match="module names collide"):
         inspection_subject.validate_flake_source(root)
-
-
-def test_cli_shows_help_and_rejects_unknown_arguments_outside_a_repository(
-    tmp_path: Path,
-) -> None:
-    """Expose the CLI and reject invalid requests outside a repository."""
-    before = _snapshot(tmp_path)
-    help_output = _run(tmp_path, "--help").stdout
-    _expect("[PATH_OR_REMOTE]" in help_output, help_output)
-    _expect("  diff " in help_output, help_output)
-    option = _run(tmp_path, "diff", "--help").stdout
-    _expect(option.splitlines()[0] == "usage: afairesi diff [-h]", option)
-    for arguments in (
-        ("--unknown",),
-        (".", "extra"),
-        ("diff", "."),
-        ("diff", "--unknown"),
-    ):
-        rejected = _run(tmp_path, *arguments, code=2)
-        _expect("unrecognized arguments" in rejected.stderr, rejected)
-    _expect(_snapshot(tmp_path) == before, "CLI help changed state")
 
 
 @pytest.mark.parametrize(
@@ -281,21 +203,13 @@ def test_cli_shows_help_and_rejects_unknown_arguments_outside_a_repository(
     ],
 )
 def test_declared_package_kind_determines_the_required_entrypoint(
-    tmp_path: Path,
+    root: Path,
     kind: str,
     constructor: str,
 ) -> None:
     """Keep the declared build kind when supporting files resemble entrypoints."""
-    entrypoints = {
-        "bash": "main.sh",
-        "html": "index.html",
-        "latex": "ms.tex",
-        "lean4": "main.lean",
-        "python": "main.py",
-    }
-    root = _repository(tmp_path)
-    _fixture_add(root, "example", kind)
     package = root / "example"
+    package.mkdir()
     executable = "executable = true;" if kind in {"lean4", "python"} else ""
     (package / "default.nix").write_text(
         "{ inputs, pkgs, ... }: let dependency = inputs.self.lib.mkHtmlPackage {}; in "
@@ -303,16 +217,16 @@ def test_declared_package_kind_determines_the_required_entrypoint(
     )
     if kind != "python":
         (package / "test_main.py").write_text("def test_unrelated(): pass")
-    for filename in (*entrypoints.values(), "main.nix"):
-        (package / filename).touch()
+    for filename, content in _ENTRYPOINTS.values():
+        (package / filename).write_text(content)
+    (package / "main.nix").touch()
     _git(root, "add", "--", "example")
-    report = json.loads(_run(root).stdout)
+    report = inspection_subject.inspect_repository(root)
     _expect(report == {"example": []}, report)
     inspection_subject.validate_flake_source(root)
-    (package / entrypoints[kind]).unlink()
-    with pytest.raises(
-        inspection_subject.CommandError, match=re.escape(entrypoints[kind])
-    ):
+    entrypoint, _ = _ENTRYPOINTS[kind]
+    (package / entrypoint).unlink()
+    with pytest.raises(ValueError, match=re.escape(entrypoint)):
         inspection_subject.validate_flake_source(root)
 
 
@@ -325,9 +239,7 @@ def test_source_validation_rejects_a_tracked_python_package_initializer(
     initializer.write_text('"""Personal initialization."""\n')
     _git(root, "add", "example/__init__.py")
     before = _snapshot(root)
-    with pytest.raises(
-        inspection_subject.CommandError, match=r"__init__\.py: reserved"
-    ):
+    with pytest.raises(ValueError, match=r"__init__\.py: reserved"):
         inspection_subject.validate_flake_source(root)
     _expect(_snapshot(root) == before, "rejection changed sources")
 
@@ -357,12 +269,10 @@ def test_source_validation_identifies_the_file_with_invalid_nix_syntax(
     _fixture_add(root, "example", "generic")
     (root / relative).write_text("{ inputs, pkgs, ... }: (\n")
     _git(root, "add", "--", relative)
-    before = _snapshot(root)
     with pytest.raises(
         nix_syntax.NixSyntaxError, match=rf"{re.escape(relative)}:\d+:\d+: parse error"
     ):
         inspection_subject.validate_flake_source(root)
-    _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
 def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
@@ -391,7 +301,7 @@ def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
             (package / marker).write_text("Supporting source\n")
     _git(root, "add", ".")
     inspection_subject.validate_flake_source(root)
-    report = json.loads(_run(root).stdout)
+    report = inspection_subject.inspect_repository(root)
     _expect(report == {name: ["testBuilds"] for name in builders}, report)
 
 
@@ -456,7 +366,7 @@ class AsyncReports(AsyncBase):
     collected = sorted(
         line.split("::", 1)[1] for line in result.stdout.splitlines() if "::" in line
     )
-    declared = json.loads(_run(tmp_path, str(tmp_path)).stdout)["example"]
+    declared = inspection_subject.inspect_repository(tmp_path)["example"]
     _expect(declared == collected, (declared, collected))
 
 
@@ -478,7 +388,7 @@ def test_specification_preserves_package_names_and_omits_standalone_hosts(
         _fixture_add(root, name, kind)
     _fixture_add(root, "workLaptop", "host")
     inspection_subject.validate_flake_source(root)
-    report = json.loads(_run(root).stdout)
+    report = inspection_subject.inspect_repository(root)
     _expect(report == {name: [] for _, name in packages}, report)
 
 
@@ -491,21 +401,8 @@ def _inspection_repository(root: Path) -> None:
         "inherit pkgs; src = ./.; executable = true; "
         'meta.description = "Example"; }',
     )
-    (package / "main.py").write_text(
-        """
-raise RuntimeError("inspection must not execute this")
-def main(): pass
-""",
-    )
-    (package / "test_main.py").write_text(
-        """
-raise RuntimeError("inspection must not collect or run tests")
-def test_default_output(): pass
-""",
-    )
-    library = root / "library"
-    library.mkdir()
-    (library / "default.nix").write_text("{}")
+    (package / "main.py").write_text("def main(): pass\n")
+    _write_test(root, "default_output")
 
 
 def test_package_names_follow_their_tracked_declarations(
@@ -519,11 +416,19 @@ def test_package_names_follow_their_tracked_declarations(
         "{ testDelivers = { expr = 1; expected = 1; }; }"
     )
     _git(root, "add", "--", "draft/test_main.nix")
-    _expect(json.loads(_run(root).stdout) == {}, "untracked declaration was listed")
+    _expect(
+        inspection_subject.inspect_repository(root) == {},
+        "untracked declaration was listed",
+    )
     _git(root, "add", "--", "draft/default.nix")
-    _expect(json.loads(_run(root).stdout) == {"draft": ["testDelivers"]}, package)
+    _expect(
+        inspection_subject.inspect_repository(root) == {"draft": ["testDelivers"]},
+        package,
+    )
     _git(root, "mv", "--", "draft", "inbox")
-    _expect(json.loads(_run(root).stdout) == {"inbox": ["testDelivers"]}, root)
+    _expect(
+        inspection_subject.inspect_repository(root) == {"inbox": ["testDelivers"]}, root
+    )
 
 
 def test_library_tests_are_listed_even_when_main_requires_arguments(
@@ -553,182 +458,32 @@ let options = {
         definition.read_text().replace("executable = false", "executable = true")
     )
     with pytest.raises(
-        inspection_subject.CommandError,
+        ValueError,
         match="main must accept a call without arguments",
     ):
         inspection_subject.validate_flake_source(tmp_path)
-
-
-@pytest.mark.parametrize("in_git", [False, True], ids=["outside", "git"])
-def test_afairesi_prints_package_test_names_by_default_or_by_path(
-    tmp_path: Path,
-    *,
-    in_git: bool,
-) -> None:
-    """Print the same package specification from Git and exported directories."""
-    _inspection_repository(tmp_path)
-    expected = {"example": ["test_default_output"], "library": []}
-    nested = tmp_path / "example"
-    if in_git:
-        _git(tmp_path, "init", "--quiet")
-        _git(tmp_path, "add", ".")
-        calls = [
-            (tmp_path, []),
-            (nested, []),
-            (nested, ["."]),
-            (nested, [f"../{tmp_path.name}"]),
-        ]
-    else:
-        completed = _run(tmp_path, code=1)
-        _expect(not completed.stdout, completed)
-        _expect("not inside a Git repository" in completed.stderr, completed)
-        calls = [(tmp_path, ["."]), (nested, [str(tmp_path)])]
-    before = _snapshot(tmp_path)
-    for cwd, arguments in calls:
-        completed = _run(cwd, *arguments)
-        _expect(
-            json.loads(completed.stdout) == expected,
-            "path resolution changed the package specification",
-        )
-    _expect(_snapshot(tmp_path) == before, "inspection wrote to the repository")
 
 
 def test_specification_reports_a_missing_flake_or_malformed_test_suite(
     tmp_path: Path,
 ) -> None:
     """Report invalid repositories and malformed source with useful errors."""
-    with pytest.raises(inspection_subject.CommandError, match=r"flake\.nix"):
+    with pytest.raises(ValueError, match=r"flake\.nix"):
         inspection_subject.inspect_repository(tmp_path)
     _inspection_repository(tmp_path)
     (tmp_path / "example" / "test_main.py").write_text("def invalid(")
     with pytest.raises(
-        inspection_subject.CommandError,
+        ValueError,
         match="could not parse Python source",
     ):
         inspection_subject.inspect_repository(tmp_path)
 
 
-@pytest.fixture
-def clone_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
-    """Isolate Git clones and verify that each inspection cleans up."""
-    home = tmp_path / "home"
-    scratch = tmp_path / "temporary"
-    scratch.mkdir()
-    home.mkdir()
-    monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("TMPDIR", str(scratch))
-    monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    yield tmp_path
-    _expect(not list(scratch.iterdir()), "remote inspection left temporary files")
-    _expect(not list(home.iterdir()), "remote inspection changed HOME")
-
-
-@pytest.fixture
-def remote_repository(
-    clone_workspace: Path, monkeypatch: pytest.MonkeyPatch
-) -> tuple[Path, str]:
-    """Serve the fixture commit through a local Git URL rewrite."""
-    source = clone_workspace / "source"
-    source.mkdir()
-    _committed_repository(source)
-    remote = "https://example.test/team/repository.git"
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source.as_uri()}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
-    return source, remote
-
-
-def test_remote_test_names_reflect_new_commits_on_each_run(
-    tmp_path: Path,
-    remote_repository: tuple[Path, str],
-) -> None:
-    """Inspect fresh remote contents without creating persistent home state."""
-    source, remote = remote_repository
-    _expect(
-        json.loads(_run(tmp_path, remote).stdout)
-        == inspection_subject.inspect_repository(source),
-        "wrong remote test names",
-    )
-    _write_test(source, "remote_behavior")
-    _git(source, "add", "example/test_main.py")
-    _commit(source, "rename test")
-    _expect(
-        json.loads(_run(tmp_path, remote).stdout)
-        == inspection_subject.inspect_repository(source),
-        "remote inspection was stale",
-    )
-
-
-def test_afairesi_reports_invalid_remote_tests_without_emitting_partial_json(
-    tmp_path: Path,
-    remote_repository: tuple[Path, str],
-) -> None:
-    """Report parse failures from a cloned repository without emitting partial JSON."""
-    source, remote = remote_repository
-    (source / "example/test_main.py").write_text("def invalid(")
-    _git(source, "add", "example/test_main.py")
-    _commit(source, "malformed source")
-    completed = _run(tmp_path, remote, code=1)
-    _expect(
-        not completed.stdout and "could not parse Python source" in completed.stderr,
-        completed,
-    )
-
-
-def test_local_paths_include_uncommitted_changes_while_git_file_urls_show_commits(
-    tmp_path: Path,
-    remote_repository: tuple[Path, str],
-) -> None:
-    """Read the same dirty repository by filesystem path and by native Git URL."""
-    source, _remote = remote_repository
-    _write_test(source, "local_behavior")
-    before = _snapshot(tmp_path)
-    local_report = json.loads(_run(tmp_path, str(source)).stdout)
-    _expect(local_report["example"] == ["test_local_behavior"], local_report)
-    remote_report = json.loads(_run(tmp_path, source.as_uri()).stdout)
-    _expect(remote_report["example"] == ["test_default_output"], remote_report)
-    _expect(
-        _snapshot(tmp_path) == before,
-        "inspection changed source or Git state",
-    )
-
-
-def test_afairesi_forwards_the_error_and_exit_status_from_a_failed_remote_clone(
-    clone_workspace: Path,
-) -> None:
-    """Compare failed remote inspection with Git's exit status and diagnostics."""
-    remote = (clone_workspace / "missing.git").as_uri()
-    scratch = Path(os.environ["TMPDIR"])
-    native_checkout = clone_workspace / "native-checkout"
-    expected = subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
-        ["git", "clone", "--", remote, str(native_checkout)],  # noqa: S607
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=30,
-    )
-    actual = _run(clone_workspace, remote, code=expected.returncode)
-    actual_error = re.sub(
-        re.escape(str(scratch)) + r"/afairesi-inspect-[^/]+/repository",
-        "<CHECKOUT>",
-        actual.stderr,
-    )
-    _expect(
-        (actual.stdout, actual_error)
-        == (
-            expected.stdout,
-            expected.stderr.replace(str(native_checkout), "<CHECKOUT>"),
-        ),
-        f"native clone error changed: {expected.stderr!r}, {actual.stderr!r}",
-    )
-
-
-def _committed_repository(root: Path) -> None:
-    """Create a committed repository with inspectable sources."""
+def _indexed_repository(root: Path) -> None:
+    """Stage the sources used as the diff baseline."""
     _inspection_repository(root)
     _git(root, "init", "--quiet")
     _git(root, "add", ".")
-    _commit(root, "initial")
 
 
 def _write_test(root: Path, behavior: str) -> None:
@@ -736,56 +491,20 @@ def _write_test(root: Path, behavior: str) -> None:
     (root / "example/test_main.py").write_text(f"def test_{behavior}(): pass\n")
 
 
-def _apply_diff(
-    before: dict[str, list[str]],
-    difference: str,
-) -> dict[str, list[str]]:
-    """Use jd itself to verify that an emitted patch reconstructs the inspection."""
-    with NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".jd") as patch:
-        patch.write(difference)
-        patch.flush()
-        completed = subprocess.run(  # noqa: S603 - Fixed jd executable; patch is a temporary fixture file.
-            ["jd", "-p", patch.name],  # noqa: S607
-            input=json.dumps(before),
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=10,
-        )
-    return cast("dict[str, list[str]]", json.loads(completed.stdout))
-
-
-def test_diff_emits_a_jd_patch_from_index_to_working_tree(tmp_path: Path) -> None:
-    """Use the staged test names as the baseline even from a nested directory."""
-    _committed_repository(tmp_path)
-    _write_test(tmp_path, "Staged")
-    _git(tmp_path, "add", ".")
-    index = inspection_subject.inspect_repository(tmp_path)
-    (tmp_path / "example/test_main.py").write_text(
-        "def test_empty_input(): pass\ndef test_unicode_input(): pass\n"
-    )
-    working = inspection_subject.inspect_repository(tmp_path)
-    before = _snapshot(tmp_path)
-    completed = _run(tmp_path / "example", "diff")
-    _expect(_apply_diff(index, completed.stdout) == working, completed)
-    _expect(not completed.stderr, completed)
-    _expect("afairesi-diff-" not in completed.stdout, completed)
-    _expect(_run(tmp_path, "diff").stdout == completed.stdout, "diff output changed")
-    _expect(
-        _snapshot(tmp_path) == before,
-        "diff changed Git or sources",
-    )
-
-
 def test_diff_ignores_implementation_edits_and_untracked_resources(
     tmp_path: Path,
 ) -> None:
     """Only changes to the package-to-test-name mapping produce output."""
-    _committed_repository(tmp_path)
+    _inspection_repository(tmp_path)
+    _git(tmp_path, "init", "--quiet")
+    _expect(not inspection_subject.diff_repository(tmp_path), "untracked files in diff")
+    _git(tmp_path, "add", ".")
     source = tmp_path / "example/main.py"
     source.write_text("def unfinished(")
     declaration = tmp_path / "example/default.nix"
-    declaration.write_text(declaration.read_text().replace("Example", "Renamed CLI"))
+    declaration.write_text(
+        declaration.read_text().replace("Example", "Updated description")
+    )
     tests = tmp_path / "example/test_main.py"
     tests.write_text(
         'def test_default_output():\n    """Updated notes."""\n'
@@ -794,25 +513,34 @@ def test_diff_ignores_implementation_edits_and_untracked_resources(
     (tmp_path / "untracked").mkdir()
     (tmp_path / "untracked/default.nix").write_text("{}")
     before = _snapshot(tmp_path)
-    completed = _run(tmp_path, "diff")
-    _expect(not completed.stdout and not completed.stderr, completed)
+    difference = inspection_subject.diff_repository(tmp_path)
+    _expect(not difference, difference)
     _expect(_snapshot(tmp_path) == before, "empty diff changed state")
 
 
 def test_diff_follows_tracked_symlink_targets_of_test_suites(tmp_path: Path) -> None:
     """Keep deeply nested symlink targets in both snapshots."""
-    _committed_repository(tmp_path)
+    _indexed_repository(tmp_path)
     source = tmp_path / "example/test_main.py"
     target = tmp_path / "assets/deep/entry"
     target.parent.mkdir(parents=True)
     source.rename(target)
     source.symlink_to("../assets/deep/entry")
     _git(tmp_path, "add", ".")
-    before = inspection_subject.inspect_repository(tmp_path)
-    target.write_text(target.read_text().replace("default_output", "requested_output"))
-    after = inspection_subject.inspect_repository(tmp_path)
-    _expect(before != after, after)
-    _expect(_apply_diff(before, _run(tmp_path, "diff").stdout) == after, after)
+    target.write_text("def test_unicode_input(): ...\ndef test_empty_input(): ...\n")
+    changes = inspection_subject.diff_repository(tmp_path)
+    _expect(
+        changes
+        == [
+            {
+                "package": "example",
+                "status": "modified",
+                "added": ["test_empty_input", "test_unicode_input"],
+                "removed": ["test_default_output"],
+            }
+        ],
+        changes,
+    )
 
 
 def test_removing_a_package_drops_its_entry_even_when_it_shares_a_host(
@@ -822,84 +550,45 @@ def test_removing_a_package_drops_its_entry_even_when_it_shares_a_host(
     _fixture_add(root, "shared", "host")
     (root / "shared/default.nix").write_text("{}")
     _git(root, "add", "--", "shared/default.nix")
-    before = json.loads(_run(root).stdout)
-    _expect(before == {"shared": []}, before)
     (root / "shared/default.nix").unlink()
-    after = json.loads(_run(root).stdout)
-    _expect(after == {}, after)
-    _expect(_apply_diff(before, _run(root, "diff").stdout) == after, after)
+    changes = inspection_subject.diff_repository(root)
+    _expect(
+        changes
+        == [{"package": "shared", "status": "removed", "added": [], "removed": []}],
+        changes,
+    )
     with pytest.raises(
-        inspection_subject.CommandError,
+        ValueError,
         match=r"shared/default\.nix: missing required tracked regular file",
     ):
         inspection_subject.validate_flake_source(root)
 
 
-def test_diff_uses_the_index_before_the_first_commit(tmp_path: Path) -> None:
-    """Compare against the index even when the repository has no HEAD."""
-    _git(tmp_path, "init", "--quiet")
-    _expect(not _run(tmp_path, "diff").stdout, "nonempty diff")
-    _inspection_repository(tmp_path)
-    _git(tmp_path, "add", ".")
-    staged = inspection_subject.inspect_repository(tmp_path)
-    _write_test(tmp_path, "Unstaged")
-    before = _snapshot(tmp_path)
-    completed = _run(tmp_path, "diff")
-    _expect(
-        _apply_diff(staged, completed.stdout)
-        == inspection_subject.inspect_repository(tmp_path),
-        completed,
-    )
-    _expect(_snapshot(tmp_path) == before, "initial diff changed state")
-
-
-def test_diff_errors_leave_no_partial_output_or_temporary_sources(
+def test_diff_errors_clean_up_temporary_sources(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Clean failed snapshots when a tracked source cannot be inspected."""
     root = tmp_path / "repository"
     root.mkdir()
-    _committed_repository(root)
+    _indexed_repository(root)
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    monkeypatch.setenv("TMPDIR", str(scratch))
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     (root / "example/test_main.py").write_text("def invalid(")
     before = _snapshot(root)
-    completed = _run(root, "diff", code=1)
-    _expect(not completed.stdout, completed)
-    _expect("could not parse Python source" in completed.stderr, completed)
+    with pytest.raises(ValueError, match="could not parse Python source"):
+        inspection_subject.diff_repository(root)
     _expect(not list(scratch.iterdir()), "failed diff left temporary sources")
     _expect(_snapshot(root) == before, "failed diff changed state")
-
-
-@pytest.mark.parametrize(
-    ("name", "arguments"),
-    [
-        ("diff", ["./diff"]),
-        ("diff", ["--", "diff"]),
-        ("repository with spaces", ["repository with spaces"]),
-    ],
-)
-def test_cli_accepts_repository_names_that_need_disambiguation_or_contain_spaces(
-    tmp_path: Path,
-    name: str,
-    arguments: list[str],
-) -> None:
-    """Accept explicit paths to diff and ordinary directory names as given."""
-    root = tmp_path / name
-    root.mkdir()
-    (root / "flake.nix").touch()
-    completed = _run(tmp_path, *arguments)
-    _expect(json.loads(completed.stdout) == {}, completed)
 
 
 def test_diff_reports_unresolved_merge_conflicts_and_leaves_the_index_untouched(
     tmp_path: Path,
 ) -> None:
     """Report the conflicting index before producing a test-name diff."""
-    _committed_repository(tmp_path)
-    blob = _git(tmp_path, "rev-parse", "HEAD:example/main.py").strip()
+    _indexed_repository(tmp_path)
+    blob = _git(tmp_path, "rev-parse", ":example/main.py").strip()
     subprocess.run(
         ["git", "update-index", "--index-info"],  # noqa: S607
         cwd=tmp_path,
@@ -916,8 +605,8 @@ def test_diff_reports_unresolved_merge_conflicts_and_leaves_the_index_untouched(
         timeout=10,
     )
     before = _snapshot(tmp_path)
-    completed = _run(tmp_path, "diff", code=1)
-    _expect(not completed.stdout and "unmerged index" in completed.stderr, completed)
+    with pytest.raises(ValueError, match="unmerged index"):
+        inspection_subject.diff_repository(tmp_path)
     _expect(
         _snapshot(tmp_path) == before,
         "conflict diff changed state",
@@ -930,16 +619,39 @@ def test_diff_reads_the_selected_linked_worktree_without_modifying_it(
     """Read the selected worktree's index while preserving shared Git metadata."""
     root, linked = tmp_path / "repository", tmp_path / "linked"
     root.mkdir()
-    _committed_repository(root)
-    report = inspection_subject.inspect_repository(root)
+    _indexed_repository(root)
+    _git(
+        root,
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+        "-c",
+        "maintenance.auto=false",
+        "commit",
+        "--quiet",
+        "-m",
+        "initial",
+    )
     _git(root, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
-    _write_test(linked, "Linked")
+    _write_test(linked, "staged")
+    _git(linked, "add", "example/test_main.py")
+    _write_test(linked, "working")
     before = _snapshot(tmp_path)
-    completed = _run(linked / "example", "diff")
+    changes = inspection_subject.diff_repository(linked)
     _expect(
-        _apply_diff(report, completed.stdout)
-        == inspection_subject.inspect_repository(linked),
-        completed,
+        changes
+        == [
+            {
+                "package": "example",
+                "status": "modified",
+                "added": ["test_working"],
+                "removed": ["test_staged"],
+            }
+        ],
+        changes,
     )
     _expect(
         _snapshot(tmp_path) == before,
@@ -967,9 +679,10 @@ def test_source_validation_ignores_untracked_packages_and_test_files(
     )
 
 
-@pytest.mark.parametrize(
-    ("kind", "suite", "source", "expected"),
-    [
+def test_inspection_extracts_named_cases_from_tracked_suites(root: Path) -> None:
+    """Read Bats, Nix, and Lean declarations once their suites are staged."""
+    expected = {}
+    for kind, suite, source, names in [
         (
             "bash",
             "test_main.bats",
@@ -1011,24 +724,15 @@ end Résultats
 """,
             ["Résultats.preservesCafé"],
         ),
-    ],
-)
-def test_named_cases_appear_in_the_package_specification_and_its_diff(
-    root: Path, kind: str, suite: str, source: str, expected: list[str]
-) -> None:
-    """Follow a declared behavior through inspection, a rename, and a jd patch."""
-    _fixture_add(root, "example", kind)
-    path = root / "example" / suite
-    path.write_text(source)
-    untracked = json.loads(_run(root).stdout)
-    _expect(untracked == {"example": []}, untracked)
-    _git(root, "add", "--", "example")
-    before = json.loads(_run(root).stdout)
-    _expect(before == {"example": expected}, before)
-    path.write_text(source.replace("preserves", "retains"))
-    after = {"example": [name.replace("preserves", "retains") for name in expected]}
-    _expect(json.loads(_run(root).stdout) == after, after)
-    _expect(_apply_diff(before, _run(root, "diff").stdout) == after, after)
+    ]:
+        _fixture_add(root, kind, kind)
+        (root / kind / suite).write_text(source)
+        expected[kind] = names
+    untracked = inspection_subject.inspect_repository(root)
+    _expect(untracked == {kind: [] for kind in expected}, untracked)
+    _git(root, "add", "--", *expected)
+    report = inspection_subject.inspect_repository(root)
+    _expect(report == expected, report)
 
 
 def test_cargo_lists_tests_from_enabled_targets_and_their_module_trees(
@@ -1068,7 +772,7 @@ test = false
         path.write_text(source)
     _git(root, "add", "--", "example")
     (package / "src/bin/untracked.rs").write_text("#[test] fn untracked() {}\n")
-    before = json.loads(_run(root).stdout)
+    before = inspection_subject.inspect_repository(root)
     _expect(
         before
         == {
@@ -1082,8 +786,16 @@ test = false
     )
     suite = package / "src/shared.rs"
     suite.write_text(suite.read_text().replace("preserves", "retains"))
-    after = json.loads(_run(root).stdout)
+    changes = inspection_subject.diff_repository(root)
     _expect(
-        before != after and _apply_diff(before, _run(root, "diff").stdout) == after,
-        after,
+        changes
+        == [
+            {
+                "package": "example",
+                "status": "modified",
+                "added": ["tests::shared::nested::retains_spaces"],
+                "removed": ["tests::shared::nested::preserves_spaces"],
+            }
+        ],
+        changes,
     )

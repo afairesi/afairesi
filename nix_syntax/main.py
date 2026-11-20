@@ -3,7 +3,6 @@
 
 # ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
-import subprocess
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -13,7 +12,6 @@ if TYPE_CHECKING:
     from collections.abc import Iterable
 
     from tree_sitter import Node, Tree
-_PARSER = get_parser("nix")
 
 
 class NixSyntaxError(ValueError):
@@ -46,7 +44,7 @@ def parse(source: str | bytes, path: str = "<expression>") -> Document:
     except UnicodeDecodeError as error:
         msg = f"{path}: source is not UTF-8"
         raise NixSyntaxError(msg) from error
-    tree = _PARSER.parse(encoded)
+    tree = get_parser("nix").parse(encoded)
     if tree.root_node.has_error:
         parse_error = _first_error(tree.root_node)
         row, column = parse_error.start_point
@@ -62,13 +60,6 @@ def _first_error(node: Node) -> Node:
         if child.has_error or child.is_error or child.is_missing:
             return _first_error(child)
     return node
-
-
-def walk(node: Node) -> Iterable[Node]:
-    """Walk a syntax tree depth first."""
-    yield node
-    for child in node.named_children:
-        yield from walk(child)
 
 
 def binding_set(node: Node) -> Node | None:
@@ -94,27 +85,23 @@ def quote_string(value: str) -> str:
 
 def string_value(document: Document, node: Node) -> str | None:
     """Decode a quoted Nix literal, returning None for other expressions."""
-    if node.type != "string_expression" or any(
-        child.type == "interpolation" for child in node.named_children
-    ):
+    if node.type != "string_expression":
         return None
-    completed = subprocess.run(
-        [  # noqa: S607
-            "nix",
-            "--extra-experimental-features",
-            "nix-command",
-            "eval",
-            "--store",
-            "dummy://",
-            "--raw",
-            "--file",
-            "-",
-        ],
-        input=document.source[node.start_byte : node.end_byte],
-        capture_output=True,
-        check=True,
-    )
-    return completed.stdout.decode("utf-8")
+    parts = []
+    for child in node.named_children:
+        match child.type:
+            case "string_fragment":
+                parts.append(
+                    document.text(child).replace("\r\n", "\n").replace("\r", "\n")
+                )
+            case "escape_sequence":
+                char = document.text(child)[1:]
+                parts.append({"n": "\n", "r": "\r", "t": "\t"}.get(char, char))
+            case "dollar_escape":
+                continue
+            case _:
+                return None
+    return "".join(parts)
 
 
 def attrpath_parts(document: Document, attrpath: Node) -> Iterable[str | None]:

@@ -26,6 +26,7 @@ def bats_names(path: Path) -> set[str]:
         input=source,
         capture_output=True,
         check=False,
+        timeout=30,
     )
     if parsed.returncode:
         message = f"{path}: {parsed.stderr.decode().strip()}"

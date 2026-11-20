@@ -49,18 +49,17 @@ in
 pkgs.runCommand "afairesi-consumer-contract"
   {
     nativeBuildInputs = [
-      overriddenCheck
       failedCheck
       failedNixCheck
       consumer.checks.${system}.bash-example
       consumer.checks.${system}.pkgs-python_native-contract
-      consumer.checks.${system}.pkgs-rust-native
       consumer.checks.${system}.nix-library
       consumer.checks.${system}.nix-tests
       consumer.checks.${system}.lean-example
       consumer.checks.${system}.test_main
       consumer.formatter.${system}
       pkgs.git
+      pkgs.shfmt
     ];
   }
   ''
@@ -116,14 +115,14 @@ pkgs.runCommand "afairesi-consumer-contract"
     mkdir native-source
     cp -R ${consumerSource}/{bash-example,example,lean-example,nix-library,python_native,rust-native} native-source/
     touch native-source/{flake.nix,flake.lock}
-    ${pkgs.lib.getExe inputs.self.packages.${system}.afairesi} "$PWD/native-source" > native-report.json
+    test ! -e ${inputs.self.packages.${system}.afairesi}/bin/afairesi
     ${(pkgs.python3.withPackages (_: [ inputs.self.packages.${system}.afairesi ]))}/bin/python - <<'PY'
-    import json
     from pathlib import Path
-    from afairesi import validate_flake_source
+    from afairesi import inspect_repository, validate_flake_source
 
-    validate_flake_source(Path("native-source").resolve())
-    report = json.loads(Path("native-report.json").read_text())
+    root = Path("native-source").resolve()
+    validate_flake_source(root)
+    report = inspect_repository(root)
     assert report == {
         "bash-example": [
             "runtime dependencies are available to tests",

@@ -70,7 +70,6 @@ def _nested_bindings(
             child.type != "inherit"
             or (attrs := child.child_by_field_name("attrs")) is None
             or not all(attr.type == "identifier" for attr in attrs.named_children)
-            or any(node.type == "comment" for node in nix_syntax.walk(child))
         ):
             return None
     expanded: list[Binding] = []
@@ -163,11 +162,19 @@ def _render_set(bindings: list[Binding]) -> str:
     return "{ " + " ".join(assignments) + " }"
 
 
+def _has_comment(node: Node) -> bool:
+    pending = [node]
+    while pending:
+        current = pending.pop()
+        if current.type == "comment":
+            return True
+        pending.extend(current.named_children)
+    return False
+
+
 def render_node(document: nix_syntax.Document, node: Node) -> str:
     """Render a node after recursively applying canonical ordering."""
-    if node.type in {"binding_set", "formals"} and any(
-        child.type == "comment" for child in nix_syntax.walk(node)
-    ):
+    if node.type in {"binding_set", "formals"} and _has_comment(node):
         return _replace_children(document, node)
     if node.type == "binding_set":
         bindings = [_binding(document, child) for child in node.named_children]

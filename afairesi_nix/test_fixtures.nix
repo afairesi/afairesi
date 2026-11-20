@@ -53,7 +53,6 @@ let
     };
     nativeCheckInputs = [ pkgs.python3Packages.colorama ];
     passthru = attributes.passthru // {
-      inherit (pkgs) lean4;
       tests.unavailable = pkgs.runCommand "excluded-check" {
         meta.badPlatforms = [ system ];
       } "exit 1";

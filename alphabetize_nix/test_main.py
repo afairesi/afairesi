@@ -141,15 +141,17 @@ def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
         "let z = 3; a = 1; in [ z a z ]",
         'let key = "dynamic"; in { ${key} = {}; "" = 2; z = 1; }',
         "builtins.concatLists [ [ 3 1 ] [ 2 ] ]",
-        "[ { z = 3; a = 1; } { b = 2; a = 0; } ]",
+        (
+            "# leading comment\n"
+            "[ { z = 3; a = 1; } { b = 2; # keep this comment\n a = 0; } ]\n"
+            "# trailing comment\n"
+        ),
         "({ z ? 3, a ? z, ... }: [ z a ]) {}",
         "let python = 7; in { passthru = { inherit python; }; }",
         "let x = 7; z = 8; in { a.z = z; a.x = x; }",
         "let x = 7; in rec { x = 9; a = { inherit x; y = 1; }; }",
         "let x = 7; in { a = rec { inherit x; y = x; }; }",
         "rec { z = 3; a = { x = z; y = 1; }; }",
-        "# leading comment\n{ z = 3; a = 1; }\n# trailing comment\n",
-        "{ z = 3; # keep this comment\n a = 1; }",
         "({ z, # keep this formal\n a }: [ z a ]) { z = 3; a = 1; }",
         "[ 3 # keep this element\n 1 2 ]",
         "{ z /* key comment */ = 3; a = 1; }",

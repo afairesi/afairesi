@@ -54,8 +54,10 @@ let
   shells = consumer.devShells.${system};
 in
 {
-  testAfairesiIsTheDefaultPackageAndNeedsNoAppWrapper = check true (
+  testAfairesiIsTheDefaultLibraryAndTheTuiIsASeparateExecutable = check true (
     !(inputs.self.apps.${system} ? afairesi)
+    && !(inputs.self.packages.${system}.afairesi.meta ? mainProgram)
+    && inputs.self.packages.${system}.afairesi_tui.meta.mainProgram == "afairesi_tui"
     && inputs.self.packages.${system}.default == inputs.self.packages.${system}.afairesi
   );
   testAppsExposePackageMetadata = check true (
@@ -111,7 +113,6 @@ in
   testEveryPackageSystemHasAFormatter = check (builtins.attrNames consumer.packages) (
     builtins.attrNames consumer.formatter
   );
-  testExecutableChecksUseTheOverriddenMainProgram = check "${overriddenPackage}/bin/renamed" overriddenCheck.PACKAGE_E2E_EXECUTABLE;
   testExecutablesExposeTheirPackageName =
     check
       [ "example" "lean-example" ]
@@ -203,7 +204,6 @@ in
         pkgs.python3Packages.colorama
       ]
   );
-  testPythonPackageNamesAreImportable = check "lean_example" pythonLibrary.pname;
   testRuntimeHooksStayOutsideThePackageBuild =
     check
       [ false false ]

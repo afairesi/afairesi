@@ -10,7 +10,6 @@ import hashlib
 import json
 import os
 import re
-import shutil
 import stat
 import subprocess
 import sys
@@ -20,53 +19,23 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, TypedDict, TypeGuard
+from typing import TYPE_CHECKING, Literal
 
-from afairesi import CommandError, diff_inputs
+import afairesi
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
-CACHE_VERSION = 5
+CACHE_VERSION = 7
 XTERM_ORANGE = 208
 RGB_COLORS = 1 << 24
 RGB_ORANGE = 0xFF8700
 type View = Literal["tests", "diff"]
 
-READ_ERRORS = (CommandError, OSError, ValueError, subprocess.SubprocessError)
+READ_ERRORS = (OSError, ValueError, subprocess.SubprocessError)
 
 
-class PatchChange(TypedDict):
-    """A package or test name added or removed by jd."""
-
-    op: Literal["add", "remove"]
-    path: str
-    value: str | list[str]
-
-
-type Payload = dict[str, list[str]] | list[PatchChange]
-
-
-def command(arguments: list[str], root: Path, *, input_text: str | None = None) -> str:
-    """Read a command result without a shell or optional Git index writes."""
-    result = subprocess.run(  # noqa: S603 - Argument vectors are constructed here, never shell source.
-        arguments,
-        cwd=root,
-        capture_output=True,
-        text=True,
-        input=input_text,
-        check=False,
-        timeout=30,
-        env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"},
-    )
-    if result.returncode:
-        raise ValueError(result.stderr.strip() or "Command failed")
-    return result.stdout
-
-
-def git(root: Path, *arguments: str) -> str:
-    """Read Git data in the selected working tree."""
-    return command(["git", *arguments], root)
+type Payload = dict[str, list[str]] | list[afairesi.PackageChange]
 
 
 def _path_stamp(path: Path) -> bytes:
@@ -97,11 +66,10 @@ def _path_stamp(path: Path) -> bytes:
 
 
 def fingerprint(root: Path, view: View) -> str | None:
-    """Track the CLI's specification inputs in the index and working tree."""
-    entries = git(root, "ls-files", "--stage", "-z")
+    """Track the specification inputs in the index and working tree."""
     try:
-        files = diff_inputs(root, entries)
-    except CommandError:
+        files = afairesi.diff_inputs(root)
+    except ValueError:
         return None
     digest = hashlib.sha256()
     paths = {path for _, _, path in files}
@@ -121,26 +89,21 @@ def fingerprint(root: Path, view: View) -> str | None:
 
 def repositories(home: Path) -> list[str]:
     """Join .gitmodules paths with gitlinks in the current home index."""
-    root = git(home, "rev-parse", "--show-toplevel").strip()
+    root = afairesi.git(home, "rev-parse", "--show-toplevel").strip()
     if Path(root).resolve() != home:
         message = "The selected home must be a Git repository root."
         raise ValueError(message)
     modules = home / ".gitmodules"
     if not modules.is_file():
         return []
-    configured = git(home, "config", "list", "--null", "--file", str(modules))
-    paths = {
-        entry.partition("\n")[2]
-        for entry in configured.split("\0")
-        if entry.partition("\n")[0].startswith("submodule.")
-        and entry.partition("\n")[0].endswith(".path")
-    }
+    configured = afairesi.git(home, "config", "list", "--null", "--file", str(modules))
+    paths = set()
+    for entry in configured.split("\0"):
+        key, _, value = entry.partition("\n")
+        if key.startswith("submodule.") and key.endswith(".path"):
+            paths.add(value)
     result = []
-    for entry in git(home, "ls-files", "--stage", "-z").split("\0"):
-        if not entry:
-            continue
-        metadata, path = entry.split("\t", 1)
-        mode, _revision, stage = metadata.split()
+    for mode, _oid, stage, path in afairesi.index_entries(home):
         if mode != "160000" or stage != "0" or path not in paths:
             continue
         location = (home / path).resolve()
@@ -150,30 +113,24 @@ def repositories(home: Path) -> list[str]:
     return sorted(result)
 
 
-def _is_test_mapping(value: object) -> TypeGuard[dict[str, list[str]]]:
-    """Recognize the CLI's package-to-test-names JSON format."""
-    return isinstance(value, dict) and all(
-        isinstance(package, str)
-        and isinstance(names, list)
-        and all(isinstance(name, str) for name in names)
-        for package, names in value.items()
-    )
+def _is_name_list(value: object) -> bool:
+    return isinstance(value, list) and all(isinstance(name, str) for name in value)
 
 
-def read_output(root: Path, view: View) -> Payload:
-    """Read only the requested CLI result; errors are never cached."""
-    commands = {"tests": ["afairesi"], "diff": ["afairesi", "diff"]}
-    output = command(commands[view], root)
+def _is_cached_view(value: object, view: View) -> bool:
+    """Check the JSON payload before reusing a cached view."""
     if view == "tests":
-        tests = json.loads(output)
-        if not _is_test_mapping(tests):
-            msg = "Expected afairesi JSON mapping each package to a list of test names."
-            raise ValueError(msg)
-        return tests
-    if not output:
-        return []
-    patch = json.loads(command(["jd", "-t", "jd2patch"], root, input_text=output))
-    return [operation for operation in patch if operation["op"] in {"add", "remove"}]
+        return isinstance(value, dict) and all(
+            _is_name_list(names) for names in value.values()
+        )
+    return isinstance(value, list) and all(
+        isinstance(change, dict)
+        and isinstance(change.get("package"), str)
+        and change.get("status") in ("added", "removed", "modified")
+        and _is_name_list(change.get("added"))
+        and _is_name_list(change.get("removed"))
+        for change in value
+    )
 
 
 def _cache_home() -> Path:
@@ -197,11 +154,9 @@ def _write_cache_entry(path: Path, value: object) -> None:
 def cached_output(
     root: Path, view: View, cache: Path, *, refresh: bool
 ) -> tuple[Payload, bool]:
-    """Reuse a stable CLI result, with atomic writes and disposable cache failures."""
-    executables = ("afairesi", "jd") if view == "diff" else ("afairesi",)
-    tools = [str(Path(shutil.which(name) or name).resolve()) for name in executables]
+    """Cache stable inspections and tolerate unavailable cache storage."""
     key = hashlib.sha256(
-        json.dumps([CACHE_VERSION, str(root), view, tools]).encode()
+        json.dumps([CACHE_VERSION, str(root), view, afairesi.__file__]).encode()
     ).hexdigest()
     path = cache / f"{key}.json"
     before = fingerprint(root, view)
@@ -211,14 +166,14 @@ def cached_output(
             if (
                 isinstance(saved, dict)
                 and saved.get("fingerprint") == before
-                and (
-                    _is_test_mapping(saved.get("value"))
-                    if view == "tests"
-                    else isinstance(saved.get("value"), list)
-                )
+                and _is_cached_view(saved.get("value"), view)
             ):
                 return saved["value"], True
-    value = read_output(root, view)
+    value = (
+        afairesi.inspect_repository(root)
+        if view == "tests"
+        else afairesi.diff_repository(root)
+    )
     if before is not None and fingerprint(root, view) == before:
         _write_cache_entry(path, {"fingerprint": before, "value": value})
     return value, False
@@ -243,13 +198,16 @@ def _repository_node(
         if not (root / ".git").exists():
             message = "This submodule is not initialized."
             raise ValueError(message)
-        if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
+        if (
+            Path(afairesi.git(root, "rev-parse", "--show-toplevel").strip()).resolve()
+            != root
+        ):
             message = "The registered path is not a repository checkout within home."
             raise ValueError(message)
         value, hit = cached_output(root, view, cache, refresh=refresh)
         if isinstance(value, dict):
             packages = value
-            status = git(
+            status = afairesi.git(
                 root,
                 "status",
                 "--porcelain",
@@ -272,28 +230,41 @@ def _repository_node(
     return path, node, "cached" if hit else "done"
 
 
+@dataclass(frozen=True)
+class Progress:
+    """Repository counts and a description of the latest update."""
+
+    completed: int
+    total: int
+    detail: str
+
+
+def write_startup_progress(update: Progress) -> None:
+    """Show a running count on a terminal or write each update to redirected stderr."""
+    if sys.stderr.isatty():
+        line = f"\rReading {update.completed}/{update.total} repositories…"
+        if update.completed == update.total:
+            line += "\r\033[K"
+    else:
+        line = update.detail + "\n"
+    sys.stderr.write(line)
+    sys.stderr.flush()
+
+
 def build_tree(
     home: Path,
-    *,
     view: View = "tests",
-    progress: bool | Callable[[int, int], None] = False,
+    progress: Callable[[Progress], None] | None = None,
+    *,
     cache: Path,
     refresh: bool = False,
 ) -> Node:
     """Group repository rows beneath their home directories in path order."""
     home = home.expanduser().resolve()
     entries = repositories(home)
-    compact_progress = progress is True and sys.stderr.isatty()
-
-    def report(completed: int, detail: str) -> None:
-        if callable(progress):
-            progress(completed, len(entries))
-        elif progress:
-            line = f"\rReading {completed}/{len(entries)} repositories…"
-            sys.stderr.write(line if compact_progress else detail + "\n")
-            sys.stderr.flush()
-
-    report(0, f"Reading {len(entries)} direct submodules of {home}…")
+    total = len(entries)
+    if progress is not None:
+        progress(Progress(0, total, f"Reading {total} direct submodules of {home}…"))
     repositories_by_path = {}
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = [
@@ -311,10 +282,9 @@ def build_tree(
             identifier, node, status = future.result()
             if node.children:
                 repositories_by_path[identifier] = node
-            report(completed, f"[{completed}/{len(entries)}] {identifier}: {status}")
-    if compact_progress:
-        sys.stderr.write("\r\033[K")
-        sys.stderr.flush()
+            if progress is not None:
+                detail = f"[{completed}/{total}] {identifier}: {status}"
+                progress(Progress(completed, total, detail))
     tree = _directory_tree(home, repositories_by_path)
     if not tree.children:
         tree.add(
@@ -379,42 +349,36 @@ def _directory_tree(home: Path, repositories_by_path: dict[str, Node]) -> Node:
 
 
 def add_tests(
-    node: Node, packages: dict[str, list[str]] | None, patch: Sequence[PatchChange] = ()
+    node: Node,
+    packages: dict[str, list[str]] | None,
+    changes: Sequence[afairesi.PackageChange] = (),
 ) -> None:
     """Mark changed tests and include current tests and counts in the tests view."""
     names = {
         package: dict.fromkeys(tests, "") for package, tests in (packages or {}).items()
     }
     package_changes = {}
-    for operation in patch:
-        marker = {"add": "+", "remove": "-"}[operation["op"]]
-        path = [
-            part.replace("~1", "/").replace("~0", "~")
-            for part in operation["path"].split("/")
+    for change in changes:
+        package = change["package"]
+        package_changes[package] = {"added": "+", "removed": "-", "modified": "~"}[
+            change["status"]
         ]
-        match path, operation["value"]:
-            case ["", package], list(tests):
-                package_changes[package] = marker
-                names[package] = dict.fromkeys(tests, marker)
-            case ["", package, index], str(name) if index.isdecimal() or index == "-":
-                package_changes[package] = "~"
-                names.setdefault(package, {})[name] = marker
-            case _:
-                message = f"Unexpected package test change at {operation['path']}"
-                raise ValueError(message)
+        tests = names.setdefault(package, {})
+        tests.update(dict.fromkeys(change["removed"], "-"))
+        tests.update(dict.fromkeys(change["added"], "+"))
     if packages is not None and not names:
         node.add("No packages")
     for package, test_changes in sorted(names.items()):
-        change = package_changes.get(package, "")
-        label = f"{change} {package}" if change in {"+", "-"} else package
-        child = node.add(label, change=change)
+        marker = package_changes.get(package, "")
+        label = f"{marker} {package}" if marker in {"+", "-"} else package
+        child = node.add(label, change=marker)
         if packages is not None:
             child.detail = str(len(packages.get(package, ())))
         for name, marker in sorted(
             test_changes.items(), key=lambda item: (item[1] != "-", item[0])
         ):
             child.add_test(name, change=marker)
-    if patch:
+    if changes:
         node.change = "~"
 
 
@@ -619,13 +583,13 @@ def _draw(
 
 
 def _show_loading(
-    screen: curses.window, view: View, completed: int = 0, total: int | None = None
+    screen: curses.window, view: View, update: Progress | None = None
 ) -> None:
     """Show the requested view and its repository count in the center of the screen."""
     height, width = screen.getmaxyx()
     label = f"Loading {view}…"
-    if total is not None:
-        label += f" {completed}/{total}"
+    if update is not None:
+        label += f" {update.completed}/{update.total}"
     screen.erase()
     with contextlib.suppress(curses.error):
         screen.addnstr(
@@ -638,7 +602,7 @@ def browse(
     screen: curses.window,
     root: Node,
     view: View,
-    load: Callable[[View, Callable[[int, int], None]], Node],
+    load: Callable[[View, Callable[[Progress], None]], Node],
 ) -> None:
     """Draw the outline with colored changes and a highlighted selection."""
     with contextlib.suppress(curses.error):
@@ -713,12 +677,7 @@ def main() -> None:
 
         load = partial(build_tree, options.home, cache=cache, refresh=options.refresh)
         view: View = options.command or "tests"
-        curses.wrapper(
-            browse,
-            load(view=view, progress=True),
-            view,
-            lambda target, report: load(view=target, progress=report),
-        )
+        curses.wrapper(browse, load(view, write_startup_progress), view, load)
     except (*READ_ERRORS, curses.error) as error:
         parser.exit(1, f"{parser.prog}: {error}\n")
     except KeyboardInterrupt:

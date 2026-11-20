@@ -116,7 +116,7 @@ let
             priority = 1;
           };
         }
-        // pkgs.lib.genAttrs' (packageNamesFor self pkgs "lean4") (name: {
+        // pkgs.lib.genAttrs' ((packageNamesByKind self system).lean4 or [ ]) (name: {
           name = "lean4-${name}";
           value = {
             command = mkLean4Tool {
@@ -147,13 +147,7 @@ let
     { pkgs, self }:
     let
       inherit (pkgs.stdenv.hostPlatform) system;
-      pythonPackageNames = packageNamesFor self pkgs "python";
-      pythonSources =
-        name:
-        builtins.filter (path: builtins.pathExists (self.outPath + "/${path}")) [
-          "${name}/main.py"
-          "${name}/test_main.py"
-        ];
+      packageNames = packageNamesByKind self system;
       tflintConfig = pkgs.writeText "tflint.hcl" ''
         plugin "terraform" {
           enabled = true
@@ -165,29 +159,6 @@ let
       inherit pkgs self;
       module = {
         programs = {
-          mypy = {
-            directories = pkgs.lib.genAttrs pythonPackageNames (
-              name:
-              let
-                environment = mkTestEnvironment {
-                  inherit pkgs;
-                  packageDrv = self.packages.${system}.${name};
-                };
-              in
-              {
-                directory = "";
-                modules = pythonSources name;
-                options = [
-                  "--config-file=${pkgs.writeText "mypy.ini" "[mypy]\n"}"
-                  "--python-executable=${environment.python}/bin/python"
-                  "--no-namespace-packages"
-                  "--ignore-missing-imports"
-                  "--strict"
-                ];
-              }
-            );
-            enable = true;
-          };
           shellcheck = {
             enable = true;
             package = pkgs.writeShellApplication {
@@ -286,11 +257,36 @@ let
             includes = [ "*.tf" ];
           };
         }
-        // pkgs.lib.genAttrs' pythonPackageNames (name: {
-          name = "mypy-${name}";
-          value.includes = pkgs.lib.mkForce [ "${name}/*.py" ];
-        })
-        // pkgs.lib.genAttrs' (packageNamesFor self pkgs "lean4") (name: {
+        // pkgs.lib.genAttrs' (packageNames.python or [ ]) (
+          name:
+          let
+            environment = mkTestEnvironment {
+              inherit pkgs;
+              packageDrv = self.packages.${system}.${name};
+            };
+            sources = builtins.filter (path: builtins.pathExists (self.outPath + "/${path}")) [
+              "${name}/main.py"
+              "${name}/test_main.py"
+            ];
+          in
+          {
+            name = "mypy-${name}";
+            value = {
+              command = pkgs.writeShellApplication {
+                name = "mypy-${name}";
+                text = ''
+                  export PYTHONPATH=
+                  exec ${pkgs.lib.getExe pkgs.mypy} \
+                    --config-file=${pkgs.writeText "mypy.ini" "[mypy]\n"} \
+                    --python-executable=${environment.python}/bin/python \
+                    --no-namespace-packages --ignore-missing-imports --strict ${pkgs.lib.escapeShellArgs sources}
+                '';
+              };
+              includes = [ "${name}/*.py" ];
+            };
+          }
+        )
+        // pkgs.lib.genAttrs' (packageNames.lean4 or [ ]) (name: {
           name = "lean4-${name}";
           value = {
             command = mkLean4Tool {
@@ -332,7 +328,6 @@ let
     }:
     let
       inherit (repositoryInputs) self;
-      bashNames = system: packageNamesFor self packageSets.${system} "bash";
       discover =
         marker:
         builtins.attrNames (
@@ -342,20 +337,25 @@ let
         );
       environments = lib.genAttrs systems (
         system:
-        lib.genAttrs (namesFor system) (
-          name:
-          mkTestEnvironment {
-            packageDrv = self.packages.${system}.${name};
-            pkgs = packageSets.${system};
-          }
-        )
+        lib.genAttrs
+          (builtins.concatMap (kind: namesByKind.${system}.${kind} or [ ]) [
+            "bash"
+            "lean4"
+            "python"
+          ])
+          (
+            name:
+            mkTestEnvironment {
+              packageDrv = self.packages.${system}.${name};
+              pkgs = packageSets.${system};
+            }
+          )
       );
       hostsFor =
         system:
         lib.filterAttrs (_: configuration: configuration.pkgs.stdenv.hostPlatform.system == system) (
           self.nixosConfigurations or { }
         );
-      lean4Names = system: packageNamesFor self packageSets.${system} "lean4";
       lib = repositoryInputs.nixpkgs.lib;
       mergeChecks =
         groups:
@@ -366,7 +366,7 @@ let
           ) "Afairesi generated check names collide";
           result // group
         ) { } groups;
-      namesFor = system: bashNames system ++ pythonNames system ++ lean4Names system;
+      namesByKind = lib.genAttrs systems (packageNamesByKind self);
       packageNames = discover "default.nix";
       packageSets = lib.genAttrs systems (
         system:
@@ -379,7 +379,6 @@ let
             overlays = nixpkgs.overlays or [ ];
           }
       );
-      pythonNames = system: packageNamesFor self packageSets.${system} "python";
       repositoryInputs = {
         inherit (afairesiInputs) nixpkgs;
       }
@@ -390,7 +389,7 @@ let
       testedNames =
         system: kind: filename:
         builtins.filter (name: builtins.pathExists (source + "/${name}/${filename}")) (
-          packageNamesFor self packageSets.${system} kind
+          namesByKind.${system}.${kind} or [ ]
         );
     in
     {
@@ -482,17 +481,6 @@ let
                 testEnvironment = environments.${system}.${name};
               }
             ))
-            (lib.mapAttrs' (
-              host: _:
-              lib.nameValuePair "${host}Vm" (mkHostCheck {
-                inherit host;
-                inputs = repositoryInputs;
-                pkgs = packageSets.${system};
-              })
-            ) (hostsFor system))
-            (lib.mapAttrs' (
-              name: configuration: lib.nameValuePair "nixos-${name}" configuration.config.system.build.toplevel
-            ) (hostsFor system))
             (lib.mapAttrs' (name: shell: lib.nameValuePair "devshell-${name}" shell) self.devShells.${system})
             {
               formatter = self.formatter.${system}.passthru.tests.check;
@@ -507,6 +495,13 @@ let
               };
             }
           ]
+          ++ lib.mapAttrsToList (host: configuration: {
+            "${host}Vm" = mkHostCheck {
+              inherit host configuration;
+              pkgs = packageSets.${system};
+            };
+            "nixos-${host}" = configuration.config.system.build.toplevel;
+          }) (hostsFor system)
           ++ lib.mapAttrsToList (
             name: package:
             {
@@ -577,13 +572,12 @@ let
     };
   mkHostCheck =
     {
+      configuration,
       host,
-      inputs,
       pkgs,
     }:
     let
       inherit (pkgs) lib;
-      configuration = inputs.self.nixosConfigurations.${host};
       hasDisko = builtins.attrNames (configuration.config.disko.devices or { }) != [ ];
       instrumented = configuration.extendModules {
         modules = [
@@ -1103,14 +1097,15 @@ let
       };
     in
     tool;
-  packageNamesFor =
-    self: pkgs: kind:
-    builtins.attrNames (
-      pkgs.lib.filterAttrs (
-        name: package:
-        builtins.pathExists (self.outPath + "/${name}/default.nix")
-        && (package.afairesiKind or "generic") == kind
-      ) self.packages.${pkgs.stdenv.hostPlatform.system}
+  packageNamesByKind =
+    self: system:
+    let
+      packages = self.packages.${system};
+    in
+    builtins.groupBy (name: packages.${name}.afairesiKind or "generic") (
+      builtins.filter (name: builtins.pathExists (self.outPath + "/${name}/default.nix")) (
+        builtins.attrNames packages
+      )
     );
   pythonCheck =
     {
@@ -1228,11 +1223,11 @@ let
       ${python}/bin/python - "${src}" <<'PY'
       import sys
       from pathlib import Path
-      from afairesi import CommandError, validate_flake_source
+      from afairesi import validate_flake_source
 
       try:
           validate_flake_source(Path(sys.argv[1]).resolve())
-      except (CommandError, OSError, SyntaxError, ValueError) as error:
+      except (OSError, SyntaxError, ValueError) as error:
           sys.exit(f"error: {error}")
       PY
       touch "$out"

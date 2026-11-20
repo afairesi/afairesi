@@ -3,21 +3,17 @@
 
 # ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
-import argparse
 import ast
-import contextlib
 import io
-import json
 import keyword
 import os
 import shutil
 import stat
 import subprocess
-import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal, TypedDict
 
 import nix_syntax
 from afairesi.rust import cargo_names
@@ -27,6 +23,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
 
     from tree_sitter import Node
+
 BUILDER_KINDS = {
     "mkBashPackage": "bash",
     "mkHtmlPackage": "html",
@@ -45,8 +42,16 @@ PACKAGE_MAIN_FILES = {
 ROOT_FILES = ("flake.lock", "flake.nix")
 
 
-class CommandError(RuntimeError):
-    """A user-facing command failure."""
+type PackageStatus = Literal["added", "removed", "modified"]
+
+
+class PackageChange(TypedDict):
+    """Changes to one package and its named tests between the index and worktree."""
+
+    package: str
+    status: PackageStatus
+    added: list[str]
+    removed: list[str]
 
 
 @dataclass(frozen=True)
@@ -58,48 +63,18 @@ class Package:
     definition: nix_syntax.Document
 
 
-def git(
-    root: Path,
-    arguments: list[str],
-    *,
-    check: bool = True,
-) -> subprocess.CompletedProcess[str]:
-    """Run Git in a selected repository, forwarding diagnostics on failure."""
+def git(root: Path, *arguments: str) -> str:
+    """Read Git output without optional writes to the index."""
     completed = subprocess.run(  # noqa: S603 - Git arguments are passed without a shell.
-        ["git", "-C", str(root), *arguments],  # noqa: S607
+        ["git", "--no-optional-locks", "-C", str(root), *arguments],  # noqa: S607
         capture_output=True,
         check=False,
         text=True,
+        timeout=30,
     )
-    if check and completed.returncode:
-        sys.stdout.write(completed.stdout)
-        sys.stderr.write(completed.stderr)
-        raise SystemExit(completed.returncode)
-    return completed
-
-
-def repository_root() -> Path:
-    """Discover the current Git worktree root."""
-    completed = git(
-        Path(),
-        ["rev-parse", "--path-format=absolute", "--show-toplevel"],
-        check=False,
-    )
-    if completed.returncode != 0:
-        msg = "not inside a Git repository"
-        raise CommandError(msg)
-    return Path(completed.stdout.strip())
-
-
-def resolve_repository_path(path: Path) -> Path:
-    """Resolve explicit paths from the Git root, or cwd outside a repository."""
-    if path.is_absolute():
-        return path.resolve()
-    try:
-        root = repository_root()
-    except CommandError:
-        root = Path.cwd()
-    return (root / path).resolve()
+    if completed.returncode:
+        raise ValueError(completed.stderr.strip())
+    return completed.stdout
 
 
 def read_regular(path: Path) -> bytes | None:
@@ -110,14 +85,14 @@ def read_regular(path: Path) -> bytes | None:
         return None
     if not stat.S_ISREG(mode):
         msg = f"{path}: must be a regular file"
-        raise CommandError(msg)
+        raise ValueError(msg)
     return path.read_bytes()
 
 
 def source_paths(root: Path) -> set[Path]:
     """Select top-level package files and indexed Rust sources for module discovery."""
     if (root / ".git").exists():
-        entries = git(root, ["ls-files", "-z"]).stdout
+        entries = git(root, "ls-files", "-z")
         return {
             Path(item)
             for item in entries.split("\0")
@@ -190,13 +165,13 @@ def validate_python_package_names(packages: list[Package]) -> None:
                 f"{name}: installed Python module must be "
                 "a valid non-keyword identifier"
             )
-            raise CommandError(msg)
+            raise ValueError(msg)
         if module in modules:
             msg = (
                 f"{name} and {modules[module]}: "
                 f"installed Python module names collide: {module}"
             )
-            raise CommandError(msg)
+            raise ValueError(msg)
         modules[module] = name
 
 
@@ -240,7 +215,7 @@ def _python_class_mro(
     """Compute Python's class precedence without executing base declarations."""
     if name in seen:
         msg = f"cyclic class inheritance: {name}"
-        raise CommandError(msg)
+        raise ValueError(msg)
     if name not in classes:
         return [name]
     bases = [ast.unparse(base) for base in classes[name].bases]
@@ -259,7 +234,7 @@ def _python_class_mro(
         )
         if candidate is None:
             msg = f"inconsistent class inheritance: {name}"
-            raise CommandError(msg)
+            raise ValueError(msg)
         result.append(candidate)
         for sequence in sequences:
             if sequence[0] == candidate:
@@ -390,7 +365,7 @@ def validate_flake_source(root: Path) -> None:
     if issues:
         formatted_issues = "\n".join(f"  - {issue}" for issue in issues)
         msg = f"repository layout validation failed:\n{formatted_issues}"
-        raise CommandError(msg)
+        raise ValueError(msg)
     for package in packages:
         if package.kind == "generic":
             for filename in (
@@ -432,27 +407,13 @@ def _unittest_classes(module: ast.Module) -> set[str]:
     return found
 
 
-@contextlib.contextmanager
-def inspection_remote_repository(remote: str) -> Iterator[Path]:
-    """Inspect a native Git clone without changing existing repositories."""
-    with tempfile.TemporaryDirectory(prefix="afairesi-inspect-") as temporary:
-        checkout = Path(temporary) / "repository"
-        clone = subprocess.run(  # noqa: S603 - Git receives the remote after the option delimiter.
-            ["git", "clone", "--", remote, str(checkout)],  # noqa: S607
-            check=False,
-        )
-        if clone.returncode:
-            raise SystemExit(clone.returncode)
-        yield checkout
-
-
 def _source(path: Path) -> ast.Module:
     """Parse source without importing it or executing its declarations."""
     try:
         return ast.parse(path.read_bytes(), filename=str(path))
     except (OSError, SyntaxError, UnicodeError) as error:
         message = f"{path}: could not parse Python source: {error}"
-        raise CommandError(message) from error
+        raise ValueError(message) from error
 
 
 def _python_library(document: nix_syntax.Document) -> bool:
@@ -490,7 +451,7 @@ def inspect_repository(root: Path) -> dict[str, list[str]]:
     """Map each declared package to its sorted, statically named tests."""
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
-        raise CommandError(message)
+        raise ValueError(message)
     paths = source_paths(root)
     packages, _ = detect_packages(root, paths)
     report: dict[str, list[str]] = {}
@@ -517,17 +478,22 @@ def inspect_repository(root: Path) -> dict[str, list[str]]:
     return report
 
 
-def diff_inputs(root: Path, listing: str) -> list[tuple[str, str, Path]]:
+def index_entries(root: Path) -> Iterator[tuple[str, str, str, str]]:
+    """Yield the mode, object ID, stage, and path of each Git index entry."""
+    for entry in git(root, "ls-files", "--stage", "-z").split("\0"):
+        if entry:
+            metadata, name = entry.split("\t", 1)
+            mode, oid, stage = metadata.split()
+            yield mode, oid, stage, name
+
+
+def diff_inputs(root: Path) -> list[tuple[str, str, Path]]:
     """Select inspection inputs, retaining possible targets of source symlinks."""
     files = []
-    for entry in listing.split("\0"):
-        if not entry:
-            continue
-        metadata, name = entry.split("\t", 1)
-        mode, oid, stage = metadata.split()
+    for mode, oid, stage, name in index_entries(root):
         if stage != "0":
             message = "cannot inspect an unmerged index; resolve conflicts first"
-            raise CommandError(message)
+            raise ValueError(message)
         if mode != "160000":
             files.append((mode, oid, Path(name)))
     manifests = {
@@ -570,22 +536,22 @@ def _inspection_git_report(
                     target = snapshot / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(source, target, follow_symlinks=False)
-        elif files:
+        else:
             completed = subprocess.run(  # noqa: S603 - Fixed Git command; object IDs are passed on stdin.
                 ["git", "-C", str(root), "cat-file", "--batch"],  # noqa: S607
                 input="".join(f"{oid}\n" for _mode, oid, _path in files).encode(),
                 capture_output=True,
                 check=False,
+                timeout=30,
             )
             if completed.returncode:
-                sys.stderr.write(completed.stderr.decode(errors="replace"))
-                raise SystemExit(completed.returncode)
+                raise ValueError(completed.stderr.decode(errors="replace").strip())
             content = io.BytesIO(completed.stdout)
             for mode, _oid, relative in files:
                 _object, separator, size = content.readline().partition(b" blob ")
                 if not separator:
                     message = f"{relative}: could not read Git blob"
-                    raise CommandError(message)
+                    raise ValueError(message)
                 source_bytes = content.read(int(size))
                 content.read(1)
                 target = snapshot / relative
@@ -599,117 +565,33 @@ def _inspection_git_report(
         )
 
 
-def _dispatch_diff(arguments: list[str]) -> None:
-    """Render changes in package test names between the index and the working tree."""
-    _diff_parser().parse_args(arguments)
-    root = repository_root()
-    files = diff_inputs(root, git(root, ["ls-files", "--stage", "-z"]).stdout)
-    before = json.dumps(_inspection_git_report(root, files))
-    after = json.dumps(_inspection_git_report(root, files, working_tree=True))
-    if before == after:
-        return
-    with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
-        baseline = Path(directory) / "before.json"
-        baseline.write_text(before, encoding="utf-8")
-        completed = subprocess.run(  # noqa: S603 - The filename is fixed.
-            ["jd", baseline.name],  # noqa: S607
-            cwd=directory,
-            input=after,
-            capture_output=True,
-            check=False,
-            text=True,
-        )
-    if completed.returncode not in {0, 1}:
-        sys.stderr.write(completed.stderr)
-        raise SystemExit(completed.returncode)
-    sys.stdout.write(completed.stdout)
-
-
-def _dispatch_inspection(arguments: list[str]) -> None:
-    """Inspect local or remote sources without executing package code."""
-    value = parser().parse_args(arguments).repository
-    repository: contextlib.AbstractContextManager[Path]
-    if value is not None and (
-        "://" in value or (":" in value.split("/", 1)[0] and not Path(value).exists())
-    ):
-        repository = inspection_remote_repository(value)
-    else:
-        repository = contextlib.nullcontext(
-            resolve_repository_path(Path(value))
-            if value is not None
-            else repository_root(),
-        )
-    with repository as root:
-        report = inspect_repository(root)
-    sys.stdout.write(json.dumps(report, indent=2) + "\n")
-
-
-def parser() -> argparse.ArgumentParser:
-    """Construct the parser for the package test-name specification."""
-    result = argparse.ArgumentParser(
-        prog="afairesi",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "Print a JSON object mapping each package to its sorted test names. "
-            "Read Python tests (test_main.py), Bats cases (test_main.bats), Nix "
-            "runTests cases (test_main.nix), Lean theorems (test_main.lean), and "
-            "Rust #[test] functions in Cargo targets without executing source. "
-            "Packages with no named tests map to []."
-        ),
-        epilog=(
-            "Commands:\n"
-            "  diff    diff test names in jd format\n"
-            "Use './diff' or '-- diff' to inspect a repository named diff."
-        ),
-    )
-    result.add_argument(
-        "repository",
-        nargs="?",
-        metavar="PATH_OR_REMOTE",
-        help=(
-            "repository directory or Git URL (default: current repository); "
-            "relative paths use the Git root, or the current directory outside Git"
-        ),
-    )
-    return result
-
-
-def _diff_parser() -> argparse.ArgumentParser:
-    """Construct the parser for the diff subcommand."""
-    return argparse.ArgumentParser(
-        prog="afairesi diff",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        description=(
-            "Print a jd-compatible diff of package test names. "
-            "Compare the current repository's index with tracked working-tree sources. "
-            "Untracked files and implementation-only changes are omitted. "
-            "Inspect source without executing it or changing Git state."
-        ),
-        epilog=(
-            "Examples:\n"
-            "  afairesi diff | jd -t jd2patch | jless\n"
-            "  afairesi diff > change.jd\n"
-            "  jd -p change.jd before.json\n"
-            "\nFor patching, before.json must contain the baseline inspection."
-        ),
-    )
-
-
-def main() -> None:
-    """Inspect by default, reserving the first argument 'diff' for comparisons."""
-    arguments = sys.argv[1:]
-    comparing = arguments[:1] == ["diff"]
-    try:
-        if comparing:
-            _dispatch_diff(arguments[1:])
+def diff_repository(root: Path) -> list[PackageChange]:
+    """List package and test-name changes from the index to the working tree."""
+    files = diff_inputs(root)
+    if not files:
+        return []
+    before = _inspection_git_report(root, files)
+    after = _inspection_git_report(root, files, working_tree=True)
+    changes: list[PackageChange] = []
+    for package in sorted(before.keys() | after.keys()):
+        previous = before.get(package)
+        current = after.get(package)
+        if previous is None:
+            status: PackageStatus = "added"
+        elif current is None:
+            status = "removed"
+        elif current != previous:
+            status = "modified"
         else:
-            _dispatch_inspection(arguments)
-    except KeyboardInterrupt:
-        sys.exit(130)
-    except CommandError as error:
-        program = "afairesi diff" if comparing else "afairesi"
-        sys.stderr.write(f"{program}: {error}\n")
-        raise SystemExit(1) from error
-    except (OSError, SyntaxError, ValueError) as error:
-        sys.stderr.write(f"error: {error}\n")
-        raise SystemExit(1) from error
+            continue
+        old_names = set(previous or ())
+        new_names = set(current or ())
+        changes.append(
+            PackageChange(
+                package=package,
+                status=status,
+                added=sorted(new_names - old_names),
+                removed=sorted(old_names - new_names),
+            )
+        )
+    return changes
