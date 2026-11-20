@@ -2,10 +2,11 @@
 """Exercise home discovery, directory grouping, and CLI diffs with real repositories."""
 
 import curses
+import json
 import os
 import subprocess
 from typing import TYPE_CHECKING
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 
 import pytest
 
@@ -40,18 +41,8 @@ def git(root: Path, *arguments: str) -> str:
     ).stdout.strip()
 
 
-def initialize(root: Path) -> None:
-    """Create a committed resource without running its Nix builder."""
-    root.mkdir(parents=True, exist_ok=True)
-    git(root, "init", "--quiet")
-    (root / "flake.nix").write_text("{}")
-    package = root / "example"
-    package.mkdir()
-    (package / "default.nix").write_text(
-        '{ pkgs, ... }: pkgs.runCommand "example" '
-        '{ meta.description = "original"; } "exit 99"'
-    )
-    git(root, "add", "--force", ".")
+def commit(root: Path, message: str) -> None:
+    """Commit the staged fixture files with a test identity."""
     git(
         root,
         "-c",
@@ -63,8 +54,32 @@ def initialize(root: Path) -> None:
         "commit",
         "--quiet",
         "-m",
-        "baseline",
+        message,
     )
+
+
+def initialize(root: Path) -> None:
+    """Create a committed resource without running its Nix builder."""
+    root.mkdir(parents=True, exist_ok=True)
+    git(root, "init", "--quiet")
+    (root / "flake.nix").write_text("{}")
+    package = root / "example"
+    package.mkdir()
+    (package / "default.nix").write_text(
+        "{ inputs, pkgs, ... }: inputs.self.lib.mkPythonPackage { "
+        "inherit pkgs; executable = false; src = ./.; }"
+    )
+    (package / "test_main.py").write_text("def test_original(): ...\n")
+    git(root, "add", "--force", ".")
+    commit(root, "baseline")
+
+
+@pytest.fixture(name="checkout")
+def checkout_fixture(tmp_path: Path) -> Path:
+    """Create one tracked package for cache tests."""
+    root = tmp_path / "project"
+    initialize(root)
+    return root
 
 
 def register(home: Path, child: Path) -> None:
@@ -106,41 +121,35 @@ def home(tmp_path: Path) -> Path:
         child = root / name
         initialize(child)
         register(root, child)
-    (root / "missing").rename(root / "parked")
+    (root / "missing").rename(root / "unregistered")
     (root / "broken/flake.nix").unlink()
-    initialize(root / "unregistered")
-    nested = first / "nested"
-    initialize(nested)
-    register(first, nested)
-    source = first / "example/default.nix"
-    source.write_text(source.read_text().replace('"original"', '"staged"'))
-    git(first, "add", "example/default.nix")
-    source.write_text(source.read_text().replace('"staged"', '"working"'))
+    source = first / "example/test_main.py"
+    source.write_text(source.read_text().replace("test_original", "test_staged"))
+    git(first, "add", "example/test_main.py")
+    source.write_text(source.read_text().replace("test_staged", "test_working"))
     return root
 
 
 def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
     home: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Discover once and inspect each direct checkout once, without eager diffs."""
-    calls: list[tuple[list[str], Path]] = []
-    original: Callable[..., str] = subject.command
-
-    def counted(
-        arguments: list[str], root: Path, *, input_text: str | None = None
-    ) -> str:
-        calls.append((arguments, root))
-        return original(arguments, root, input_text=input_text)
-
-    monkeypatch.setattr(subject, "command", counted)
     first = home / "github.com/owner/project"
-    paths = [home / ".git/index", first / ".git/index", first / "example/default.nix"]
+    second = home / "gitlab.com/owner/project"
+    nested = second / "nested"
+    initialize(nested)
+    register(second, nested)
+    commit(second, "Register nested checkout")
+    (nested / "example/test_main.py").write_text("def test_nested_edit(): ...\n")
+    (second / "untracked.txt").touch()
+    paths = [home / ".git/index", first / ".git/index", first / "example/test_main.py"]
     before = [path.read_bytes() for path in paths]
-    tree = subject.build_tree(home, cache=home.parent / "cache")
+    with patch.object(subject, "command", wraps=subject.command) as command:
+        tree = subject.build_tree(home, cache=home.parent / "cache")
+    calls = [invocation.args for invocation in command.call_args_list]
     expect(labels(tree) == ["broken", "github.com", "gitlab.com", "missing"], tree)
     project = ("github.com", "owner", "project")
-    expect("description: working" in labels(tree, *project, "example"), tree)
+    expect("test_working" in labels(tree, *project, "example"), tree)
     expect("modified" in labels(tree, *project), tree)
     viewer = subject.Viewer(tree)
     expect(viewer.search("github.com"), tree)
@@ -151,71 +160,136 @@ def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
         frame,
     )
     expect(any(selected and color == "~" for _, selected, color in frame), frame)
-    expect(
-        "description: original"
-        in labels(tree, "gitlab.com", "owner", "project", "example"),
-        tree,
-    )
+    other = ("gitlab.com", "owner", "project")
+    expect("test_original" in labels(tree, *other, "example"), tree)
+    expect("modified" not in labels(tree, *other), tree)
     expect(
         labels(tree, "missing") == ["error: This submodule is not initialized."], tree
     )
     expect(any("flake.nix" in label for label in labels(tree, "broken")), tree)
-    roots = {first, home / "gitlab.com/owner/project", home / "broken"}
-    inspections = [(args, root) for args, root in calls if args[0] == "afairesi"]
-    expect(
-        len(inspections) == len(roots) and {root for _, root in inspections} == roots,
-        inspections,
-    )
-    expect(all(args == ["afairesi"] for args, _ in inspections), inspections)
+    roots = {first, second, home / "broken"}
+    inspections = sorted((root, args) for args, root in calls if args[0] == "afairesi")
+    expect(inspections == [(root, ["afairesi"]) for root in sorted(roots)], inspections)
     expect(all(root in roots | {home} for _, root in calls), calls)
     catalogs = [
         args for args, root in calls if root == home and args[:2] == ["git", "ls-files"]
     ]
     expect(len(catalogs) == 1, catalogs)
-    for args, _ in calls:
-        if args[:2] == ["git", "status"]:
-            expect(
-                "--ignore-submodules=all" in args and "--untracked-files=no" in args,
-                args,
-            )
     expect([path.read_bytes() for path in paths] == before, "inspection modified files")
 
 
 def test_home_diff_shows_working_changes_across_registered_repositories(
     home: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Run afairesi diff once for each initialized direct checkout."""
-    calls = []
-    original: Callable[..., str] = subject.command
-
-    def counted(
-        arguments: list[str], root: Path, *, input_text: str | None = None
-    ) -> str:
-        if arguments[0] == "afairesi":
-            calls.append(arguments)
-        return original(arguments, root, input_text=input_text)
-
-    monkeypatch.setattr(subject, "command", counted)
-    tree = subject.build_tree(home, view="diff", cache=home.parent / "cache")
+    with patch.object(subject, "command", wraps=subject.command) as command:
+        tree = subject.build_tree(home, view="diff", cache=home.parent / "cache")
     project = ("github.com", "owner", "project")
     expect(labels(tree, *project) == ["example"], tree)
     expect(
-        labels(tree, *project, "example")
-        == ["- description: staged", "+ description: working"],
+        labels(tree, *project, "example") == ["- test_staged", "+ test_working"],
         tree,
     )
     expect("gitlab.com" not in labels(tree), tree)
     viewer = subject.Viewer(tree)
-    expect(viewer.search("description: staged"), tree)
+    expect(viewer.search("test_staged"), tree)
     colors = {text.strip(): color for text, _, color in viewer.frame(30)}
     expect(colors["▾ example"] == "~", colors)
-    expect(colors["- description: staged"] == "-", colors)
-    expect(colors["+ description: working"] == "+", colors)
+    expect(colors["- test_staged"] == "-", colors)
+    expect(colors["+ test_working"] == "+", colors)
     expect(
         labels(tree, "missing") == ["error: This submodule is not initialized."], tree
     )
-    expect(calls == [["afairesi", "diff"]] * 3, calls)
+    inspections = [
+        invocation.args[0]
+        for invocation in command.call_args_list
+        if invocation.args[0][0] == "afairesi"
+    ]
+    expect(inspections == [["afairesi", "diff"]] * 3, inspections)
+
+
+def test_multilingual_test_names_are_searchable_and_diffed_under_their_packages(
+    home: Path,
+) -> None:
+    """Follow names from the real CLI through the tree, search and diff views."""
+    checkout = home / "github.com/owner/project"
+    suites = {
+        "shell": (
+            "mkBashPackage",
+            "test_main.bats",
+            '@test "preserves spaces" { true; }',
+        ),
+        "nix": (
+            "",
+            "test_main.nix",
+            "{ testKeepsName = { expr = 1; expected = 1; }; }",
+        ),
+        "proof": (
+            "mkLean4Package",
+            "test_main.lean",
+            "namespace Output\ntheorem keepsName : True := trivial\nend Output",
+        ),
+        "crate": ("", "tests/output.rs", "mod output { #[test] fn keeps_name() {} }"),
+        "untested": ("", "test_main.nix", "{}"),
+    }
+    for package, (builder, filename, source) in suites.items():
+        directory = checkout / package
+        path = directory / filename
+        path.parent.mkdir(parents=True)
+        (directory / "default.nix").write_text(
+            f"{{ inputs, ... }}: inputs.self.lib.{builder} {{}}" if builder else "{}"
+        )
+        path.write_text(source + "\n")
+    (checkout / "crate/Cargo.toml").write_text(
+        '[package]\nname = "crate"\nversion = "0.1.0"\n'
+    )
+    git(checkout, "add", "--", *suites)
+    cache = home.parent / "cache"
+    tree = subject.build_tree(home, cache=cache)
+    viewer = subject.Viewer(tree)
+    project = ("github.com", "owner", "project")
+    for package, name in {
+        "example": "test_working",
+        "shell": "preserves spaces",
+        "nix": "testKeepsName",
+        "proof": "Output.keepsName",
+        "crate": "output::keeps_name",
+    }.items():
+        expect(labels(tree, *project, package) == [name], package)
+        expect(viewer.search(name), name)
+        frame = viewer.frame(40)
+        expect(
+            any(selected and row.strip() == name for row, selected, _ in frame), frame
+        )
+        expect(
+            any(row.strip() == f"▾ {package} (1 named test)" for row, _, _ in frame),
+            frame,
+        )
+    expect(viewer.search("untested"), tree)
+    frame = viewer.frame(40)
+    expect(
+        any(
+            selected and "untested (no named tests)" in row
+            for row, selected, _ in frame
+        ),
+        frame,
+    )
+
+    subject.cached_output(checkout, "diff", cache, refresh=False)
+    (checkout / "shell/test_main.bats").write_text(
+        '@test "preserves tabs" { true; }\n@test "accepts blanks" { true; }\n'
+    )
+    for package in ("crate", "proof", "untested"):
+        (checkout / package / "default.nix").unlink()
+    changes = subject.build_tree(home, view="diff", cache=cache)
+    expect(labels(changes, *project, "- crate") == ["- output::keeps_name"], changes)
+    expect(
+        labels(changes, *project, "shell")
+        == ["- preserves spaces", "+ accepts blanks", "+ preserves tabs"],
+        changes,
+    )
+    expect(labels(changes, *project, "- proof") == ["- Output.keepsName"], changes)
+    expect("- untested" in labels(changes, *project), changes)
 
 
 def test_home_tree_shows_a_timeout_alongside_results_from_other_repositories(
@@ -262,62 +336,60 @@ def test_home_tree_requires_a_git_root_and_accepts_one_without_submodules(
         tree,
     )
     differences = subject.build_tree(tmp_path, cache=cache, view="diff")
-    expect(labels(differences) == ["No changes"], differences)
+    expect(labels(differences) == ["No test specification changes"], differences)
     child = tmp_path / "directory"
     child.mkdir()
     with pytest.raises(ValueError, match="repository root"):
         subject.build_tree(child, cache=cache)
 
 
-def test_inventory_cache_tracks_index_and_file_changes_and_survives_a_commit(
-    home: Path,
+@pytest.mark.parametrize("view", ["tests", "diff"])
+def test_both_views_reuse_cached_results_until_their_test_inputs_change(
+    checkout: Path,
+    view: subject.View,
 ) -> None:
-    """Refresh on changed inputs or an explicit request, and reuse committed results."""
-    root = home / "github.com/owner/project"
-    cache = home / "cache"
-    source = root / "example/default.nix"
-    first, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(not hit, "first inspection was cached")
-    second, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(hit and first == second, "unchanged inspection was repeated")
-    nested = root / "nested/example/default.nix"
-    nested.write_text(nested.read_text() + "\n")
-    _, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(hit, "nested checkout invalidated the direct repository cache")
+    """Use working names for the tests view and staged names as the diff baseline."""
+    cache = checkout.parent / "cache"
+    nested = checkout / "nested"
+    initialize(nested)
+    register(checkout, nested)
+    source = checkout / "example/test_main.py"
+    source.write_text("def test_working(): ...\n")
+    first, hit = subject.cached_output(checkout, view, cache, refresh=False)
+    expect(bool(first) and not hit, first)
+    (checkout / "example/main.py").write_text("irrelevant")
+    git(checkout, "add", "example/main.py")
+    (nested / "example/test_main.py").write_text("def test_nested(): ...\n")
+    again, hit = subject.cached_output(checkout, view, cache, refresh=False)
+    expect(hit and first == again, again)
     metadata = source.stat()
-    source.write_text(source.read_text().replace('"working"', '"updated"'))
+    source.write_text(source.read_text().replace("test_working", "test_updated"))
     os.utime(source, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
-    changed, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(not hit and changed["example"]["description"] == "updated", changed)
-    git(root, "add", "example/default.nix")
-    _, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(not hit, "index change was missed")
-    git(
-        root,
-        "-c",
-        "user.name=Test",
-        "-c",
-        "user.email=test@example.invalid",
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "--quiet",
-        "-m",
-        "updated",
-    )
-    _, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(hit, "committing the same index invalidated the inventory")
-    _, hit = subject.cached_output(root, "resources", cache, refresh=True)
+    changed, hit = subject.cached_output(checkout, view, cache, refresh=False)
+    expect(not hit and changed != first, changed)
+    git(checkout, "add", "example/test_main.py")
+    staged, hit = subject.cached_output(checkout, view, cache, refresh=False)
+    if view == "tests":
+        expect(hit and staged == changed == {"example": ["test_updated"]}, staged)
+    else:
+        expect(not hit and staged == [], staged)
+    commit(checkout, "updated")
+    committed, hit = subject.cached_output(checkout, view, cache, refresh=False)
+    expect(hit and committed == staged, committed)
+    _, hit = subject.cached_output(checkout, view, cache, refresh=True)
     expect(not hit, "explicit refresh used cached data")
+    git(checkout, "rm", "--cached", "example/test_main.py")
+    untracked, _ = subject.cached_output(checkout, view, cache, refresh=False)
+    expect(untracked == ({"example": []} if view == "tests" else []), untracked)
 
 
-def test_home_tree_shows_the_current_branch_with_a_cached_inventory(
+def test_home_tree_shows_the_current_branch_with_cached_test_names(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Cache each operation independently while reading Git state fresh."""
     root = home / "github.com/owner/project"
     cache = home / "cache"
-    subject.cached_output(root, "resources", cache, refresh=False)
+    subject.cached_output(root, "tests", cache, refresh=False)
     subject.cached_output(root, "diff", cache, refresh=False)
     git(root, "checkout", "--quiet", "-b", "cached-branch")
     tree = subject.build_tree(home, cache=cache, progress=True)
@@ -328,82 +400,63 @@ def test_home_tree_shows_the_current_branch_with_a_cached_inventory(
     expect("github.com/owner/project: cached" in progress, progress)
 
 
-def test_resource_view_recovers_from_a_corrupt_or_unavailable_cache(
-    home: Path,
+def test_test_names_are_reloaded_when_the_cache_is_damaged_or_unavailable(
+    checkout: Path,
 ) -> None:
-    """Treat cache data as disposable; cache I/O failures must not hide resources."""
-    root = home / "github.com/owner/project"
-    cache = home / "cache"
-    expected, _ = subject.cached_output(root, "resources", cache, refresh=False)
-    next(cache.glob("*.json")).write_text("partial {")
-    actual, hit = subject.cached_output(root, "resources", cache, refresh=False)
+    """Read fresh test names when cached JSON is malformed or storage is unavailable."""
+    cache = checkout.parent / "cache"
+    expected, _ = subject.cached_output(checkout, "tests", cache, refresh=False)
+    entry = next(cache.glob("*.json"))
+    saved = json.loads(entry.read_text())
+    entry.write_text(json.dumps({**saved, "value": {"example": [None]}}))
+    actual, hit = subject.cached_output(checkout, "tests", cache, refresh=False)
     expect(not hit and actual == expected, actual)
-    blocked = home / "blocked-cache"
+    entry.write_text("partial {")
+    actual, hit = subject.cached_output(checkout, "tests", cache, refresh=False)
+    expect(not hit and actual == expected, actual)
+    blocked = checkout.parent / "blocked-cache"
     blocked.write_text("not a directory")
-    actual, hit = subject.cached_output(root, "resources", blocked, refresh=False)
+    actual, hit = subject.cached_output(checkout, "tests", blocked, refresh=False)
     expect(not hit and actual == expected, actual)
 
 
-def test_diff_cache_survives_unrelated_files_and_detects_staging(home: Path) -> None:
-    """Reuse a patch until the index or working copy of an inspection input changes."""
-    root = home / "github.com/owner/project"
-    cache = home.parent / "cache"
-    patch, hit = subject.cached_output(root, "diff", cache, refresh=False)
-    expect(bool(patch) and not hit, patch)
-    asset = root / "asset"
-    asset.write_text("irrelevant")
-    git(root, "add", "asset")
-    again, hit = subject.cached_output(root, "diff", cache, refresh=False)
-    expect(hit and patch == again, again)
-    git(root, "add", "example/default.nix")
-    staged, hit = subject.cached_output(root, "diff", cache, refresh=False)
-    expect(staged == [] and not hit, staged)
-
-
-def test_inventory_cache_only_stores_successful_reads_of_unchanged_sources(
-    home: Path, monkeypatch: pytest.MonkeyPatch
+def test_test_name_cache_only_stores_successful_reads_of_unchanged_sources(
+    checkout: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """Retry errors and avoid persisting a result read while the source was changing."""
-    root = home / "github.com/owner/project"
-    cache = home / "cache"
-    flake = root / "flake.nix"
+    cache = checkout.parent / "cache"
+    flake = checkout / "flake.nix"
     flake.unlink()
     with pytest.raises(ValueError, match=r"flake\.nix"):
-        subject.cached_output(root, "resources", cache, refresh=False)
+        subject.cached_output(checkout, "tests", cache, refresh=False)
     expect(not cache.exists(), "failed inspection was cached")
     flake.write_text("{}")
     original = subject.read_output
 
     def changing(path: Path, view: subject.View) -> object:
         value = original(path, view)
-        source = root / "example/default.nix"
-        source.write_text(source.read_text().replace('"working"', '"changed"'))
+        (path / "example/test_main.py").write_text("def test_changed(): ...\n")
         return value
 
     monkeypatch.setattr(subject, "read_output", changing)
-    subject.cached_output(root, "resources", cache, refresh=False)
+    subject.cached_output(checkout, "tests", cache, refresh=False)
     expect(not cache.exists(), "changing source was cached")
 
 
-def test_inventory_cache_refreshes_when_a_symlink_target_changes(home: Path) -> None:
-    """A tracked Python entrypoint can change through an unchanged symlink."""
-    root = home / "github.com/owner/project"
-    cache = home / "cache"
-    (root / "example/default.nix").write_text(
-        "{ inputs, pkgs, ... }: inputs.self.lib.mkPythonPackage { "
-        "inherit pkgs; executable = true; src = ./.; }"
-    )
-    target = home / "external.py"
-    target.write_text(
-        "import argparse\ndef main():\n    p = argparse.ArgumentParser()\n"
-        '    p.add_argument("--name", default="first")\n    p.parse_args()\n'
-    )
-    (root / "example/main.py").symlink_to(target)
-    git(root, "add", "example/default.nix", "example/main.py")
-    subject.cached_output(root, "resources", cache, refresh=False)
-    target.write_text(target.read_text().replace('"first"', '"other"'))
-    value, hit = subject.cached_output(root, "resources", cache, refresh=False)
-    expect(not hit and value["example"]["arguments"][0]["default"] == "other", value)
+def test_test_name_cache_refreshes_when_a_symlink_target_changes(
+    checkout: Path,
+) -> None:
+    """Read new test names through an unchanged suite symlink."""
+    cache = checkout.parent / "cache"
+    target = checkout.parent / "external.py"
+    tests = checkout / "example/test_main.py"
+    tests.rename(target)
+    tests.symlink_to(target)
+    git(checkout, "add", "example/test_main.py")
+    subject.cached_output(checkout, "tests", cache, refresh=False)
+    target.write_text("def test_other(): ...\n")
+    value, hit = subject.cached_output(checkout, "tests", cache, refresh=False)
+    expect(not hit and value == {"example": ["test_other"]}, value)
 
 
 def test_viewer_starts_with_folded_directories_and_supports_vim_navigation() -> None:
@@ -412,18 +465,7 @@ def test_viewer_starts_with_folded_directories_and_supports_vim_navigation() -> 
     project = root.add("github.com").add("owner").add("project")
     project.add("branch: main")
     project.add("modified")
-    subject.add_resources(
-        project,
-        {
-            "hello": {
-                "type": "python",
-                "description": "Hello [red]literal[/red]",
-                "arguments": [{"names": ["--name"], "default": "world"}],
-                "tests": ["test_hello"],
-                "dependencies": {"library": ["runtime", "test"]},
-            }
-        },
-    )
+    subject.add_tests(project, {"hello": ["test_greets_the_reader"]})
     viewer = subject.Viewer(root)
     expect(
         viewer.frame(30) == [("▾ /home/test", True, ""), ("  ▸ github.com", False, "")],
@@ -440,17 +482,9 @@ def test_viewer_starts_with_folded_directories_and_supports_vim_navigation() -> 
     )
     for key in "ljjjl":
         viewer.handle(key, 30)
-    resource = list(viewer.root.visible())[viewer.selected][0]
-    expect(resource.label == "hello" and resource.expanded, resource)
-    expect(
-        resource.children[1].label == "description: Hello [red]literal[/red]",
-        resource.children,
-    )
-    arguments = resource.children[2]
-    expect(arguments.label == "arguments", arguments)
-    expect(arguments.children[0].label == "--name", arguments.children)
-    dependencies = resource.children[4]
-    expect(dependencies.children[0].label == "library (runtime, test)", dependencies)
+    package = list(viewer.root.visible())[viewer.selected][0]
+    expect(package.label == "hello" and package.expanded, package)
+    expect(labels(package) == ["test_greets_the_reader"], package.children)
     for key in "hhh":
         viewer.handle(key, 30)
     expect(
@@ -537,8 +571,8 @@ def test_browse_refreshes_both_views_and_preserves_navigation(
         group.add(f"generation {len(calls)}")
         return tree
 
-    subject.browse(screen, subject.Node("home"), "resources", load)
-    expect(calls == ["diff", "diff", "resources", "resources"], calls)
+    subject.browse(screen, subject.Node("home"), "tests", load)
+    expect(calls == ["diff", "diff", "tests", "tests"], calls)
     pairs.assert_has_calls(
         [
             call(1, curses.COLOR_GREEN, -1),
@@ -568,13 +602,13 @@ def test_switching_to_diff_shows_repository_progress_until_the_view_is_ready(
             home, view=view, cache=home / "cache", progress=report
         )
 
-    subject.browse(screen, subject.Node("home"), "resources", load)
+    subject.browse(screen, subject.Node("home"), "tests", load)
     expect(
         frames[1:-3] == ["Loading diff…", *(f"Loading diff… {n}/4" for n in range(5))],
         frames,
     )
     expect(
-        [line.split()[0] for line in frames[-3:]] == ["diff", "resources", "diff"],
+        [line.split()[0] for line in frames[-3:]] == ["diff", "tests", "diff"],
         frames,
     )
 

@@ -1,6 +1,7 @@
 import «lean-example»
 
-example : Proofs.answer = 42 := Proofs.answer_eq
+/-- The package exposes the answer from its dependency. -/
+theorem dependencyAnswerIs42 : Proofs.answer = 42 := Proofs.answer_eq
 
 #eval show IO Unit from do
   let greeting ← IO.Process.output { cmd := "hello" }

@@ -421,24 +421,48 @@ let
         system:
         mergeChecks (
           [
-            (lib.genAttrs (testedNames system "bash" "test_main.sh") (
+            (lib.genAttrs (testedNames system "bash" "test_main.bats") (
               name:
               packageSets.${system}.runCommand name environments.${system}.${name}.environment ''
                 cp -R ${source + "/${name}"} source
                 chmod -R u+w source
                 cd source
-                ${packageSets.${system}.bash}/bin/bash -euo pipefail test_main.sh
+                bats test_main.bats
                 touch "$out"
               ''
             ))
             (lib.genAttrs (testedNames system "generic" "test_main.nix") (
               pname:
-              lib.callPackageWith {
-                inherit system pname;
-                inputs = repositoryInputs;
-                packageDrv = self.packages.${system}.${pname};
+              let
                 pkgs = packageSets.${system};
-              } (source + "/${pname}/test_main.nix") { }
+                suite = import (source + "/${pname}/test_main.nix");
+                tests =
+                  if lib.isFunction suite then
+                    lib.callPackageWith {
+                      inherit
+                        lib
+                        pkgs
+                        system
+                        pname
+                        ;
+                      inputs = repositoryInputs;
+                      packageDrv = self.packages.${system}.${pname};
+                    } suite { }
+                  else
+                    suite;
+              in
+              assert lib.assertMsg (
+                builtins.isAttrs tests && !lib.isDerivation tests
+              ) "${pname}/test_main.nix must return a set of named test cases";
+              pkgs.runCommand pname
+                { failures = builtins.toJSON (map (failure: failure.name) (lib.debug.runTests tests)); }
+                ''
+                  if [[ "$failures" != '[]' ]]; then
+                    echo "Failed Nix tests: $failures" >&2
+                    exit 1
+                  fi
+                  touch "$out"
+                ''
             ))
             (lib.genAttrs (testedNames system "lean4" "test_main.lean") (
               name:
@@ -1013,6 +1037,7 @@ let
               ++ [
                 packageDrv
                 pkgs.bash
+                pkgs.bats
               ];
           };
         in

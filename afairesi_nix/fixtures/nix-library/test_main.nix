@@ -5,11 +5,17 @@
   pname,
   system,
 }:
-assert pname == "nix-library";
-assert system == pkgs.stdenv.hostPlatform.system;
-assert packageDrv == inputs.self.packages.${system}.${pname};
-assert (import ./main.nix).answer == 42;
-pkgs.runCommand "${pname}-test" { } ''
-  test "$(cat ${packageDrv})" = 42
-  touch "$out"
-''
+{
+  testPackageKeepsItsDeclaredName = {
+    expected = "nix-library";
+    expr = packageDrv.name;
+  };
+  testSuiteReceivesTheConsumersPackage = {
+    expected = inputs.self.packages.${system}.${pname}.drvPath;
+    expr = packageDrv.drvPath;
+  };
+  testSuiteTargetsTheHostSystem = {
+    expected = pkgs.stdenv.hostPlatform.system;
+    expr = system;
+  };
+}

@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, cast
 
 import pytest
 
@@ -18,7 +18,6 @@ import afairesi as inspection_subject
 import nix_syntax
 
 if TYPE_CHECKING:
-    import ast
     from collections.abc import Iterator
 
 
@@ -55,9 +54,9 @@ def _git(root: Path, *arguments: str) -> str:
     ).stdout
 
 
-def _fixture_git(root: Path, *arguments: str) -> str:
-    """Run fixture Git commands without signing or background maintenance."""
-    return _git(
+def _commit(root: Path, message: str) -> None:
+    """Commit staged fixture files without relying on the user's Git config."""
+    _git(
         root,
         "-c",
         "user.name=Test",
@@ -67,7 +66,10 @@ def _fixture_git(root: Path, *arguments: str) -> str:
         "commit.gpgsign=false",
         "-c",
         "maintenance.auto=false",
-        *arguments,
+        "commit",
+        "--quiet",
+        "-m",
+        message,
     )
 
 
@@ -107,11 +109,7 @@ def _fixture_add(
         if kind in {"python", "lean4"}:
             settings += "  executable = true;\n"
         sources["default.nix"] = (
-            "{ inputs, pkgs, ... }:\n"
-            + builder
-            + " {\n"
-            + settings
-            + '  meta.description = "Fixture package.";\n}\n'
+            f"{{ inputs, pkgs, ... }}:\n{builder} {{\n{settings}}}\n"
         )
     package = root / name
     package.mkdir()
@@ -128,7 +126,6 @@ def test_source_validation_skips_nested_assets_without_running_package_code(
     repository = _repository(tmp_path)
     _fixture_add(repository, "example", "python")
     (repository / "example/main.py").write_text(
-        "from pathlib import Path\noutput = Path.home() / 'reports'\n"
         "raise RuntimeError('must not execute')\n"
     )
     assets = repository / "example/assets"
@@ -195,18 +192,61 @@ def _snapshot(root: Path) -> dict[Path, tuple[int, bytes]]:
     return files
 
 
-def test_inventory_lists_a_renamed_package_and_its_tests_under_the_new_name(
-    tmp_path: Path,
+def test_afairesi_prints_the_behavioral_specification_before_implementation(
+    root: Path,
 ) -> None:
-    """Report the renamed package and its tests from the Git index."""
-    root = _repository(tmp_path)
-    _fixture_add(root, "example", "generic")
-    (root / "example/test_main.nix").write_text('throw "must not evaluate"')
-    _git(root, "add", "--", "example/test_main.nix")
-    _git(root, "mv", "--", "example", "renamed")
+    """Publish high-level test names as soon as the tests have been written."""
+    _fixture_add(root, "inbox", "python")
+    (root / "inbox/main.py").unlink()
+    tests = root / "inbox/test_main.py"
+    tests.write_text(
+        "raise RuntimeError('inspection must not import this suite')\n"
+        "def test_delivers_messages(): ...\n"
+    )
+    _git(root, "add", "--", "inbox/test_main.py")
     report = json.loads(_run(root).stdout)
-    _expect(set(report) == {"renamed"}, report)
-    _expect(report["renamed"]["tests"] == ["test_main.nix"], report)
+    _expect(report == {"inbox": ["test_delivers_messages"]}, report)
+
+
+def test_detailed_behavior_names_extend_the_specification_in_stable_order(
+    root: Path,
+) -> None:
+    """List each declaration once, independently of assertion text or case data."""
+    _fixture_add(root, "inbox", "python")
+    tests = root / "inbox/test_main.py"
+    tests.write_text(
+        "import pytest\n"
+        "@pytest.mark.parametrize('message', ['abc', 'ABC'])\n"
+        "def test_preserves_message_case(message): assert deliver(message) == message\n"
+        "def test_delivers_messages(): assert deliver('hello') == 'hello'\n"
+    )
+    _git(root, "add", "--", "inbox/test_main.py")
+    first = _run(root).stdout
+    _expect(
+        json.loads(first)
+        == {"inbox": ["test_delivers_messages", "test_preserves_message_case"]},
+        first,
+    )
+    tests.write_text(
+        "def test_delivers_messages(): ...\ndef test_preserves_message_case(): ...\n"
+    )
+    _expect(_run(root).stdout == first, first)
+
+
+def test_each_package_lists_a_shared_behavior_name_once(root: Path) -> None:
+    """Keep equal identifiers distinct across packages and unique within a suite."""
+    for name in ("mail_box", "mail-box"):
+        _fixture_add(root, name, "python")
+        tests = root / name / "test_main.py"
+        tests.write_text("def test_delivers(): ...\ndef test_delivers(): ...\n")
+        _git(root, "add", "--", f"{name}/test_main.py")
+    report = json.loads(_run(root).stdout)
+    _expect(list(report) == ["mail-box", "mail_box"], report)
+    _expect(
+        report == {"mail-box": ["test_delivers"], "mail_box": ["test_delivers"]}, report
+    )
+    with pytest.raises(inspection_subject.CommandError, match="module names collide"):
+        inspection_subject.validate_flake_source(root)
 
 
 def test_cli_shows_help_and_rejects_unknown_arguments_outside_a_repository(
@@ -237,14 +277,7 @@ def test_cli_shows_help_and_rejects_unknown_arguments_outside_a_repository(
         ("html", "inputs.self.lib.mkHtmlPackage"),
         ("latex", "inputs.afairesi.lib.mkLatexPackage"),
         ("lean4", "(inputs.self).lib.mkLean4Package"),
-        ("python", "let lib = inputs.self.lib; in lib.mkPythonPackage"),
-        (
-            "python",
-            (
-                "let build = inputs.self.lib.mkPythonPackage; "
-                "in { fallback ? build }: (build)"
-            ),
-        ),
+        ("python", "let build = inputs.self.lib.mkPythonPackage; in (build)"),
     ],
 )
 def test_declared_package_kind_determines_the_required_entrypoint(
@@ -268,36 +301,19 @@ def test_declared_package_kind_determines_the_required_entrypoint(
         "{ inputs, pkgs, ... }: let dependency = inputs.self.lib.mkHtmlPackage {}; in "
         f"{constructor} {{ inherit pkgs; src = ./.; {executable} }}",
     )
+    if kind != "python":
+        (package / "test_main.py").write_text("def test_unrelated(): pass")
     for filename in (*entrypoints.values(), "main.nix"):
         (package / filename).touch()
     _git(root, "add", "--", "example")
     report = json.loads(_run(root).stdout)
-    _expect(report["example"]["type"] == kind, report)
+    _expect(report == {"example": []}, report)
     inspection_subject.validate_flake_source(root)
     (package / entrypoints[kind]).unlink()
     with pytest.raises(
         inspection_subject.CommandError, match=re.escape(entrypoints[kind])
     ):
         inspection_subject.validate_flake_source(root)
-
-
-@pytest.mark.parametrize("kind", ["bash", "html", "latex", "lean4", "generic"])
-def test_package_kind_determines_which_tests_are_listed(root: Path, kind: str) -> None:
-    """Supporting Python files never replace another package kind's test report."""
-    _fixture_add(root, "example", kind)
-    package = root / "example"
-    (package / "test_main.py").write_text("not valid python!")
-    (package / "test_main.sh").write_text("exit 1\n")
-    (package / "test_main.lean").write_text("example : 1 = 1 := rfl\n")
-    (package / "test_main.nix").write_text("{}\n")
-    _git(root, "add", "--", "example")
-    report = json.loads(_run(root).stdout)["example"]
-    expected = {
-        "bash": ["test_main.sh"],
-        "lean4": ["test_main.lean"],
-        "generic": ["test_main.nix"],
-    }.get(kind, [])
-    _expect(report.get("tests", []) == expected, report)
 
 
 def test_source_validation_rejects_a_tracked_python_package_initializer(
@@ -316,27 +332,14 @@ def test_source_validation_rejects_a_tracked_python_package_initializer(
     _expect(_snapshot(root) == before, "rejection changed sources")
 
 
-@pytest.mark.parametrize(
-    "expression",
-    [
-        (
-            "let executable = true; args = { inherit pkgs executable; src = ./.; }; "
-            "in inputs.self.lib.mkPythonPackage args"
-        ),
-        (
-            "with inputs.self.lib; "
-            "mkPythonPackage { inherit pkgs; src = ./.; executable = true; }"
-        ),
-    ],
-)
-def test_source_validation_accepts_indirect_afairesi_builders(
-    root: Path,
-    expression: str,
-) -> None:
-    """Accept Nix expressions without rewriting builders or evaluating source."""
+def test_source_validation_accepts_builders_in_a_with_scope(root: Path) -> None:
+    """Validate a package without rewriting its Nix scope."""
     _fixture_add(root, "example", "python")
     definition = root / "example/default.nix"
-    definition.write_text("{ inputs, pkgs, ... }: " + expression + "\n")
+    definition.write_text(
+        "{ inputs, pkgs, ... }: with inputs.self.lib; "
+        "mkPythonPackage { inherit pkgs; src = ./.; executable = true; }\n"
+    )
     _git(root, "add", ".")
     before = _snapshot(root)
     inspection_subject.validate_flake_source(root)
@@ -362,26 +365,24 @@ def test_source_validation_identifies_the_file_with_invalid_nix_syntax(
     _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
-@pytest.mark.parametrize(
-    "builder",
-    [
-        "pkgs.python3Packages.buildPythonPackage",
-        "pkgs.rustPlatform.buildRustPackage",
-        'pkgs.haskellPackages.callCabal2nix "example" ./.',
-        "import ./builder.nix",
-    ],
-)
 def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
     root: Path,
-    builder: str,
 ) -> None:
-    """Keep native and opaque builders generic regardless of supporting sources."""
-    for name in ("class", "dash-name", "dash_name"):
-        _fixture_add(root, name, "generic")
+    """Discover Nix suites for native and opaque builders with mixed source files."""
+    builders = {
+        "class": "pkgs.python3Packages.buildPythonPackage",
+        "dash-name": "pkgs.rustPlatform.buildRustPackage",
+        "dash_name": 'pkgs.haskellPackages.callCabal2nix "example" ./.',
+        "custom": "import ./builder.nix",
+    }
+    for name, builder in builders.items():
         package = root / name
+        package.mkdir()
         (package / "default.nix").write_text(
-            f"{{ inputs, pkgs, ... }}: {builder} {{ "
-            'meta.description = "Generic package"; }\n',
+            f"{{ pkgs, ... }}: {builder} {{}}\n",
+        )
+        (package / "test_main.nix").write_text(
+            "{ testBuilds = { expr = 1; expected = 1; }; }"
         )
         (package / "__init__.py").write_text("VALUE = 42\n")
         (package / "main.py").write_text("not valid Python!\n")
@@ -389,21 +390,12 @@ def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
         for marker in ("main.lean", "ms.tex", "index.html"):
             (package / marker).write_text("Supporting source\n")
     _git(root, "add", ".")
-    before = _snapshot(root)
     inspection_subject.validate_flake_source(root)
     report = json.loads(_run(root).stdout)
-    _expect(
-        report
-        == {
-            name: {"type": "generic", "description": "Generic package"}
-            for name in ("class", "dash-name", "dash_name")
-        },
-        report,
-    )
-    _expect(_snapshot(root) == before, "generic packages were rewritten")
+    _expect(report == {name: ["testBuilds"] for name in builders}, report)
 
 
-def test_python_test_inventory_matches_the_functions_and_methods_collected_by_pytest(
+def test_python_names_match_the_functions_and_methods_collected_by_pytest(
     tmp_path: Path,
 ) -> None:
     """Use pytest's collection as the oracle for ordinary and unittest test names."""
@@ -464,13 +456,15 @@ class AsyncReports(AsyncBase):
     collected = sorted(
         line.split("::", 1)[1] for line in result.stdout.splitlines() if "::" in line
     )
-    declared = inspection_subject.inspect_repository(tmp_path)["example"]["tests"]
+    declared = json.loads(_run(tmp_path, str(tmp_path)).stdout)["example"]
     _expect(declared == collected, (declared, collected))
 
 
-@pytest.mark.parametrize(
-    ("kind", "name"),
-    [
+def test_specification_preserves_package_names_and_omits_standalone_hosts(
+    root: Path,
+) -> None:
+    """Keep each package's exact spelling in a mixed repository."""
+    packages = [
         ("python", "Mixed_Name-v2"),
         ("python", "double--dash"),
         ("python", "_Private"),
@@ -479,866 +473,13 @@ class AsyncReports(AsyncBase):
         ("lean4", "Proof_Library-v2"),
         ("generic", "Package Name"),
         ("generic", "δοκιμή"),
-        ("host", "workLaptop"),
-    ],
-)
-def test_inventory_preserves_the_spelling_of_package_and_host_names(
-    root: Path, kind: str, name: str
-) -> None:
-    """Validate and inspect names without a shared style rule."""
-    _fixture_add(root, name, kind)
-    before = _snapshot(root)
+    ]
+    for kind, name in packages:
+        _fixture_add(root, name, kind)
+    _fixture_add(root, "workLaptop", "host")
     inspection_subject.validate_flake_source(root)
     report = json.loads(_run(root).stdout)
-    _expect(report[name]["type"] == kind, report)
-    _expect(_snapshot(root) == before, "validation changed resource spelling")
-
-
-@pytest.mark.parametrize("description", [None, "package"])
-def test_package_metadata_excludes_dependency_descriptions(
-    tmp_path: Path,
-    description: str | None,
-) -> None:
-    """Read only the returned package's description, including curried builders."""
-    metadata = "" if description is None else f'meta.description = "{description}";'
-    source = (
-        '{ pkgs }: let dependency = { meta.description = "dependency"; }; '
-        f'in pkgs.runCommand "example" {{ {metadata} }} "touch $out"'
-    )
-    (tmp_path / "flake.nix").touch()
-    package = tmp_path / "example"
-    package.mkdir()
-    (package / "default.nix").write_text(source)
-    resource = json.loads(_run(tmp_path, str(tmp_path)).stdout)["example"]
-    expected = {"type": "generic"}
-    if description is not None:
-        expected["description"] = description
-    _expect(resource == expected, resource)
-
-
-def _inspection_discovery(source: str) -> dict[str, Any]:
-    return inspection_subject.ArgumentDiscovery(source).report()
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "raise RuntimeError('do not execute')\ndef main(): pass",
-        "import sys\ndef main(): return sys.version",
-        "from .argparse import *\ndef main(): pass",
-        "if __name__ == '__main__':\n    import argparse\ndef main(): pass",
-        """
-import argparse
-def main():
-    argparse.ArgumentParser().parse_args()
-""",
-    ],
-)
-def test_argument_free_executables_have_an_empty_argument_list(
-    tmp_path: Path, source: str
-) -> None:
-    """Argument-free scripts need no parser and remain statically inspectable."""
-    _inspection_repository(tmp_path)
-    (tmp_path / "example/main.py").write_text(source)
-    completed = _run(tmp_path, str(tmp_path))
-    resource = json.loads(completed.stdout)["example"]
-    _expect(resource["arguments"] == [] and "commands" not in resource, resource)
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        "import argparse",
-        "from argparse import *\ndef main(): pass",
-        "import argparse\ndef unused(): return argparse.ArgumentParser()",
-        """\
-import argparse
-def main():
-    argparse.ArgumentParser().parse_args()
-from replacement import main
-""",
-        """
-import argparse
-import sys
-def main():
-    preview = argparse.ArgumentParser()
-    preview.add_argument('--preview')
-    return sys.argv[1:]
-""",
-        "import click\n@click.command()\ndef main(): pass",
-        "import typer\napp = typer.Typer()",
-        "import sys\ndef main(): return sys.argv[1:]",
-        "import sys as system\ndef main(): return system.argv[1:]",
-        "from sys import argv as args\ndef main(): return args[1:]",
-    ],
-)
-def test_afairesi_reports_an_error_for_python_clis_it_cannot_identify(
-    tmp_path: Path, source: str
-) -> None:
-    """Fail inspection when a Python package's interface cannot be discovered."""
-    _inspection_repository(tmp_path)
-    path = tmp_path / "example/main.py"
-    path.write_text(source)
-    completed = _run(tmp_path, str(tmp_path), code=1)
-    _expect(completed.stdout == "", completed)
-    _expect(
-        f"{path}: cannot inspect CLI: no supported parser found" in completed.stderr,
-        completed,
-    )
-
-
-def test_cli_arguments_are_listed_under_the_command_that_accepts_them() -> None:
-    """Resolve aliases, returned parsers, groups, and helper contexts."""
-    report = _inspection_discovery("""
-import argparse as ap
-def configure(cli):
-    group = cli.add_mutually_exclusive_group()
-    group.add_argument("--quiet", action="store_true")
-def parser():
-    cli = ap.ArgumentParser()
-    cli.add_argument("input", type=str)
-    subs = cli.add_subparsers(dest="command")
-    build = subs.add_parser("build")
-    build.add_argument("-j", "--jobs", type=int, default=2, choices=[1, 2])
-    configure(build)
-    return cli
-def main():
-    parser().parse_args()
-""")
-    _expect(list(report["commands"]) == ["build"], "lost subcommand")
-    _expect(
-        report["arguments"] == [{"names": ["input"], "type": "str"}],
-        "wrong positional scope",
-    )
-    rows = {
-        tuple(row["names"]): row for row in report["commands"]["build"]["arguments"]
-    }
-    _expect(
-        rows[("-j", "--jobs")]
-        == {"names": ["-j", "--jobs"], "type": "int", "default": 2, "choices": [1, 2]},
-        "lost metadata",
-    )
-    _expect(
-        rows[("--quiet",)] == {"names": ["--quiet"], "action": "store_true"},
-        "lost helper context",
-    )
-
-
-def test_cli_reports_preserve_nested_and_argument_free_commands() -> None:
-    """Keep empty commands and arguments with the same name in distinct scopes."""
-    report = _inspection_discovery("""
-import argparse
-cli = argparse.ArgumentParser()
-cli.add_argument("--verbose", action="store_true")
-commands = cli.add_subparsers()
-commands.add_parser("version")
-remote = commands.add_parser("remote")
-remote.add_argument("--verbose", action="count")
-subcommands = remote.add_subparsers()
-subcommands.add_parser("list")
-add = subcommands.add_parser("add")
-add.add_argument("url")
-cli.parse_args()
-""")
-    _expect(
-        report
-        == {
-            "arguments": [
-                {"names": ["--verbose"], "action": "store_true"},
-            ],
-            "commands": {
-                "version": {},
-                "remote": {
-                    "arguments": [
-                        {"names": ["--verbose"], "action": "count"},
-                    ],
-                    "commands": {
-                        "list": {},
-                        "add": {"arguments": [{"names": ["url"]}]},
-                    },
-                },
-            },
-        },
-        "command tree lost scope or empty commands",
-    )
-
-
-def test_unresolved_argument_metadata_is_marked_as_unknown() -> None:
-    """Keep unresolved metadata when argument names and scope are known."""
-    report = _inspection_discovery("""
-from argparse import ArgumentParser as Parser
-cli = Parser()
-cli.add_argument("--output", default=compute_default(), **options)
-cli.parse_args()
-""")
-    argument = report["arguments"][0]
-    _expect(
-        argument["default"] == {"unknown": "compute_default()"},
-        "default was guessed",
-    )
-    _expect(
-        argument["**kwargs"] == {"unknown": "options"},
-        "unresolved kwargs were hidden",
-    )
-
-
-@pytest.mark.parametrize(
-    "declaration",
-    [
-        'if enabled:\n    cli.add_argument("--token")',
-        'for item in items:\n    cli.add_argument("--token")',
-        'while enabled:\n    cli.add_argument("--token")',
-        '[cli.add_argument("--token") for item in items]',
-        (
-            'def configure(target):\n    target.add_argument("--token")\n'
-            "if enabled:\n    configure(cli)"
-        ),
-        'if enabled:\n    target = cli\ntarget.add_argument("--token")',
-    ],
-)
-def test_cli_discovery_rejects_arguments_whose_presence_depends_on_runtime_values(
-    declaration: str,
-) -> None:
-    """Reject uncertain argument membership, including helper and alias dependencies."""
-    source = (
-        "import argparse\ncli = argparse.ArgumentParser()\n"
-        f"{declaration}\ncli.parse_args()"
-    )
-    with pytest.raises(
-        inspection_subject.CommandError,
-        match="unresolved control flow",
-    ):
-        _inspection_discovery(source)
-
-
-@pytest.mark.parametrize(
-    "configure",
-    [
-        "configure(cli)",
-        "helpers.configure(target=cli)",
-        'configure({"parser": cli})',
-        'settings = {"parser": cli}\nconfigure(settings)',
-        'add = cli.add_argument\nadd("--token")',
-        "def configure(*parsers): pass\nconfigure(cli)",
-        "cli.customize()",
-    ],
-)
-def test_cli_discovery_fails_when_argument_configuration_cannot_be_resolved(
-    configure: str,
-) -> None:
-    """Fail when parser flow escapes the supported helper and method patterns."""
-    source = (
-        "import argparse\ncli = argparse.ArgumentParser()\n"
-        f"{configure}\ncli.parse_args()"
-    )
-    with pytest.raises(inspection_subject.CommandError, match="cannot inspect CLI"):
-        _inspection_discovery(source)
-
-
-def test_cli_discovery_rejects_executables_with_multiple_public_parsers() -> None:
-    """Require an unambiguous root instead of merging distinct command interfaces."""
-    source = """
-import argparse
-one = argparse.ArgumentParser()
-one.add_argument('--one')
-two = argparse.ArgumentParser()
-two.add_argument('--two')
-def main():
-    one.parse_args()
-    two.parse_args()
-"""
-    with pytest.raises(
-        inspection_subject.CommandError,
-        match="multiple public parsers",
-    ):
-        _inspection_discovery(source)
-
-
-def test_statically_declared_cli_arguments_appear_in_order() -> None:
-    """Resolve literal branches and preserve the order of finite literal loops."""
-    report = _inspection_discovery("""
-import argparse
-cli = argparse.ArgumentParser()
-if True:
-    cli.add_argument('--enabled')
-else:
-    cli.add_argument('--disabled')
-for name in ('--one', '--two'):
-    cli.add_argument(name, default=compute_default())
-for name in []:
-    cli.add_argument(name)
-cli.parse_args()
-""")
-    _expect(
-        report
-        == {
-            "arguments": [
-                {"names": ["--enabled"]},
-                {"names": ["--one"], "default": {"unknown": "compute_default()"}},
-                {"names": ["--two"], "default": {"unknown": "compute_default()"}},
-            ],
-        },
-        report,
-    )
-
-
-def test_cli_reports_describe_the_imported_entry_point() -> None:
-    """Report only the options available through the package's installed launcher."""
-    report = _inspection_discovery("""
-import argparse
-cli = argparse.ArgumentParser()
-if __name__ == '__main__':
-    cli.add_argument('--script-only')
-if __name__ != '__main__':
-    cli.add_argument('--public')
-def main():
-    cli.parse_args()
-""")
-    _expect(report == {"arguments": [{"names": ["--public"]}]}, report)
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "(process(path) for path in cli.parse_args().files)",
-        "[process(path) for path in cli.parse_args().files]",
-        "{process(path) for path in cli.parse_args().files}",
-        "{path: process(path) for path in cli.parse_args().files}",
-    ],
-)
-def test_cli_reports_include_arguments_read_as_input_to_a_comprehension(
-    expression: str,
-) -> None:
-    """Recognize a parser consumed while evaluating the first comprehension iterable."""
-    report = _inspection_discovery(
-        """
-import argparse
-def main():
-    cli = argparse.ArgumentParser()
-    cli.add_argument('files', nargs='+')
-    results = EXPRESSION
-""".replace("EXPRESSION", expression),
-    )
-    _expect(report == {"arguments": [{"names": ["files"], "nargs": "+"}]}, report)
-
-
-@pytest.mark.parametrize(
-    "expression",
-    [
-        "(cli.parse_args() for item in items)",
-        "(item for item in items if cli.parse_args())",
-        "(item for item in items for path in cli.parse_args().files)",
-    ],
-)
-def test_cli_discovery_rejects_conditional_argument_parsing_inside_comprehensions(
-    expression: str,
-) -> None:
-    """Reject parser consumption that depends on comprehension iterations or filters."""
-    source = """
-import argparse
-def main():
-    cli = argparse.ArgumentParser()
-    cli.add_argument('files', nargs='+')
-    results = EXPRESSION
-""".replace("EXPRESSION", expression)
-    with pytest.raises(
-        inspection_subject.CommandError,
-        match="unresolved control flow",
-    ):
-        _inspection_discovery(source)
-
-
-@pytest.mark.parametrize(
-    "loop",
-    [
-        "for path in cli.parse_args().files:\n        process(path)",
-        "while cli.parse_args().files:\n        break",
-    ],
-)
-def test_cli_reports_include_arguments_read_before_a_loop_body_runs(loop: str) -> None:
-    """Loop iterables and initial while conditions execute before their bodies."""
-    report = _inspection_discovery(
-        """
-import argparse
-def main():
-    cli = argparse.ArgumentParser()
-    cli.add_argument('files', nargs='+')
-    LOOP
-""".replace("LOOP", loop),
-    )
-    _expect(report == {"arguments": [{"names": ["files"], "nargs": "+"}]}, report)
-
-
-def test_cli_reports_preserve_argument_groups_exclusivity_and_defaults() -> None:
-    """Expose group membership, exclusivity, and defaults in the correct command."""
-    report = _inspection_discovery("""
-import argparse
-cli = argparse.ArgumentParser()
-run = cli.add_subparsers().add_parser('run')
-options = run.add_argument_group('Credentials', 'Choose an identity')
-identity = options.add_mutually_exclusive_group(required=True)
-identity.add_argument('--token')
-identity.add_argument('--password')
-run.set_defaults(token='anonymous', password=compute_default())
-cli.parse_args()
-""")
-    command = report["commands"]["run"]
-    _expect(
-        command
-        == {
-            "arguments": [{"names": ["--token"]}, {"names": ["--password"]}],
-            "groups": [
-                {
-                    "arguments": [["--token"], ["--password"]],
-                    "exclusive": False,
-                    "title": "Credentials",
-                    "description": "Choose an identity",
-                },
-                {
-                    "arguments": [["--token"], ["--password"]],
-                    "exclusive": True,
-                    "required": True,
-                },
-            ],
-            "defaults": {
-                "token": "anonymous",
-                "password": {"unknown": "compute_default()"},
-            },
-        },
-        command,
-    )
-
-
-@pytest.mark.parametrize(
-    ("entrypoint", "method"),
-    [
-        ("def main(): start()", "parse_args"),
-        ("start()", "parse_intermixed_args"),
-        ("run = start\nmain = run", "parse_known_intermixed_args"),
-        (
-            "def main(): internal.parse_args()\nclass main: pass\nstart()\nmain()",
-            "parse_args",
-        ),
-        ("def main(): start()\nmain()\ndel main", "parse_args"),
-    ],
-)
-def test_cli_reports_omit_arguments_unreachable_from_the_entrypoint(
-    entrypoint: str, method: str
-) -> None:
-    """Follow the executable entry point and ignore an uncalled parser factory."""
-    source = f"""
-import argparse
-cli = argparse.ArgumentParser()
-internal = argparse.ArgumentParser()
-internal.add_argument('--internal')
-def run():
-    private = argparse.ArgumentParser()
-    other.add_argument('--unused')
-    return private
-def start():
-    cli.add_argument('--public')
-    try:
-        cli.{method}()
-    except ValueError:
-        cli.error('invalid input')
-"""
-    report = _inspection_discovery(source + entrypoint)
-    _expect(report == {"arguments": [{"names": ["--public"]}]}, report)
-
-
-@pytest.mark.parametrize(
-    ("source", "reason"),
-    [
-        (
-            "cli = argparse.ArgumentParser()\nother.add_parser('external')",
-            "cannot resolve the subcommand parser",
-        ),
-        ("cli = other", "cannot resolve the public argparse parser"),
-        ("cli = argparse.ArgumentParser(**options)", "literal mapping"),
-        ("cli = argparse.ArgumentParser(**{str: []})", "literal mapping"),
-        (
-            "cli = argparse.ArgumentParser()\ncli.add_subparsers(**options)",
-            "literal mapping",
-        ),
-        (
-            (
-                "cli = argparse.ArgumentParser()\n"
-                "cli.add_subparsers().add_parser('run', **options)"
-            ),
-            "literal mapping",
-        ),
-        (
-            (
-                "from helpers import CustomParser\ncli = argparse.ArgumentParser()\n"
-                "cli.add_subparsers(parser_class=CustomParser).add_parser('run')"
-            ),
-            "custom subcommand parser",
-        ),
-        (
-            "cli = argparse.ArgumentParser()\ncli.add_argument(**options)",
-            "argument names must be literal strings",
-        ),
-        (
-            "cli = argparse.ArgumentParser(parents=[shared])",
-            "argparse parents= inheritance is not supported",
-        ),
-        (
-            (
-                "cli = argparse.ArgumentParser()\n"
-                'cli.add_subparsers().add_parser("run", parents=[shared])'
-            ),
-            "argparse parents= inheritance is not supported",
-        ),
-        (
-            "cli = argparse.ArgumentParser()\ncli.add_argument(*names)",
-            "argument names must be literal strings",
-        ),
-        (
-            "cli = argparse.ArgumentParser()\ncli.add_subparsers().add_parser(name)",
-            "subcommand name must be a literal string",
-        ),
-        (
-            (
-                "cli = argparse.ArgumentParser()\ncli.add_subparsers()"
-                '.add_parser("list", aliases=names)'
-            ),
-            "subcommand aliases must be literal strings",
-        ),
-    ],
-)
-def test_cli_discovery_errors_identify_the_unresolved_expression_and_its_location(
-    source: str, reason: str
-) -> None:
-    """Fail discovery with source context instead of a partial successful report."""
-    with pytest.raises(
-        inspection_subject.CommandError,
-        match=re.escape(reason),
-    ) as error:
-        inspection_subject.ArgumentDiscovery(
-            f"import argparse\n{source}\ncli.parse_args()",
-            "example/main.py",
-        ).report()
-    _expect(
-        re.search(r"example/main.py:\d+:\d+:", str(error.value)) is not None,
-        "missing source location",
-    )
-    _expect("\n  " in str(error.value), "missing offending expression")
-
-
-@pytest.mark.parametrize("constructor", ["argparse.ArgumentParser()", "Parser()"])
-def test_cli_discovery_rejects_argparse_interfaces_defined_in_class_methods(
-    constructor: str,
-) -> None:
-    """Do not report a class-based CLI as an empty successful interface."""
-    source = f"""
-import argparse
-from argparse import ArgumentParser as Parser
-class CLI:
-    def run(self):
-        cli = {constructor}
-        cli.add_argument('--token', required=True)
-        cli.parse_args()
-def main():
-    CLI().run()
-"""
-    with pytest.raises(inspection_subject.CommandError, match="class-based argparse"):
-        _inspection_discovery(source)
-
-
-def test_subcommand_options_stay_separate_when_helpers_share_a_name() -> None:
-    """Resolve captured and passed parsers in same-named nested helpers."""
-    source = """
-import argparse
-def configure_one(cli):
-    def configure():
-        cli.add_argument('--one')
-    configure()
-def configure_two(cli):
-    def configure(target):
-        target.add_argument('--two')
-    configure(cli)
-def parser():
-    cli = argparse.ArgumentParser()
-    commands = cli.add_subparsers()
-    configure_one(commands.add_parser('one'))
-    configure_two(commands.add_parser('two'))
-    return cli
-def main():
-    parser().parse_args()
-"""
-    report = _inspection_discovery(source)
-    _expect(
-        report
-        == {
-            "commands": {
-                "one": {"arguments": [{"names": ["--one"]}]},
-                "two": {"arguments": [{"names": ["--two"]}]},
-            },
-        },
-        report,
-    )
-
-
-def test_cli_discovery_rejects_conflicting_definitions_of_an_argument_helper() -> None:
-    """Retain an explicit failure when helper definitions remain ambiguous."""
-    with pytest.raises(inspection_subject.CommandError, match="ambiguous helper"):
-        _inspection_discovery("""
-import argparse
-def configure(cli):
-    cli.add_argument('--first')
-def configure(cli):
-    cli.add_argument('--second')
-def main():
-    cli = argparse.ArgumentParser()
-    configure(cli)
-    cli.parse_args()
-""")
-
-
-def test_unrelated_imports_do_not_change_the_reported_cli() -> None:
-    """Keep an unrelated factory alias from replacing the CLI constructor."""
-    report = _inspection_discovery("""
-def parser():
-    from argparse import ArgumentParser as Factory
-    return Factory()
-def unrelated():
-    from argparse import Namespace as Factory
-    return Factory()
-def main():
-    cli = parser()
-    cli.add_argument('--public')
-    cli.parse_args()
-""")
-    _expect(
-        report == {"arguments": [{"names": ["--public"]}]},
-        report,
-    )
-
-
-def test_cli_discovery_finds_public_arguments_despite_unrelated_recursive_calls(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Inspect recursive helpers without enumerating every route through a cycle."""
-    calls = "    recurse(value)\n" * 12
-    discovery = inspection_subject.ArgumentDiscovery(
-        "import argparse\ndef recurse(value):\n" + calls + "    return value\n"
-        "def main():\n"
-        "    cli = argparse.ArgumentParser()\n"
-        "    recurse('unrelated')\n"
-        "    cli.add_argument('--public')\n"
-        "    cli.parse_args()\n",
-    )
-    original = discovery._bindings  # noqa: SLF001 - Bound graph traversal work without timing-dependent assertions.
-    visits = 0
-    limit = 2000
-
-    def bindings(node: ast.Name) -> list[ast.expr]:
-        nonlocal visits
-        visits += 1
-        _expect(visits <= limit, "repeated recursive binding traversal")
-        return original(node)
-
-    monkeypatch.setattr(discovery, "_bindings", bindings)
-    report = discovery.report()
-    _expect(
-        report == {"arguments": [{"names": ["--public"]}]},
-        report,
-    )
-
-
-def test_parsers_returned_by_recursive_helpers_keep_their_public_arguments() -> None:
-    """Keep parser-bearing cycles reachable while excluding unrelated cycles."""
-    report = _inspection_discovery("""
-import argparse
-def forward(value):
-    forward(value)
-    return value
-def main():
-    cli = forward(argparse.ArgumentParser())
-    cli.add_argument('--public')
-    cli.parse_args()
-""")
-    _expect(
-        report == {"arguments": [{"names": ["--public"]}]},
-        report,
-    )
-
-
-@pytest.mark.parametrize(
-    "source",
-    [
-        """
-from argparse import ArgumentParser
-def main(ArgumentParser):
-    cli = ArgumentParser()
-    cli.add_argument('--unknown')
-    cli.parse_args()
-""",
-        """
-import argparse
-argparse = external_module
-cli = argparse.ArgumentParser()
-cli.add_argument('--unknown')
-cli.parse_args()
-""",
-        """
-from argparse import ArgumentParser
-ArgumentParser = external_factory
-cli = ArgumentParser()
-cli.add_argument('--unknown')
-cli.parse_args()
-""",
-    ],
-)
-def test_cli_discovery_rejects_parsers_whose_argparse_import_has_been_shadowed(
-    source: str,
-) -> None:
-    """Do not treat reassigned names or parameters as their shadowed imports."""
-    with pytest.raises(inspection_subject.CommandError, match="cannot resolve"):
-        _inspection_discovery(source)
-
-
-def test_cli_discovery_rejects_external_replacements_for_argument_helpers() -> None:
-    """An opaque callable must not inherit the interface of a replaced helper."""
-    with pytest.raises(inspection_subject.CommandError, match="external helper"):
-        _inspection_discovery("""
-import argparse
-def configure(cli):
-    cli.add_argument('--hidden')
-configure = external_helper
-def main():
-    cli = argparse.ArgumentParser()
-    configure(cli)
-    cli.parse_args()
-""")
-
-
-@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
-def test_cli_reports_preserve_unicode_arguments_across_line_endings(
-    newline: str,
-) -> None:
-    """Match AST byte columns to LibCST names across Unicode and line endings."""
-    source = """import argparse
-def main():
-    label = 'é\u2028'; cli = argparse.ArgumentParser()
-    cli.add_argument('--résumé', default=label)
-    cli.parse_args()
-""".replace("\n", newline)
-    report = _inspection_discovery(source)
-    _expect(
-        report
-        == {
-            "arguments": [
-                {"names": ["--résumé"], "default": {"unknown": "label"}},
-            ],
-        },
-        report,
-    )
-
-
-def test_cli_reports_read_option_names_and_defaults_in_the_declared_python_encoding(
-    root: Path,
-) -> None:
-    """Respect the Python encoding declaration in validation and CLI discovery."""
-    _fixture_add(root, "example", "python")
-    (root / "example/main.py").write_bytes(
-        """# coding: latin-1
-import argparse
-label = 'é'; cli = argparse.ArgumentParser()
-cli.add_argument('--résumé', default='é')
-cli.parse_args()
-""".encode("latin-1")
-    )
-    inspection_subject.validate_flake_source(root)
-    resource = json.loads(_run(root).stdout)["example"]
-    _expect(
-        resource["arguments"] == [{"names": ["--résumé"], "default": "é"}], resource
-    )
-
-
-def test_command_aliases_expose_the_same_interface_as_their_canonical_command() -> None:
-    """Expose aliases with the same interface as their canonical command."""
-    report = _inspection_discovery("""
-import argparse
-cli = argparse.ArgumentParser(**{'parents': []})
-commands = cli.add_subparsers()
-listing = commands.add_parser(name='list', **{'aliases': ['ls']})
-listing.add_argument('--all', action='store_true')
-listing.add_subparsers().add_parser('files', aliases=['f'])
-cli.parse_args()
-""")
-    _expect(set(report["commands"]) == {"list", "ls"}, "missing alias")
-    listing = report["commands"]["list"]
-    _expect(listing == report["commands"]["ls"], "alias interface differs")
-    _expect(
-        listing["arguments"]
-        == [
-            {"names": ["--all"], "action": "store_true"},
-        ],
-        "lost alias arguments",
-    )
-    _expect(
-        set(listing["commands"]) == {"files", "f"},
-        "missing nested alias",
-    )
-
-
-def test_cli_reports_preserve_required_arguments_declared_by_helpers() -> None:
-    """Follow returned constructors and keyword helper arguments."""
-    report = _inspection_discovery("""
-from argparse import ArgumentParser
-def configure(target):
-    target.add_argument("--required", required=True)
-def parser():
-    return ArgumentParser()
-def main():
-    cli = parser()
-    configure(target=cli)
-    cli.parse_args()
-""")
-    _expect(
-        report["arguments"] == [{"names": ["--required"], "required": True}],
-        "factory or keyword binding was lost",
-    )
-
-
-@pytest.mark.parametrize("entrypoint", ["parser().parse_args()", "parse(parser())"])
-def test_cli_reports_exclude_internal_commands_and_arguments(
-    entrypoint: str,
-) -> None:
-    """Select the parser consumed by main while retaining its configured helpers."""
-    source = """
-import argparse
-class Internal:
-    def parser(self):
-        cli = argparse.ArgumentParser()
-        cli.add_argument("--class-internal")
-        return cli
-def configure(cli):
-    cli.add_argument("--shared")
-def formatter_main():
-    cli = argparse.ArgumentParser()
-    configure(cli)
-    cli.add_argument("--source")
-    cli.add_subparsers().add_parser("internal")
-    cli.parse_args()
-def parser():
-    cli = argparse.ArgumentParser()
-    configure(cli)
-    cli.add_argument("--public")
-    cli.add_subparsers().add_parser("repo")
-    return cli
-def main():
-    ENTRYPOINT
-def parse(cli):
-    cli.parse_args()
-"""
-    report = _inspection_discovery(source.replace("ENTRYPOINT", entrypoint))
-    _expect(
-        [row["names"] for row in report["arguments"]] == [["--shared"], ["--public"]],
-        "internal parser arguments leaked into the public CLI",
-    )
-    _expect(list(report["commands"]) == ["repo"], "internal command leaked")
+    _expect(report == {name: [] for _, name in packages}, report)
 
 
 def _inspection_repository(root: Path) -> None:
@@ -1352,14 +493,8 @@ def _inspection_repository(root: Path) -> None:
     )
     (package / "main.py").write_text(
         """
-import argparse
 raise RuntimeError("inspection must not execute this")
-def parser():
-    cli = argparse.ArgumentParser()
-    cli.add_argument("--output", default="result")
-    return cli
-def main():
-    parser().parse_args()
+def main(): pass
 """,
     )
     (package / "test_main.py").write_text(
@@ -1368,57 +503,30 @@ raise RuntimeError("inspection must not collect or run tests")
 def test_default_output(): pass
 """,
     )
-    host = root / "laptop"
-    host.mkdir(parents=True)
-    (host / "configuration.nix").touch()
     library = root / "library"
     library.mkdir()
     (library / "default.nix").write_text("{}")
 
 
-def test_a_package_enters_the_inventory_when_git_tracks_its_declaration(
+def test_package_names_follow_their_tracked_declarations(
     root: Path,
 ) -> None:
-    """Discover a package when its declaration joins its tracked supporting files."""
-    storage = root / "tmp"
-    storage.mkdir()
-    (storage / "default.nix").write_text("{}")
-    (storage / "main.py").write_text("def main(): pass\n")
-    _git(root, "add", "--force", "--", "tmp/main.py")
-    before = inspection_subject.inspect_repository(root)
-    _expect(before == {}, before)
-    _git(root, "add", "--force", "--", "tmp/default.nix")
-    after = inspection_subject.inspect_repository(root)
-    _expect(after == {"tmp": {"type": "generic"}}, after)
-
-
-def test_inventory_lists_hosts_and_packages_without_running_or_modifying_source(
-    tmp_path: Path,
-) -> None:
-    """Inspect source containing failing statements without executing or writing."""
-    _inspection_repository(tmp_path)
-    before = _snapshot(tmp_path)
-    report = inspection_subject.inspect_repository(tmp_path)
-    _expect(_snapshot(tmp_path) == before, "inspection wrote to the repository")
-    _expect(list(report) == ["example", "laptop", "library"], report)
-    _expect(report["example"]["type"] == "python", report)
-    _expect(
-        set(report["example"]) == {"type", "description", "arguments", "tests"},
-        report,
+    """Publish a tracked package and carry its test names through a rename."""
+    package = root / "draft"
+    package.mkdir()
+    (package / "default.nix").write_text("{}")
+    (package / "test_main.nix").write_text(
+        "{ testDelivers = { expr = 1; expected = 1; }; }"
     )
-    _expect(
-        report["laptop"] == {"type": "host"},
-        "wrong hosts",
-    )
-    _expect(
-        report["library"] == {"type": "generic"},
-        "empty optional fields leaked into the package inventory",
-    )
-    _expect(report["example"]["tests"] == ["test_default_output"], report)
-    _expect(report["example"]["description"] == "Example", report)
+    _git(root, "add", "--", "draft/test_main.nix")
+    _expect(json.loads(_run(root).stdout) == {}, "untracked declaration was listed")
+    _git(root, "add", "--", "draft/default.nix")
+    _expect(json.loads(_run(root).stdout) == {"draft": ["testDelivers"]}, package)
+    _git(root, "mv", "--", "draft", "inbox")
+    _expect(json.loads(_run(root).stdout) == {"inbox": ["testDelivers"]}, root)
 
 
-def test_library_inventory_includes_metadata_and_tests_without_a_cli(
+def test_library_tests_are_listed_even_when_main_requires_arguments(
     tmp_path: Path,
 ) -> None:
     """Only executables require a main function callable without arguments."""
@@ -1429,28 +537,18 @@ def test_library_inventory_includes_metadata_and_tests_without_a_cli(
     definition.write_text(
         """
 { inputs, pkgs, ... }:
-let python = pkgs.python3;
-in inputs.self.lib.mkPythonPackage {
+let options = {
     inherit pkgs;
     executable = false;
-    meta.description = "Python library";
     src = ./.;
-}
+}; in inputs.self.lib.mkPythonPackage options
 """,
     )
     source = package / "main.py"
     source.write_text(source.read_text().replace("def main():", "def main(values):"))
     inspection_subject.validate_flake_source(tmp_path)
     report = inspection_subject.inspect_repository(tmp_path)["example"]
-    _expect(
-        report
-        == {
-            "type": "python",
-            "description": "Python library",
-            "tests": ["test_default_output"],
-        },
-        report,
-    )
+    _expect(report == ["test_default_output"], report)
     definition.write_text(
         definition.read_text().replace("executable = false", "executable = true")
     )
@@ -1461,104 +559,15 @@ in inputs.self.lib.mkPythonPackage {
         inspection_subject.validate_flake_source(tmp_path)
 
 
-def test_the_package_executable_setting_determines_whether_to_list_its_cli(
-    tmp_path: Path,
-) -> None:
-    """Read executable metadata from the outer package rather than dependencies."""
-    _inspection_repository(tmp_path)
-    (tmp_path / "example/default.nix").write_text(
-        """
-{ inputs, pkgs, ... }:
-let dependency = { executable = false; };
-in inputs.self.lib.mkPythonPackage {
-    inherit pkgs;
-    executable = true;
-    src = ./.;
-}
-""",
-    )
-    report = inspection_subject.inspect_repository(tmp_path)["example"]
-    _expect(
-        report["arguments"] == [{"names": ["--output"], "default": "result"}],
-        report,
-    )
-
-
-def test_afairesi_reports_cli_errors_on_stderr_without_emitting_partial_json(
-    tmp_path: Path,
-) -> None:
-    """Surface discovery errors on stderr with a failing status and no JSON output."""
-    _inspection_repository(tmp_path)
-    source = tmp_path / "example/main.py"
-    source.write_text("import argparse\nother.add_argument('--missing')\n")
-    completed = _run(tmp_path, str(tmp_path), code=1)
-    _expect(completed.stdout == "", completed)
-    _expect(f"{source}:2:1: cannot inspect CLI:" in completed.stderr, completed)
-    _expect("cannot resolve the argument parser" in completed.stderr, completed)
-    _expect("other.add_argument('--missing')" in completed.stderr, completed)
-    _expect("Traceback" not in completed.stderr, completed)
-
-
-def test_cli_reports_preserve_empty_commands_and_falsy_argument_defaults(
-    tmp_path: Path,
-) -> None:
-    """Keep empty commands, aliases, and literal defaults when pruning containers."""
-    _inspection_repository(tmp_path)
-    (tmp_path / "example/main.py").write_text(
-        """
-import argparse
-cli = argparse.ArgumentParser()
-commands = cli.add_subparsers()
-commands.add_parser('empty', aliases=['e'])
-cli.set_defaults(scope='root')
-run = commands.add_parser('run')
-run.add_argument('--values', default=[])
-run.add_argument('--mapping', default={})
-run.add_argument('--optional', default=None)
-run.add_argument('--enabled', default=False)
-run.add_argument('--count', default=0)
-run.add_argument('--name', default='')
-run.set_defaults(internal=None)
-cli.parse_args()
-""",
-    )
-    report = inspection_subject.inspect_repository(tmp_path)["example"]
-    _expect(
-        report
-        == {
-            "type": "python",
-            "description": "Example",
-            "tests": ["test_default_output"],
-            "defaults": {"scope": "root"},
-            "commands": {
-                "empty": {},
-                "e": {},
-                "run": {
-                    "arguments": [
-                        {"names": ["--values"], "default": []},
-                        {"names": ["--mapping"], "default": {}},
-                        {"names": ["--optional"], "default": None},
-                        {"names": ["--enabled"], "default": False},
-                        {"names": ["--count"], "default": 0},
-                        {"names": ["--name"], "default": ""},
-                    ],
-                    "defaults": {"internal": None},
-                },
-            },
-        },
-        report,
-    )
-
-
 @pytest.mark.parametrize("in_git", [False, True], ids=["outside", "git"])
-def test_afairesi_prints_the_current_repository_inventory_by_default_or_by_path(
+def test_afairesi_prints_package_test_names_by_default_or_by_path(
     tmp_path: Path,
     *,
     in_git: bool,
 ) -> None:
-    """Return the same JSON inventory through supported paths inside and outside Git."""
+    """Print the same package specification from Git and exported directories."""
     _inspection_repository(tmp_path)
-    expected = inspection_subject.inspect_repository(tmp_path)
+    expected = {"example": ["test_default_output"], "library": []}
     nested = tmp_path / "example"
     if in_git:
         _git(tmp_path, "init", "--quiet")
@@ -1574,22 +583,24 @@ def test_afairesi_prints_the_current_repository_inventory_by_default_or_by_path(
         _expect(not completed.stdout, completed)
         _expect("not inside a Git repository" in completed.stderr, completed)
         calls = [(tmp_path, ["."]), (nested, [str(tmp_path)])]
+    before = _snapshot(tmp_path)
     for cwd, arguments in calls:
         completed = _run(cwd, *arguments)
         _expect(
             json.loads(completed.stdout) == expected,
-            "path resolution changed the CLI inventory",
+            "path resolution changed the package specification",
         )
+    _expect(_snapshot(tmp_path) == before, "inspection wrote to the repository")
 
 
-def test_inventory_reports_a_missing_flake_or_malformed_python_source(
+def test_specification_reports_a_missing_flake_or_malformed_test_suite(
     tmp_path: Path,
 ) -> None:
     """Report invalid repositories and malformed source with useful errors."""
     with pytest.raises(inspection_subject.CommandError, match=r"flake\.nix"):
         inspection_subject.inspect_repository(tmp_path)
     _inspection_repository(tmp_path)
-    (tmp_path / "example" / "main.py").write_text("def invalid(")
+    (tmp_path / "example" / "test_main.py").write_text("def invalid(")
     with pytest.raises(
         inspection_subject.CommandError,
         match="could not parse Python source",
@@ -1598,30 +609,36 @@ def test_inventory_reports_a_missing_flake_or_malformed_python_source(
 
 
 @pytest.fixture
-def remote_repository(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> Iterator[tuple[Path, str]]:
-    """Serve a local Git remote and check that inspections clean up after themselves."""
-    home, source = tmp_path / "home", tmp_path / "source"
+def clone_workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
+    """Isolate Git clones and verify that each inspection cleans up."""
+    home = tmp_path / "home"
     scratch = tmp_path / "temporary"
     scratch.mkdir()
     home.mkdir()
-    source.mkdir()
-    _committed_repository(source)
-    remote = "https://example.test/team/repository.git"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("TMPDIR", str(scratch))
-    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
-    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source.as_uri()}.insteadOf")
-    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
     monkeypatch.setenv("GIT_ALLOW_PROTOCOL", "file")
-    yield source, remote
+    yield tmp_path
     _expect(not list(scratch.iterdir()), "remote inspection left temporary files")
     _expect(not list(home.iterdir()), "remote inspection changed HOME")
 
 
-def test_remote_inventory_reflects_new_commits_on_each_run(
+@pytest.fixture
+def remote_repository(
+    clone_workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> tuple[Path, str]:
+    """Serve the fixture commit through a local Git URL rewrite."""
+    source = clone_workspace / "source"
+    source.mkdir()
+    _committed_repository(source)
+    remote = "https://example.test/team/repository.git"
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", f"url.{source.as_uri()}.insteadOf")
+    monkeypatch.setenv("GIT_CONFIG_VALUE_0", remote)
+    return source, remote
+
+
+def test_remote_test_names_reflect_new_commits_on_each_run(
     tmp_path: Path,
     remote_repository: tuple[Path, str],
 ) -> None:
@@ -1630,12 +647,11 @@ def test_remote_inventory_reflects_new_commits_on_each_run(
     _expect(
         json.loads(_run(tmp_path, remote).stdout)
         == inspection_subject.inspect_repository(source),
-        "wrong remote inventory",
+        "wrong remote test names",
     )
-    (source / "new").mkdir()
-    (source / "new/configuration.nix").touch()
-    _git(source, "add", "new")
-    _fixture_git(source, "commit", "--quiet", "-m", "add host")
+    _write_test(source, "remote_behavior")
+    _git(source, "add", "example/test_main.py")
+    _commit(source, "rename test")
     _expect(
         json.loads(_run(tmp_path, remote).stdout)
         == inspection_subject.inspect_repository(source),
@@ -1643,15 +659,15 @@ def test_remote_inventory_reflects_new_commits_on_each_run(
     )
 
 
-def test_afairesi_reports_invalid_remote_python_source_without_emitting_partial_json(
+def test_afairesi_reports_invalid_remote_tests_without_emitting_partial_json(
     tmp_path: Path,
     remote_repository: tuple[Path, str],
 ) -> None:
     """Report parse failures from a cloned repository without emitting partial JSON."""
     source, remote = remote_repository
-    (source / "example/main.py").write_text("def invalid(")
-    _git(source, "add", "example/main.py")
-    _fixture_git(source, "commit", "--quiet", "-m", "malformed source")
+    (source / "example/test_main.py").write_text("def invalid(")
+    _git(source, "add", "example/test_main.py")
+    _commit(source, "malformed source")
     completed = _run(tmp_path, remote, code=1)
     _expect(
         not completed.stdout and "could not parse Python source" in completed.stderr,
@@ -1665,33 +681,25 @@ def test_local_paths_include_uncommitted_changes_while_git_file_urls_show_commit
 ) -> None:
     """Read the same dirty repository by filesystem path and by native Git URL."""
     source, _remote = remote_repository
-    module = source / "example/main.py"
-    module.write_text(module.read_text().replace('default="result"', 'default="local"'))
+    _write_test(source, "local_behavior")
     before = _snapshot(tmp_path)
     local_report = json.loads(_run(tmp_path, str(source)).stdout)
-    _expect(
-        local_report["example"]["arguments"][0]["default"] == "local",
-        local_report,
-    )
+    _expect(local_report["example"] == ["test_local_behavior"], local_report)
     remote_report = json.loads(_run(tmp_path, source.as_uri()).stdout)
-    _expect(
-        remote_report["example"]["arguments"][0]["default"] == "result",
-        remote_report,
-    )
+    _expect(remote_report["example"] == ["test_default_output"], remote_report)
     _expect(
         _snapshot(tmp_path) == before,
         "inspection changed source or Git state",
     )
 
 
-@pytest.mark.usefixtures("remote_repository")
 def test_afairesi_forwards_the_error_and_exit_status_from_a_failed_remote_clone(
-    tmp_path: Path,
+    clone_workspace: Path,
 ) -> None:
     """Compare failed remote inspection with Git's exit status and diagnostics."""
-    remote = (tmp_path / "missing.git").as_uri()
+    remote = (clone_workspace / "missing.git").as_uri()
     scratch = Path(os.environ["TMPDIR"])
-    native_checkout = tmp_path / "native-checkout"
+    native_checkout = clone_workspace / "native-checkout"
     expected = subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
         ["git", "clone", "--", remote, str(native_checkout)],  # noqa: S607
         capture_output=True,
@@ -1699,7 +707,7 @@ def test_afairesi_forwards_the_error_and_exit_status_from_a_failed_remote_clone(
         check=False,
         timeout=30,
     )
-    actual = _run(tmp_path, remote, code=expected.returncode)
+    actual = _run(clone_workspace, remote, code=expected.returncode)
     actual_error = re.sub(
         re.escape(str(scratch)) + r"/afairesi-inspect-[^/]+/repository",
         "<CHECKOUT>",
@@ -1720,20 +728,18 @@ def _committed_repository(root: Path) -> None:
     _inspection_repository(root)
     _git(root, "init", "--quiet")
     _git(root, "add", ".")
-    _fixture_git(root, "commit", "--quiet", "-m", "initial")
+    _commit(root, "initial")
 
 
-def _diff_description(root: Path, description: str) -> None:
-    """Change a public field without changing resource identity."""
-    (root / "example/default.nix").write_text(
-        '{ meta.description = "' + description + '"; }',
-    )
+def _write_test(root: Path, behavior: str) -> None:
+    """Give the fixture's sole Python test a new name."""
+    (root / "example/test_main.py").write_text(f"def test_{behavior}(): pass\n")
 
 
 def _apply_diff(
-    before: dict[str, Any],
+    before: dict[str, list[str]],
     difference: str,
-) -> dict[str, Any]:
+) -> dict[str, list[str]]:
     """Use jd itself to verify that an emitted patch reconstructs the inspection."""
     with NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".jd") as patch:
         patch.write(difference)
@@ -1746,16 +752,18 @@ def _apply_diff(
             check=True,
             timeout=10,
         )
-    return cast("dict[str, Any]", json.loads(completed.stdout))
+    return cast("dict[str, list[str]]", json.loads(completed.stdout))
 
 
 def test_diff_emits_a_jd_patch_from_index_to_working_tree(tmp_path: Path) -> None:
-    """Use the staged interface as the baseline even from a nested directory."""
+    """Use the staged test names as the baseline even from a nested directory."""
     _committed_repository(tmp_path)
-    _diff_description(tmp_path, "Staged")
+    _write_test(tmp_path, "Staged")
     _git(tmp_path, "add", ".")
     index = inspection_subject.inspect_repository(tmp_path)
-    _diff_description(tmp_path, "Working")
+    (tmp_path / "example/test_main.py").write_text(
+        "def test_empty_input(): pass\ndef test_unicode_input(): pass\n"
+    )
     working = inspection_subject.inspect_repository(tmp_path)
     before = _snapshot(tmp_path)
     completed = _run(tmp_path / "example", "diff")
@@ -1772,126 +780,59 @@ def test_diff_emits_a_jd_patch_from_index_to_working_tree(tmp_path: Path) -> Non
 def test_diff_ignores_implementation_edits_and_untracked_resources(
     tmp_path: Path,
 ) -> None:
-    """Emit nothing for changes outside the tracked interface contract."""
+    """Only changes to the package-to-test-name mapping produce output."""
     _committed_repository(tmp_path)
     source = tmp_path / "example/main.py"
-    source.write_text(
-        '"""Implementation notes."""\n'
-        + source.read_text()
-        + "\ndef internal(): return 42\n"
-    )
+    source.write_text("def unfinished(")
+    declaration = tmp_path / "example/default.nix"
+    declaration.write_text(declaration.read_text().replace("Example", "Renamed CLI"))
     tests = tmp_path / "example/test_main.py"
     tests.write_text(
         'def test_default_output():\n    """Updated notes."""\n'
         '    raise RuntimeError("changed")\n',
     )
     (tmp_path / "untracked").mkdir()
-    (tmp_path / "untracked/configuration.nix").touch()
+    (tmp_path / "untracked/default.nix").write_text("{}")
     before = _snapshot(tmp_path)
     completed = _run(tmp_path, "diff")
     _expect(not completed.stdout and not completed.stderr, completed)
     _expect(_snapshot(tmp_path) == before, "empty diff changed state")
 
 
-def test_diff_analyzes_each_distinct_entrypoint_once_across_snapshots_and_runs(
-    root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """Analyze identical entrypoints once and invalidate by their actual bytes."""
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    _inspection_repository(root)
-    _git(root, "add", ".")
-    analyze = inspection_subject.ArgumentDiscovery.report
-    calls = []
-
-    def count(discovery: inspection_subject.ArgumentDiscovery) -> dict[str, Any]:
-        calls.append(discovery.filename)
-        return analyze(discovery)
-
-    monkeypatch.setattr(inspection_subject.ArgumentDiscovery, "report", count)
-    monkeypatch.chdir(root)
-    monkeypatch.setattr(sys, "argv", ["afairesi", "diff"])
-    inspection_subject.main()
-    inspection_subject.main()
-    _expect(len(calls) == 1, calls)
-    calls.clear()
-    source = root / "example/main.py"
-    source.write_text(source.read_text().replace("--output", "--user"))
-    inspection_subject.main()
-    _expect(len(calls) == 1, calls)
-
-
-def test_diff_includes_tracked_targets_of_symlinked_entrypoints(tmp_path: Path) -> None:
+def test_diff_follows_tracked_symlink_targets_of_test_suites(tmp_path: Path) -> None:
     """Keep deeply nested symlink targets in both snapshots."""
     _committed_repository(tmp_path)
-    source = tmp_path / "example/main.py"
+    source = tmp_path / "example/test_main.py"
     target = tmp_path / "assets/deep/entry"
     target.parent.mkdir(parents=True)
     source.rename(target)
     source.symlink_to("../assets/deep/entry")
     _git(tmp_path, "add", ".")
     before = inspection_subject.inspect_repository(tmp_path)
-    target.write_text(target.read_text().replace("--output", "--user"))
+    target.write_text(target.read_text().replace("default_output", "requested_output"))
     after = inspection_subject.inspect_repository(tmp_path)
     _expect(before != after, after)
     _expect(_apply_diff(before, _run(tmp_path, "diff").stdout) == after, after)
 
 
-def test_diff_reconstructs_changes_to_hosts_tests_and_subcommand_arguments(
-    tmp_path: Path,
-) -> None:
-    """Round-trip resource changes, nested arguments, and lists with jd context."""
-    _committed_repository(tmp_path)
-    before = inspection_subject.inspect_repository(tmp_path)
-    source = tmp_path / "example/main.py"
-    source.write_text(
-        source.read_text().replace(
-            "    return cli",
-            "    cli.add_argument('--verbose', action='store_true')\n"
-            "    command = cli.add_subparsers().add_parser('run')\n"
-            "    command.add_argument('paths', nargs='+')\n"
-            "    return cli",
-        ),
-    )
-    (tmp_path / "example/test_main.py").write_text("def test_new(): pass\n")
-    (tmp_path / "laptop/configuration.nix").unlink()
-    after = inspection_subject.inspect_repository(tmp_path)
-    completed = _run(tmp_path, "diff")
-    _expect(_apply_diff(before, completed.stdout) == after, completed)
-
-
-def test_removing_a_package_drops_its_references_and_preserves_a_colocated_host(
+def test_removing_a_package_drops_its_entry_even_when_it_shares_a_host(
     root: Path,
 ) -> None:
-    """Remove packages and their dependency edges while retaining a colocated host."""
-    _fixture_add(root, "app", "python")
+    """Drop deleted declarations and keep diagnosing them in layout validation."""
     _fixture_add(root, "shared", "host")
     (root / "shared/default.nix").write_text("{}")
-    _fixture_add(root, "consumer", "generic")
-    (root / "consumer/default.nix").write_text("{ sources = [ ../app ../shared ]; }")
-    _git(root, "add", "--", "consumer", "shared")
+    _git(root, "add", "--", "shared/default.nix")
     before = json.loads(_run(root).stdout)
-    for name in ("app", "shared"):
-        (root / name / "default.nix").unlink()
+    _expect(before == {"shared": []}, before)
+    (root / "shared/default.nix").unlink()
     after = json.loads(_run(root).stdout)
-    _expect(
-        after
-        == {
-            "consumer": {"type": "generic", "dependencies": {"shared": ["source"]}},
-            "shared": {"type": "host"},
-        },
-        after,
-    )
+    _expect(after == {}, after)
     _expect(_apply_diff(before, _run(root, "diff").stdout) == after, after)
     with pytest.raises(
-        inspection_subject.CommandError, match="missing required tracked regular file"
-    ) as rejected:
+        inspection_subject.CommandError,
+        match=r"shared/default\.nix: missing required tracked regular file",
+    ):
         inspection_subject.validate_flake_source(root)
-    for name in ("app", "shared"):
-        _expect(
-            f"{name}/default.nix: missing required tracked regular file"
-            in str(rejected.value),
-            rejected.value,
-        )
 
 
 def test_diff_uses_the_index_before_the_first_commit(tmp_path: Path) -> None:
@@ -1901,7 +842,7 @@ def test_diff_uses_the_index_before_the_first_commit(tmp_path: Path) -> None:
     _inspection_repository(tmp_path)
     _git(tmp_path, "add", ".")
     staged = inspection_subject.inspect_repository(tmp_path)
-    _diff_description(tmp_path, "Unstaged")
+    _write_test(tmp_path, "Unstaged")
     before = _snapshot(tmp_path)
     completed = _run(tmp_path, "diff")
     _expect(
@@ -1923,7 +864,7 @@ def test_diff_errors_leave_no_partial_output_or_temporary_sources(
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     monkeypatch.setenv("TMPDIR", str(scratch))
-    (root / "example/main.py").write_text("def invalid(")
+    (root / "example/test_main.py").write_text("def invalid(")
     before = _snapshot(root)
     completed = _run(root, "diff", code=1)
     _expect(not completed.stdout, completed)
@@ -1956,7 +897,7 @@ def test_cli_accepts_repository_names_that_need_disambiguation_or_contain_spaces
 def test_diff_reports_unresolved_merge_conflicts_and_leaves_the_index_untouched(
     tmp_path: Path,
 ) -> None:
-    """Reject conflict stages instead of emitting an incomplete interface diff."""
+    """Report the conflicting index before producing a test-name diff."""
     _committed_repository(tmp_path)
     blob = _git(tmp_path, "rev-parse", "HEAD:example/main.py").strip()
     subprocess.run(
@@ -1992,7 +933,7 @@ def test_diff_reads_the_selected_linked_worktree_without_modifying_it(
     _committed_repository(root)
     report = inspection_subject.inspect_repository(root)
     _git(root, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
-    _diff_description(linked, "Linked")
+    _write_test(linked, "Linked")
     before = _snapshot(tmp_path)
     completed = _run(linked / "example", "diff")
     _expect(
@@ -2006,102 +947,143 @@ def test_diff_reads_the_selected_linked_worktree_without_modifying_it(
     )
 
 
-def test_afairesi_lists_its_repository_argument_and_argument_free_diff() -> None:
-    """Expose the repository argument only on the top-level inspection command."""
-    report = inspection_subject.ArgumentDiscovery(
-        Path(__file__).with_name("main.py").read_bytes(),
-    ).report()
-    _expect(report["commands"] == {"diff": {}}, report["commands"])
-    _expect(
-        [row["names"] for row in report["arguments"]] == [["repository"]],
-        report["arguments"],
-    )
-
-
-@pytest.mark.parametrize("kind", ["python", "generic", "lean4"])
 def test_source_validation_ignores_untracked_packages_and_test_files(
-    tmp_path: Path,
-    kind: str,
+    root: Path,
 ) -> None:
-    """Keep unselected sources out of validation and inspection."""
-    root = tmp_path / "project"
-    root.mkdir()
-    _repository(root)
-    _fixture_add(root, "example", kind)
-    extension = {"python": "py", "generic": "nix", "lean4": "lean"}[kind]
-    tests = f"example/test_main.{extension}"
-    (root / tests).write_bytes(b"def broken(:")
+    """Skip malformed local declarations and suites until they are tracked."""
+    _fixture_add(root, "example", "python")
+    _fixture_add(root, "library", "generic")
+    (root / "example/test_main.py").write_text("def broken(:")
+    (root / "library/test_main.nix").write_text("{ invalid")
     local = root / "experiments"
     local.mkdir()
     (local / "default.nix").write_text("{ invalid")
-    (local / "main.py").write_bytes(b"def broken(:")
     before = _snapshot(root)
     inspection_subject.validate_flake_source(root)
-    _expect(_snapshot(root) == before, "validation admitted or changed local sources")
     report = inspection_subject.inspect_repository(root)
-    _expect(set(report) == {"example"} and "tests" not in report["example"], report)
+    _expect(report == {"example": [], "library": []}, report)
+    _expect(
+        _snapshot(root) == before, "reading untracked sources changed the repository"
+    )
 
 
-def test_inventory_groups_package_and_host_dependencies_by_role(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("kind", "suite", "source", "expected"),
+    [
+        (
+            "bash",
+            "test_main.bats",
+            """exit 99
+cat <<'TEXT'
+@test "not a declaration" {
+TEXT
+@test "preserves spaces" { true; }
+check_status() { # @test
+  true
+}
+helper() { true; }
+""",
+            ["check_status", "preserves spaces"],
+        ),
+        (
+            "generic",
+            "test_main.nix",
+            """{ ... }: let
+              selection = [ "preservesSpaces" ];
+              suite = {
+                tests = selection;
+                preservesSpaces = { expr = throw "never evaluate"; expected = true; };
+                testExcluded = { expr = false; expected = true; };
+              };
+            in (suite)""",
+            ["preservesSpaces"],
+        ),
+        (
+            "lean4",
+            "test_main.lean",
+            """namespace Résultats
+section
+/- theorem ignored : True := trivial -/
+theorem preservesCafé : True := trivial
+example : True := trivial
+end
+end Résultats
+""",
+            ["Résultats.preservesCafé"],
+        ),
+    ],
+)
+def test_named_cases_appear_in_the_package_specification_and_its_diff(
+    root: Path, kind: str, suite: str, source: str, expected: list[str]
 ) -> None:
-    """Combine a package and host's local dependency roles without evaluating Nix."""
-    root = _repository(tmp_path)
-    for name in ("consumer", "library", "other", "tool", "helper"):
-        directory = root / name
-        directory.mkdir()
-        (directory / "default.nix").write_text("{}: {}")
-        (directory / "main.nix").write_text("{}")
-    source = """{ inputs, pkgs, ... }:
-      let inherit (pkgs.stdenv.hostPlatform) system;
-          local = inputs.self.packages.${system};
-          deps = [ local.library local.library ];
-      in pkgs.runCommand "consumer" {
-        propagatedBuildInputs = deps /* base */ ++
-          ( /* extra */ with inputs.self.packages.${system}; [ other ]);
-        nativeCheckInputs = [ inputs.self /* local */ .packages.${system}.library ];
-        hook = local: { checkInputs = [ local.other ]; };
-        buildInputs = [ inputs.external.packages.${system}.other ];
-        text = "inputs.self.packages.fake.consumer";
-        tool = local.tool;
-        src = ../other/main.nix;
-        root = ../.;
-      } "throw must-not-evaluate"
-    """
-    (root / "consumer/default.nix").write_text(source)
-    (root / "consumer/configuration.nix").write_text("""
-      { inputs, system, ... }: let local = inputs.self.packages.${system}; in {
-        environment.systemPackages = [ local.tool ];
-        settings = [ local.library local.helper local.consumer ];
-      }
-    """)
-    _git(root, "add", ".")
-    report = inspection_subject.inspect_repository(root)
-    _expect(report["consumer"]["type"] == ["generic", "host"], report)
+    """Follow a declared behavior through inspection, a rename, and a jd patch."""
+    _fixture_add(root, "example", kind)
+    path = root / "example" / suite
+    path.write_text(source)
+    untracked = json.loads(_run(root).stdout)
+    _expect(untracked == {"example": []}, untracked)
+    _git(root, "add", "--", "example")
+    before = json.loads(_run(root).stdout)
+    _expect(before == {"example": expected}, before)
+    path.write_text(source.replace("preserves", "retains"))
+    after = {"example": [name.replace("preserves", "retains") for name in expected]}
+    _expect(json.loads(_run(root).stdout) == after, after)
+    _expect(_apply_diff(before, _run(root, "diff").stdout) == after, after)
+
+
+def test_cargo_lists_tests_from_enabled_targets_and_their_module_trees(
+    root: Path,
+) -> None:
+    """List declared unit and integration tests without building the crate."""
+    _fixture_add(root, "example", "generic")
+    package = root / "example"
+    sources = {
+        "Cargo.toml": """[package]
+name = "example"
+edition = "2024"
+autotests = false
+[[test]]
+name = "behavior"
+path = "cases/output.rs"
+[[bin]]
+name = "tool"
+test = false
+""",
+        "src/lib.rs": (
+            '#[cfg(test)]\nmod tests;\nconst TEXT: &str = "#[test] fn fake() {}";\n'
+        ),
+        "src/tests.rs": (
+            '#[path = "shared.rs"] mod shared;\n#[test]\nfn accepts_input() {}\n'
+        ),
+        "src/shared.rs": "mod nested { #[test] fn preserves_spaces() {} }\n",
+        "src/bin/tool.rs": "#[test] fn disabled() {}\n",
+        "cases/output.rs": "#[test] /* a comment */ #[ignore] fn prints_output() {}\n",
+        "tests/unused.rs": "#[test] fn ignored_target() {}\n",
+        "src/orphan.rs": "#[test] fn unreachable() {}\n",
+        "build.rs": 'fn main() { panic!("do not build"); }\n',
+    }
+    for filename, source in sources.items():
+        path = package / filename
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(source)
+    _git(root, "add", "--", "example")
+    (package / "src/bin/untracked.rs").write_text("#[test] fn untracked() {}\n")
+    before = json.loads(_run(root).stdout)
     _expect(
-        report["consumer"]["dependencies"]
+        before
         == {
-            "helper": ["reference"],
-            "library": ["runtime", "test"],
-            "other": ["runtime", "source"],
-            "tool": ["runtime"],
+            "example": [
+                "prints_output",
+                "tests::accepts_input",
+                "tests::shared::nested::preserves_spaces",
+            ]
         },
-        report,
+        before,
     )
-    _expect("dependencies" not in report["library"], report)
-    (root / "consumer/default.nix").write_text("\n# moved declaration\n" + source)
+    suite = package / "src/shared.rs"
+    suite.write_text(suite.read_text().replace("preserves", "retains"))
+    after = json.loads(_run(root).stdout)
     _expect(
-        inspection_subject.inspect_repository(root) == report,
-        "line numbers leaked into the interface",
+        before != after and _apply_diff(before, _run(root, "diff").stdout) == after,
+        after,
     )
-
-
-def test_cli_discovery_ignores_nested_aliases_unrelated_to_arguments() -> None:
-    """Traverse shared containers once while finding actual parser arguments."""
-    source = "import argparse\nvalue0 = []\n"
-    for index in range(1, 24):
-        source += f"value{index} = [value{index - 1}, value{index - 1}]\n"
-    source += "consume(value23)\nparser = argparse.ArgumentParser()\n"
-    source += "parser.add_argument('--name')\nparser.parse_args()\n"
-    report = _inspection_discovery(source)
-    _expect(report["arguments"] == [{"names": ["--name"]}], report)

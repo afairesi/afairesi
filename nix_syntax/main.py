@@ -135,3 +135,59 @@ def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | Non
             return None
         parts.append(value)
     return tuple(parts) if parts else None
+
+
+def _resolve_binding(
+    document: Document,
+    node: Node,
+) -> Node | None:
+    """Find a let or recursive-set alias in the reference's lexical scope."""
+    name = document.text(node)
+    parent = node.parent
+    while parent is not None:
+        if parent.type == "function_expression":
+            parameter = parent.child_by_field_name("universal")
+            if parameter is not None and document.text(parameter) == name:
+                return None
+            formals = parent.child_by_field_name("formals")
+            if formals is not None and any(
+                (formal := child.child_by_field_name("name")) is not None
+                and document.text(formal) == name
+                for child in formals.children_by_field_name("formal")
+            ):
+                return None
+        if parent.type in {"let_expression", "rec_attrset_expression"}:
+            bindings = binding_set(parent)
+            for binding in [] if bindings is None else bindings.named_children:
+                attrpath = binding.child_by_field_name("attrpath")
+                if attrpath is not None and static_attrpath(
+                    document,
+                    attrpath,
+                ) == (name,):
+                    return binding.child_by_field_name("expression")
+        parent = parent.parent
+    return None
+
+
+def resolve_expression(document: Document, node: Node | None) -> Node | None:
+    """Follow local aliases and expression bodies without evaluating Nix."""
+    seen = set()
+    while node is not None and node.id not in seen:
+        seen.add(node.id)
+        if node.type == "parenthesized_expression":
+            node = node.child_by_field_name("expression")
+        elif node.type in {"let_expression", "assert_expression"}:
+            node = node.child_by_field_name("body")
+        elif node.type == "variable_expression":
+            node = _resolve_binding(document, node)
+        else:
+            return node
+    return None
+
+
+def call_package_body(document: Document) -> Node | None:
+    """Read a file's result after at most one call with the package arguments."""
+    expression = resolve_expression(document, document.root)
+    if expression is not None and expression.type == "function_expression":
+        return resolve_expression(document, expression.child_by_field_name("body"))
+    return expression

@@ -1,33 +1,30 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Inspect repositories in the afairesi computing environment."""
+"""Extract behavioral specifications from Afairesi repositories."""
 
 # ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
 import argparse
 import ast
 import contextlib
-import hashlib
 import io
 import json
 import keyword
 import os
-import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-from collections import defaultdict
-from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING
 
 import nix_syntax
+from afairesi.rust import cargo_names
+from afairesi.specification import bats_names, lean_names, nix_names
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
-    from typing import Never
 
     from tree_sitter import Node
 BUILDER_KINDS = {
@@ -45,19 +42,7 @@ PACKAGE_MAIN_FILES = {
     "lean4": "main.lean",
     "python": "main.py",
 }
-PACKAGE_TEST_FILES = {
-    "bash": "test_main.sh",
-    "generic": "test_main.nix",
-    "lean4": "test_main.lean",
-    "python": "test_main.py",
-}
 ROOT_FILES = ("flake.lock", "flake.nix")
-INSPECTION_FILENAMES = {
-    "configuration.nix",
-    "default.nix",
-    "main.py",
-    *PACKAGE_TEST_FILES.values(),
-}
 
 
 class CommandError(RuntimeError):
@@ -130,11 +115,13 @@ def read_regular(path: Path) -> bytes | None:
 
 
 def source_paths(root: Path) -> set[Path]:
-    """Select root and resource files from the Git index or an exported tree."""
+    """Select top-level package files and indexed Rust sources for module discovery."""
     if (root / ".git").exists():
         entries = git(root, ["ls-files", "-z"]).stdout
         return {
-            Path(item) for item in entries.split("\0") if item and item.count("/") <= 1
+            Path(item)
+            for item in entries.split("\0")
+            if item and (item.count("/") <= 1 or item.endswith(".rs"))
         }
     paths: set[Path] = set()
     for directory, directories, filenames in root.walk():
@@ -145,22 +132,17 @@ def source_paths(root: Path) -> set[Path]:
     return paths
 
 
+def _builder_field(document: nix_syntax.Document, field: str) -> Node | None:
+    """Resolve the function or argument of the returned builder call."""
+    body = nix_syntax.call_package_body(document)
+    if body is None or body.type != "apply_expression":
+        return None
+    return nix_syntax.resolve_expression(document, body.child_by_field_name(field))
+
+
 def _package_kind(document: nix_syntax.Document) -> str:
     """Select conventions only from recognizable builders without evaluating Nix."""
-    function = _package_body(document).child_by_field_name("function")
-    seen = set()
-    while function is not None and function.type in {
-        "parenthesized_expression",
-        "variable_expression",
-    }:
-        if function.id in seen:
-            return "generic"
-        seen.add(function.id)
-        function = (
-            function.child_by_field_name("expression")
-            if function.type == "parenthesized_expression"
-            else _alias_value(document, function)
-        )
+    function = _builder_field(document, "function")
     if function is not None and function.type == "select_expression":
         attrs = function.child_by_field_name("attrpath")
         if attrs is not None and (parts := nix_syntax.static_attrpath(document, attrs)):
@@ -180,15 +162,6 @@ def _resource_definitions(root: Path, paths: set[Path], filename: str) -> list[P
     return sorted(definitions)
 
 
-def detect_hosts(root: Path, paths: set[Path]) -> list[Path]:
-    """Detect hosts under the same directory rules as packages."""
-    return [
-        definition.parent
-        for definition in _resource_definitions(root, paths, "configuration.nix")
-        if definition.is_file()
-    ]
-
-
 def detect_packages(root: Path, paths: set[Path]) -> tuple[list[Package], list[Path]]:
     """Read package declarations and identify tracked declarations missing on disk."""
     result = []
@@ -201,7 +174,6 @@ def detect_packages(root: Path, paths: set[Path]) -> tuple[list[Package], list[P
             continue
         document = nix_syntax.parse(source, str(relative))
         result.append(Package(path.parent, _package_kind(document), document))
-    validate_python_package_names(result)
     return result, missing
 
 
@@ -234,18 +206,19 @@ def _structure_issues(
     """Check tracked resource files for layout and Python source errors."""
     issues: list[str] = []
     conventional = {Path(item) for item in ROOT_FILES}
-    for host in detect_hosts(root, paths):
-        conventional.update(
-            Path(host.name) / filename
-            for filename in ("configuration.nix", "hardware-configuration.nix")
-        )
+    for config in _resource_definitions(root, paths, "configuration.nix"):
+        if config.is_file():
+            relative = config.relative_to(root)
+            conventional.update(
+                (relative, relative.with_name("hardware-configuration.nix"))
+            )
     for package in packages:
         issues.extend(_python_source_issues(package, paths))
         directory = package.root.relative_to(root)
         main = directory / PACKAGE_MAIN_FILES[package.kind]
         conventional.add(main)
-        if test_name := PACKAGE_TEST_FILES.get(package.kind):
-            conventional.add(directory / test_name)
+        if suite := NAMED_TEST_FILES.get(package.kind):
+            conventional.add(directory / suite[0])
         if package.kind != "generic" and (
             main not in paths or not (root / main).is_file()
         ):
@@ -294,18 +267,18 @@ def _python_class_mro(
     return result
 
 
-def _python_test_names(module: ast.Module) -> list[str]:
-    """List sorted pytest identifiers, including methods inherited from local bases."""
+def _python_test_names(module: ast.Module) -> set[str]:
+    """Collect pytest identifiers, including methods inherited from local bases."""
     classes = {
         node.name: node for node in module.body if isinstance(node, ast.ClassDef)
     }
     case_classes = _unittest_classes(module)
-    names = [
+    names = {
         node.name
         for node in module.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
         and node.name.startswith("test")
-    ]
+    }
     for name in classes:
         if not (name.startswith("Test") or name in case_classes):
             continue
@@ -326,8 +299,8 @@ def _python_test_names(module: ast.Module) -> list[str]:
                     methods.difference_update(
                         target.id for target in targets if isinstance(target, ast.Name)
                     )
-        names.extend(f"{name}::{method}" for method in methods)
-    return sorted(names)
+        names.update(f"{name}::{method}" for method in methods)
+    return names
 
 
 def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
@@ -372,49 +345,6 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
     return issues
 
 
-def _attrset_expression(
-    document: nix_syntax.Document,
-    expression: Node | None,
-    path: tuple[str, ...],
-) -> list[Node]:
-    """Find direct static bindings beneath an attribute-set expression."""
-    if expression is None or expression.type not in {
-        "attrset_expression",
-        "rec_attrset_expression",
-    }:
-        return []
-    binding_set = nix_syntax.binding_set(expression)
-    return [
-        value
-        for binding in ([] if binding_set is None else binding_set.named_children)
-        if binding.type == "binding"
-        and (attrpath := binding.child_by_field_name("attrpath")) is not None
-        and nix_syntax.static_attrpath(document, attrpath) == path
-        and (value := binding.child_by_field_name("expression")) is not None
-    ]
-
-
-def _meta_description(document: nix_syntax.Document) -> str | None:
-    """Read the returned package's description without searching dependencies."""
-    container = _package_body(document)
-    while container.type == "apply_expression":
-        argument = container.child_by_field_name("argument")
-        if argument is not None and argument.type in {
-            "attrset_expression",
-            "rec_attrset_expression",
-        }:
-            container = argument
-            break
-        function = container.child_by_field_name("function")
-        if function is None:
-            return None
-        container = function
-    matches = _attrset_expression(document, container, ("meta", "description"))
-    for metadata in _attrset_expression(document, container, ("meta",)):
-        matches.extend(_attrset_expression(document, metadata, ("description",)))
-    return nix_syntax.string_value(document, matches[0]) if len(matches) == 1 else None
-
-
 def _python_entrypoint(
     module: ast.Module,
 ) -> ast.stmt | ast.expr | None:
@@ -444,28 +374,11 @@ def _python_entrypoint(
     return None
 
 
-def _package_body(document: nix_syntax.Document) -> Node:
-    """Find the outer package expression beneath functions and let bindings."""
-    body = document.root
-    while body.type in {
-        "function_expression",
-        "let_expression",
-        "parenthesized_expression",
-    }:
-        child = body.child_by_field_name(
-            "expression" if body.type == "parenthesized_expression" else "body",
-        )
-        if child is None:
-            msg = "Package definition has no body"
-            raise CommandError(msg)
-        body = child
-    return body
-
-
 def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     paths = source_paths(root)
     packages, missing = detect_packages(root, paths)
+    validate_python_package_names(packages)
     issues = _structure_issues(root, packages, paths)
     issues.extend(f"{path}: missing required tracked regular file" for path in missing)
     flake = read_regular(root / "flake.nix")
@@ -482,7 +395,7 @@ def validate_flake_source(root: Path) -> None:
         if package.kind == "generic":
             for filename in (
                 PACKAGE_MAIN_FILES["generic"],
-                PACKAGE_TEST_FILES["generic"],
+                NAMED_TEST_FILES["generic"][0],
             ):
                 source = package.root / filename
                 if source.relative_to(root) in paths and source.is_file():
@@ -542,1115 +455,66 @@ def _source(path: Path) -> ast.Module:
         raise CommandError(message) from error
 
 
-class _PythonNames:
-    """Resolve lexical Python names using LibCST without importing the source."""
-
-    def __init__(self, source: str | bytes, filename: str) -> None:
-        """Index qualified references and definitions at their UTF-8 byte offsets."""
-        import libcst as cst  # noqa: PLC0415 - Load metadata only for CLI inspection.
-        from libcst import metadata  # noqa: PLC0415 - Keep CLI startup lightweight.
-
-        try:
-            syntax = cst.parse_module(source)
-            code = syntax.code
-            self.module = ast.parse(code, filename=filename)
-        except (cst.ParserSyntaxError, SyntaxError, UnicodeError) as error:
-            message = f"{filename}: could not parse Python source: {error}"
-            raise CommandError(message) from error
-        encoded = code.encode("utf-8")
-        self.line_offsets = [
-            0,
-            *(match.end() for match in re.finditer(rb"\r\n?|\n", encoded)),
-        ]
-        wrapper = metadata.MetadataWrapper(syntax, unsafe_skip_copy=True)
-        spans = wrapper.resolve(metadata.ByteSpanPositionProvider)
-        scopes = wrapper.resolve(metadata.ScopeProvider)
-        self.references: dict[int, set[str]] = {}
-        self.imported_references: dict[int, set[str]] = {}
-        self.definitions: dict[int, str] = {}
-        for node, span in spans.items():
-            if not isinstance(node, (cst.Name, cst.FunctionDef, cst.ClassDef)):
-                continue
-            scope = scopes.get(node)
-            qualified_names = scope.get_qualified_names_for(node) if scope else set()
-            names = {name.name for name in qualified_names}
-            if isinstance(node, cst.Name):
-                sources = {name.source for name in qualified_names}
-                if sources == {metadata.QualifiedNameSource.LOCAL}:
-                    self.references[span.start] = names
-                elif sources == {metadata.QualifiedNameSource.IMPORT}:
-                    self.imported_references[span.start] = names
-            elif len(names) == 1:
-                self.definitions[span.start] = next(iter(names))
-
-        self._select_import_branches()
-
-    def _select_import_branches(self) -> None:
-        """Discard script-only code before looking for CLI imports and calls."""
-        for node in ast.walk(self.module):
-            if not isinstance(node, (ast.If, ast.While)):
-                continue
-            match node.test:
-                case ast.Compare(
-                    left=ast.Name(id="__name__") as name,
-                    ops=[(ast.Eq() | ast.NotEq()) as operator],
-                    comparators=[ast.Constant(value="__main__")],
-                ) if not self.names(name) and not self.names(name, imported=True):
-                    active = isinstance(operator, ast.NotEq)
-                case _:
-                    continue
-            node.test = ast.copy_location(ast.Constant(active), node.test)
-            if not active:
-                node.body.clear()
-            else:
-                node.orelse.clear()
-
-    def _offset(
-        self,
-        node: ast.expr
-        | ast.arg
-        | ast.FunctionDef
-        | ast.AsyncFunctionDef
-        | ast.ClassDef,
-    ) -> int:
-        return self.line_offsets[node.lineno - 1] + node.col_offset
-
-    def names(self, node: ast.expr | ast.arg, *, imported: bool = False) -> set[str]:
-        """Return canonical names, honoring imports, closures, and shadowing."""
-        if isinstance(node, (ast.Name, ast.arg)):
-            references = self.imported_references if imported else self.references
-            return references.get(self._offset(node), set())
-        if isinstance(node, ast.Attribute):
-            return {
-                f"{name}.{node.attr}"
-                for name in self.names(node.value, imported=imported)
-            }
-        return set()
-
-    def imported_modules(self) -> set[str]:
-        """Return the top-level names of modules imported by absolute name."""
-        modules: set[str] = set()
-        for node in ast.walk(self.module):
-            if isinstance(node, ast.Import):
-                modules.update(alias.name.partition(".")[0] for alias in node.names)
-            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
-                modules.add(node.module.partition(".")[0])
-        return modules
-
-    def definition(
-        self,
-        node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
-    ) -> str:
-        """Return the qualified name of a function or class declaration."""
-        return self.definitions[self._offset(node)]
-
-
-def _value(node: ast.expr) -> object:
-    """Describe literals exactly and unresolved expressions explicitly."""
-    try:
-        value = ast.literal_eval(node)
-        json.dumps(value)
-    except ValueError, TypeError:
-        if isinstance(node, ast.Name) and node.id in {"str", "int", "float", "bool"}:
-            return node.id
-        return {"unknown": ast.unparse(node)}
-    else:
-        return value
-
-
-def _command_node(tree: dict[str, Any], path: tuple[str, ...]) -> dict[str, Any]:
-    """Find or create the command node at a resolved path."""
-    node = tree
-    for name in path:
-        node = node.setdefault("commands", {}).setdefault(name, {})
-    return node
-
-
-class _LoopLiteral(ast.NodeTransformer):
-    """Substitute a simple loop variable without executing its body."""
-
-    def __init__(self, name: str, value: object) -> None:
-        """Remember the literal binding for one loop iteration."""
-        self.name = name
-        self.value = value
-
-    def visit_Name(self, node: ast.Name) -> ast.expr:
-        """Replace reads while retaining their source locations."""
-        if node.id == self.name and isinstance(node.ctx, ast.Load):
-            return ast.copy_location(
-                ast.parse(repr(self.value), mode="eval").body,
-                node,
-            )
-        return node
-
-
-class ArgumentDiscovery:
-    """Follow static parser bindings, factory returns, and configuration helpers."""
-
-    def __init__(self, source: str | bytes, filename: str = "<source>") -> None:
-        """Index parser assignments and helper call arguments."""
-        self.filename = filename
-        self.names = _PythonNames(source, filename)
-        self.entrypoint = _python_entrypoint(self.names.module)
-        imports = self.names.imported_modules()
-        self.has_argparse = "argparse" in imports
-        self.argument_free = imports.isdisjoint(
-            {"argparse", "click", "typer", "fire", "docopt", "getopt"},
-        ) and not any(
-            self._qualified(node) == "sys.argv"
-            for node in ast.walk(self.names.module)
-            if isinstance(node, (ast.Name, ast.Attribute))
-        )
-        self.bindings: dict[str, list[ast.expr]] = {}
-        self.returns: dict[str, list[ast.expr]] = {}
-        self.functions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
-        self.ambiguous_functions: set[str] = set()
-        self.classes: dict[str, ast.ClassDef] = {}
-        self.calls: list[tuple[str, ast.Call]] = []
-        self.conditional_nodes: set[ast.expr] = set()
-        self._parser_candidates: set[int] = set()
-        self._non_parser_candidates: set[int] = set()
-        self._collect(self.names.module, "")
-        scopes = self._public_scopes()
-        self.calls = [(scope, call) for scope, call in self.calls if scope in scopes]
-        for _scope, call in self.calls:
-            if (key := self._function(call.func)) is not None:
-                function = self.functions[key]
-                parameters = function.args.posonlyargs + function.args.args
-                for parameter, argument in zip(parameters, call.args, strict=False):
-                    self._bind(parameter, argument)
-                for keyword in call.keywords:
-                    if keyword.arg is not None:
-                        for parameter in [*parameters, *function.args.kwonlyargs]:
-                            if parameter.arg == keyword.arg:
-                                self._bind(parameter, keyword.value)
-
-    def _bind(
-        self,
-        target: ast.Name | ast.arg,
-        value: ast.expr,
-    ) -> None:
-        for name in self.names.names(target):
-            self.bindings.setdefault(name, []).append(value)
-
-    def _bindings(self, node: ast.Name) -> list[ast.expr]:
-        return [
-            binding
-            for name in self.names.names(node)
-            for binding in self.bindings.get(name, [])
-        ]
-
-    def _function(self, node: ast.expr) -> str | None:
-        if isinstance(node, ast.Name) and not self._bindings(node):
-            names = self.names.names(node) & self.functions.keys()
-            if (
-                names == {"main"}
-                and isinstance(self.entrypoint, (ast.ClassDef, ast.Delete))
-                and (node.lineno, node.col_offset)
-                > (self.entrypoint.lineno, self.entrypoint.col_offset)
-            ):
-                return None
-            if len(names) == 1:
-                return next(iter(names))
-        return None
-
-    def _error(self, node: ast.expr, reason: str) -> Never:
-        message = (
-            f"{self.filename}:{node.lineno}:{node.col_offset + 1}: "
-            f"cannot inspect CLI: {reason}\n  {ast.unparse(node)}"
-        )
-        raise CommandError(message)
-
-    def _collect(
-        self,
-        node: ast.AST,
-        scope: str,
-        *,
-        conditional: bool = False,
-    ) -> None:
-        if conditional and isinstance(node, ast.expr):
-            self.conditional_nodes.add(node)
-        if self._collect_branches(node, scope, conditional=conditional):
-            return
-        if isinstance(
-            node,
-            (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
-        ):
-            self._collect_comprehension(node, scope, conditional=conditional)
-            return
-        if self._collect_runtime_loop(node, scope, conditional=conditional):
-            return
-        if isinstance(node, ast.ClassDef):
-            self.classes[self.names.definition(node)] = node
-            return
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scope = self.names.definition(node)
-            self.ambiguous_functions.update(self.functions.keys() & {scope})
-            self.functions[scope] = node
-        self._index_binding(node, scope)
-        conditional = conditional or isinstance(node, ast.Match)
-        for child in ast.iter_child_nodes(node):
-            self._collect(child, scope, conditional=conditional)
-
-    def _index_binding(self, node: ast.AST, scope: str) -> None:
-        """Record simple assignments, factory returns, and calls."""
-        if isinstance(node, ast.Assign):
-            for target in node.targets:
-                if isinstance(target, ast.Name):
-                    self._bind(target, node.value)
-        elif (
-            isinstance(node, ast.AnnAssign)
-            and isinstance(node.target, ast.Name)
-            and node.value
-        ):
-            self._bind(node.target, node.value)
-        elif isinstance(node, ast.Return) and node.value:
-            self.returns.setdefault(scope, []).append(node.value)
-        elif isinstance(node, ast.Call):
-            self.calls.append((scope, node))
-
-    def _collect_branches(
-        self,
-        node: ast.AST,
-        scope: str,
-        *,
-        conditional: bool,
-    ) -> bool:
-        """Select literal branches and retain uncertain exception handlers."""
-        if isinstance(node, ast.If):
-            self._collect(node.test, scope, conditional=conditional)
-            try:
-                condition = ast.literal_eval(node.test)
-            except ValueError, TypeError:
-                for child in [*node.body, *node.orelse]:
-                    self._collect(child, scope, conditional=True)
-            else:
-                for child in node.body if condition else node.orelse:
-                    self._collect(child, scope, conditional=conditional)
-            return True
-        if isinstance(node, (ast.Try, ast.TryStar)):
-            for child in [*node.body, *node.orelse, *node.finalbody]:
-                self._collect(child, scope, conditional=conditional)
-            for handler in node.handlers:
-                self._collect(handler, scope, conditional=True)
-            return True
-        return False
-
-    def _collect_runtime_loop(
-        self,
-        node: ast.AST,
-        scope: str,
-        *,
-        conditional: bool,
-    ) -> bool:
-        """Collect eager loop inputs before marking iteration-dependent statements."""
-        if isinstance(node, ast.For) and self._collect_literal_loop(
-            node,
-            scope,
-            conditional=conditional,
-        ):
-            return True
-        if isinstance(node, (ast.For, ast.AsyncFor)):
-            self._collect(node.iter, scope, conditional=conditional)
-            self._collect(node.target, scope, conditional=True)
-            for statement in [*node.body, *node.orelse]:
-                self._collect(statement, scope, conditional=True)
-            return True
-        if isinstance(node, ast.While):
-            self._collect(node.test, scope, conditional=conditional)
-            try:
-                condition = ast.literal_eval(node.test)
-            except ValueError, TypeError:
-                condition = True
-            for statement in node.body if condition else []:
-                self._collect(statement, scope, conditional=True)
-            for statement in node.orelse:
-                self._collect(
-                    statement, scope, conditional=conditional or bool(condition)
-                )
-            return True
-        return False
-
-    def _collect_comprehension(
-        self,
-        node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
-        scope: str,
-        *,
-        conditional: bool,
-    ) -> None:
-        """Collect eager iterables separately from conditional comprehension parts."""
-        first, *remaining = node.generators
-        self._collect(first.iter, scope, conditional=conditional)
-        for child in [first.target, *first.ifs, *remaining]:
-            self._collect(child, scope, conditional=True)
-        values = (
-            [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
-        )
-        for value in values:
-            self._collect(value, scope, conditional=True)
-
-    def _collect_literal_loop(
-        self,
-        node: ast.For,
-        scope: str,
-        *,
-        conditional: bool,
-    ) -> bool:
-        """Expand finite literal loops whose variable is never rebound."""
-        if not isinstance(node.target, ast.Name):
-            return False
-        try:
-            values = ast.literal_eval(node.iter)
-        except ValueError, TypeError:
-            return False
-        if not isinstance(values, (list, tuple, str)) or any(
-            isinstance(
-                child,
-                (
-                    ast.Break,
-                    ast.Continue,
-                    ast.FunctionDef,
-                    ast.AsyncFunctionDef,
-                    ast.ClassDef,
-                ),
-            )
-            or (
-                isinstance(child, ast.Name)
-                and child.id == node.target.id
-                and isinstance(child.ctx, (ast.Store, ast.Del))
-            )
-            for statement in node.body
-            for child in ast.walk(statement)
-        ):
-            return False
-        for value in values:
-            for statement in node.body:
-                expanded = _LoopLiteral(node.target.id, value).visit(
-                    deepcopy(statement),
-                )
-                self._collect(expanded, scope, conditional=conditional)
-        for statement in node.orelse:
-            self._collect(statement, scope, conditional=conditional)
-        return True
-
-    def _qualified(self, node: ast.expr) -> str:
-        names = self.names.names(node, imported=True)
-        return next(iter(names)) if len(names) == 1 else ""
-
-    def _sources(self, node: ast.expr) -> list[ast.expr]:
-        """Follow assignments, helper returns, and method receivers."""
-        if isinstance(node, ast.Name):
-            return self._bindings(node)
-        if isinstance(node, ast.Call):
-            if isinstance(node.func, ast.Attribute):
-                return [node.func.value]
-            if (key := self._function(node.func)) is not None:
-                return self.returns.get(key, [])
-        return []
-
-    def _is_conditional(self, node: ast.expr) -> bool:
-        """Check for unresolved control flow through aliases and helper parameters."""
-        pending = [node]
-        seen: set[ast.expr] = set()
-        while pending:
-            current = pending.pop()
-            if current in self.conditional_nodes:
-                return True
-            if current not in seen:
-                seen.add(current)
-                pending.extend(self._sources(current))
-        return False
-
-    def _check_structure(self, call: ast.Call) -> None:
-        """Reject runtime-dependent construction of the selected CLI."""
-        if self._is_conditional(call):
-            self._error(call, "CLI construction depends on unresolved control flow")
-
-    def _parser_keywords(self, call: ast.Call) -> dict[str, ast.expr]:
-        """Expand literal parser settings that can affect command structure."""
-        result = {}
-        for option in call.keywords:
-            if option.arg is not None:
-                result[option.arg] = option.value
-                continue
-            if not isinstance(option.value, ast.Dict):
-                self._error(call, "parser keyword expansion must be a literal mapping")
-            for key, value in zip(
-                option.value.keys,
-                option.value.values,
-                strict=True,
-            ):
-                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
-                    self._error(
-                        call, "parser keyword expansion must be a literal mapping"
-                    )
-                result[key.value] = value
-        return result
-
-    def _may_resolve_parser(self, node: ast.expr) -> bool:
-        """Exclude source graphs with no parser constructor, including cycles."""
-        pending = [node]
-        visited: set[int] = set()
-        while pending:
-            current = pending.pop()
-            key = id(current)
-            if key in visited or key in self._non_parser_candidates:
-                continue
-            if key in self._parser_candidates or (
-                isinstance(current, ast.Call)
-                and self._qualified(current.func) == "argparse.ArgumentParser"
-            ):
-                self._parser_candidates.add(id(node))
-                return True
-            visited.add(key)
-            pending.extend(self._sources(current))
-        self._non_parser_candidates.update(visited)
-        return False
-
-    def _resolve(
-        self,
-        node: ast.expr,
-        seen: frozenset[int] = frozenset(),
-    ) -> set[tuple[str, ...]]:
-        key = id(node)
-        if key in seen or not self._may_resolve_parser(node):
-            return set()
-        seen = seen | {key}
-        if isinstance(node, ast.Name):
-            return set().union(
-                *(self._resolve(value, seen) for value in self._bindings(node)),
-            )
-        if not isinstance(node, ast.Call):
-            return set()
-        return self._resolve_call(node, seen)
-
-    def _resolve_call(
-        self,
-        node: ast.Call,
-        seen: frozenset[int],
-    ) -> set[tuple[str, ...]]:
-        if self._qualified(node.func) == "argparse.ArgumentParser":
-            return {(f"{node.lineno}:{node.col_offset}:{id(node)}",)}
-        if (key := self._function(node.func)) is not None:
-            return set().union(
-                *(self._resolve(value, seen) for value in self.returns.get(key, [])),
-            )
-        if not isinstance(node.func, ast.Attribute):
-            return set()
-        if node.func.attr in {
-            "add_subparsers",
-            "add_argument_group",
-            "add_mutually_exclusive_group",
-        }:
-            return self._resolve(node.func.value, seen)
-        if node.func.attr != "add_parser" or not (
-            parents := self._resolve(node.func.value, seen)
-        ):
-            return set()
-        keywords = self._parser_keywords(node)
-        name_node = node.args[0] if node.args else keywords.get("name")
-        name = _value(name_node) if name_node is not None else None
-        aliases = _value(keywords["aliases"]) if "aliases" in keywords else []
-        if not isinstance(name, str):
-            self._error(node, "subcommand name must be a literal string")
-        if not isinstance(aliases, (list, tuple)) or not all(
-            isinstance(alias, str) for alias in aliases
-        ):
-            self._error(node, "subcommand aliases must be literal strings")
-        return {(*parent, label) for parent in parents for label in [name, *aliases]}
-
-    def _public_scopes(self) -> set[str]:
-        """Follow module-level calls and the installed main entry point."""
-        entrypoint = self.entrypoint
-        scopes = {""}
-        if isinstance(entrypoint, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            scopes.add(self.names.definition(entrypoint))
-        seen: set[int] = set()
-        while isinstance(entrypoint, ast.Name) and id(entrypoint) not in seen:
-            seen.add(id(entrypoint))
-            if (function := self._function(entrypoint)) is not None:
-                scopes.add(function)
-                break
-            bindings = self._bindings(entrypoint)
-            entrypoint = bindings[0] if len(bindings) == 1 else None
-        while True:
-            reachable = scopes | {
-                key
-                for scope, call in self.calls
-                if scope in scopes and (key := self._function(call.func)) is not None
-            }
-            if reachable == scopes:
-                break
-            scopes = reachable
-        return scopes
-
-    def _public_roots(self) -> set[str]:
-        """Select consumed parsers, rejecting unsupported public construction."""
-        roots: set[str] = set()
-        for _scope, call in self.calls:
-            if isinstance(call.func, ast.Name):
-                if self._function(call.func) in self.ambiguous_functions:
-                    self._error(
-                        call,
-                        f"ambiguous helper {call.func.id!r}: multiple definitions",
-                    )
-                classes = self.names.names(call.func) & self.classes.keys()
-                definition = (
-                    self.classes[next(iter(classes))] if len(classes) == 1 else None
-                )
-                if definition is not None and any(
-                    (
-                        isinstance(node, (ast.Name, ast.Attribute))
-                        and self._qualified(node) == "argparse.ArgumentParser"
-                    )
-                    or (
-                        isinstance(node, ast.Attribute)
-                        and node.attr in {"add_argument", "add_parser"}
-                    )
-                    for node in ast.walk(definition)
-                ):
-                    self._error(
-                        call,
-                        "class-based argparse construction is not supported",
-                    )
-            if not isinstance(call.func, ast.Attribute) or call.func.attr not in {
-                "parse_args",
-                "parse_known_args",
-                "parse_intermixed_args",
-                "parse_known_intermixed_args",
-            }:
-                continue
-            paths = self._resolve(call.func.value)
-            if not paths:
-                if self.has_argparse:
-                    self._error(call, "cannot resolve the public argparse parser")
-                continue
-            self._check_structure(call)
-            roots.update(path[0] for path in paths)
-            if len(roots) > 1:
-                self._error(call, "multiple public parsers cannot form one CLI")
-        return roots
-
-    def _check_parents(self, call: ast.Call, roots: set[str]) -> None:
-        """Reject inherited interfaces until their argument scopes can be resolved."""
-        contexts = self._resolve(call)
-        if not any(context[0] in roots for context in contexts):
-            return
-        self._check_structure(call)
-        options = self._parser_keywords(call)
-        if "parents" in options and _value(options["parents"]) not in ([], ()):
-            self._error(call, "argparse parents= inheritance is not supported")
-        if (
-            "parser_class" in options
-            and self._qualified(options["parser_class"]) != "argparse.ArgumentParser"
-        ):
-            self._error(call, "custom subcommand parser classes cannot be inspected")
-
-    def _check_helpers(self, roots: set[str]) -> None:
-        """Do not let opaque helpers or parser methods silently change the interface."""
-        methods = {
-            "add_argument",
-            "add_parser",
-            "add_subparsers",
-            "add_argument_group",
-            "add_mutually_exclusive_group",
-            "set_defaults",
-            "get_default",
-            "parse_args",
-            "parse_known_args",
-            "parse_intermixed_args",
-            "parse_known_intermixed_args",
-            "error",
-            "exit",
-            "print_help",
-            "print_usage",
-            "format_help",
-            "format_usage",
-        }
-        for _scope, call in self.calls:
-            if isinstance(call.func, ast.Name):
-                self._parser_input(call.func, roots)
-            receiver = (
-                self._resolve(call.func.value)
-                if isinstance(call.func, ast.Attribute)
-                else set()
-            )
-            arguments = [*call.args, *(keyword.value for keyword in call.keywords)]
-            passed = {
-                index
-                for index, argument in enumerate(arguments)
-                if self._parser_input(argument, roots)
-            }
-            if any(path[0] in roots for path in receiver):
-                if isinstance(call.func, ast.Attribute) and call.func.attr in methods:
-                    continue
-                self._error(call, "unsupported parser method may change the CLI")
-            if not passed:
-                continue
-            if (key := self._function(call.func)) is not None:
-                self._check_helper_binding(self.functions[key], call, passed)
-                continue
-            self._error(call, "external helper receiving a parser cannot be inspected")
-
-    def _check_helper_binding(
-        self,
-        function: ast.FunctionDef | ast.AsyncFunctionDef,
-        call: ast.Call,
-        passed: set[int],
-    ) -> None:
-        """Require forwarded parsers to bind to explicit helper parameters."""
-        parameters = function.args.posonlyargs + function.args.args
-        for index in passed:
-            if index < len(call.args):
-                if isinstance(call.args[index], ast.Starred) or index >= len(
-                    parameters,
-                ):
-                    self._error(
-                        call,
-                        "cannot bind parser argument to helper parameter",
-                    )
-            elif call.keywords[index - len(call.args)].arg not in {
-                parameter.arg for parameter in [*parameters, *function.args.kwonlyargs]
-            }:
-                self._error(
-                    call,
-                    "cannot bind parser argument to helper parameter",
-                )
-
-    def _parser_input(
-        self,
-        node: ast.expr,
-        roots: set[str],
-        seen: set[int] | None = None,
-    ) -> bool:
-        """Find parser inputs wrapped in literal containers or aliases."""
-        if seen is None:
-            seen = set()
-        key = id(node)
-        if key in seen:
-            return False
-        seen.add(key)
-        if any(path[0] in roots for path in self._resolve(node)):
-            return True
-        if isinstance(node, ast.Name):
-            return any(
-                self._parser_input(value, roots, seen) for value in self._bindings(node)
-            )
-        if (
-            isinstance(node, ast.Attribute)
-            and node.attr.startswith("add_")
-            and self._parser_input(node.value, roots, seen)
-        ):
-            self._error(node, "indirect parser mutation cannot be inspected")
-        if isinstance(node, (ast.Dict, ast.List, ast.Tuple, ast.Set, ast.Starred)):
-            return any(
-                self._parser_input(child, roots, seen)
-                for child in ast.iter_child_nodes(node)
-                if isinstance(child, ast.expr)
-            )
-        return False
-
-    def _groups(
-        self,
-        node: ast.expr,
-        seen: frozenset[int] = frozenset(),
-    ) -> set[int]:
-        """Find group declarations through the same bindings used for parser scopes."""
-        key = id(node)
-        if key in seen:
-            return set()
-        seen = seen | {key}
-        groups: set[int] = set()
-        for value in self._sources(node):
-            groups.update(self._groups(value, seen))
-        if (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Attribute)
-            and node.func.attr in {"add_argument_group", "add_mutually_exclusive_group"}
-        ):
-            groups.add(id(node))
-        return groups
-
-    def _group_members(
-        self,
-        call: ast.Call,
-        contexts: set[tuple[str, ...]],
-        roots: set[str],
-    ) -> dict[tuple[str, ...], list[list[object]]]:
-        """List group members by their declared argument names."""
-        members: dict[tuple[str, ...], list[list[object]]] = {
-            context: [] for context in contexts
-        }
-        for _argument_scope, argument in self.calls:
-            if (
-                not isinstance(argument.func, ast.Attribute)
-                or argument.func.attr != "add_argument"
-            ):
-                continue
-            if id(call) not in self._groups(argument.func.value):
-                continue
-            for path in self._resolve(argument.func.value):
-                if path[0] in roots and path[1:] in members:
-                    members[path[1:]].append(
-                        [_value(name) for name in argument.args],
-                    )
-        return members
-
-    def _report_metadata(self, result: dict[str, Any], roots: set[str]) -> None:
-        """Describe parser defaults and group constraints without evaluating values."""
-        for _scope, call in self.calls:
-            if not isinstance(call.func, ast.Attribute) or call.func.attr not in {
-                "set_defaults",
-                "add_argument_group",
-                "add_mutually_exclusive_group",
-            }:
-                continue
-            paths = self._resolve(call.func.value)
-            contexts = {path[1:] for path in paths if path[0] in roots}
-            if not contexts:
-                continue
-            options = {
-                keyword.arg or "**kwargs": _value(keyword.value)
-                for keyword in call.keywords
-            }
-            if call.func.attr == "set_defaults":
-                if self._is_conditional(call):
-                    options = {name: {"unknown": ast.unparse(call)} for name in options}
-                for context in sorted(contexts):
-                    _command_node(result, context).setdefault("defaults", {}).update(
-                        options,
-                    )
-                continue
-            self._check_structure(call)
-            for name, value in zip(("title", "description"), call.args, strict=False):
-                options[name] = _value(value)
-            members = self._group_members(call, contexts, roots)
-            for context in sorted(contexts):
-                _command_node(result, context).setdefault("groups", []).append(
-                    {
-                        "arguments": members[context],
-                        "exclusive": call.func.attr == "add_mutually_exclusive_group",
-                        **options,
-                    },
-                )
-
-    def _report_argument(
-        self,
-        result: dict[str, Any],
-        call: ast.Call,
-        receiver: ast.expr,
-        roots: set[str],
-    ) -> None:
-        """Attach a declaration only when its parser and argument names are known."""
-        contexts = self._resolve(receiver)
-        if not contexts:
-            if self.has_argparse:
-                self._error(call, "cannot resolve the argument parser")
-            return
-        public_contexts = {context[1:] for context in contexts if context[0] in roots}
-        if not public_contexts:
-            return
-        self._check_structure(call)
-        names = [_value(argument) for argument in call.args]
-        if not names or any(not isinstance(name, str) for name in names):
-            self._error(call, "argument names must be literal strings")
-        options = {
-            keyword.arg or "**kwargs": _value(keyword.value)
-            for keyword in call.keywords
-        }
-        for context in sorted(public_contexts):
-            _command_node(result, context).setdefault("arguments", []).append(
-                {"names": names, **options},
-            )
-
-    def report(self) -> dict[str, Any]:
-        """Return a command tree, failing when its interface cannot be resolved."""
-        roots = self._public_roots()
-        self._check_helpers(roots)
-        result: dict[str, Any] = {}
-        for _scope, call in self.calls:
-            if self._qualified(call.func) == "argparse.ArgumentParser":
-                self._check_parents(call, roots)
-            if not isinstance(call.func, ast.Attribute):
-                continue
-            if call.func.attr == "add_subparsers":
-                self._check_parents(call, roots)
-            if call.func.attr == "add_parser":
-                contexts = self._resolve(call)
-                if not contexts and self.has_argparse:
-                    self._error(call, "cannot resolve the subcommand parser")
-                self._check_parents(call, roots)
-                paths = {path[1:] for path in contexts if path[0] in roots}
-                for path in sorted(paths):
-                    _command_node(result, path)
-            if call.func.attr == "add_argument":
-                self._report_argument(result, call, call.func.value, roots)
-        if not self.argument_free and not roots:
-            message = f"{self.filename}: cannot inspect CLI: no supported parser found"
-            raise CommandError(message)
-        self._report_metadata(result, roots)
-        return result or {"arguments": []}
-
-
 def _python_library(document: nix_syntax.Document) -> bool:
     """Read the executable setting from the Python builder's arguments."""
-    argument = _package_body(document).child_by_field_name("argument")
-    values = _attrset_expression(document, argument, ("executable",))
-    return len(values) == 1 and document.text(values[0]) == "false"
+    argument = _builder_field(document, "argument")
+    if argument is None or argument.type not in {
+        "attrset_expression",
+        "rec_attrset_expression",
+    }:
+        return False
+    bindings = nix_syntax.binding_set(argument)
+    return [
+        document.text(value)
+        for binding in (bindings.named_children if bindings is not None else [])
+        if (attrpath := binding.child_by_field_name("attrpath")) is not None
+        and nix_syntax.static_attrpath(document, attrpath) == ("executable",)
+        and (value := binding.child_by_field_name("expression")) is not None
+    ] == ["false"]
 
 
-_DEPENDENCY_FIELDS = {
-    "propagatedBuildInputs": "runtime",
-    "propagatedNativeBuildInputs": "build",
-    "buildInputs": "build",
-    "nativeBuildInputs": "build",
-    "runtimeInputs": "runtime",
-    "dependencies": "runtime",
-    "build-system": "build",
-    "checkInputs": "test",
-    "nativeCheckInputs": "test",
-    "systemPackages": "runtime",
+def _python_suite_names(path: Path) -> set[str]:
+    """Read the pytest identifiers declared in a suite."""
+    return _python_test_names(_source(path))
+
+
+NAMED_TEST_FILES = {
+    "bash": ("test_main.bats", bats_names),
+    "generic": ("test_main.nix", nix_names),
+    "lean4": ("test_main.lean", lean_names),
+    "python": ("test_main.py", _python_suite_names),
 }
 
 
-def _alias_value(
-    document: nix_syntax.Document,
-    node: Node,
-) -> Node | None:
-    """Find a let or recursive-set alias in the reference's lexical scope."""
-    name = document.text(node)
-    parent = node.parent
-    while parent is not None:
-        if parent.type == "function_expression":
-            parameter = parent.child_by_field_name("universal")
-            if parameter is not None and document.text(parameter) == name:
-                return None
-            formals = parent.child_by_field_name("formals")
-            if formals is not None and any(
-                (formal := child.child_by_field_name("name")) is not None
-                and document.text(formal) == name
-                for child in formals.children_by_field_name("formal")
-            ):
-                return None
-        if parent.type in {"let_expression", "rec_attrset_expression"}:
-            bindings = nix_syntax.binding_set(parent)
-            for binding in [] if bindings is None else bindings.named_children:
-                attrpath = binding.child_by_field_name("attrpath")
-                if attrpath is not None and nix_syntax.static_attrpath(
-                    document,
-                    attrpath,
-                ) == (name,):
-                    return binding.child_by_field_name("expression")
-        parent = parent.parent
-    return None
-
-
-def _dependency_parts(
-    document: nix_syntax.Document,
-    node: Node,
-    seen: frozenset[int] = frozenset(),
-) -> list[str | None] | None:
-    """Expand static attribute prefixes and aliases, retaining dynamic components."""
-    if node.id in seen:
-        return None
-    seen = seen | {node.id}
-    if node.type in {"variable_expression", "identifier"}:
-        alias = _alias_value(document, node)
-        if alias is not None:
-            return _dependency_parts(document, alias, seen)
-        return [document.text(node)]
-    if node.type == "select_expression":
-        base = node.child_by_field_name("expression")
-        attrs = node.child_by_field_name("attrpath")
-        parts = None if base is None else _dependency_parts(document, base, seen)
-        if parts is None or attrs is None:
-            return None
-        parts.extend(nix_syntax.attrpath_parts(document, attrs))
-        return parts
-    return None
-
-
-def _dependency_target(parts: list[str | None] | None) -> str | None:
-    """Return a statically named package from this flake only."""
-    if parts is not None:
-        for prefix in (["inputs", "self", "packages"], ["self", "packages"]):
-            if parts[: len(prefix)] == prefix and len(parts) >= len(prefix) + 2:
-                return parts[len(prefix) + 1]
-    return None
-
-
-def _dependency_values(  # noqa: PLR0911 - one case per supported syntax form
-    document: nix_syntax.Document,
-    node: Node | None,
-    seen: frozenset[int] = frozenset(),
-) -> list[list[str | None]]:
-    """Collect attribute paths from dependency declarations."""
-    if node is None or node.id in seen:
-        return []
-    seen = seen | {node.id}
-    if node.type == "list_expression":
-        return [
-            value
-            for child in node.named_children
-            for value in _dependency_values(document, child, seen)
-        ]
-    if node.type in {"variable_expression", "identifier"}:
-        alias = _alias_value(document, node)
-        if alias is None or alias.type in {
-            "apply_expression",
-            "attrset_expression",
-            "rec_attrset_expression",
-        }:
-            return [[document.text(node)]]
-        return _dependency_values(document, alias, seen)
-    if node.type == "with_expression":
-        body = node.child_by_field_name("body")
-        environment = node.child_by_field_name("environment")
-        prefix = (
-            None if environment is None else _dependency_parts(document, environment)
-        )
-        values = _dependency_values(document, body, seen)
-        return [
-            prefix + parts if prefix and len(parts) == 1 else parts for parts in values
-        ]
-    if node.type == "parenthesized_expression":
-        return _dependency_values(
-            document, node.child_by_field_name("expression"), seen
-        )
-    if node.type == "binary_expression":
-        operator = node.child_by_field_name("operator")
-        if operator is not None and operator.type == "++":
-            return _dependency_values(
-                document, node.child_by_field_name("left"), seen
-            ) + _dependency_values(document, node.child_by_field_name("right"), seen)
-    parts = _dependency_parts(document, node)
-    return [parts] if parts is not None else []
-
-
-def resource_dependencies(  # noqa: C901 - Recognize dependency declarations, package selections, and source paths.
-    name: str,
-    documents: list[nix_syntax.Document],
-    resources: set[str],
-) -> dict[str, list[str]]:
-    """Group declared local dependency roles by resource without evaluating Nix."""
-    roles: defaultdict[str, set[str]] = defaultdict(set)
-    for document in documents:
-        for node in nix_syntax.walk(document.root):
-            if node.type == "binding":
-                attrs = node.child_by_field_name("attrpath")
-                parts = (
-                    None
-                    if attrs is None
-                    else nix_syntax.static_attrpath(document, attrs)
-                )
-                expression = node.child_by_field_name("expression")
-                if (
-                    not parts
-                    or parts[-1] not in _DEPENDENCY_FIELDS
-                    or expression is None
-                ):
-                    continue
-                for reference in _dependency_values(document, expression):
-                    target = _dependency_target(reference)
-                    if target in resources:
-                        roles[target].add(_DEPENDENCY_FIELDS[parts[-1]])
-            elif node.type == "select_expression":
-                target = _dependency_target(_dependency_parts(document, node))
-                if target in resources:
-                    roles.setdefault(target, set())
-            elif node.type == "path_expression":
-                text = document.text(node)
-                if text.startswith(("./", "../")) and "${" not in text:
-                    normalized = os.path.normpath(str(Path(name) / text))
-                    components = Path(normalized).parts
-                    target = components[0] if components else None
-                    if target in resources:
-                        roles[target].add("source")
-    return {
-        target: sorted(kinds) or ["reference"]
-        for target, kinds in sorted(roles.items())
-        if target != name
-    }
-
-
-def _inspect_arguments(path: Path, cache: Path | None) -> dict[str, Any]:
-    """Reuse successful CLI analysis of identical sources when diffing snapshots."""
-    source = path.read_bytes()
-    if cache is None:
-        return ArgumentDiscovery(source, str(path)).report()
-    analyzer = f"2:{__file__}:{sys.implementation.cache_tag}\0".encode()
-    digest = hashlib.sha256(analyzer)
-    digest.update(source)
-    entry = cache / f"{digest.hexdigest()}.json"
-    with contextlib.suppress(OSError, ValueError):
-        saved = json.loads(entry.read_bytes())
-        if isinstance(saved, dict):
-            return saved
-    report = ArgumentDiscovery(source, str(path)).report()
-    write_cache_entry(entry, report)
-    return report
-
-
-def _package_report(
-    package: Package, paths: set[Path], argument_cache: Path | None
-) -> dict[str, Any]:
-    """Describe a package's metadata, public CLI, and test identifiers."""
-    resource: dict[str, Any] = {"type": package.kind}
-    if description := _meta_description(package.definition):
-        resource["description"] = description
-    if package.kind == "python":
-        path = package.root / "main.py"
-        if _python_library(package.definition):
-            _source(path)
-        else:
-            resource.update(_inspect_arguments(path, argument_cache))
-    test_name = PACKAGE_TEST_FILES.get(package.kind)
-    if test_name is not None and Path(package.root.name) / test_name in paths:
-        tests = package.root / test_name
-        if tests.is_file():
-            identifiers = (
-                _python_test_names(_source(tests))
-                if package.kind == "python"
-                else [test_name]
-            )
-            if identifiers:
-                resource["tests"] = identifiers
-    return resource
-
-
-def inspect_repository(
-    root: Path, *, argument_cache: Path | None = None
-) -> dict[str, Any]:
-    """Describe root resources by name, with their interfaces and test identifiers."""
+def inspect_repository(root: Path) -> dict[str, list[str]]:
+    """Map each declared package to its sorted, statically named tests."""
     if not (root / "flake.nix").is_file():
         message = f"{root}: expected an Afairesi repository with flake.nix"
         raise CommandError(message)
     paths = source_paths(root)
-    host_names = {host.name for host in detect_hosts(root, paths)}
-    declared, _ = detect_packages(root, paths)
-    packages = {package.root.name: package for package in declared}
-    resource_names = host_names | packages.keys()
-    resources = {}
-    for name in sorted(resource_names):
-        documents = []
-        package = packages.get(name)
-        if package is None:
-            resource: dict[str, Any] = {"type": "host"}
-        else:
-            resource = _package_report(package, paths, argument_cache)
-            documents.append(package.definition)
-        if name in host_names:
-            relative = Path(name) / "configuration.nix"
-            documents.append(
-                nix_syntax.parse((root / relative).read_bytes(), str(relative))
-            )
-            if package is not None:
-                resource["type"] = [package.kind, "host"]
-        dependencies = resource_dependencies(name, documents, resource_names)
-        if dependencies:
-            resource["dependencies"] = dependencies
-        resources[name] = resource
-    return resources
+    packages, _ = detect_packages(root, paths)
+    report: dict[str, list[str]] = {}
+    tracked_rust = None
+    for package in packages:
+        name = package.root.name
+        names: set[str] = set()
+        if suite_info := NAMED_TEST_FILES.get(package.kind):
+            filename, extract = suite_info
+            suite = package.root / filename
+            if suite.relative_to(root) in paths and suite.is_file():
+                names.update(extract(suite))
+        if (
+            package.kind == "generic"
+            and Path(name) / "Cargo.toml" in paths
+            and (package.root / "Cargo.toml").is_file()
+        ):
+            if tracked_rust is None and (root / ".git").exists():
+                tracked_rust = {
+                    root / source for source in paths if source.suffix == ".rs"
+                }
+            names.update(cargo_names(package.root, tracked_rust))
+        report[name] = sorted(names)
+    return report
 
 
 def diff_inputs(root: Path, listing: str) -> list[tuple[str, str, Path]]:
@@ -1666,11 +530,22 @@ def diff_inputs(root: Path, listing: str) -> list[tuple[str, str, Path]]:
             raise CommandError(message)
         if mode != "160000":
             files.append((mode, oid, Path(name)))
+    manifests = {
+        path.parent
+        for _, _, path in files
+        if path.name == "Cargo.toml" and len(path.parent.parts) == 1
+    }
+    filenames = {
+        "default.nix",
+        "Cargo.toml",
+        *(entry[0] for entry in NAMED_TEST_FILES.values()),
+    }
     inputs = [
         (mode, oid, path)
         for mode, oid, path in files
         if path == Path("flake.nix")
-        or (len(path.parent.parts) == 1 and path.name in INSPECTION_FILENAMES)
+        or (len(path.parent.parts) == 1 and path.name in filenames)
+        or (path.suffix == ".rs" and Path(path.parts[0]) in manifests)
     ]
     if any(mode == "120000" or (root / path).is_symlink() for mode, _, path in inputs):
         return files
@@ -1680,10 +555,9 @@ def diff_inputs(root: Path, listing: str) -> list[tuple[str, str, Path]]:
 def _inspection_git_report(
     root: Path,
     files: list[tuple[str, str, Path]],
-    argument_cache: Path,
     *,
     working_tree: bool = False,
-) -> dict[str, Any]:
+) -> dict[str, list[str]]:
     """Inspect tracked sources in a temporary directory without checkout filters."""
     with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
         snapshot = Path(directory)
@@ -1721,38 +595,17 @@ def _inspection_git_report(
                 else:
                     target.write_bytes(source_bytes)
         return (
-            inspect_repository(snapshot, argument_cache=argument_cache)
-            if (snapshot / "flake.nix").is_file()
-            else {}
+            inspect_repository(snapshot) if (snapshot / "flake.nix").is_file() else {}
         )
 
 
-def cache_home() -> Path:
-    """Locate the user's XDG cache directory."""
-    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
-    return base if base.is_absolute() else Path.home() / ".cache"
-
-
-def write_cache_entry(path: Path, value: object) -> None:
-    """Publish a complete JSON cache entry, tolerating unavailable storage."""
-    with contextlib.suppress(OSError):
-        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            mode="w", encoding="utf-8", dir=path.parent, delete_on_close=False
-        ) as pending:
-            json.dump(value, pending)
-            pending.close()
-            Path(pending.name).replace(path)
-
-
 def _dispatch_diff(arguments: list[str]) -> None:
-    """Render tracked interface changes between the index and the working tree."""
+    """Render changes in package test names between the index and the working tree."""
     _diff_parser().parse_args(arguments)
     root = repository_root()
     files = diff_inputs(root, git(root, ["ls-files", "--stage", "-z"]).stdout)
-    cache = cache_home() / "afairesi" / "arguments"
-    before = json.dumps(_inspection_git_report(root, files, cache))
-    after = json.dumps(_inspection_git_report(root, files, cache, working_tree=True))
+    before = json.dumps(_inspection_git_report(root, files))
+    after = json.dumps(_inspection_git_report(root, files, working_tree=True))
     if before == after:
         return
     with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
@@ -1792,23 +645,20 @@ def _dispatch_inspection(arguments: list[str]) -> None:
 
 
 def parser() -> argparse.ArgumentParser:
-    """Construct the parser for the default repository inventory."""
+    """Construct the parser for the package test-name specification."""
     result = argparse.ArgumentParser(
         prog="afairesi",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Print JSON describing hosts, packages, CLI arguments, "
-            "and test identifiers. "
-            "Resource type is the package kind or 'host'. "
-            "CLI fields appear directly on each resource. An executable with "
-            "an otherwise empty interface has an empty arguments list. "
-            "Dependencies map local resource names to their roles. "
-            "Fail if CLI declarations cannot be resolved reliably. "
-            "Inspect source without executing it."
+            "Print a JSON object mapping each package to its sorted test names. "
+            "Read Python tests (test_main.py), Bats cases (test_main.bats), Nix "
+            "runTests cases (test_main.nix), Lean theorems (test_main.lean), and "
+            "Rust #[test] functions in Cargo targets without executing source. "
+            "Packages with no named tests map to []."
         ),
         epilog=(
             "Commands:\n"
-            "  diff    diff inspected interfaces in jd format\n"
+            "  diff    diff test names in jd format\n"
             "Use './diff' or '-- diff' to inspect a repository named diff."
         ),
     )
@@ -1826,13 +676,11 @@ def parser() -> argparse.ArgumentParser:
 
 def _diff_parser() -> argparse.ArgumentParser:
     """Construct the parser for the diff subcommand."""
-    commands = parser().add_subparsers()
-    return commands.add_parser(
-        "diff",
+    return argparse.ArgumentParser(
         prog="afairesi diff",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         description=(
-            "Print a jd-compatible structural diff of repository inspections. "
+            "Print a jd-compatible diff of package test names. "
             "Compare the current repository's index with tracked working-tree sources. "
             "Untracked files and implementation-only changes are omitted. "
             "Inspect source without executing it or changing Git state."

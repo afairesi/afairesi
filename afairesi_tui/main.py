@@ -1,5 +1,5 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Browse home's direct submodules in an expandable text tree."""
+"""Browse package test names and their changes across home's direct submodules."""
 
 # ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
@@ -13,24 +13,35 @@ import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Literal, TypedDict, TypeGuard
 
-from afairesi import CommandError, cache_home, diff_inputs, write_cache_entry
+from afairesi import CommandError, diff_inputs
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator
 
-CACHE_VERSION = 2
+CACHE_VERSION = 5
 XTERM_ORANGE = 208
-type Payload = dict[str, Any] | list[dict[str, Any]]
-type View = Literal["resources", "diff"]
+type View = Literal["tests", "diff"]
 
 READ_ERRORS = (CommandError, OSError, ValueError, subprocess.SubprocessError)
+
+
+class PatchChange(TypedDict):
+    """A package or test name added or removed by jd."""
+
+    op: Literal["add", "remove"]
+    path: str
+    value: str | list[str]
+
+
+type Payload = dict[str, list[str]] | list[PatchChange]
 
 
 def command(arguments: list[str], root: Path, *, input_text: str | None = None) -> str:
@@ -55,59 +66,53 @@ def git(root: Path, *arguments: str) -> str:
     return command(["git", *arguments], root)
 
 
+def _path_stamp(path: Path) -> bytes:
+    """Include changes to a file or link target and track directory identity."""
+    try:
+        info = path.lstat()
+    except FileNotFoundError, NotADirectoryError:
+        return b"missing"
+    if stat.S_ISDIR(info.st_mode):
+        return repr((info.st_dev, info.st_ino, info.st_mode)).encode()
+    stats = [info]
+    if stat.S_ISLNK(info.st_mode):
+        with contextlib.suppress(OSError):
+            stats.append(path.stat())
+    return repr(
+        [
+            (
+                item.st_dev,
+                item.st_ino,
+                item.st_mode,
+                item.st_size,
+                item.st_mtime_ns,
+                item.st_ctime_ns,
+            )
+            for item in stats
+        ]
+    ).encode()
+
+
 def fingerprint(root: Path, view: View) -> str | None:
-    """Track each view's inputs, bypassing diffs with independently staged links."""
+    """Track the CLI's specification inputs in the index and working tree."""
     entries = git(root, "ls-files", "--stage", "-z")
-    digest = hashlib.sha256()
-    if view == "diff":
+    try:
         files = diff_inputs(root, entries)
-        if any(mode == "120000" for mode, _, _ in files):
-            return None
-        paths = {path for _, _, path in files}
-        for mode, oid, path in files:
-            digest.update(f"{mode} {oid}\t{path}\0".encode())
+    except CommandError:
+        return None
+    digest = hashlib.sha256()
+    paths = {path for _, _, path in files}
+    if view == "tests":
+        paths.add(Path("flake.nix"))
     else:
-        digest.update(entries.encode())
-        paths = {
-            Path(entry.split("\t", 1)[1])
-            for entry in entries.split("\0")
-            if entry and not entry.startswith("160000 ")
-        }
+        for mode, oid, path in files:
+            if mode == "120000":
+                return None
+            digest.update(f"{mode} {oid}\t{path}\0".encode())
     paths.update(parent for path in list(paths) for parent in path.parents)
     for tracked in sorted(paths):
-        path = root / tracked
         digest.update(str(tracked).encode())
-        try:
-            entry_stat = path.lstat()
-        except FileNotFoundError, NotADirectoryError:
-            digest.update(b"missing")
-            continue
-        stats = [entry_stat]
-        if view == "diff" and stat.S_ISDIR(entry_stat.st_mode):
-            digest.update(
-                repr(
-                    (entry_stat.st_dev, entry_stat.st_ino, entry_stat.st_mode)
-                ).encode()
-            )
-            continue
-        if stat.S_ISLNK(entry_stat.st_mode):
-            try:
-                stats.append(path.stat())
-            except OSError as error:
-                digest.update(f"unreadable target: {error.errno}".encode())
-        for info in stats:
-            digest.update(
-                repr(
-                    (
-                        info.st_dev,
-                        info.st_ino,
-                        info.st_mode,
-                        info.st_size,
-                        info.st_mtime_ns,
-                        info.st_ctime_ns,
-                    )
-                ).encode()
-            )
+        digest.update(_path_stamp(root / tracked))
     return digest.hexdigest()
 
 
@@ -142,28 +147,56 @@ def repositories(home: Path) -> list[str]:
     return sorted(result)
 
 
+def _is_test_mapping(value: object) -> TypeGuard[dict[str, list[str]]]:
+    """Recognize the CLI's package-to-test-names JSON format."""
+    return isinstance(value, dict) and all(
+        isinstance(package, str)
+        and isinstance(names, list)
+        and all(isinstance(name, str) for name in names)
+        for package, names in value.items()
+    )
+
+
 def read_output(root: Path, view: View) -> Payload:
     """Read only the requested CLI result; errors are never cached."""
-    commands = {"resources": ["afairesi"], "diff": ["afairesi", "diff"]}
+    commands = {"tests": ["afairesi"], "diff": ["afairesi", "diff"]}
     output = command(commands[view], root)
-    if view == "resources":
-        resources: dict[str, Any] = json.loads(output)
-        return resources
-    patch: list[dict[str, Any]] = (
-        json.loads(command(["jd", "-t", "jd2patch"], root, input_text=output))
-        if output
-        else []
-    )
-    return patch
+    if view == "tests":
+        tests = json.loads(output)
+        if not _is_test_mapping(tests):
+            msg = "Expected afairesi JSON mapping each package to a list of test names."
+            raise ValueError(msg)
+        return tests
+    if not output:
+        return []
+    patch = json.loads(command(["jd", "-t", "jd2patch"], root, input_text=output))
+    return [operation for operation in patch if operation["op"] in {"add", "remove"}]
+
+
+def _cache_home() -> Path:
+    """Locate the user's XDG cache directory."""
+    base = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache")
+    return base if base.is_absolute() else Path.home() / ".cache"
+
+
+def _write_cache_entry(path: Path, value: object) -> None:
+    """Publish a complete JSON cache entry, tolerating unavailable storage."""
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete_on_close=False
+        ) as pending:
+            json.dump(value, pending)
+            pending.close()
+            Path(pending.name).replace(path)
 
 
 def cached_output(
     root: Path, view: View, cache: Path, *, refresh: bool
 ) -> tuple[Payload, bool]:
     """Reuse a stable CLI result, with atomic writes and disposable cache failures."""
-    tools = [
-        str(Path(shutil.which(name) or name).resolve()) for name in ("afairesi", "jd")
-    ]
+    executables = ("afairesi", "jd") if view == "diff" else ("afairesi",)
+    tools = [str(Path(shutil.which(name) or name).resolve()) for name in executables]
     key = hashlib.sha256(
         json.dumps([CACHE_VERSION, str(root), view, tools]).encode()
     ).hexdigest()
@@ -175,14 +208,16 @@ def cached_output(
             if (
                 isinstance(saved, dict)
                 and saved.get("fingerprint") == before
-                and isinstance(
-                    saved.get("value"), dict if view == "resources" else list
+                and (
+                    _is_test_mapping(saved.get("value"))
+                    if view == "tests"
+                    else isinstance(saved.get("value"), list)
                 )
             ):
                 return saved["value"], True
     value = read_output(root, view)
     if before is not None and fingerprint(root, view) == before:
-        write_cache_entry(path, {"fingerprint": before, "value": value})
+        _write_cache_entry(path, {"fingerprint": before, "value": value})
     return value, False
 
 
@@ -207,7 +242,7 @@ def _repository_node(
         if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
             message = "The registered path is not a repository checkout within home."
             raise ValueError(message)
-        if view == "resources":
+        if view == "tests":
             branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
             node.add(f"branch: {branch}")
             if git(
@@ -217,10 +252,10 @@ def _repository_node(
                 "--untracked-files=no",
                 "--ignore-submodules=all",
             ):
-                node.add("modified").change = "~"
+                node.add("modified", change="~")
         value, hit = cached_output(root, view, cache, refresh=refresh)
         if isinstance(value, dict):
-            add_resources(node, value)
+            add_tests(node, value)
             if any(child.change == "~" for child in node.children):
                 node.change = "~"
         else:
@@ -234,7 +269,7 @@ def _repository_node(
 def build_tree(
     home: Path,
     *,
-    view: View = "resources",
+    view: View = "tests",
     progress: bool | Callable[[int, int], None] = False,
     cache: Path,
     refresh: bool = False,
@@ -274,13 +309,13 @@ def build_tree(
     if compact_progress:
         sys.stderr.write("\r\033[K")
         sys.stderr.flush()
-    tree = Node(str(home), expanded=True)
-    directories: dict[tuple[Node, str], Node] = {}
-    for path, node in sorted(repositories_by_path.items()):
-        parent = _tree_branch(tree, Path(path).parts[:-1], directories)
-        parent.children.append(node)
+    tree = _directory_tree(home, repositories_by_path)
     if not tree.children:
-        tree.add("No changes" if view == "diff" else "No direct registered submodules.")
+        tree.add(
+            "No test specification changes"
+            if view == "diff"
+            else "No direct registered submodules."
+        )
     return tree
 
 
@@ -292,10 +327,11 @@ class Node:
     children: list[Node] = field(default_factory=list)
     expanded: bool = False
     change: str = ""
+    detail: str = ""
 
-    def add(self, label: str) -> Node:
+    def add(self, label: str, *, change: str = "") -> Node:
         """Append a folded child and return it for further details."""
-        child = Node(label, change=self.change)
+        child = Node(label, change=change)
         self.children.append(child)
         return child
 
@@ -307,79 +343,58 @@ class Node:
                 yield from child.visible(depth + 1)
 
 
-def add_value(parent: Node, label: str, value: object) -> None:
-    """Render metadata as named text nodes, without JSON braces or array indexes."""
-    if not isinstance(value, (dict, list)) or not value:
-        text = "none" if value is None or value in ([], {}) else str(value)
-        parent.add(f"{label}: {text}" if label else text)
-        return
-    node = parent.add(label)
-    if isinstance(value, dict):
-        for key, item in value.items():
-            add_value(node, str(key), item)
-    else:
-        for item in value:
-            if isinstance(item, dict) and "names" in item:
-                name = ", ".join(item["names"])
-                add_value(
-                    node,
-                    name,
-                    {key: data for key, data in item.items() if key != "names"},
-                )
-            else:
-                add_value(node, "item" if isinstance(item, (dict, list)) else "", item)
+def _directory_tree(home: Path, repositories_by_path: dict[str, Node]) -> Node:
+    """Group repositories that share a home directory under the same node."""
+    tree = Node(str(home), expanded=True)
+    directories: dict[tuple[Node, str], Node] = {}
+    for path, node in sorted(repositories_by_path.items()):
+        parent = tree
+        for directory in Path(path).parts[:-1]:
+            key = (parent, directory)
+            if key not in directories:
+                directories[key] = parent.add(directory)
+            parent = directories[key]
+        parent.children.append(node)
+    return tree
 
 
-def add_resources(node: Node, resources: dict[str, Any]) -> None:
-    """Add the CLI's resource fields and group dependencies by target."""
-    for resource, fields in resources.items():
-        child = node.add(resource)
-        for key, value in fields.items():
-            if key == "dependencies":
-                dependencies = child.add(key)
-                for target, roles in value.items():
-                    dependencies.add(f"{target} ({', '.join(roles)})")
-            else:
-                add_value(child, key, value)
+def add_tests(node: Node, packages: dict[str, list[str]]) -> None:
+    """Keep each name searchable and show the number of named tests when folded."""
+    if not packages:
+        node.add("No packages")
+    for package, tests in packages.items():
+        child = node.add(package)
+        count = len(tests)
+        child.detail = f"{count or 'no'} named test{'' if count == 1 else 's'}"
+        for name in tests:
+            child.add(name)
 
 
-def _tree_branch(
-    parent: Node,
-    parts: Sequence[str],
-    branches: dict[tuple[Node, str], Node],
-) -> Node:
-    """Find or create the shared parent for a directory or patch path."""
-    for part in parts:
-        key = (parent, part)
-        if key not in branches:
-            branches[key] = parent.add(part)
-        parent = branches[key]
-    return parent
-
-
-def add_changes(node: Node, patch: list[dict[str, Any]]) -> None:
-    """Show added and removed interface values, omitting redundant patch tests."""
-    branches: dict[tuple[Node, str], Node] = {}
+def add_changes(node: Node, patch: list[PatchChange]) -> None:
+    """Show package and test name changes from a jd patch."""
+    packages: dict[str, Node] = {}
     for operation in patch:
-        if operation["op"] == "test":
-            continue
-        parts = [
+        marker = {"add": "+", "remove": "-"}[operation["op"]]
+        path = [
             part.replace("~1", "/").replace("~0", "~")
-            for part in operation["path"].split("/")[1:]
-        ] or ["repository"]
-        parent = _tree_branch(node, parts[:-1], branches)
-        marker = {"add": "+", "remove": "-", "replace": "~"}[operation["op"]]
-        value = operation.get("value")
-        structured = isinstance(value, (dict, list))
-        label = f"{marker} {parts[-1]}"
-        change = parent.add(label if structured else f"{label}: {value}")
-        change.change = marker
-        if structured:
-            add_value(change, "value", value)
+            for part in operation["path"].split("/")
+        ]
+        match path, operation["value"]:
+            case ["", package], list(names):
+                change = node.add(f"{marker} {package}", change=marker)
+                for name in names:
+                    change.add(f"{marker} {name}", change=marker)
+            case ["", package, index], str(name) if index.isdecimal() or index == "-":
+                if package not in packages:
+                    packages[package] = node.add(package, change="~")
+                packages[package].add(f"{marker} {name}", change=marker)
+            case _:
+                message = f"Unexpected package test change at {operation['path']}"
+                raise ValueError(message)
     if node.children:
         node.change = "~"
-    for branch in branches.values():
-        branch.change = "~"
+    for branch in packages.values():
+        branch.children.sort(key=lambda child: (child.change != "-", child.label))
 
 
 class Viewer:
@@ -518,6 +533,8 @@ class Viewer:
             label = "".join(
                 char if char.isprintable() else repr(char)[1:-1] for char in node.label
             )
+            if node.detail:
+                label += f" ({node.detail})"
             result.append(
                 (
                     f"{'  ' * depth}{marker} {label}"[self.horizontal :],
@@ -602,7 +619,7 @@ def browse(
     query = None
     message = ""
     while True:
-        other: View = "resources" if view == "diff" else "diff"
+        other: View = "tests" if view == "diff" else "diff"
         help_line = f"{view}   / search   d {other}   r refresh"
         footer = "/" + query if query is not None else message or help_line
         page = _draw(screen, viewer, colors, footer)
@@ -645,7 +662,7 @@ def main() -> None:
         "command",
         nargs="?",
         choices=["diff"],
-        help="show only interface diffs across all registered home repositories",
+        help="show test name changes across registered home repositories",
     )
     parser.add_argument(
         "--home",
@@ -662,10 +679,10 @@ def main() -> None:
     if not sys.stdin.isatty() or not sys.stdout.isatty():
         parser.error("an interactive terminal is required")
     try:
-        cache = cache_home() / "afairesi_tui"
+        cache = _cache_home() / "afairesi_tui"
 
         load = partial(build_tree, options.home, cache=cache, refresh=options.refresh)
-        view: View = options.command or "resources"
+        view: View = options.command or "tests"
         curses.wrapper(
             browse,
             load(view=view, progress=True),

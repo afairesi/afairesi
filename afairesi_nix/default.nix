@@ -1,4 +1,4 @@
-{ pkgs, ... }:
+{ inputs, pkgs, ... }:
 pkgs.stdenvNoCC.mkDerivation {
   dontBuild = true;
   installPhase = ''
@@ -8,6 +8,7 @@ pkgs.stdenvNoCC.mkDerivation {
     runHook postInstall
   '';
   meta.description = "Nix library for Afairesi packages, checks, formatters, and hosts";
+  passthru.tests.consumer = import ./test_consumer.nix { inherit inputs pkgs; };
   pname = baseNameOf ./.;
   src = ./.;
   version = "0.0.0";
