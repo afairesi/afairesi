@@ -1,6 +1,7 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Inspect repositories in the afairesi computing environment."""
+
+# ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
 import argparse
 import ast
@@ -20,7 +21,7 @@ from collections import defaultdict
 from copy import deepcopy
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import nix_syntax
 
@@ -445,7 +446,7 @@ def _python_entrypoint(
 
 def _package_body(document: nix_syntax.Document) -> Node:
     """Find the outer package expression beneath functions and let bindings."""
-    body: Node = document.root
+    body = document.root
     while body.type in {
         "function_expression",
         "let_expression",
@@ -581,6 +582,28 @@ class _PythonNames:
                     self.imported_references[span.start] = names
             elif len(names) == 1:
                 self.definitions[span.start] = next(iter(names))
+
+        self._select_import_branches()
+
+    def _select_import_branches(self) -> None:
+        """Discard script-only code before looking for CLI imports and calls."""
+        for node in ast.walk(self.module):
+            if not isinstance(node, (ast.If, ast.While)):
+                continue
+            match node.test:
+                case ast.Compare(
+                    left=ast.Name(id="__name__") as name,
+                    ops=[(ast.Eq() | ast.NotEq()) as operator],
+                    comparators=[ast.Constant(value="__main__")],
+                ) if not self.names(name) and not self.names(name, imported=True):
+                    active = isinstance(operator, ast.NotEq)
+                case _:
+                    continue
+            node.test = ast.copy_location(ast.Constant(active), node.test)
+            if not active:
+                node.body.clear()
+            else:
+                node.orelse.clear()
 
     def _offset(
         self,
@@ -797,7 +820,7 @@ class ArgumentDiscovery:
         if isinstance(node, ast.If):
             self._collect(node.test, scope, conditional=conditional)
             try:
-                condition = self._branch_value(node.test)
+                condition = ast.literal_eval(node.test)
             except ValueError, TypeError:
                 for child in [*node.body, *node.orelse]:
                     self._collect(child, scope, conditional=True)
@@ -812,20 +835,6 @@ class ArgumentDiscovery:
                 self._collect(handler, scope, conditional=True)
             return True
         return False
-
-    @staticmethod
-    def _branch_value(node: ast.expr) -> object:
-        """Interpret literals and the standard executable-module guard."""
-        if (
-            isinstance(node, ast.Compare)
-            and isinstance(node.left, ast.Name)
-            and node.left.id == "__name__"
-            and len(node.ops) == 1
-            and isinstance(node.ops[0], (ast.Eq, ast.NotEq))
-            and _value(node.comparators[0]) == "__main__"
-        ):
-            return isinstance(node.ops[0], ast.Eq)
-        return ast.literal_eval(node)
 
     def _collect_runtime_loop(
         self,
@@ -850,7 +859,7 @@ class ArgumentDiscovery:
         if isinstance(node, ast.While):
             self._collect(node.test, scope, conditional=conditional)
             try:
-                condition = self._branch_value(node.test)
+                condition = ast.literal_eval(node.test)
             except ValueError, TypeError:
                 condition = True
             for statement in node.body if condition else []:
@@ -964,18 +973,18 @@ class ArgumentDiscovery:
             if option.arg is not None:
                 result[option.arg] = option.value
                 continue
-            if not isinstance(option.value, ast.Dict) or any(
-                key is None or not isinstance(_value(key), str)
-                for key in option.value.keys
-            ):
+            if not isinstance(option.value, ast.Dict):
                 self._error(call, "parser keyword expansion must be a literal mapping")
             for key, value in zip(
                 option.value.keys,
                 option.value.values,
                 strict=True,
             ):
-                if key is not None:
-                    result[cast("str", _value(key))] = value
+                if not isinstance(key, ast.Constant) or not isinstance(key.value, str):
+                    self._error(
+                        call, "parser keyword expansion must be a literal mapping"
+                    )
+                result[key.value] = value
         return result
 
     def _may_resolve_parser(self, node: ast.expr) -> bool:
@@ -1424,7 +1433,7 @@ def _alias_value(
             ):
                 return None
         if parent.type in {"let_expression", "rec_attrset_expression"}:
-            bindings: Node | None = nix_syntax.binding_set(parent)
+            bindings = nix_syntax.binding_set(parent)
             for binding in [] if bindings is None else bindings.named_children:
                 attrpath = binding.child_by_field_name("attrpath")
                 if attrpath is not None and nix_syntax.static_attrpath(
@@ -1856,7 +1865,3 @@ def main() -> None:
     except (OSError, SyntaxError, ValueError) as error:
         sys.stderr.write(f"error: {error}\n")
         raise SystemExit(1) from error
-
-
-if __name__ == "__main__":
-    main()

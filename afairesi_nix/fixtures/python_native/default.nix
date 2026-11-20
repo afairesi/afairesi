@@ -23,7 +23,6 @@ pkgs.python3Packages.buildPythonPackage {
         '';
   };
   pyproject = true;
-  pythonImportsCheck = [ "native_example" ];
   src = ./.;
   version = "0.0.0";
 }

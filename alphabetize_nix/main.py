@@ -1,6 +1,7 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Canonicalize ordering and nesting in Nix expressions."""
+
+# ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
 import argparse
 import sys
@@ -8,7 +9,7 @@ import tempfile
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import nix_syntax
 
@@ -142,7 +143,7 @@ def _render_key(key: str) -> str:
         and all(character.isalnum() or character in "_-'" for character in key)
     ):
         return key
-    return cast("str", nix_syntax.quote_string(key))
+    return nix_syntax.quote_string(key)
 
 
 def _render_set(bindings: list[Binding]) -> str:
@@ -236,7 +237,3 @@ def main() -> None:
         succeeded &= format_file(Path(argument))
     if not succeeded:
         raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()

@@ -1,6 +1,7 @@
-#!/usr/bin/env python3
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Browse home's direct submodules in an expandable text tree."""
+
+# ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
 import argparse
 import contextlib
@@ -675,7 +676,3 @@ def main() -> None:
         parser.exit(1, f"{parser.prog}: {error}\n")
     except KeyboardInterrupt:
         raise SystemExit(130) from None
-
-
-if __name__ == "__main__":
-    main()

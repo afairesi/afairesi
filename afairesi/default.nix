@@ -1,14 +1,8 @@
 { inputs, pkgs, ... }:
-let
-  python = pkgs.python3;
-in
 inputs.self.lib.mkPythonPackage {
   inherit pkgs;
   executable = true;
   meta.description = "afairesi CLI for inspecting repositories in the afairesi computing environment.";
-  postFixup = ''
-    touch "$out/${python.sitePackages}/$pname/py.typed"
-  '';
   propagatedBuildInputs = [
     inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.nix_syntax
     pkgs.git

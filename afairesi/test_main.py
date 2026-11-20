@@ -526,6 +526,7 @@ def _inspection_discovery(source: str) -> dict[str, Any]:
         "raise RuntimeError('do not execute')\ndef main(): pass",
         "import sys\ndef main(): return sys.version",
         "from .argparse import *\ndef main(): pass",
+        "if __name__ == '__main__':\n    import argparse\ndef main(): pass",
         """
 import argparse
 def main():
@@ -781,13 +782,16 @@ cli.parse_args()
     )
 
 
-def test_cli_reports_include_arguments_declared_in_the_python_main_guard() -> None:
-    """Treat the standard main guard as active when describing an executable CLI."""
+def test_cli_reports_describe_the_imported_entry_point() -> None:
+    """Report only the options available through the package's installed launcher."""
     report = _inspection_discovery("""
 import argparse
+cli = argparse.ArgumentParser()
 if __name__ == '__main__':
-    cli = argparse.ArgumentParser()
+    cli.add_argument('--script-only')
+if __name__ != '__main__':
     cli.add_argument('--public')
+def main():
     cli.parse_args()
 """)
     _expect(report == {"arguments": [{"names": ["--public"]}]}, report)
@@ -951,6 +955,7 @@ def start():
         ),
         ("cli = other", "cannot resolve the public argparse parser"),
         ("cli = argparse.ArgumentParser(**options)", "literal mapping"),
+        ("cli = argparse.ArgumentParser(**{str: []})", "literal mapping"),
         (
             "cli = argparse.ArgumentParser()\ncli.add_subparsers(**options)",
             "literal mapping",
@@ -1041,13 +1046,13 @@ def main():
 
 
 def test_subcommand_options_stay_separate_when_helpers_share_a_name() -> None:
-    """Keep same-named helpers attached to their own subcommands."""
+    """Resolve captured and passed parsers in same-named nested helpers."""
     source = """
 import argparse
 def configure_one(cli):
-    def configure(target):
-        target.add_argument('--one')
-    configure(cli)
+    def configure():
+        cli.add_argument('--one')
+    configure()
 def configure_two(cli):
     def configure(target):
         target.add_argument('--two')
@@ -1088,25 +1093,6 @@ def main():
     configure(cli)
     cli.parse_args()
 """)
-
-
-def test_cli_reports_include_arguments_declared_by_nested_helpers() -> None:
-    """Follow parser parameters read by a nested helper without global fallback."""
-    report = _inspection_discovery("""
-import argparse
-def configure(cli):
-    def add():
-        cli.add_argument('--closed-over')
-    add()
-def main():
-    cli = argparse.ArgumentParser()
-    configure(cli)
-    cli.parse_args()
-""")
-    _expect(
-        report == {"arguments": [{"names": ["--closed-over"]}]},
-        report,
-    )
 
 
 def test_unrelated_imports_do_not_change_the_reported_cli() -> None:
