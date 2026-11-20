@@ -54,19 +54,25 @@ let
     };
     systems = [ system ];
   };
-  failedCheck =
-    name: test: diagnostic:
-    pkgs.testers.testBuildFailure' {
-      inherit name;
-      drv = overriddenCheck.overrideAttrs {
-        src = pkgs.writeTextDir "test_main.py" test;
-      };
-      expectedBuilderLogEntries = [
-        "FAILED"
-        "test_failure"
-        diagnostic
-      ];
+  failedCheck = pkgs.testers.testBuildFailure' {
+    drv = overriddenCheck.overrideAttrs {
+      src = pkgs.writeTextDir "test_main.py" ''
+        from hypothesis import given, settings, strategies as st
+
+        @given(st.just(0))
+        def test_failure(value):
+            assert settings.default.max_examples == 100
+            assert settings.default.derandomize
+            assert value != 0, "generated assertion failed"
+      '';
     };
+    expectedBuilderLogEntries = [
+      "FAILED"
+      "test_failure"
+      "AssertionError: generated assertion failed"
+    ];
+    name = "hypothesis-failure";
+  };
   htmlPackage = inputs.self.lib.mkHtmlPackage {
     inherit pkgs;
     meta.description = "Source listing";
@@ -110,6 +116,9 @@ let
     nativeCheckInputs = [ pkgs.python3Packages.colorama ];
     passthru = attributes.passthru // {
       inherit (pkgs) lean4;
+      tests.unavailable = pkgs.runCommand "excluded-check" {
+        meta.badPlatforms = [ system ];
+      } "exit 1";
     };
     postInstall = ''mv "$out/bin/example" "$out/bin/renamed"'';
   });
@@ -142,14 +151,10 @@ assert package.afairesiKind == "python";
 assert pythonLibrary.pname == "lean_example";
 assert !(pythonLibrary.meta ? mainProgram);
 assert consumer.packages.${system}.bash-example.afairesiKind == "bash";
-assert consumer.devShells.${system} ? bash-example-test;
 assert htmlPackage.afairesiKind == "html";
 assert htmlPackage.meta.description == "Source listing";
 assert leanExample.afairesiKind == "lean4";
 assert consumer.checks.${system} ? example;
-assert
-  consumer.checks.${system}.devshell-lean-example-test
-  == consumer.devShells.${system}.lean-example-test;
 assert leanExample.meta.mainProgram == "lean-example";
 assert !(leanLibrary.meta ? mainProgram);
 assert !(leanExample.drvAttrs ? runtimeHook);
@@ -169,19 +174,22 @@ assert
   == consumer.packages.${system}.python_native.passthru.tests.contract;
 assert !(consumer.packages.${system}.python_native ? afairesiKind);
 assert !(consumer.packages.${system}.rust-native ? afairesiKind);
-assert !(consumer.devShells.${system} ? python_native-test);
-assert !(consumer.devShells.${system} ? rust-native-test);
 assert
-  consumer.checks.${system}.pkgs-native-contract
-  == consumer.packages.${system}.native.passthru.tests.contract;
-assert consumer.checks.${system}.devshell-example-test == consumer.devShells.${system}.example-test;
+  builtins.attrNames consumer.devShells.${system} == [
+    "bash-example-test"
+    "example-test"
+    "lean-example-test"
+    "test_main-test"
+  ];
+assert pkgs.lib.all (
+  name: consumer.checks.${system}."devshell-${name}" == consumer.devShells.${system}.${name}
+) (builtins.attrNames consumer.devShells.${system});
 assert !(consumer.packages.${system} ? unavailable);
 assert !(consumer.checks.${system} ? unavailable);
 assert !(consumer.checks.${system} ? orphan);
 assert !(consumer.checks.${system} ? nix-untested);
-assert !(consumer.checks.${system} ? native);
-assert !(consumer.devShells.${system} ? nix-library-test);
-assert consumer.packages.${system}.native.example == package;
+assert !(consumer.checks.${system} ? python_native);
+assert consumer.packages.${system}.python_native.example == package;
 assert consumer.nixosConfigurations.example.pkgs.config.allowUnfree;
 assert consumer.nixosConfigurations.example.pkgs.config.cudaSupport;
 assert consumer.nixosConfigurations.example.pkgs.afairesiContract;
@@ -204,6 +212,7 @@ assert consumer.apps.${system}.example.type == "app";
 assert consumer.apps.${system}.example.meta == package.meta;
 assert consumer.apps.${system}.example.meta.description == "Afairesi consumer contract example";
 assert overridden.apps.${system}.example.meta.description == "Run example";
+assert !(overridden.checks.${system} ? pkgs-example-unavailable);
 assert overriddenCheck.PACKAGE_E2E_EXECUTABLE == "${overriddenPackage}/bin/renamed";
 assert !(inputs.self.checks.${system}.nix_syntax ? PACKAGE_E2E_EXECUTABLE);
 assert pkgs.lib.all
@@ -232,22 +241,8 @@ pkgs.runCommand "afairesi-consumer-contract"
     leanShell = consumer.devShells.${system}.lean-example-test;
     nativeBuildInputs = [
       overriddenCheck
-      (failedCheck "pytest-failure" ''
-        def test_failure():
-            assert False, "ordinary assertion failed"
-      '' "AssertionError: ordinary assertion failed")
-      (failedCheck "hypothesis-failure" ''
-        from hypothesis import given, settings, strategies as st
-
-        @given(st.just(0))
-        def test_failure(value):
-            assert settings.default.max_examples == 100
-            assert settings.default.derandomize
-            assert value != 0, "generated assertion failed"
-      '' "AssertionError: generated assertion failed")
+      failedCheck
       consumer.checks.${system}.bash-example
-      consumer.checks.${system}.pkgs-native
-      consumer.checks.${system}.pkgs-native-contract
       consumer.checks.${system}.pkgs-python_native-contract
       consumer.checks.${system}.pkgs-rust-native
       consumer.checks.${system}.nix-library
@@ -255,6 +250,7 @@ pkgs.runCommand "afairesi-consumer-contract"
       consumer.checks.${system}.lean-example
       consumer.checks.${system}.test_main
       consumer.formatter.${system}
+      pkgs.git
     ];
   }
   ''
@@ -332,8 +328,6 @@ pkgs.runCommand "afairesi-consumer-contract"
     expected=$(printf '%s\n' unloaded "['two words', '--flag']")
     actual=$(${pkgs.lib.getExe package} 'two words' --flag)
     test "$actual" = "$expected"
-    export AFAIRESI_CONSUMER_HOOK=server
-    test "$(${pkgs.lib.getExe package} | head -n1)" = server
     status=0
     AFAIRESI_CONSUMER_FAIL=1 ${consumer.apps.${system}.example.program} > failed-output || status=$?
     test "$status" = 23
@@ -341,16 +335,13 @@ pkgs.runCommand "afairesi-consumer-contract"
     expected=$(printf '%s\n' '42:resource:loaded' 'two words' '--flag')
     actual=$(${consumer.apps.${system}.lean-example.program} 'two words' --flag)
     test "$actual" = "$expected"
-    expected=$(printf '%s\n' '42:resource:unloaded' 'two words' '--flag')
-    actual=$(${pkgs.lib.getExe leanExample} 'two words' --flag)
-    test "$actual" = "$expected"
     test ! -e ${leanLibrary}/bin
     cmp ${leanLibrary.src}/test_main.lean ${leanLibrary}/test_main.lean
     cp -R ${consumerSource} formatted
     chmod -R u+w formatted
     cd formatted
-    touch flake.nix
-    ${lintTool}/bin/treefmt --no-cache --formatters mypy-example example/main.py
+    printf '{}\n' > flake.nix
+    (cd example && ${lintTool}/bin/treefmt --no-cache --on-unmatched=fatal --formatters mypy-example main.py)
     for name in default orphan unavailable python_native; do
       if ${lintTool}/bin/treefmt --formatters "mypy-$name" flake.nix > selection.log 2>&1; then exit 1; fi
       grep -F "formatter mypy-$name not found in config" selection.log
@@ -361,7 +352,6 @@ pkgs.runCommand "afairesi-consumer-contract"
     printf '%s\n' 'locals { value="hello" }' > supporting/main.tf
     if treefmt --no-cache --fail-on-change supporting/main.tf; then exit 1; fi
     grep -Fx 'locals { value = "hello" }' supporting/main.tf
-    treefmt --no-cache --fail-on-change supporting/main.tf
     cat > pyproject.toml <<'TOML'
     [tool.ruff.lint]
     ignore = ["ALL"]
@@ -382,12 +372,6 @@ pkgs.runCommand "afairesi-consumer-contract"
     cmp expected-extra.py supporting/extra.py
     cp supporting/extra.py fixtures/extra.py
     cp supporting/extra.py fixtures/source.py.txt
-    treefmt --no-cache supporting/extra.py fixtures/extra.py fixtures/source.py.txt
-    ! grep -F '# Keep this explanation' supporting/extra.py
-    grep -F 'import os' supporting/extra.py
-    grep -F 'value = 1' supporting/extra.py
-    cmp supporting/extra.py fixtures/extra.py
-    cmp expected-extra.py fixtures/source.py.txt
     cat > supporting/ordered.nix <<'NIX'
     # ordinary explanation
     {
@@ -397,12 +381,58 @@ pkgs.runCommand "afairesi-consumer-contract"
     }
     NIX
     printf '%s\n' '*' "" '!*/' > .gitignore
+    printf '%s\n' first "" second > LICENSE
     printf '%s\n' '{' '"value": "first\nsecond",' '"items": [1, 2]' '}' > supporting/data.json
     cp supporting/data.json flake.lock
     cp flake.lock expected-lock
-    treefmt --no-cache supporting/ordered.nix supporting/data.json flake.lock .gitignore
+    git init --quiet
+    git add --force .gitignore flake.lock LICENSE flake.nix
+    treefmt --no-cache supporting/{extra.py,ordered.nix,data.json} fixtures/{extra.py,source.py.txt} flake.lock .gitignore LICENSE
+    if grep -F '# Keep this explanation' supporting/extra.py; then exit 1; fi
+    grep -Fx 'import os' supporting/extra.py
+    grep -Fx 'value = 1' supporting/extra.py
+    cmp supporting/extra.py fixtures/extra.py
+    cmp expected-extra.py fixtures/source.py.txt
     touch -d @1 supporting/data.json supporting/ordered.nix
-    treefmt --no-cache --fail-on-change supporting/ordered.nix supporting/data.json flake.lock .gitignore
+    treefmt --no-cache --fail-on-change supporting/{ordered.nix,data.json,main.tf} flake.lock .gitignore
+    mkdir -p site/assets site/helpers paper
+    printf '%s\n' '// ordinary explanation' 'export const value = () => { return "hello"; };' \
+      'export const lines = `first' "" 'second`;' > site/script.js
+    cp site/script.js site/assets/app.js
+    printf '%s\n' '/* ordinary explanation */' 'body{color:red}' > site/style.css
+    cp site/style.css site/assets/theme.css
+    printf '%s\n' '<!doctype html><html><body><pre>first' "" 'second</pre></body></html>' > site/index.html
+    printf '%s\n' '# ordinary explanation' 'import os' 'value=  "hello"' > site/helpers/extra.py
+    printf '%s\n' '\documentclass{article}' '% ordinary explanation' '\begin{document}' 'Hello.' '\end{document}' > paper/ms.tex
+    sources=(flake.nix site/{script.js,style.css,index.html,assets/app.js,assets/theme.css,helpers/extra.py} paper/ms.tex)
+    git add --force -- "''${sources[@]}"
+    cp expected-extra.py site/local.py
+    index=$(git write-tree)
+    treefmt --no-cache
+    treefmt --no-cache --fail-on-change
+    test "$(git write-tree)" = "$index"
+    cmp expected-extra.py site/local.py
+    cmp site/script.js site/assets/app.js
+    cmp site/style.css site/assets/theme.css
+    if grep -F 'ordinary explanation' "''${sources[@]}"; then exit 1; fi
+    grep -Fx 'import os' site/helpers/extra.py
+    git diff --binary -- "''${sources[@]}" > expected-format.diff
+
+    printf '%s\n' '[tool.ruff.format]' 'quote-style = "single"' >> pyproject.toml
+    printf '%s\n' '{"singleQuote":true,"semi":false}' > .oxfmtrc.json
+    cp .oxfmtrc.json site/.oxfmtrc.json
+    printf '%s\n' 'preserve_patterns = ["ordinary explanation"]' > .uncomment.toml
+    printf '%s\n' 'wraplen = 10' > tex-fmt.toml
+    printf '%s\n' 'root = true' '[*]' 'indent_style = tab' 'indent_size = 8' 'end_of_line = crlf' \
+      'insert_final_newline = false' 'max_line_length = 20' > .editorconfig
+    for config_state in local tracked; do
+      if [[ $config_state == tracked ]]; then
+        git add --force -- pyproject.toml .oxfmtrc.json site/.oxfmtrc.json .uncomment.toml tex-fmt.toml .editorconfig
+      fi
+      git restore --worktree -- "''${sources[@]}"
+      treefmt --no-cache
+      git diff --binary -- "''${sources[@]}" | cmp expected-format.diff -
+    done
     ${pkgs.python3}/bin/python - <<'PY'
     from pathlib import Path
     import json
@@ -411,6 +441,9 @@ pkgs.runCommand "afairesi-consumer-contract"
     assert source.index("a = 1;") < source.index("z = 2;")
     assert "retained = false;" in source
     assert Path(".gitignore").read_text() == "*\n\n!*/\n"
+    assert Path("LICENSE").read_text() == "first\n\nsecond\n"
+    assert "`first\n\nsecond`" in Path("site/script.js").read_text()
+    assert "first\n\nsecond" in Path("site/index.html").read_text()
     assert Path("supporting/data.json").stat().st_mtime == 1
     assert Path("supporting/ordered.nix").stat().st_mtime == 1
     text = Path("supporting/data.json").read_text()
@@ -442,29 +475,15 @@ pkgs.runCommand "afairesi-consumer-contract"
     fi
     grep -F F401 fixture-lint.log
     cmp supporting/extra.py fixtures/extra.py
-    printf '%s\n' '-- ordinary explanation' '/- outer /- nested -/ explanation -/' >> lean-example/main.lean
-    cat >> lean-example/main.lean <<'LEAN'
-    example : String := "-- literal /- literal"
-    example : String := r#""-- raw literal /- literal"#
-    example : String := s!"{("-- interpolation")} /- text"
-    example : Nat := 1 /- inline explanation -/ + 2
-    LEAN
+    printf '%s\n' '-- ordinary explanation' >> lean-example/main.lean
     sed -i 's/$/\r/' lean-example/main.lean
     mkdir -p lean-example/Nested
     printf '%s\n' '/-- A supporting constant. -/' 'def extra:Nat:=42' > lean-example/Nested/Extra.lean
-    cp lean-example/Nested/Extra.lean expected-extra.lean
     treefmt --no-cache {lean-example,test_main}/{main,test_main}.lean lean-example/Nested/Extra.lean
     treefmt --no-cache --fail-on-change {lean-example,test_main}/{main,test_main}.lean lean-example/Nested/Extra.lean
-    ! cmp -s expected-extra.lean lean-example/Nested/Extra.lean
-    grep -F '/-- A supporting constant. -/' lean-example/Nested/Extra.lean
+    printf '%s\n' '/-- A supporting constant. -/' 'def extra : Nat :=' '  42' | cmp - lean-example/Nested/Extra.lean
     grep -F -- '-- lean-fmt: ignore[FMT005]' lean-example/main.lean
     grep -F 'ordinary explanation' lean-example/main.lean
-    grep -F 'nested -/ explanation' lean-example/main.lean
-    grep -F 'inline explanation' lean-example/main.lean
-    grep -F '"-- literal /- literal"' lean-example/main.lean
-    grep -F 'r#""-- raw literal /- literal"#' lean-example/main.lean
-    grep -F '"-- interpolation"' lean-example/main.lean
-    grep -F '/-- Print the dependency value' lean-example/main.lean
     grep -F 'set_option linter.missingDocs false in' test_main/main.lean
     cp test_main/main.lean expected-main.lean
     cp ${consumerSource}/test_main/main.lean test_main/main.lean

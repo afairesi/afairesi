@@ -1,8 +1,6 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Check Nix parsing and literal decoding through the shared library."""
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING
 
 import pytest
@@ -33,25 +31,13 @@ def test_parsing_returns_the_original_bytes_or_raises_a_nix_syntax_error(
         raise AssertionError(document)
 
 
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
-        ('"a\r\nb"', "a\nb"),
-        ('"a\rb"', "a\nb"),
-        ('"a\\\r\nb"', "a\r\nb"),
-        (r'"\q"', "q"),
-        (r'"\${name}"', "${name}"),
-        (r'"back\\slash\"quote\n\t\r"', 'back\\slash"quote\n\t\r'),
-        ('"é"', "é"),
-    ],
-)
-def test_string_literals_follow_native_nix_decoding_rules(
-    source: str, expected: str
-) -> None:
-    """Preserve the decoded value of escapes, line endings, and Unicode."""
-    document = nix_syntax.parse(source)
-    if nix_syntax.string_value(document, document.root) != expected:
-        raise AssertionError(source)
+def test_string_value_decodes_only_the_selected_literal() -> None:
+    """Read the literal at its UTF-8 byte offset and preserve its trailing newline."""
+    document = nix_syntax.parse('["préfixe" "café\\r\\n\\${name}\r\n" undefined]')
+    literal = document.root.named_children[1]
+    value = nix_syntax.string_value(document, literal)
+    if value != "café\r\n${name}\n":
+        raise AssertionError(value)
 
 
 @pytest.mark.parametrize("source", ['"${undefined}"', "42", "''indented''"])

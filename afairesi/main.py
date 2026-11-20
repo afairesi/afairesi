@@ -2,8 +2,6 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Inspect repositories in the afairesi computing environment."""
 
-from __future__ import annotations
-
 import argparse
 import ast
 import contextlib
@@ -375,11 +373,14 @@ def _python_source_issues(package: Package, paths: set[Path]) -> list[str]:
 
 def _attrset_expression(
     document: nix_syntax.Document,
-    expression: Node,
+    expression: Node | None,
     path: tuple[str, ...],
 ) -> list[Node]:
     """Find direct static bindings beneath an attribute-set expression."""
-    if expression.type not in {"attrset_expression", "rec_attrset_expression"}:
+    if expression is None or expression.type not in {
+        "attrset_expression",
+        "rec_attrset_expression",
+    }:
         return []
     binding_set = nix_syntax.binding_set(expression)
     return [
@@ -460,20 +461,15 @@ def _package_body(document: nix_syntax.Document) -> Node:
     return body
 
 
-def _validate_flake_syntax(root: Path) -> None:
-    """Parse the flake without restricting its resource definitions."""
-    source = read_regular(root / "flake.nix")
-    if source is not None and source.strip():
-        nix_syntax.parse(source, "flake.nix")
-
-
 def validate_flake_source(root: Path) -> None:
     """Validate a Git-filtered flake source without requiring Git metadata."""
     paths = source_paths(root)
     packages, missing = detect_packages(root, paths)
     issues = _structure_issues(root, packages, paths)
     issues.extend(f"{path}: missing required tracked regular file" for path in missing)
-    _validate_flake_syntax(root)
+    flake = read_regular(root / "flake.nix")
+    if flake is not None:
+        nix_syntax.parse(flake, "flake.nix")
     for required in ROOT_FILES:
         if not (root / required).is_file():
             issues.append(f"{required}: missing required regular file")
@@ -551,7 +547,7 @@ class _PythonNames:
     def __init__(self, source: str | bytes, filename: str) -> None:
         """Index qualified references and definitions at their UTF-8 byte offsets."""
         import libcst as cst  # noqa: PLC0415 - Load metadata only for CLI inspection.
-        from libcst import helpers, metadata  # noqa: PLC0415 - Keep CLI startup lightweight.
+        from libcst import metadata  # noqa: PLC0415 - Keep CLI startup lightweight.
 
         try:
             syntax = cst.parse_module(source)
@@ -585,21 +581,6 @@ class _PythonNames:
                     self.imported_references[span.start] = names
             elif len(names) == 1:
                 self.definitions[span.start] = next(iter(names))
-        self.imports = {
-            name.name.split(".", 1)[0]
-            for scope in set(scopes.values())
-            if scope is not None
-            for assignment in scope.assignments
-            for name in assignment.get_qualified_names_for(assignment.name)
-            if name.source == metadata.QualifiedNameSource.IMPORT
-        }
-        self.imports.update(
-            (helpers.get_full_name_for_node(node.module) or "").split(".", 1)[0]
-            for node in spans
-            if isinstance(node, cst.ImportFrom)
-            and node.module is not None
-            and isinstance(node.names, cst.ImportStar)
-        )
 
     def _offset(
         self,
@@ -623,6 +604,16 @@ class _PythonNames:
             }
         return set()
 
+    def imported_modules(self) -> set[str]:
+        """Return the top-level names of modules imported by absolute name."""
+        modules: set[str] = set()
+        for node in ast.walk(self.module):
+            if isinstance(node, ast.Import):
+                modules.update(alias.name.partition(".")[0] for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                modules.add(node.module.partition(".")[0])
+        return modules
+
     def definition(
         self,
         node: ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef,
@@ -636,7 +627,7 @@ def _value(node: ast.expr) -> object:
     try:
         value = ast.literal_eval(node)
         json.dumps(value)
-    except (ValueError, TypeError):
+    except ValueError, TypeError:
         if isinstance(node, ast.Name) and node.id in {"str", "int", "float", "bool"}:
             return node.id
         return {"unknown": ast.unparse(node)}
@@ -678,8 +669,9 @@ class ArgumentDiscovery:
         self.filename = filename
         self.names = _PythonNames(source, filename)
         self.entrypoint = _python_entrypoint(self.names.module)
-        self.has_argparse = "argparse" in self.names.imports
-        self.argument_free = not self.names.imports.intersection(
+        imports = self.names.imported_modules()
+        self.has_argparse = "argparse" in imports
+        self.argument_free = imports.isdisjoint(
             {"argparse", "click", "typer", "fire", "docopt", "getopt"},
         ) and not any(
             self._qualified(node) == "sys.argv"
@@ -692,7 +684,7 @@ class ArgumentDiscovery:
         self.ambiguous_functions: set[str] = set()
         self.classes: dict[str, ast.ClassDef] = {}
         self.calls: list[tuple[str, ast.Call]] = []
-        self.controls: dict[int, ast.expr] = {}
+        self.conditional_nodes: set[ast.expr] = set()
         self._parser_candidates: set[int] = set()
         self._non_parser_candidates: set[int] = set()
         self._collect(self.names.module, "")
@@ -750,22 +742,21 @@ class ArgumentDiscovery:
         self,
         node: ast.AST,
         scope: str,
-        control: ast.expr | None = None,
+        *,
+        conditional: bool = False,
     ) -> None:
-        if control is not None:
-            self.controls[id(node)] = control
-        if self._collect_branches(node, scope, control):
+        if conditional and isinstance(node, ast.expr):
+            self.conditional_nodes.add(node)
+        if self._collect_branches(node, scope, conditional=conditional):
             return
         if isinstance(
             node,
             (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp),
         ):
-            self._collect_comprehension(node, scope, control)
+            self._collect_comprehension(node, scope, conditional=conditional)
             return
-        if self._collect_runtime_loop(node, scope, control):
+        if self._collect_runtime_loop(node, scope, conditional=conditional):
             return
-        if control is None and isinstance(node, ast.Match):
-            control = node.subject
         if isinstance(node, ast.ClassDef):
             self.classes[self.names.definition(node)] = node
             return
@@ -774,8 +765,9 @@ class ArgumentDiscovery:
             self.ambiguous_functions.update(self.functions.keys() & {scope})
             self.functions[scope] = node
         self._index_binding(node, scope)
+        conditional = conditional or isinstance(node, ast.Match)
         for child in ast.iter_child_nodes(node):
-            self._collect(child, scope, control)
+            self._collect(child, scope, conditional=conditional)
 
     def _index_binding(self, node: ast.AST, scope: str) -> None:
         """Record simple assignments, factory returns, and calls."""
@@ -798,29 +790,26 @@ class ArgumentDiscovery:
         self,
         node: ast.AST,
         scope: str,
-        control: ast.expr | None,
+        *,
+        conditional: bool,
     ) -> bool:
         """Select literal branches and retain uncertain exception handlers."""
         if isinstance(node, ast.If):
-            self._collect(node.test, scope, control)
+            self._collect(node.test, scope, conditional=conditional)
             try:
                 condition = self._branch_value(node.test)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 for child in [*node.body, *node.orelse]:
-                    self._collect(child, scope, control or node.test)
+                    self._collect(child, scope, conditional=True)
             else:
                 for child in node.body if condition else node.orelse:
-                    self._collect(child, scope, control)
+                    self._collect(child, scope, conditional=conditional)
             return True
         if isinstance(node, (ast.Try, ast.TryStar)):
             for child in [*node.body, *node.orelse, *node.finalbody]:
-                self._collect(child, scope, control)
+                self._collect(child, scope, conditional=conditional)
             for handler in node.handlers:
-                self._collect(
-                    handler,
-                    scope,
-                    control or ast.Constant(value="exception handler"),
-                )
+                self._collect(handler, scope, conditional=True)
             return True
         return False
 
@@ -842,34 +831,33 @@ class ArgumentDiscovery:
         self,
         node: ast.AST,
         scope: str,
-        control: ast.expr | None,
+        *,
+        conditional: bool,
     ) -> bool:
         """Collect eager loop inputs before marking iteration-dependent statements."""
         if isinstance(node, ast.For) and self._collect_literal_loop(
             node,
             scope,
-            control,
+            conditional=conditional,
         ):
             return True
         if isinstance(node, (ast.For, ast.AsyncFor)):
-            self._collect(node.iter, scope, control)
-            self._collect(node.target, scope, control or node.iter)
+            self._collect(node.iter, scope, conditional=conditional)
+            self._collect(node.target, scope, conditional=True)
             for statement in [*node.body, *node.orelse]:
-                self._collect(statement, scope, control or node.iter)
+                self._collect(statement, scope, conditional=True)
             return True
         if isinstance(node, ast.While):
-            self._collect(node.test, scope, control)
+            self._collect(node.test, scope, conditional=conditional)
             try:
                 condition = self._branch_value(node.test)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 condition = True
             for statement in node.body if condition else []:
-                self._collect(statement, scope, control or node.test)
+                self._collect(statement, scope, conditional=True)
             for statement in node.orelse:
                 self._collect(
-                    statement,
-                    scope,
-                    (control or node.test) if condition else control,
+                    statement, scope, conditional=conditional or bool(condition)
                 )
             return True
         return False
@@ -878,32 +866,33 @@ class ArgumentDiscovery:
         self,
         node: ast.ListComp | ast.SetComp | ast.DictComp | ast.GeneratorExp,
         scope: str,
-        control: ast.expr | None,
+        *,
+        conditional: bool,
     ) -> None:
         """Collect eager iterables separately from conditional comprehension parts."""
         first, *remaining = node.generators
-        self._collect(first.iter, scope, control)
-        uncertain = control or node
+        self._collect(first.iter, scope, conditional=conditional)
         for child in [first.target, *first.ifs, *remaining]:
-            self._collect(child, scope, uncertain)
+            self._collect(child, scope, conditional=True)
         values = (
             [node.key, node.value] if isinstance(node, ast.DictComp) else [node.elt]
         )
         for value in values:
-            self._collect(value, scope, uncertain)
+            self._collect(value, scope, conditional=True)
 
     def _collect_literal_loop(
         self,
         node: ast.For,
         scope: str,
-        control: ast.expr | None,
+        *,
+        conditional: bool,
     ) -> bool:
         """Expand finite literal loops whose variable is never rebound."""
         if not isinstance(node.target, ast.Name):
             return False
         try:
             values = ast.literal_eval(node.iter)
-        except (ValueError, TypeError):
+        except ValueError, TypeError:
             return False
         if not isinstance(values, (list, tuple, str)) or any(
             isinstance(
@@ -930,9 +919,9 @@ class ArgumentDiscovery:
                 expanded = _LoopLiteral(node.target.id, value).visit(
                     deepcopy(statement),
                 )
-                self._collect(expanded, scope, control)
+                self._collect(expanded, scope, conditional=conditional)
         for statement in node.orelse:
-            self._collect(statement, scope, control)
+            self._collect(statement, scope, conditional=conditional)
         return True
 
     def _qualified(self, node: ast.expr) -> str:
@@ -950,24 +939,22 @@ class ArgumentDiscovery:
                 return self.returns.get(key, [])
         return []
 
-    def _conditions(
-        self,
-        node: ast.expr,
-        seen: frozenset[int] = frozenset(),
-    ) -> set[ast.expr]:
-        """Follow control dependencies through parser aliases and helper parameters."""
-        key = id(node)
-        if key in seen:
-            return set()
-        seen = seen | {key}
-        result = {self.controls[id(node)]} if id(node) in self.controls else set()
-        for value in self._sources(node):
-            result.update(self._conditions(value, seen))
-        return result
+    def _is_conditional(self, node: ast.expr) -> bool:
+        """Check for unresolved control flow through aliases and helper parameters."""
+        pending = [node]
+        seen: set[ast.expr] = set()
+        while pending:
+            current = pending.pop()
+            if current in self.conditional_nodes:
+                return True
+            if current not in seen:
+                seen.add(current)
+                pending.extend(self._sources(current))
+        return False
 
     def _check_structure(self, call: ast.Call) -> None:
         """Reject runtime-dependent construction of the selected CLI."""
-        if self._conditions(call):
+        if self._is_conditional(call):
             self._error(call, "CLI construction depends on unresolved control flow")
 
     def _parser_keywords(self, call: ast.Call) -> dict[str, ast.expr]:
@@ -1318,7 +1305,7 @@ class ArgumentDiscovery:
                 for keyword in call.keywords
             }
             if call.func.attr == "set_defaults":
-                if self._conditions(call):
+                if self._is_conditional(call):
                     options = {name: {"unknown": ast.unparse(call)} for name in options}
                 for context in sorted(contexts):
                     _command_node(result, context).setdefault("defaults", {}).update(
@@ -1397,14 +1384,9 @@ class ArgumentDiscovery:
 
 
 def _python_library(document: nix_syntax.Document) -> bool:
-    """Recognize an explicitly non-executable package without evaluating Nix."""
-    body = _package_body(document)
-    argument = body.child_by_field_name("argument")
-    values = _attrset_expression(
-        document,
-        body if argument is None else argument,
-        ("executable",),
-    )
+    """Read the executable setting from the Python builder's arguments."""
+    argument = _package_body(document).child_by_field_name("argument")
+    values = _attrset_expression(document, argument, ("executable",))
     return len(values) == 1 and document.text(values[0]) == "false"
 
 
@@ -1474,11 +1456,7 @@ def _dependency_parts(
         parts = None if base is None else _dependency_parts(document, base, seen)
         if parts is None or attrs is None:
             return None
-        for child in attrs.named_children:
-            if child.type == "identifier":
-                parts.append(document.text(child))
-            else:
-                parts.append(nix_syntax.string_value(document, child))
+        parts.extend(nix_syntax.attrpath_parts(document, attrs))
         return parts
     return None
 
@@ -1494,11 +1472,11 @@ def _dependency_target(parts: list[str | None] | None) -> str | None:
 
 def _dependency_values(  # noqa: PLR0911 - one case per supported syntax form
     document: nix_syntax.Document,
-    node: Node,
+    node: Node | None,
     seen: frozenset[int] = frozenset(),
 ) -> list[list[str | None]]:
     """Collect attribute paths from dependency declarations."""
-    if node.id in seen or node.type == "comment":
+    if node is None or node.id in seen:
         return []
     seen = seen | {node.id}
     if node.type == "list_expression":
@@ -1509,41 +1487,33 @@ def _dependency_values(  # noqa: PLR0911 - one case per supported syntax form
         ]
     if node.type in {"variable_expression", "identifier"}:
         alias = _alias_value(document, node)
-        if alias is not None:
-            if alias.type in {
-                "apply_expression",
-                "attrset_expression",
-                "rec_attrset_expression",
-            }:
-                return [[document.text(node)]]
-            return _dependency_values(document, alias, seen)
+        if alias is None or alias.type in {
+            "apply_expression",
+            "attrset_expression",
+            "rec_attrset_expression",
+        }:
+            return [[document.text(node)]]
+        return _dependency_values(document, alias, seen)
     if node.type == "with_expression":
         body = node.child_by_field_name("body")
         environment = node.child_by_field_name("environment")
         prefix = (
             None if environment is None else _dependency_parts(document, environment)
         )
-        values = [] if body is None else _dependency_values(document, body, seen)
+        values = _dependency_values(document, body, seen)
         return [
             prefix + parts if prefix and len(parts) == 1 else parts for parts in values
         ]
     if node.type == "parenthesized_expression":
-        return _dependency_values(document, node.named_children[0], seen)
-    if node.type == "binary_expression":
-        left, right = (
-            node.child_by_field_name("left"),
-            node.child_by_field_name("right"),
+        return _dependency_values(
+            document, node.child_by_field_name("expression"), seen
         )
-        if (
-            left is not None
-            and right is not None
-            and document.source[left.end_byte : right.start_byte].strip() == b"++"
-        ):
-            return _dependency_values(document, left, seen) + _dependency_values(
-                document,
-                right,
-                seen,
-            )
+    if node.type == "binary_expression":
+        operator = node.child_by_field_name("operator")
+        if operator is not None and operator.type == "++":
+            return _dependency_values(
+                document, node.child_by_field_name("left"), seen
+            ) + _dependency_values(document, node.child_by_field_name("right"), seen)
     parts = _dependency_parts(document, node)
     return [parts] if parts is not None else []
 
@@ -1599,7 +1569,7 @@ def _inspect_arguments(path: Path, cache: Path | None) -> dict[str, Any]:
     source = path.read_bytes()
     if cache is None:
         return ArgumentDiscovery(source, str(path)).report()
-    analyzer = f"1:{__file__}:{sys.implementation.cache_tag}\0".encode()
+    analyzer = f"2:{__file__}:{sys.implementation.cache_tag}\0".encode()
     digest = hashlib.sha256(analyzer)
     digest.update(source)
     entry = cache / f"{digest.hexdigest()}.json"
@@ -1608,12 +1578,7 @@ def _inspect_arguments(path: Path, cache: Path | None) -> dict[str, Any]:
         if isinstance(saved, dict):
             return saved
     report = ArgumentDiscovery(source, str(path)).report()
-    with contextlib.suppress(OSError):
-        cache.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with tempfile.TemporaryDirectory(dir=cache) as temporary:
-            pending = Path(temporary) / entry.name
-            pending.write_text(json.dumps(report), encoding="utf-8")
-            pending.replace(entry)
+    write_cache_entry(entry, report)
     return report
 
 
@@ -1759,6 +1724,18 @@ def cache_home() -> Path:
     return base if base.is_absolute() else Path.home() / ".cache"
 
 
+def write_cache_entry(path: Path, value: object) -> None:
+    """Publish a complete JSON cache entry, tolerating unavailable storage."""
+    with contextlib.suppress(OSError):
+        path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete_on_close=False
+        ) as pending:
+            json.dump(value, pending)
+            pending.close()
+            Path(pending.name).replace(path)
+
+
 def _dispatch_diff(arguments: list[str]) -> None:
     """Render tracked interface changes between the index and the working tree."""
     _diff_parser().parse_args(arguments)
@@ -1770,12 +1747,12 @@ def _dispatch_diff(arguments: list[str]) -> None:
     if before == after:
         return
     with tempfile.TemporaryDirectory(prefix="afairesi-diff-") as directory:
-        left, right = (Path(directory) / name for name in ("before.json", "after.json"))
-        left.write_text(before, encoding="utf-8")
-        right.write_text(after, encoding="utf-8")
-        completed = subprocess.run(  # noqa: S603 - The filenames are fixed.
-            ["jd", left.name, right.name],  # noqa: S607
+        baseline = Path(directory) / "before.json"
+        baseline.write_text(before, encoding="utf-8")
+        completed = subprocess.run(  # noqa: S603 - The filename is fixed.
+            ["jd", baseline.name],  # noqa: S607
             cwd=directory,
+            input=after,
             capture_output=True,
             check=False,
             text=True,
@@ -1859,22 +1836,6 @@ def _diff_parser() -> argparse.ArgumentParser:
             "\nFor patching, before.json must contain the baseline inspection."
         ),
     )
-
-
-def check_source_main() -> None:
-    """Validate an exported flake source without changing it."""
-    cli = argparse.ArgumentParser(description="Validate the flake source structure.")
-    cli.add_argument(
-        "source",
-        type=Path,
-        help="path to the exported flake source",
-    )
-    options = cli.parse_args()
-    try:
-        validate_flake_source(options.source.resolve())
-    except (CommandError, OSError, SyntaxError, ValueError) as error:
-        sys.stderr.write(f"error: {error}\n")
-        raise SystemExit(1) from error
 
 
 def main() -> None:

@@ -1,8 +1,6 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Exercise home discovery, directory grouping, and CLI diffs with real repositories."""
 
-from __future__ import annotations
-
 import curses
 import os
 import subprocess
@@ -72,10 +70,11 @@ def initialize(root: Path) -> None:
 def register(home: Path, child: Path) -> None:
     """Register a direct gitlink even when its path has several directory levels."""
     path = child.relative_to(home).as_posix()
-    git(home, "config", "--file", ".gitmodules", f"submodule.{path}.path", path)
+    git(home, "config", "set", "--file", ".gitmodules", f"submodule.{path}.path", path)
     git(
         home,
         "config",
+        "set",
         "--file",
         ".gitmodules",
         f"submodule.{path}.url",

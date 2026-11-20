@@ -1,16 +1,10 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
-"""Shared, lossless-enough Nix parsing and rewriting helpers."""
+"""Parse Nix expressions and read or quote their literals."""
 
 # ruff: noqa: INP001 - mkPythonPackage installs this module as __init__.py.
 
-from __future__ import annotations
-
-import contextlib
-import os
 import subprocess
-import tempfile
 from dataclasses import dataclass
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from tree_sitter_language_pack import get_parser
@@ -101,7 +95,7 @@ def quote_string(value: str) -> str:
 def string_value(document: Document, node: Node) -> str | None:
     """Decode a quoted Nix literal, returning None for other expressions."""
     if node.type != "string_expression" or any(
-        child.type == "interpolation" for child in walk(node)
+        child.type == "interpolation" for child in node.named_children
     ):
         return None
     completed = subprocess.run(
@@ -123,39 +117,21 @@ def string_value(document: Document, node: Node) -> str | None:
     return completed.stdout.decode("utf-8")
 
 
-def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | None:
-    """Extract an attribute path when every component is statically named."""
-    parts = []
-    for child in attrpath.named_children:
-        value = (
+def attrpath_parts(document: Document, attrpath: Node) -> Iterable[str | None]:
+    """Read the attribute components in order, yielding None for dynamic names."""
+    for child in attrpath.children_by_field_name("attr"):
+        yield (
             document.text(child)
             if child.type == "identifier"
             else string_value(document, child)
         )
+
+
+def static_attrpath(document: Document, attrpath: Node) -> tuple[str, ...] | None:
+    """Extract an attribute path when every component is statically named."""
+    parts = []
+    for value in attrpath_parts(document, attrpath):
         if value is None:
             return None
         parts.append(value)
     return tuple(parts) if parts else None
-
-
-def write_if_changed(path: Path, contents: str) -> None:
-    """Atomically replace a regular file only when its contents changed."""
-    original = path.read_text(encoding="utf-8")
-    if original == contents:
-        return
-    if path.is_symlink() or not path.is_file():
-        msg = f"{path}: must be a regular file"
-        raise OSError(msg)
-    descriptor, temporary_name = tempfile.mkstemp(
-        prefix=f".{path.name}.",
-        dir=path.parent,
-    )
-    temporary_path = Path(temporary_name)
-    try:
-        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-            handle.write(contents)
-        temporary_path.chmod(path.stat().st_mode)
-        temporary_path.replace(path)
-    finally:
-        with contextlib.suppress(FileNotFoundError):
-            temporary_path.unlink()

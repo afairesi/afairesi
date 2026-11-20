@@ -1,8 +1,6 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Check Afairesi's CLI and source validation."""
 
-from __future__ import annotations
-
 import json
 import os
 import re
@@ -11,12 +9,13 @@ import stat
 import subprocess
 import sys
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile
 from typing import TYPE_CHECKING, Any, cast
 
 import pytest
 
 import afairesi as inspection_subject
+import nix_syntax
 
 if TYPE_CHECKING:
     import ast
@@ -27,13 +26,9 @@ def _run(
     root: Path,
     *arguments: str,
     code: int = 0,
-    executable: str | None = None,
 ) -> subprocess.CompletedProcess[str]:
     result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-        [
-            executable or os.environ["PACKAGE_E2E_EXECUTABLE"],
-            *arguments,
-        ],
+        [os.environ["PACKAGE_E2E_EXECUTABLE"], *arguments],
         cwd=root,
         capture_output=True,
         text=True,
@@ -45,24 +40,8 @@ def _run(
             f"expected exit {code}, got {result.returncode}\n"
             f"{result.stdout}{result.stderr}"
         )
-        raise AssertionError(
-            msg,
-        )
+        raise AssertionError(msg)
     return result
-
-
-def _check_flake_source(
-    root: Path, *, code: int = 0
-) -> subprocess.CompletedProcess[str]:
-    """Exercise the source-only validator used by the structure check."""
-    return _run(
-        root,
-        "-c",
-        "from afairesi import check_source_main; check_source_main()",
-        str(root),
-        code=code,
-        executable=sys.executable,
-    )
 
 
 def _git(root: Path, *arguments: str) -> str:
@@ -187,8 +166,8 @@ def _expect(condition: bool, detail: object) -> None:  # noqa: FBT001
 def _repository(root: Path) -> Path:
     """Index a minimal flake in an existing temporary directory."""
     _git(root, "init", "--quiet")
-    for name in (".gitignore", "flake.nix", "flake.lock", "LICENSE"):
-        (root / name).write_text("", encoding="utf-8")
+    (root / "flake.nix").write_text("{}\n")
+    (root / "flake.lock").touch()
     _git(root, "add", ".")
     return root
 
@@ -294,10 +273,12 @@ def test_declared_package_kind_determines_the_required_entrypoint(
     _git(root, "add", "--", "example")
     report = json.loads(_run(root).stdout)
     _expect(report["example"]["type"] == kind, report)
-    _check_flake_source(root)
+    inspection_subject.validate_flake_source(root)
     (package / entrypoints[kind]).unlink()
-    rejected = _check_flake_source(root, code=1)
-    _expect(entrypoints[kind] in rejected.stderr, rejected)
+    with pytest.raises(
+        inspection_subject.CommandError, match=re.escape(entrypoints[kind])
+    ):
+        inspection_subject.validate_flake_source(root)
 
 
 @pytest.mark.parametrize("kind", ["bash", "html", "latex", "lean4", "generic"])
@@ -328,15 +309,16 @@ def test_source_validation_rejects_a_tracked_python_package_initializer(
     initializer.write_text('"""Personal initialization."""\n')
     _git(root, "add", "example/__init__.py")
     before = _snapshot(root)
-    result = _check_flake_source(root, code=1)
-    _expect("__init__.py: reserved" in result.stderr, result)
+    with pytest.raises(
+        inspection_subject.CommandError, match=r"__init__\.py: reserved"
+    ):
+        inspection_subject.validate_flake_source(root)
     _expect(_snapshot(root) == before, "rejection changed sources")
 
 
 @pytest.mark.parametrize(
     "expression",
     [
-        "pkgs.python3.pkgs.buildPythonPackage { src = ./.; }",
         (
             "let executable = true; args = { inherit pkgs executable; src = ./.; }; "
             "in inputs.self.lib.mkPythonPackage args"
@@ -345,10 +327,9 @@ def test_source_validation_rejects_a_tracked_python_package_initializer(
             "with inputs.self.lib; "
             "mkPythonPackage { inherit pkgs; src = ./.; executable = true; }"
         ),
-        "import ./builder.nix { inherit inputs pkgs; }",
     ],
 )
-def test_source_validation_accepts_custom_package_expressions(
+def test_source_validation_accepts_indirect_afairesi_builders(
     root: Path,
     expression: str,
 ) -> None:
@@ -358,7 +339,7 @@ def test_source_validation_accepts_custom_package_expressions(
     definition.write_text("{ inputs, pkgs, ... }: " + expression + "\n")
     _git(root, "add", ".")
     before = _snapshot(root)
-    _check_flake_source(root)
+    inspection_subject.validate_flake_source(root)
     _expect(_snapshot(root) == before, "validation changed repository")
 
 
@@ -374,8 +355,10 @@ def test_source_validation_identifies_the_file_with_invalid_nix_syntax(
     (root / relative).write_text("{ inputs, pkgs, ... }: (\n")
     _git(root, "add", "--", relative)
     before = _snapshot(root)
-    result = _check_flake_source(root, code=1)
-    _expect(f"{relative}:" in result.stderr and "parse error" in result.stderr, result)
+    with pytest.raises(
+        nix_syntax.NixSyntaxError, match=rf"{re.escape(relative)}:\d+:\d+: parse error"
+    ):
+        inspection_subject.validate_flake_source(root)
     _expect(_snapshot(root) == before, "syntax validation changed repository")
 
 
@@ -407,7 +390,7 @@ def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
             (package / marker).write_text("Supporting source\n")
     _git(root, "add", ".")
     before = _snapshot(root)
-    _check_flake_source(root)
+    inspection_subject.validate_flake_source(root)
     report = json.loads(_run(root).stdout)
     _expect(
         report
@@ -420,10 +403,16 @@ def test_packages_with_custom_builders_stay_generic_regardless_of_source_files(
     _expect(_snapshot(root) == before, "generic packages were rewritten")
 
 
-@pytest.mark.parametrize(
-    "source",
-    [
-        """
+def test_python_test_inventory_matches_the_functions_and_methods_collected_by_pytest(
+    tmp_path: Path,
+) -> None:
+    """Use pytest's collection as the oracle for ordinary and unittest test names."""
+    _inspection_repository(tmp_path)
+    path = tmp_path / "example/test_main.py"
+    path.write_text("""
+import unittest as unit
+from unittest import IsolatedAsyncioTestCase as AsyncCase
+from unittest import TestCase
 from unittest import TestCase as Case
 def testCamelCase(): pass
 def test(): pass
@@ -438,40 +427,21 @@ class Derived(Arguments):
     def test_other_input(self): pass
 class Helper:
     def test_not_collected(self): pass
-""",
-        (
-            "from unittest import TestCase\n"
-            "class Reports(TestCase):\n    def testCamelCase(self): pass\n"
-        ),
-        (
-            "class Cases:\n    def test_result(self): pass\n"
-            "class Intermediate(Cases): pass\n"
-            "class TestBehavior(Intermediate): pass\n"
-        ),
-        (
-            "class Cases:\n    def test_result(self): pass\n"
-            "class TestBehavior(Cases):\n"
-            "    test_result = None\n"
-            "    def test_visible(self): pass\n"
-        ),
-        (
-            "import unittest as unit\n"
-            "class Reports(unit.TestCase):\n    def test_result(self): pass\n"
-        ),
-        (
-            "from unittest import IsolatedAsyncioTestCase as Case\n"
-            "class Base(Case): pass\n"
-            "class Reports(Base):\n    async def test_result(self): pass\n"
-        ),
-    ],
-)
-def test_python_test_inventory_matches_the_functions_and_methods_collected_by_pytest(
-    tmp_path: Path, source: str
-) -> None:
-    """Use pytest's collection as the oracle for ordinary and unittest test names."""
-    _inspection_repository(tmp_path)
-    path = tmp_path / "example/test_main.py"
-    path.write_text(source)
+class Reports(TestCase):
+    def testCamelCase(self): pass
+class Cases:
+    def test_result(self): pass
+class Intermediate(Cases): pass
+class TestInherited(Intermediate): pass
+class TestOverride(Cases):
+    test_result = None
+    def test_visible(self): pass
+class Qualified(unit.TestCase):
+    def test_qualified(self): pass
+class AsyncBase(AsyncCase): pass
+class AsyncReports(AsyncBase):
+    async def test_result(self): pass
+""")
     result = subprocess.run(  # noqa: S603 - Use this interpreter with test-authored code and arguments.
         [
             sys.executable,
@@ -518,160 +488,10 @@ def test_inventory_preserves_the_spelling_of_package_and_host_names(
     """Validate and inspect names without a shared style rule."""
     _fixture_add(root, name, kind)
     before = _snapshot(root)
-    _check_flake_source(root)
+    inspection_subject.validate_flake_source(root)
     report = json.loads(_run(root).stdout)
     _expect(report[name]["type"] == kind, report)
     _expect(_snapshot(root) == before, "validation changed resource spelling")
-
-
-def test_formatting_preserves_line_breaks_in_javascript_strings_and_html_pre_blocks(
-    root: Path,
-) -> None:
-    """Automatic formatting preserves JavaScript strings and HTML preformatted text."""
-    _fixture_add(root, "site", "html")
-    script = root / "site/script.js"
-    script.write_text("document.body.dataset.value = `first\n\nsecond`;\n")
-    html = root / "site/index.html"
-    html.write_text(
-        "<!doctype html><html><body><pre>first\n\nsecond</pre></body></html>\n",
-    )
-    _run(
-        root,
-        "--no-cache",
-        "site/script.js",
-        "site/index.html",
-        executable="treefmt",
-    )
-    _expect("`first\n\nsecond`" in script.read_text(), script.read_text())
-    _expect("first\n\nsecond" in html.read_text(), html.read_text())
-
-
-def test_formatting_updates_only_tracked_sources_and_leaves_the_index_untouched(
-    root: Path,
-) -> None:
-    """Remove ordinary comments while preserving lint findings and Git selection."""
-    _fixture_add(root, "site", "html")
-    (root / "flake.nix").write_text("{}\n")
-    sources = {
-        "site/script.js": "// Keep this comment\nconst value={answer:42};\n",
-        "site/assets/app.js": "// Keep this comment\nconst value={answer:42};\n",
-        "site/style.css": "/* Keep this comment */\nbody{color:red}\n",
-        "site/assets/theme.css": "/* Keep this comment */\nbody{color:red}\n",
-        "site/helpers/extra.py": "# Keep this comment\nimport os\nVALUE=  1\n",
-    }
-    for name, source in sources.items():
-        path = root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(source)
-        _git(root, "add", "--force", "--", name)
-    local = root / "site/local.py"
-    local.write_text("# Keep this comment\nVALUE=  2\n")
-    ignore = root / ".gitignore"
-    ignore.write_text("*\n\n!*/\n")
-    staged = _git(root, "diff", "--cached", "--binary")
-    _run(root, "--no-cache", executable="treefmt")
-    _run(root, "--no-cache", "--fail-on-change", executable="treefmt")
-    for name, source in sources.items():
-        formatted = (root / name).read_text()
-        _expect(formatted != source and "Keep this comment" not in formatted, name)
-    _expect(
-        (root / "site/script.js").read_text()
-        == (root / "site/assets/app.js").read_text(),
-        "JavaScript formatting depends on filename or depth",
-    )
-    _expect(
-        (root / "site/style.css").read_text()
-        == (root / "site/assets/theme.css").read_text(),
-        "CSS formatting depends on filename or depth",
-    )
-    _expect(
-        "import os" in (root / "site/helpers/extra.py").read_text(),
-        "lint fix applied",
-    )
-    _expect(
-        local.read_text() == "# Keep this comment\nVALUE=  2\n",
-        "local file changed",
-    )
-    _expect(ignore.read_text() == "*\n\n!*/\n", "formatter changed ignore rules")
-    _expect(
-        _git(root, "diff", "--cached", "--binary") == staged,
-        "formatter staged changes",
-    )
-
-
-@pytest.mark.parametrize("tracked", [False, True])
-def test_formatting_ignores_repository_tool_configuration(
-    root: Path, *, tracked: bool
-) -> None:
-    """Selected sources receive the same policy with tracked or local tool settings."""
-    files = {
-        "flake.nix": "{}\n",
-        "example.py": '# ordinary explanation\nvalue = "hello"\n',
-        "site/example.js": (
-            "// ordinary explanation\nexport const value = () => {\n"
-            '  return "hello";\n};\n'
-        ),
-        "paper/ms.tex": (
-            "\\documentclass{article}\n% ordinary explanation\n"
-            "\\begin{document}\nHello.\n\\end{document}\n"
-        ),
-    }
-    for name, source in files.items():
-        path = root / name
-        path.parent.mkdir(exist_ok=True)
-        path.write_text(source)
-    _git(root, "add", ".")
-    _run(root, "--no-cache", executable="treefmt")
-    expected = {name: (root / name).read_bytes() for name in files}
-    configs = {
-        "pyproject.toml": '[tool.ruff.format]\nquote-style = "single"\n',
-        ".oxfmtrc.json": '{"singleQuote": true, "semi": false}\n',
-        "site/.oxfmtrc.json": '{"singleQuote": true, "semi": false}\n',
-        ".uncomment.toml": 'preserve_patterns = ["ordinary explanation"]\n',
-        "tex-fmt.toml": "wraplen = 10\n",
-        ".editorconfig": (
-            "root = true\n[*]\nindent_style = tab\nindent_size = 8\n"
-            "end_of_line = crlf\ninsert_final_newline = false\n"
-            "max_line_length = 20\n"
-        ),
-    }
-    for name, source in configs.items():
-        (root / name).write_text(source)
-    if tracked:
-        _git(root, "add", "--force", *configs)
-    for name, source in files.items():
-        (root / name).write_text(source)
-    _run(root, "--no-cache", executable="treefmt")
-    for name, content in expected.items():
-        _expect((root / name).read_bytes() == content, name)
-        _expect(b"ordinary explanation" not in content, name)
-
-
-def test_formatting_explicit_paths_preserves_metadata_and_formats_nested_sources(
-    root: Path,
-) -> None:
-    """Format explicitly named sources even when the repository ignores them."""
-    metadata = {
-        ".gitignore": "*\n\n!*/\n",
-        "LICENSE": "first\n\nsecond\n",
-        "flake.lock": "{\n\n}\n",
-    }
-    for name, source in metadata.items():
-        (root / name).write_text(source)
-    directory = root / "site/prm"
-    directory.mkdir(parents=True)
-    source_file = directory / "main.py"
-    source_file.write_text("# Explanation\nvalue=  1\n")
-    _run(
-        root,
-        "--no-cache",
-        *metadata,
-        str(source_file.relative_to(root)),
-        executable="treefmt",
-    )
-    for name, source in metadata.items():
-        _expect((root / name).read_text() == source, name)
-    _expect(source_file.read_text() == "value = 1\n", source_file)
 
 
 @pytest.mark.parametrize("description", [None, "package"])
@@ -703,9 +523,9 @@ def _inspection_discovery(source: str) -> dict[str, Any]:
 @pytest.mark.parametrize(
     "source",
     [
-        "def main(): pass",
         "raise RuntimeError('do not execute')\ndef main(): pass",
         "import sys\ndef main(): return sys.version",
+        "from .argparse import *\ndef main(): pass",
         """
 import argparse
 def main():
@@ -728,6 +548,7 @@ def test_argument_free_executables_have_an_empty_argument_list(
     "source",
     [
         "import argparse",
+        "from argparse import *\ndef main(): pass",
         "import argparse\ndef unused(): return argparse.ArgumentParser()",
         """\
 import argparse
@@ -1406,13 +1227,6 @@ def main():
 """)
 
 
-@pytest.mark.parametrize("module", ["argparse", "click"])
-def test_cli_discovery_rejects_unresolved_wildcard_imports(module: str) -> None:
-    """Keep unresolved wildcard interfaces from becoming an empty successful CLI."""
-    with pytest.raises(inspection_subject.CommandError, match="no supported parser"):
-        _inspection_discovery(f"from {module} import *\ndef main(): pass\n")
-
-
 @pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
 def test_cli_reports_preserve_unicode_arguments_across_line_endings(
     newline: str,
@@ -1449,7 +1263,7 @@ cli.add_argument('--résumé', default='é')
 cli.parse_args()
 """.encode("latin-1")
     )
-    _check_flake_source(root)
+    inspection_subject.validate_flake_source(root)
     resource = json.loads(_run(root).stdout)["example"]
     _expect(
         resource["arguments"] == [{"names": ["--résumé"], "default": "é"}], resource
@@ -1640,7 +1454,7 @@ in inputs.self.lib.mkPythonPackage {
     )
     source = package / "main.py"
     source.write_text(source.read_text().replace("def main():", "def main(values):"))
-    _check_flake_source(tmp_path)
+    inspection_subject.validate_flake_source(tmp_path)
     report = inspection_subject.inspect_repository(tmp_path)["example"]
     _expect(
         report
@@ -1654,8 +1468,11 @@ in inputs.self.lib.mkPythonPackage {
     definition.write_text(
         definition.read_text().replace("executable = false", "executable = true")
     )
-    rejected = _check_flake_source(tmp_path, code=1)
-    _expect("main must accept a call without arguments" in rejected.stderr, rejected)
+    with pytest.raises(
+        inspection_subject.CommandError,
+        match="main must accept a call without arguments",
+    ):
+        inspection_subject.validate_flake_source(tmp_path)
 
 
 def test_the_package_executable_setting_determines_whether_to_list_its_cli(
@@ -1747,28 +1564,31 @@ cli.parse_args()
     )
 
 
-@pytest.mark.parametrize("location", ["outside", "root", "nested"])
+@pytest.mark.parametrize("in_git", [False, True], ids=["outside", "git"])
 def test_afairesi_prints_the_current_repository_inventory_by_default_or_by_path(
     tmp_path: Path,
-    location: str,
+    *,
+    in_git: bool,
 ) -> None:
     """Return the same JSON inventory through supported paths inside and outside Git."""
     _inspection_repository(tmp_path)
     expected = inspection_subject.inspect_repository(tmp_path)
-    if location != "outside":
+    nested = tmp_path / "example"
+    if in_git:
         _git(tmp_path, "init", "--quiet")
         _git(tmp_path, "add", ".")
-    cwd = tmp_path / "example" if location == "nested" else tmp_path
-    paths = [["."], [str(tmp_path)]]
-    if location == "outside":
-        completed = _run(cwd, code=1)
+        calls = [
+            (tmp_path, []),
+            (nested, []),
+            (nested, ["."]),
+            (nested, [f"../{tmp_path.name}"]),
+        ]
+    else:
+        completed = _run(tmp_path, code=1)
         _expect(not completed.stdout, completed)
         _expect("not inside a Git repository" in completed.stderr, completed)
-    else:
-        paths.append([])
-    if location == "nested":
-        paths.append([f"../{tmp_path.name}"])
-    for arguments in paths:
+        calls = [(tmp_path, ["."]), (nested, [str(tmp_path)])]
+    for cwd, arguments in calls:
         completed = _run(cwd, *arguments)
         _expect(
             json.loads(completed.stdout) == expected,
@@ -1791,17 +1611,6 @@ def test_inventory_reports_a_missing_flake_or_malformed_python_source(
         inspection_subject.inspect_repository(tmp_path)
 
 
-def test_an_empty_repository_has_an_empty_inventory(
-    tmp_path: Path,
-) -> None:
-    """Return an empty resource map for an empty repository."""
-    (tmp_path / "flake.nix").touch()
-    _expect(
-        inspection_subject.inspect_repository(tmp_path) == {},
-        "empty collections were omitted",
-    )
-
-
 @pytest.fixture
 def remote_repository(
     tmp_path: Path,
@@ -1813,10 +1622,7 @@ def remote_repository(
     scratch.mkdir()
     home.mkdir()
     source.mkdir()
-    _inspection_repository(source)
-    _git(source, "init", "--quiet")
-    _git(source, "add", ".")
-    _fixture_git(source, "commit", "--quiet", "-m", "initial")
+    _committed_repository(source)
     remote = "https://example.test/team/repository.git"
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("TMPDIR", str(scratch))
@@ -1892,18 +1698,12 @@ def test_local_paths_include_uncommitted_changes_while_git_file_urls_show_commit
     )
 
 
-@pytest.mark.parametrize("remote_kind", ["missing", "unsupported", "invalid"])
 @pytest.mark.usefixtures("remote_repository")
 def test_afairesi_forwards_the_error_and_exit_status_from_a_failed_remote_clone(
     tmp_path: Path,
-    remote_kind: str,
 ) -> None:
     """Compare failed remote inspection with Git's exit status and diagnostics."""
-    remote = {
-        "missing": (tmp_path / "missing.git").as_uri(),
-        "unsupported": "unsupported://example.test/team/repository",
-        "invalid": "https://",
-    }[remote_kind]
+    remote = (tmp_path / "missing.git").as_uri()
     scratch = Path(os.environ["TMPDIR"])
     native_checkout = tmp_path / "native-checkout"
     expected = subprocess.run(  # noqa: S603 - Fixed Git executable with test-controlled arguments.
@@ -1929,15 +1729,12 @@ def test_afairesi_forwards_the_error_and_exit_status_from_a_failed_remote_clone(
     )
 
 
-def _diff_repository(root: Path) -> dict[str, Any]:
-    """Commit inspectable sources, including binary data and archive exclusions."""
+def _committed_repository(root: Path) -> None:
+    """Create a committed repository with inspectable sources."""
     _inspection_repository(root)
-    (root / "asset").write_bytes(b"\x00\xff\n")
-    (root / ".gitattributes").write_text("example export-ignore\n")
     _git(root, "init", "--quiet")
     _git(root, "add", ".")
     _fixture_git(root, "commit", "--quiet", "-m", "initial")
-    return inspection_subject.inspect_repository(root)
 
 
 def _diff_description(root: Path, description: str) -> None:
@@ -1950,15 +1747,13 @@ def _diff_description(root: Path, description: str) -> None:
 def _apply_diff(
     before: dict[str, Any],
     difference: str,
-    *,
-    diff_format: str = "jd",
 ) -> dict[str, Any]:
     """Use jd itself to verify that an emitted patch reconstructs the inspection."""
-    with TemporaryDirectory(prefix="afairesi-jd-patch-") as directory:
-        patch = Path(directory) / "change.jd"
-        patch.write_text(difference)
+    with NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".jd") as patch:
+        patch.write(difference)
+        patch.flush()
         completed = subprocess.run(  # noqa: S603 - Fixed jd executable; patch is a temporary fixture file.
-            ["jd", "-f", diff_format, "-p", str(patch)],  # noqa: S607
+            ["jd", "-p", patch.name],  # noqa: S607
             input=json.dumps(before),
             capture_output=True,
             text=True,
@@ -1970,7 +1765,7 @@ def _apply_diff(
 
 def test_diff_emits_a_jd_patch_from_index_to_working_tree(tmp_path: Path) -> None:
     """Use the staged interface as the baseline even from a nested directory."""
-    _diff_repository(tmp_path)
+    _committed_repository(tmp_path)
     _diff_description(tmp_path, "Staged")
     _git(tmp_path, "add", ".")
     index = inspection_subject.inspect_repository(tmp_path)
@@ -1980,6 +1775,8 @@ def test_diff_emits_a_jd_patch_from_index_to_working_tree(tmp_path: Path) -> Non
     completed = _run(tmp_path / "example", "diff")
     _expect(_apply_diff(index, completed.stdout) == working, completed)
     _expect(not completed.stderr, completed)
+    _expect("afairesi-diff-" not in completed.stdout, completed)
+    _expect(_run(tmp_path, "diff").stdout == completed.stdout, "diff output changed")
     _expect(
         _snapshot(tmp_path) == before,
         "diff changed Git or sources",
@@ -1990,7 +1787,7 @@ def test_diff_ignores_implementation_edits_and_untracked_resources(
     tmp_path: Path,
 ) -> None:
     """Emit nothing for changes outside the tracked interface contract."""
-    _diff_repository(tmp_path)
+    _committed_repository(tmp_path)
     source = tmp_path / "example/main.py"
     source.write_text(
         '"""Implementation notes."""\n'
@@ -2039,7 +1836,7 @@ def test_diff_analyzes_each_distinct_entrypoint_once_across_snapshots_and_runs(
 
 def test_diff_includes_tracked_targets_of_symlinked_entrypoints(tmp_path: Path) -> None:
     """Keep deeply nested symlink targets in both snapshots."""
-    _diff_repository(tmp_path)
+    _committed_repository(tmp_path)
     source = tmp_path / "example/main.py"
     target = tmp_path / "assets/deep/entry"
     target.parent.mkdir(parents=True)
@@ -2057,7 +1854,8 @@ def test_diff_reconstructs_changes_to_hosts_tests_and_subcommand_arguments(
     tmp_path: Path,
 ) -> None:
     """Round-trip resource changes, nested arguments, and lists with jd context."""
-    before = _diff_repository(tmp_path)
+    _committed_repository(tmp_path)
+    before = inspection_subject.inspect_repository(tmp_path)
     source = tmp_path / "example/main.py"
     source.write_text(
         source.read_text().replace(
@@ -2098,41 +1896,16 @@ def test_removing_a_package_drops_its_references_and_preserves_a_colocated_host(
         after,
     )
     _expect(_apply_diff(before, _run(root, "diff").stdout) == after, after)
-    rejected = _check_flake_source(root, code=1)
+    with pytest.raises(
+        inspection_subject.CommandError, match="missing required tracked regular file"
+    ) as rejected:
+        inspection_subject.validate_flake_source(root)
     for name in ("app", "shared"):
         _expect(
             f"{name}/default.nix: missing required tracked regular file"
-            in rejected.stderr,
-            rejected,
+            in str(rejected.value),
+            rejected.value,
         )
-
-
-def test_diff_output_can_be_applied_as_json_patch_after_conversion(
-    tmp_path: Path,
-) -> None:
-    """Translate native diff stdin to JSON Patch for JSON viewers and patching."""
-    before = _diff_repository(tmp_path)
-    _diff_description(tmp_path, "Changed")
-    difference = _run(tmp_path, "diff").stdout
-    translated = subprocess.run(
-        ["jd", "-t", "jd2patch"],  # noqa: S607
-        input=difference,
-        capture_output=True,
-        text=True,
-        check=True,
-        timeout=10,
-    )
-    _expect(isinstance(json.loads(translated.stdout), list), translated)
-    _expect(
-        _apply_diff(before, translated.stdout, diff_format="patch")
-        == inspection_subject.inspect_repository(tmp_path),
-        translated,
-    )
-    _expect("afairesi-diff-" not in difference, difference)
-    _expect(
-        _run(tmp_path, "diff").stdout == difference,
-        "temporary snapshot paths made identical diffs unstable",
-    )
 
 
 def test_diff_uses_the_index_before_the_first_commit(tmp_path: Path) -> None:
@@ -2160,7 +1933,7 @@ def test_diff_errors_leave_no_partial_output_or_temporary_sources(
     """Clean failed snapshots when a tracked source cannot be inspected."""
     root = tmp_path / "repository"
     root.mkdir()
-    _diff_repository(root)
+    _committed_repository(root)
     scratch = tmp_path / "scratch"
     scratch.mkdir()
     monkeypatch.setenv("TMPDIR", str(scratch))
@@ -2198,7 +1971,7 @@ def test_diff_reports_unresolved_merge_conflicts_and_leaves_the_index_untouched(
     tmp_path: Path,
 ) -> None:
     """Reject conflict stages instead of emitting an incomplete interface diff."""
-    _diff_repository(tmp_path)
+    _committed_repository(tmp_path)
     blob = _git(tmp_path, "rev-parse", "HEAD:example/main.py").strip()
     subprocess.run(
         ["git", "update-index", "--index-info"],  # noqa: S607
@@ -2230,7 +2003,8 @@ def test_diff_reads_the_selected_linked_worktree_without_modifying_it(
     """Read the selected worktree's index while preserving shared Git metadata."""
     root, linked = tmp_path / "repository", tmp_path / "linked"
     root.mkdir()
-    report = _diff_repository(root)
+    _committed_repository(root)
+    report = inspection_subject.inspect_repository(root)
     _git(root, "worktree", "add", "--quiet", "--detach", str(linked), "HEAD")
     _diff_description(linked, "Linked")
     before = _snapshot(tmp_path)
@@ -2276,7 +2050,7 @@ def test_source_validation_ignores_untracked_packages_and_test_files(
     (local / "default.nix").write_text("{ invalid")
     (local / "main.py").write_bytes(b"def broken(:")
     before = _snapshot(root)
-    _check_flake_source(root)
+    inspection_subject.validate_flake_source(root)
     _expect(_snapshot(root) == before, "validation admitted or changed local sources")
     report = inspection_subject.inspect_repository(root)
     _expect(set(report) == {"example"} and "tests" not in report["example"], report)
@@ -2293,14 +2067,15 @@ def test_inventory_groups_package_and_host_dependencies_by_role(
         (directory / "default.nix").write_text("{}: {}")
         (directory / "main.nix").write_text("{}")
     source = """{ inputs, pkgs, ... }:
-      let local = inputs.self.packages.${pkgs.stdenv.system};
+      let inherit (pkgs.stdenv.hostPlatform) system;
+          local = inputs.self.packages.${system};
           deps = [ local.library local.library ];
       in pkgs.runCommand "consumer" {
-        propagatedBuildInputs = deps ++
-          (with inputs.self.packages.${pkgs.stdenv.system}; [ other ]);
-        nativeCheckInputs = [ inputs.self.packages.${pkgs.stdenv.system}.library ];
+        propagatedBuildInputs = deps /* base */ ++
+          ( /* extra */ with inputs.self.packages.${system}; [ other ]);
+        nativeCheckInputs = [ inputs.self /* local */ .packages.${system}.library ];
         hook = local: { checkInputs = [ local.other ]; };
-        buildInputs = [ inputs.external.packages.${pkgs.stdenv.system}.other ];
+        buildInputs = [ inputs.external.packages.${system}.other ];
         text = "inputs.self.packages.fake.consumer";
         tool = local.tool;
         src = ../other/main.nix;

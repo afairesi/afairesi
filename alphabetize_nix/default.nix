@@ -4,6 +4,6 @@ inputs.self.lib.mkPythonPackage {
   executable = true;
   meta.description = "Canonicalize ordering and nesting in Nix expressions";
   passthru.checkInputs = [ pkgs.nix ];
-  propagatedBuildInputs = [ inputs.self.packages.${pkgs.stdenv.system}.nix_syntax ];
+  propagatedBuildInputs = [ inputs.self.packages.${pkgs.stdenv.hostPlatform.system}.nix_syntax ];
   src = ./.;
 }

@@ -2,10 +2,9 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Canonicalize ordering and nesting in Nix expressions."""
 
-from __future__ import annotations
-
 import argparse
 import sys
+import tempfile
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -201,9 +200,21 @@ def format_file(path: Path) -> bool:
     try:
         source = path.read_text(encoding="utf-8")
         formatted = format_text(source, str(path))
-        nix_syntax.write_if_changed(path, formatted)
+        if formatted == source:
+            return True
+        if path.is_symlink() or not path.is_file():
+            sys.stderr.write(f"error: {path}: must be a regular file\n")
+            return False
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=path.parent, delete_on_close=False
+        ) as temporary:
+            temporary.write(formatted)
+            temporary.close()
+            pending = Path(temporary.name)
+            pending.chmod(path.stat().st_mode)
+            pending.replace(path)
     except (OSError, ValueError) as error:
-        sys.stderr.write((f"error: {path}: {error}") + "\n")
+        sys.stderr.write(f"error: {path}: {error}\n")
         return False
     return True
 

@@ -2,8 +2,6 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Browse home's direct submodules in an expandable text tree."""
 
-from __future__ import annotations
-
 import argparse
 import contextlib
 import curses
@@ -14,7 +12,6 @@ import shutil
 import stat
 import subprocess
 import sys
-import tempfile
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -22,14 +19,14 @@ from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 
-from afairesi import CommandError, cache_home, diff_inputs
+from afairesi import CommandError, cache_home, diff_inputs, write_cache_entry
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Sequence
 
 CACHE_VERSION = 2
 XTERM_ORANGE = 208
-Payload = dict[str, Any] | list[dict[str, Any]]
+type Payload = dict[str, Any] | list[dict[str, Any]]
 type View = Literal["resources", "diff"]
 
 READ_ERRORS = (CommandError, OSError, ValueError, subprocess.SubprocessError)
@@ -81,7 +78,7 @@ def fingerprint(root: Path, view: View) -> str | None:
         digest.update(str(tracked).encode())
         try:
             entry_stat = path.lstat()
-        except (FileNotFoundError, NotADirectoryError):
+        except FileNotFoundError, NotADirectoryError:
             digest.update(b"missing")
             continue
         stats = [entry_stat]
@@ -122,7 +119,7 @@ def repositories(home: Path) -> list[str]:
     modules = home / ".gitmodules"
     if not modules.is_file():
         return []
-    configured = git(home, "config", "--null", "--file", str(modules), "--list")
+    configured = git(home, "config", "list", "--null", "--file", str(modules))
     paths = {
         entry.partition("\n")[2]
         for entry in configured.split("\0")
@@ -184,18 +181,7 @@ def cached_output(
                 return saved["value"], True
     value = read_output(root, view)
     if before is not None and fingerprint(root, view) == before:
-        with contextlib.suppress(OSError):
-            cache.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with tempfile.NamedTemporaryFile(
-                mode="w", encoding="utf-8", dir=cache, delete=False
-            ) as temporary:
-                pending = Path(temporary.name)
-                try:
-                    json.dump({"fingerprint": before, "value": value}, temporary)
-                    temporary.close()
-                    pending.replace(path)
-                finally:
-                    pending.unlink(missing_ok=True)
+        write_cache_entry(path, {"fingerprint": before, "value": value})
     return value, False
 
 

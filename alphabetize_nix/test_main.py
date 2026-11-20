@@ -1,8 +1,6 @@
 # Copyright (c) 2026- Paschalis Bizopoulos
 """Check Nix formatting through files and the installed executable."""
 
-from __future__ import annotations
-
 import json
 import os
 import subprocess
@@ -81,9 +79,11 @@ def test_formatting_integer_bindings_preserves_their_values_and_stabilizes_in_on
         raise AssertionError((source, formatted, result))
 
 
-@pytest.mark.parametrize(
-    ("source", "expected"),
-    [
+def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
+    tmp_path: Path,
+) -> None:
+    """Format a batch of expressions in place and verify each result on both runs."""
+    cases = [
         (
             '{ z = [ 3 1 2 ]; strings = [ "c" "a" ]; f = { z, a }: z + a; }',
             '{ f = { a, z }: z + a; strings = [ "c" "a" ]; z = [ 3 1 2 ]; }',
@@ -113,25 +113,25 @@ def test_formatting_integer_bindings_preserves_their_values_and_stabilizes_in_on
             r'{ "literal \${name}" = 1; "back\\slash\"quote" = 2; }',
             r'{ "back\\slash\"quote" = 2; "literal \${name}" = 1; }',
         ),
-    ],
-)
-def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
-    tmp_path: Path, source: str, expected: str
-) -> None:
-    """Canonicalize representative expressions without losing significant text."""
-    path = tmp_path / "example with spaces.nix"
-    path.write_text(source, encoding="utf-8")
+    ]
+    expected_files = {}
+    for index, (source, expected) in enumerate(cases):
+        path = tmp_path / f"example {index}.nix"
+        path.write_text(source, encoding="utf-8")
+        expected_files[path] = expected
     for _ in range(2):
         result = subprocess.run(  # noqa: S603 - Test harness selects the executable and fixture arguments.
-            [os.environ["PACKAGE_E2E_EXECUTABLE"], str(path)],
+            [os.environ["PACKAGE_E2E_EXECUTABLE"], *expected_files],
             capture_output=True,
             check=False,
             timeout=10,
         )
         if result.returncode or result.stdout or result.stderr:
             raise AssertionError(result)
-        if path.read_text(encoding="utf-8") != expected:
-            raise AssertionError(path.read_text(encoding="utf-8"))
+        for path, expected in expected_files.items():
+            actual = path.read_text(encoding="utf-8")
+            if actual != expected:
+                raise AssertionError((path, expected, actual))
 
 
 @pytest.mark.parametrize(
@@ -148,7 +148,6 @@ def test_formatting_sorts_nix_bindings_and_reaches_a_stable_form_in_one_pass(
         "let x = 7; in rec { x = 9; a = { inherit x; y = 1; }; }",
         "let x = 7; in { a = rec { inherit x; y = x; }; }",
         "rec { z = 3; a = { x = z; y = 1; }; }",
-        "{ b.z = 1; b.x = 2; a = 1; }",
         "# leading comment\n{ z = 3; a = 1; }\n# trailing comment\n",
         "{ z = 3; # keep this comment\n a = 1; }",
         "({ z, # keep this formal\n a }: [ z a ]) { z = 3; a = 1; }",

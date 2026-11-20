@@ -2,9 +2,12 @@ afairesiInputs:
 let
   formatter =
     { pkgs, self }:
+    let
+      inherit (pkgs.stdenv.hostPlatform) system;
+    in
     mkTreefmtTool {
       inherit pkgs self;
-      treefmtEval = afairesiInputs.treefmt-nix.lib.evalModule pkgs {
+      module = {
         enableDefaultExcludes = false;
         programs = {
           oxfmt = {
@@ -28,22 +31,34 @@ let
             priority = 5;
           };
         };
-        projectRootFile = "flake.nix";
         settings.formatter = {
           alphabetize-nix = {
-            command = mkFileFormatter {
-              inherit pkgs;
+            command = pkgs.writeShellApplication {
               name = "format-nix";
               runtimeInputs = [
-                afairesiInputs.self.packages.${pkgs.stdenv.system}.alphabetize_nix
-                afairesiInputs.self.packages.${pkgs.stdenv.system}.uncomment
+                afairesiInputs.self.packages.${system}.alphabetize_nix
+                afairesiInputs.self.packages.${system}.uncomment
+                pkgs.coreutils
+                pkgs.diffutils
                 pkgs.nixfmt
               ];
               text = ''
-                nixfmt - < "$temporary" > /dev/null
-                uncomment --config ${pkgs.writeText "uncomment.toml" ""} --no-gitignore "$temporary"
-                alphabetize_nix "$temporary"
-                nixfmt "$temporary"
+                workspace=$(mktemp -d)
+                trap 'rm -rf "$workspace"' EXIT
+                for source in "$@"; do
+                  if [ -L "$source" ]; then
+                    continue
+                  fi
+                  temporary="$workspace/$(basename "$source")"
+                  cp "$source" "$temporary"
+                  nixfmt - < "$temporary" > /dev/null
+                  uncomment --config ${pkgs.writeText "uncomment.toml" ""} --no-gitignore "$temporary"
+                  alphabetize_nix "$temporary"
+                  nixfmt "$temporary"
+                  if ! cmp -s "$source" "$temporary"; then
+                    cat "$temporary" > "$source"
+                  fi
+                done
               '';
             };
             includes = [ "*.nix" ];
@@ -65,10 +80,13 @@ let
             "--ignore-path"
             "/dev/null"
           ];
-          ruff-format.options = [ "--isolated" ];
+          ruff-format.options = [
+            "--isolated"
+            (ruffTarget pkgs)
+          ];
           texfmt.options = [ "--noconfig" ];
           uncomment = {
-            command = afairesiInputs.self.packages.${pkgs.stdenv.system}.uncomment;
+            command = afairesiInputs.self.packages.${system}.uncomment;
             includes = [
               "*.py"
               "*.pyi"
@@ -103,7 +121,7 @@ let
           value = {
             command = mkLean4Tool {
               inherit pkgs;
-              packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+              packageDrv = self.packages.${system}.${name};
               packageName = name;
             };
             includes = [ "${name}/*.lean" ];
@@ -128,6 +146,7 @@ let
   lint =
     { pkgs, self }:
     let
+      inherit (pkgs.stdenv.hostPlatform) system;
       pythonPackageNames = packageNamesFor self pkgs "python";
       pythonSources =
         name:
@@ -144,7 +163,7 @@ let
     in
     mkTreefmtTool {
       inherit pkgs self;
-      treefmtEval = afairesiInputs.treefmt-nix.lib.evalModule pkgs {
+      module = {
         programs = {
           mypy = {
             directories = pkgs.lib.genAttrs pythonPackageNames (
@@ -152,7 +171,7 @@ let
               let
                 environment = mkTestEnvironment {
                   inherit pkgs;
-                  packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+                  packageDrv = self.packages.${system}.${name};
                 };
               in
               {
@@ -191,7 +210,6 @@ let
             settings.extends = "default";
           };
         };
-        projectRootFile = "flake.nix";
         settings.formatter = {
           deadnix = {
             command = pkgs.deadnix;
@@ -228,6 +246,7 @@ let
             options = [
               "check"
               "--isolated"
+              (ruffTarget pkgs)
               "--no-fix"
               "--extend-select=ALL"
               "--extend-ignore=W191,E111,E114,E117,D203,D206,D300,Q000,Q001,Q002,Q003,Q004,COM812,COM819"
@@ -277,7 +296,7 @@ let
             command = mkLean4Tool {
               inherit pkgs;
               check = true;
-              packageDrv = self.packages.${pkgs.stdenv.system}.${name};
+              packageDrv = self.packages.${system}.${name};
               packageName = name;
             };
             includes = [ "${name}/*.lean" ];
@@ -301,35 +320,6 @@ let
         text = builtins.readFile (src + "/main.sh");
       }
     );
-  mkFileFormatter =
-    {
-      name,
-      pkgs,
-      runtimeInputs,
-      text,
-    }:
-    pkgs.writeShellApplication {
-      inherit name;
-      runtimeInputs = runtimeInputs ++ [
-        pkgs.coreutils
-        pkgs.diffutils
-      ];
-      text = ''
-        workspace=$(mktemp -d)
-        trap 'rm -rf "$workspace"' EXIT
-        for source in "$@"; do
-          if [ -L "$source" ]; then
-            continue
-          fi
-          temporary="$workspace/$(basename "$source")"
-          cp "$source" "$temporary"
-          ${text}
-          if ! cmp -s "$source" "$temporary"; then
-            cat "$temporary" > "$source"
-          fi
-        done
-      '';
-    };
   mkFlake =
     {
       inputs,
@@ -348,7 +338,7 @@ let
         builtins.attrNames (
           lib.filterAttrs (
             name: type: type == "directory" && builtins.pathExists (source + "/${name}/${marker}")
-          ) (if builtins.pathExists source then builtins.readDir source else { })
+          ) (builtins.readDir source)
         );
       environments = lib.genAttrs systems (
         system:
@@ -384,8 +374,8 @@ let
           repositoryInputs.nixpkgs.legacyPackages.${system}
         else
           import repositoryInputs.nixpkgs {
-            inherit system;
             config = nixpkgs.config or { };
+            localSystem.system = system;
             overlays = nixpkgs.overlays or [ ];
           }
       );
@@ -396,12 +386,7 @@ let
       // inputs;
       source = self.outPath;
       supported =
-        system:
-        lib.filterAttrs (
-          _: package:
-          (package.meta.platforms or [ ]) == [ ]
-          || lib.meta.availableOn packageSets.${system}.stdenv.hostPlatform package
-        );
+        system: lib.filterAttrs (_: lib.meta.availableOn packageSets.${system}.stdenv.hostPlatform);
       testedNames =
         system: kind: filename:
         builtins.filter (name: builtins.pathExists (source + "/${name}/${filename}")) (
@@ -891,9 +876,7 @@ let
                 cp "$workspace/$relative" "$source_root/$relative"
               fi
             done
-            if [ "$format_status" -ne 0 ]; then
-              exit "$format_status"
-            fi
+            exit "$format_status"
           ''
       );
     };
@@ -1057,24 +1040,44 @@ let
     .${packageDrv.afairesiKind};
   mkTreefmtTool =
     {
+      module,
       pkgs,
       self,
-      treefmtEval,
     }:
-    pkgs.writeShellApplication {
-      name = "treefmt";
-      passthru.tests.check = (treefmtEval.config.build.check self.outPath).overrideAttrs (previous: {
-        buildCommand =
-          builtins.replaceStrings
-            [ "git add ." "treefmt --no-cache" ]
-            [ "git add --force -- ." "treefmt --no-cache --walk git" ]
-            previous.buildCommand;
-      });
-      runtimeInputs = [ pkgs.git ];
-      text = ''
-        exec ${treefmtEval.config.build.wrapper}/bin/treefmt --walk git "$@"
-      '';
-    };
+    let
+      inherit (afairesiInputs.treefmt-nix.lib.evalModule pkgs module) config;
+      tool = pkgs.writeShellApplication {
+        name = "treefmt";
+        passthru.tests.check =
+          pkgs.runCommandLocal "treefmt-check"
+            {
+              meta.description = "Check the project tree with treefmt";
+              nativeBuildInputs = [
+                pkgs.git
+                pkgs.git-lfs
+              ];
+            }
+            ''
+              export HOME="$TMPDIR"
+              export LC_ALL=${if pkgs.stdenv.hostPlatform.isDarwin then "en_US.UTF-8" else "C.UTF-8"}
+              cp -R ${self.outPath} project
+              chmod -R u+w project
+              cd project
+              git init --quiet
+              git add --force -- .
+              ${pkgs.lib.getExe tool} --no-cache
+              git diff --exit-code
+              touch "$out"
+            '';
+        runtimeInputs = [ pkgs.git ];
+        text = ''
+          unset PRJ_ROOT
+          exec ${pkgs.lib.getExe config.package} --config-file=${config.build.configFile} \
+            --tree-root-file=flake.nix --walk git "$@"
+        '';
+      };
+    in
+    tool;
   packageNamesFor =
     self: pkgs: kind:
     builtins.attrNames (
@@ -1082,7 +1085,7 @@ let
         name: package:
         builtins.pathExists (self.outPath + "/${name}/default.nix")
         && (package.afairesiKind or "generic") == kind
-      ) self.packages.${pkgs.stdenv.system}
+      ) self.packages.${pkgs.stdenv.hostPlatform.system}
     );
   pythonCheck =
     {
@@ -1094,15 +1097,21 @@ let
     let
       inherit (packageDrv) pythonModule;
       installedModule = "${packageDrv}/${pythonModule.sitePackages}/${packageDrv.pname}";
-      runtime = builtins.toFile "coverage_support.py" ''
-        from __future__ import annotations
-
+      pytestPlugin = pkgs.writeTextDir "_afairesi_coverage_support.py" ''
         import os
         from collections.abc import Generator
         from pathlib import Path
 
         import coverage
         import pytest
+        from hypothesis import settings
+
+
+        @pytest.hookimpl(tryfirst=True)
+        def pytest_load_initial_conftests() -> None:
+            """Set reproducible Hypothesis defaults before loading project tests."""
+            settings.register_profile("afairesi", max_examples=100, derandomize=True)
+            settings.load_profile("afairesi")
 
 
         def remap_coverage_paths(installed_path: str) -> None:
@@ -1137,7 +1146,10 @@ let
                 if tracer is not None:
                     tracer.switch_context(previous)
       '';
-      startup = builtins.toFile "sitecustomize.py" ("import coverage\n" + "coverage.process_startup()\n");
+      startup = pkgs.writeTextDir "sitecustomize.py" ''
+        import coverage
+        coverage.process_startup()
+      '';
     in
     pkgs.runCommand "${packageName}-coverage"
       (
@@ -1150,11 +1162,9 @@ let
         }
       )
       ''
-        mkdir -p "$out/html" "$TMPDIR/coverage-startup"
+        mkdir -p "$out"
         export COVERAGE_PROCESS_START="$TMPDIR/coverage.ini"
         unset AFAIRESI_TEST_CONTEXT
-        cp "${startup}" "$TMPDIR/coverage-startup/sitecustomize.py"
-        cp "${runtime}" "$TMPDIR/coverage-startup/_afairesi_coverage_support.py"
         cat > "$COVERAGE_PROCESS_START" <<EOF
         [run]
         core = ctrace
@@ -1168,36 +1178,38 @@ let
         omit =
             */test_main.py
         EOF
-        export PYTHONPATH="$TMPDIR/coverage-startup:${pythonModule.pkgs.coverage}/${pythonModule.sitePackages}:$PYTHONPATH"
+        export PYTHONPATH="${startup}:${pytestPlugin}:${pythonModule.pkgs.coverage}/${pythonModule.sitePackages}:$PYTHONPATH"
         export HOME="$(mktemp -d)"
         cd "$out"
-        "${testEnvironment.python}/bin/python" -c '
-        import sys
-        import pytest
-        class Defaults:
-            @pytest.hookimpl(tryfirst=True)
-            def pytest_load_initial_conftests(self, early_config, parser, args):
-                from hypothesis import settings
-                settings.register_profile("afairesi", max_examples=100, derandomize=True)
-                settings.load_profile("afairesi")
-        sys.exit(pytest.main(plugins=[Defaults()]))
-        ' -p _afairesi_coverage_support -p no:cacheprovider \
+        "${testEnvironment.python}/bin/python" -m pytest -p _afairesi_coverage_support -p no:cacheprovider \
           --import-mode=importlib --durations=10 --maxfail=1 "$src/test_main.py"
+        export COVERAGE_RCFILE="$COVERAGE_PROCESS_START"
         unset COVERAGE_PROCESS_START
-        python -m coverage combine --rcfile="$TMPDIR/coverage.ini"
+        python -m coverage combine
         python -c 'from _afairesi_coverage_support import remap_coverage_paths; remap_coverage_paths("${installedModule}/__init__.py")'
-        python -m coverage html --show-contexts --rcfile="$TMPDIR/coverage.ini" -d "$out/html"
-        python -m coverage json --show-contexts --rcfile="$TMPDIR/coverage.ini" -o "$out/coverage.json"
+        python -m coverage html --show-contexts -d "$out/html"
+        python -m coverage json --show-contexts -o "$out/coverage.json"
       '';
+  ruffTarget =
+    pkgs: "--target-version=py${builtins.replaceStrings [ "." ] [ "" ] pkgs.python3.pythonVersion}";
   sourceCheck =
     { pkgs, src }:
     let
       python = pkgs.python3.withPackages (_: [
-        afairesiInputs.self.packages.${pkgs.stdenv.system}.afairesi
+        afairesiInputs.self.packages.${pkgs.stdenv.hostPlatform.system}.afairesi
       ]);
     in
     pkgs.runCommand "afairesi-structure-check" { } ''
-      ${python}/bin/python -c 'from afairesi import check_source_main; check_source_main()' ${src}
+      ${python}/bin/python - "${src}" <<'PY'
+      import sys
+      from pathlib import Path
+      from afairesi import CommandError, validate_flake_source
+
+      try:
+          validate_flake_source(Path(sys.argv[1]).resolve())
+      except (CommandError, OSError, SyntaxError, ValueError) as error:
+          sys.exit(f"error: {error}")
+      PY
       touch "$out"
     '';
 in
