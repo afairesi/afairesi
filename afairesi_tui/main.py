@@ -9,6 +9,7 @@ import curses
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -24,10 +25,12 @@ from typing import TYPE_CHECKING, Literal, TypedDict, TypeGuard
 from afairesi import CommandError, diff_inputs
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator
+    from collections.abc import Callable, Iterator, Sequence
 
 CACHE_VERSION = 5
 XTERM_ORANGE = 208
+RGB_COLORS = 1 << 24
+RGB_ORANGE = 0xFF8700
 type View = Literal["tests", "diff"]
 
 READ_ERRORS = (CommandError, OSError, ValueError, subprocess.SubprocessError)
@@ -231,6 +234,7 @@ def _repository_node(
 ) -> tuple[str, Node, str]:
     """Build a repository row and return its progress status."""
     node = Node(Path(path).name)
+    packages = None
     try:
         root = (home / path).resolve()
         if not root.is_relative_to(home) or root == home:
@@ -242,25 +246,27 @@ def _repository_node(
         if Path(git(root, "rev-parse", "--show-toplevel").strip()).resolve() != root:
             message = "The registered path is not a repository checkout within home."
             raise ValueError(message)
-        if view == "tests":
-            branch = git(root, "rev-parse", "--abbrev-ref", "HEAD").strip()
-            node.add(f"branch: {branch}")
-            if git(
+        value, hit = cached_output(root, view, cache, refresh=refresh)
+        if isinstance(value, dict):
+            packages = value
+            status = git(
                 root,
                 "status",
                 "--porcelain",
                 "--untracked-files=no",
                 "--ignore-submodules=all",
-            ):
-                node.add("modified", change="~")
-        value, hit = cached_output(root, view, cache, refresh=refresh)
-        if isinstance(value, dict):
-            add_tests(node, value)
-            if any(child.change == "~" for child in node.children):
+            )
+            if status:
                 node.change = "~"
-        else:
-            add_changes(node, value)
+                if any(line[1] != " " for line in status.rstrip("\n").split("\n")):
+                    value, diff_hit = cached_output(
+                        root, "diff", cache, refresh=refresh
+                    )
+                    hit = hit and diff_hit
+        add_tests(node, packages, value if isinstance(value, list) else ())
     except READ_ERRORS as error:
+        if packages is not None:
+            add_tests(node, packages)
         node.add(f"error: {error}")
         return path, node, "error"
     return path, node, "cached" if hit else "done"
@@ -328,12 +334,22 @@ class Node:
     expanded: bool = False
     change: str = ""
     detail: str = ""
+    test_label: str = ""
 
     def add(self, label: str, *, change: str = "") -> Node:
         """Append a folded child and return it for further details."""
         child = Node(label, change=change)
         self.children.append(child)
         return child
+
+    def add_test(self, name: str, *, change: str = "") -> None:
+        """Show a readable test label while keeping the source name searchable."""
+        scope, separator, leaf = name.rpartition("::" if "::" in name else ".")
+        title = re.sub(r"^test(?:_|(?=[A-Z]))", "", leaf) or leaf
+        label = (scope + separator + title).replace("_", " ")
+        marker = f"{change} " if change else ""
+        child = self.add(marker + name, change=change)
+        child.test_label = marker + (label if label.strip() else name)
 
     def visible(self, depth: int = 0) -> Iterator[tuple[Node, int]]:
         """Visit only the rows exposed by expanded branches."""
@@ -349,30 +365,27 @@ def _directory_tree(home: Path, repositories_by_path: dict[str, Node]) -> Node:
     directories: dict[tuple[Node, str], Node] = {}
     for path, node in sorted(repositories_by_path.items()):
         parent = tree
+        if node.change:
+            tree.change = "~"
         for directory in Path(path).parts[:-1]:
             key = (parent, directory)
             if key not in directories:
                 directories[key] = parent.add(directory)
             parent = directories[key]
+            if node.change:
+                parent.change = "~"
         parent.children.append(node)
     return tree
 
 
-def add_tests(node: Node, packages: dict[str, list[str]]) -> None:
-    """Keep each name searchable and show the number of named tests when folded."""
-    if not packages:
-        node.add("No packages")
-    for package, tests in packages.items():
-        child = node.add(package)
-        count = len(tests)
-        child.detail = f"{count or 'no'} named test{'' if count == 1 else 's'}"
-        for name in tests:
-            child.add(name)
-
-
-def add_changes(node: Node, patch: list[PatchChange]) -> None:
-    """Show package and test name changes from a jd patch."""
-    packages: dict[str, Node] = {}
+def add_tests(
+    node: Node, packages: dict[str, list[str]] | None, patch: Sequence[PatchChange] = ()
+) -> None:
+    """Mark changed tests and include current tests and counts in the tests view."""
+    names = {
+        package: dict.fromkeys(tests, "") for package, tests in (packages or {}).items()
+    }
+    package_changes = {}
     for operation in patch:
         marker = {"add": "+", "remove": "-"}[operation["op"]]
         path = [
@@ -380,21 +393,29 @@ def add_changes(node: Node, patch: list[PatchChange]) -> None:
             for part in operation["path"].split("/")
         ]
         match path, operation["value"]:
-            case ["", package], list(names):
-                change = node.add(f"{marker} {package}", change=marker)
-                for name in names:
-                    change.add(f"{marker} {name}", change=marker)
+            case ["", package], list(tests):
+                package_changes[package] = marker
+                names[package] = dict.fromkeys(tests, marker)
             case ["", package, index], str(name) if index.isdecimal() or index == "-":
-                if package not in packages:
-                    packages[package] = node.add(package, change="~")
-                packages[package].add(f"{marker} {name}", change=marker)
+                package_changes[package] = "~"
+                names.setdefault(package, {})[name] = marker
             case _:
                 message = f"Unexpected package test change at {operation['path']}"
                 raise ValueError(message)
-    if node.children:
+    if packages is not None and not names:
+        node.add("No packages")
+    for package, test_changes in sorted(names.items()):
+        change = package_changes.get(package, "")
+        label = f"{change} {package}" if change in {"+", "-"} else package
+        child = node.add(label, change=change)
+        if packages is not None:
+            child.detail = str(len(packages.get(package, ())))
+        for name, marker in sorted(
+            test_changes.items(), key=lambda item: (item[1] != "-", item[0])
+        ):
+            child.add_test(name, change=marker)
+    if patch:
         node.change = "~"
-    for branch in packages.values():
-        branch.children.sort(key=lambda child: (child.change != "-", child.label))
 
 
 class Viewer:
@@ -447,7 +468,10 @@ class Viewer:
         start = nodes.index(current) + 1
         needle = query.casefold()
         for match in nodes[start:] + nodes[:start]:
-            if needle in match.label.casefold():
+            if (
+                needle in match.label.casefold()
+                or needle in match.test_label.casefold()
+            ):
                 node = match
                 while node in parents:
                     node = parents[node]
@@ -531,7 +555,8 @@ class Viewer:
         ):
             marker = ("▾" if node.expanded else "▸") if node.children else " "
             label = "".join(
-                char if char.isprintable() else repr(char)[1:-1] for char in node.label
+                char if char.isprintable() else repr(char)[1:-1]
+                for char in node.test_label or node.label
             )
             if node.detail:
                 label += f" ({node.detail})"
@@ -561,6 +586,8 @@ def _change_colors() -> dict[str, int]:
             orange = (
                 XTERM_ORANGE if curses.COLORS > XTERM_ORANGE else curses.COLOR_YELLOW
             )
+            if curses.COLORS == RGB_COLORS:
+                orange = RGB_ORANGE
             curses.init_pair(3, orange, background)
             colors["~"] = curses.color_pair(3)
     return colors
@@ -574,13 +601,16 @@ def _draw(
     page = max(1, height - 1)
     screen.erase()
     for row, (text, selected, change) in enumerate(viewer.frame(page)):
+        style = colors.get(change, 0)
+        if selected:
+            style |= curses.A_UNDERLINE | curses.A_BOLD if style else curses.A_REVERSE
         with contextlib.suppress(curses.error):
             screen.addnstr(
                 row,
                 0,
                 text,
                 max(0, width - 1),
-                colors.get(change, 0) | (curses.A_REVERSE if selected else 0),
+                style,
             )
     with contextlib.suppress(curses.error):
         screen.addnstr(height - 1, 0, footer, max(0, width - 1))

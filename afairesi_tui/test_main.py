@@ -27,7 +27,7 @@ def labels(node: subject.Node, *path: str) -> list[str]:
     """Read the child labels at a displayed tree path."""
     for name in path:
         node = next(child for child in node.children if child.label == name)
-    return [child.label for child in node.children]
+    return [child.test_label or child.label for child in node.children]
 
 
 def git(root: Path, *arguments: str) -> str:
@@ -133,7 +133,7 @@ def home(tmp_path: Path) -> Path:
 def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
     home: Path,
 ) -> None:
-    """Discover once and inspect each direct checkout once, without eager diffs."""
+    """Discover direct checkouts and read diffs only for unstaged changes."""
     first = home / "github.com/owner/project"
     second = home / "gitlab.com/owner/project"
     nested = second / "nested"
@@ -149,27 +149,32 @@ def test_home_tree_groups_direct_submodules_by_path_without_modifying_them(
     calls = [invocation.args for invocation in command.call_args_list]
     expect(labels(tree) == ["broken", "github.com", "gitlab.com", "missing"], tree)
     project = ("github.com", "owner", "project")
-    expect("test_working" in labels(tree, *project, "example"), tree)
-    expect("modified" in labels(tree, *project), tree)
+    expect(labels(tree, *project, "example") == ["- staged", "+ working"], tree)
+    expect(labels(tree, *project) == ["example"], tree)
     viewer = subject.Viewer(tree)
-    expect(viewer.search("github.com"), tree)
-    expect(viewer.search("modified"), tree)
-    frame = viewer.frame(30)
+    expect(viewer.search("test_working"), tree)
+    colors = {text.strip(): color for text, _, color in viewer.frame(30)}
     expect(
-        any(text.strip() == "▾ project" and color == "~" for text, _, color in frame),
-        frame,
+        all(
+            colors["▾ " + label] == "~"
+            for label in (str(home), *project, "example (1)")
+        ),
+        colors,
     )
-    expect(any(selected and color == "~" for _, selected, color in frame), frame)
+    expect(colors["+ working"] == "+" and colors["- staged"] == "-", colors)
+    expect(colors["▸ gitlab.com"] == "", colors)
     other = ("gitlab.com", "owner", "project")
-    expect("test_original" in labels(tree, *other, "example"), tree)
-    expect("modified" not in labels(tree, *other), tree)
+    expect(labels(tree, *other, "example") == ["original"], tree)
+    expect(labels(tree, *other) == ["example"], tree)
     expect(
         labels(tree, "missing") == ["error: This submodule is not initialized."], tree
     )
     expect(any("flake.nix" in label for label in labels(tree, "broken")), tree)
     roots = {first, second, home / "broken"}
     inspections = sorted((root, args) for args, root in calls if args[0] == "afairesi")
-    expect(inspections == [(root, ["afairesi"]) for root in sorted(roots)], inspections)
+    expected = [(root, ["afairesi"]) for root in roots]
+    expected.append((first, ["afairesi", "diff"]))
+    expect(inspections == sorted(expected), inspections)
     expect(all(root in roots | {home} for _, root in calls), calls)
     catalogs = [
         args for args, root in calls if root == home and args[:2] == ["git", "ls-files"]
@@ -187,7 +192,7 @@ def test_home_diff_shows_working_changes_across_registered_repositories(
     project = ("github.com", "owner", "project")
     expect(labels(tree, *project) == ["example"], tree)
     expect(
-        labels(tree, *project, "example") == ["- test_staged", "+ test_working"],
+        labels(tree, *project, "example") == ["- staged", "+ working"],
         tree,
     )
     expect("gitlab.com" not in labels(tree), tree)
@@ -195,8 +200,8 @@ def test_home_diff_shows_working_changes_across_registered_repositories(
     expect(viewer.search("test_staged"), tree)
     colors = {text.strip(): color for text, _, color in viewer.frame(30)}
     expect(colors["▾ example"] == "~", colors)
-    expect(colors["- test_staged"] == "-", colors)
-    expect(colors["+ test_working"] == "+", colors)
+    expect(colors["- staged"] == "-", colors)
+    expect(colors["+ working"] == "+", colors)
     expect(
         labels(tree, "missing") == ["error: This submodule is not initialized."], tree
     )
@@ -229,7 +234,11 @@ def test_multilingual_test_names_are_searchable_and_diffed_under_their_packages(
             "test_main.lean",
             "namespace Output\ntheorem keepsName : True := trivial\nend Output",
         ),
-        "crate": ("", "tests/output.rs", "mod output { #[test] fn keeps_name() {} }"),
+        "crate": (
+            "",
+            "tests/output.rs",
+            "mod output { #[test] fn test_keeps_name() {} }",
+        ),
         "untested": ("", "test_main.nix", "{}"),
     }
     for package, (builder, filename, source) in suites.items():
@@ -249,11 +258,10 @@ def test_multilingual_test_names_are_searchable_and_diffed_under_their_packages(
     viewer = subject.Viewer(tree)
     project = ("github.com", "owner", "project")
     for package, name in {
-        "example": "test_working",
         "shell": "preserves spaces",
-        "nix": "testKeepsName",
+        "nix": "KeepsName",
         "proof": "Output.keepsName",
-        "crate": "output::keeps_name",
+        "crate": "output::keeps name",
     }.items():
         expect(labels(tree, *project, package) == [name], package)
         expect(viewer.search(name), name)
@@ -262,16 +270,13 @@ def test_multilingual_test_names_are_searchable_and_diffed_under_their_packages(
             any(selected and row.strip() == name for row, selected, _ in frame), frame
         )
         expect(
-            any(row.strip() == f"▾ {package} (1 named test)" for row, _, _ in frame),
+            any(row.strip() == f"▾ {package} (1)" for row, _, _ in frame),
             frame,
         )
     expect(viewer.search("untested"), tree)
     frame = viewer.frame(40)
     expect(
-        any(
-            selected and "untested (no named tests)" in row
-            for row, selected, _ in frame
-        ),
+        any(selected and row.strip() == "untested (0)" for row, selected, _ in frame),
         frame,
     )
 
@@ -282,7 +287,7 @@ def test_multilingual_test_names_are_searchable_and_diffed_under_their_packages(
     for package in ("crate", "proof", "untested"):
         (checkout / package / "default.nix").unlink()
     changes = subject.build_tree(home, view="diff", cache=cache)
-    expect(labels(changes, *project, "- crate") == ["- output::keeps_name"], changes)
+    expect(labels(changes, *project, "- crate") == ["- output::keeps name"], changes)
     expect(
         labels(changes, *project, "shell")
         == ["- preserves spaces", "+ accepts blanks", "+ preserves tabs"],
@@ -290,6 +295,11 @@ def test_multilingual_test_names_are_searchable_and_diffed_under_their_packages(
     )
     expect(labels(changes, *project, "- proof") == ["- Output.keepsName"], changes)
     expect("- untested" in labels(changes, *project), changes)
+    tests = subject.Viewer(subject.build_tree(home, cache=cache))
+    expect(tests.search("+ preserves tabs"), tests.root)
+    rows = {row.strip(): color for row, _, color in tests.frame(40)}
+    expect(rows["▾ shell (2)"] == "~" and rows["▸ - crate (0)"] == "-", rows)
+    expect(rows["- preserves spaces"] == "-" and rows["+ preserves tabs"] == "+", rows)
 
 
 def test_home_tree_shows_a_timeout_alongside_results_from_other_repositories(
@@ -383,21 +393,24 @@ def test_both_views_reuse_cached_results_until_their_test_inputs_change(
     expect(untracked == ({"example": []} if view == "tests" else []), untracked)
 
 
-def test_home_tree_shows_the_current_branch_with_cached_test_names(
+def test_home_tree_shows_modified_files_with_cached_test_names(
     home: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    """Cache each operation independently while reading Git state fresh."""
-    root = home / "github.com/owner/project"
+    """Read repository status again when test names come from the cache."""
+    root = home / "gitlab.com/owner/project"
     cache = home / "cache"
     subject.cached_output(root, "tests", cache, refresh=False)
-    subject.cached_output(root, "diff", cache, refresh=False)
-    git(root, "checkout", "--quiet", "-b", "cached-branch")
+    (root / "notes.txt").touch()
+    git(root, "add", "notes.txt")
     tree = subject.build_tree(home, cache=cache, progress=True)
+    expect(labels(tree, "gitlab.com", "owner", "project") == ["example"], tree)
+    viewer = subject.Viewer(tree)
+    expect(viewer.search("gitlab.com"), tree)
     expect(
-        "branch: cached-branch" in labels(tree, "github.com", "owner", "project"), tree
+        any(selected and color == "~" for _, selected, color in viewer.frame(8)), tree
     )
     progress = capsys.readouterr().err
-    expect("github.com/owner/project: cached" in progress, progress)
+    expect("gitlab.com/owner/project: cached" in progress, progress)
 
 
 def test_test_names_are_reloaded_when_the_cache_is_damaged_or_unavailable(
@@ -463,8 +476,6 @@ def test_viewer_starts_with_folded_directories_and_supports_vim_navigation() -> 
     """Show meaningful labels and let h/l fold and unfold details without JSON noise."""
     root = subject.Node("/home/test", expanded=True)
     project = root.add("github.com").add("owner").add("project")
-    project.add("branch: main")
-    project.add("modified")
     subject.add_tests(project, {"hello": ["test_greets_the_reader"]})
     viewer = subject.Viewer(root)
     expect(
@@ -476,15 +487,14 @@ def test_viewer_starts_with_folded_directories_and_supports_vim_navigation() -> 
     repository = list(viewer.root.visible())[viewer.selected][0]
     expect(repository.label == "project" and not repository.expanded, repository)
     expect(
-        [node.label for node in repository.children]
-        == ["branch: main", "modified", "hello"],
+        [node.label for node in repository.children] == ["hello"],
         repository.children,
     )
-    for key in "ljjjl":
+    for key in "ljl":
         viewer.handle(key, 30)
     package = list(viewer.root.visible())[viewer.selected][0]
     expect(package.label == "hello" and package.expanded, package)
-    expect(labels(package) == ["test_greets_the_reader"], package.children)
+    expect(labels(package) == ["greets the reader"], package.children)
     for key in "hhh":
         viewer.handle(key, 30)
     expect(
@@ -547,7 +557,7 @@ def test_viewer_pans_and_displays_control_characters_as_text() -> None:
 
 
 @pytest.mark.parametrize(
-    ("palette", "modified"), [(256, 208), (8, curses.COLOR_YELLOW)]
+    ("palette", "modified"), [(1 << 24, 0xFF8700), (256, 208), (8, curses.COLOR_YELLOW)]
 )
 def test_browse_refreshes_both_views_and_preserves_navigation(
     monkeypatch: pytest.MonkeyPatch, palette: int, modified: int
@@ -555,7 +565,7 @@ def test_browse_refreshes_both_views_and_preserves_navigation(
     """Reload each mode and allow r in search queries."""
     screen = Mock(spec=curses.window)
     screen.getmaxyx.return_value = (24, 80)
-    screen.get_wch.side_effect = ["d", "/", "r", "\n", "r", "d", "r", "q"]
+    screen.get_wch.side_effect = ["d", "j", "j", "/", "r", "\n", "r", "d", "r", "q"]
     monkeypatch.setattr(curses, "has_colors", lambda: True)
     monkeypatch.setattr(curses, "use_default_colors", lambda: None)
     monkeypatch.setattr(curses, "COLORS", palette, raising=False)
@@ -567,6 +577,15 @@ def test_browse_refreshes_both_views_and_preserves_navigation(
     def load(view: subject.View, _report: Callable[[int, int], None]) -> subject.Node:
         calls.append(view)
         tree = subject.Node("home", expanded=True)
+        if view == "diff":
+            subject.add_tests(
+                tree,
+                None,
+                [
+                    {"op": "add", "path": "/new", "value": []},
+                    {"op": "remove", "path": "/old", "value": []},
+                ],
+            )
         group = tree.add("group")
         group.add(f"generation {len(calls)}")
         return tree
@@ -583,6 +602,14 @@ def test_browse_refreshes_both_views_and_preserves_navigation(
     lines = [args.args[2] for args in screen.addnstr.call_args_list]
     expect("/r" in lines and any("r refresh" in line for line in lines), lines)
     expect("  ▸ group" in lines, lines)
+    for label, pair in (("+ new", 1), ("- old", 2)):
+        styles = {
+            args.args[-1]
+            for args in screen.addnstr.call_args_list
+            if args.args[2].strip() == label
+        }
+        color = curses.color_pair(pair)
+        expect(styles == {color, color | curses.A_BOLD | curses.A_UNDERLINE}, styles)
 
 
 def test_switching_to_diff_shows_repository_progress_until_the_view_is_ready(
